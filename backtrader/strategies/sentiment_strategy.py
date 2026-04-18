@@ -26,44 +26,76 @@ import backtrader as bt
 
 class SentimentStrategy(bt.Strategy):
     '''
-    Sentiment-based trading strategy.
+    Sentiment-based trading strategy with SMA smoothing.
+    
+    Features:
+      - 5-day SMA smoothing on sentiment data to reduce noise
+      - Uses smoothed sentiment for trading decisions
+      - Exposes smoothed sentiment for dynamic position sizing (SentimentSizer)
     
     Buy Logic:
       - No position is open
-      - Today's sentiment > 0.8
+      - Smoothed sentiment > buy_threshold
       
     Sell Logic:
       - A position exists
-      - Today's sentiment < -0.5
+      - Smoothed sentiment < sell_threshold
     '''
     
     params = (
-        ('buy_threshold', 0.8),
-        ('sell_threshold', -0.5),
+        ('buy_threshold', 0.5),
+        ('sell_threshold', -0.3),
+        ('sma_period', 5),
+        ('use_smoothed', True),
         ('prdata', True),
         ('prtrade', True),
     )
     
     def __init__(self):
-        self.sentiment = self.data.sentiment
+        self.raw_sentiment = self.data.sentiment
+        
+        if self.p.use_smoothed:
+            self.sentiment_sma = bt.indicators.SMA(
+                self.data.sentiment,
+                period=self.p.sma_period
+            )
+            self.smoothed_sentiment = self.sentiment_sma
+        else:
+            self.smoothed_sentiment = self.raw_sentiment
+        
+        self.sentiment = self.smoothed_sentiment
         
     def next(self):
         current_date = self.data.datetime.date(0)
-        current_sentiment = self.data.sentiment[0]
+        current_raw_sentiment = self.raw_sentiment[0]
         current_close = self.data.close[0]
         
+        try:
+            current_smoothed = self.smoothed_sentiment[0]
+        except (TypeError, IndexError):
+            current_smoothed = None
+        
         if self.p.prdata:
-            print(f'DATE: {current_date}, CLOSE: {current_close:.2f}, SENTIMENT: {current_sentiment:.2f}')
+            if current_smoothed is not None:
+                print(f'DATE: {current_date}, CLOSE: {current_close:.2f}, '
+                      f'RAW_SENT: {current_raw_sentiment:.2f}, '
+                      f'SMOOTHED: {current_smoothed:.2f}')
+            else:
+                print(f'DATE: {current_date}, CLOSE: {current_close:.2f}, '
+                      f'RAW_SENT: {current_raw_sentiment:.2f}')
+        
+        if current_smoothed is None:
+            return
         
         if not self.position:
-            if current_sentiment > self.p.buy_threshold:
+            if current_smoothed > self.p.buy_threshold:
                 if self.p.prdata:
-                    print(f'  >>> BUY SIGNAL: sentiment ({current_sentiment:.2f}) > threshold ({self.p.buy_threshold})')
+                    print(f'  >>> BUY SIGNAL: smoothed sentiment ({current_smoothed:.2f}) > threshold ({self.p.buy_threshold})')
                 self.buy()
         else:
-            if current_sentiment < self.p.sell_threshold:
+            if current_smoothed < self.p.sell_threshold:
                 if self.p.prdata:
-                    print(f'  <<< SELL SIGNAL: sentiment ({current_sentiment:.2f}) < threshold ({self.p.sell_threshold})')
+                    print(f'  <<< SELL SIGNAL: smoothed sentiment ({current_smoothed:.2f}) < threshold ({self.p.sell_threshold})')
                 self.sell()
     
     def notify_order(self, order):
@@ -72,9 +104,11 @@ class SentimentStrategy(bt.Strategy):
         
         if order.status in [order.Completed]:
             if order.isbuy():
-                print(f'  --- ORDER EXECUTED: BUY at {order.executed.price:.2f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}')
+                print(f'  --- ORDER EXECUTED: BUY {order.executed.size} shares at {order.executed.price:.2f}, '
+                      f'Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}')
             else:
-                print(f'  --- ORDER EXECUTED: SELL at {order.executed.price:.2f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}')
+                print(f'  --- ORDER EXECUTED: SELL {abs(order.executed.size)} shares at {order.executed.price:.2f}, '
+                      f'Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}')
         
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             print(f'  --- ORDER FAILED: {order.getstatusname()}')
