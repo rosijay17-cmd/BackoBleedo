@@ -2450,24 +2450,11 @@ if rdy
          C10 * (pe_a  - MU10) / SC10 +
          C11 * (es_a  - MU11) / SC11
 
-int cnt_intra = 0
-int cnt_daily = 0
-int cnt_local = 0
-
-if n_cands > 0
-    for k = 0 to n_cands - 1
-        int family =
-             array.get(ca_tf, k)
-
-        if family == 0
-            cnt_intra += 1
-        else if family <= 2
-            cnt_daily += 1
-        else
-            cnt_local += 1
-
 // ─────────────────────────────────────────────────────────────────
 // SECTION 27 — AUDIT PLOTS
+// Limited to the optional audit fields listed in the spec, to stay
+// well under the 64-plot platform limit alongside the 18 required
+// data-window exports above.
 // ─────────────────────────────────────────────────────────────────
 
 plot(i_show_audit ? atr_val : na, "Aud ATR", display = display.data_window)
@@ -2481,15 +2468,10 @@ plot(i_show_audit ? vwap_dist : na, "Aud VWAP Dist", display = display.data_wind
 plot(i_show_audit ? prc_vs_e21 : na, "Aud Price EMA21", display = display.data_window)
 plot(i_show_audit ? ema_slope : na, "Aud EMA Slope", display = display.data_window)
 plot(i_show_audit ? liq_asym : na, "Aud Liq Asym", display = display.data_window)
-plot(i_show_audit ? float(n_abv) : na, "Aud N Above", display = display.data_window)
-plot(i_show_audit ? float(n_blw) : na, "Aud N Below", display = display.data_window)
 plot(i_show_audit ? aud_rank : na, "Aud Sel Rank", display = display.data_window)
 plot(i_show_audit ? aud_nsd : na, "Aud Sel N Same", display = display.data_window)
 plot(i_show_audit ? aud_dopp : na, "Aud Opp Dist", display = display.data_window)
 plot(i_show_audit ? aud_lp : na, "Aud Raw LP", display = display.data_window)
-
-// Model-distance diagnostics.
-plot(i_show_audit ? top_dst : na, "Aud Model Distance Input", display = display.data_window)
 
 plot(
      i_show_audit and not na(top_dst)
@@ -2504,31 +2486,6 @@ plot(
          : na,
      "Aud Distance LP Contribution",
      display = display.data_window)
-
-plot(i_show_audit ? sess_h_lvl : na, "Aud Sess High", display = display.data_window)
-plot(i_show_audit ? sess_l_lvl : na, "Aud Sess Low", display = display.data_window)
-plot(i_show_audit ? prev_s_h : na, "Aud Prev Sess High", display = display.data_window)
-plot(i_show_audit ? prev_s_l : na, "Aud Prev Sess Low", display = display.data_window)
-plot(i_show_audit ? on_h_lvl : na, "Aud Overnight High", display = display.data_window)
-plot(i_show_audit ? on_l_lvl : na, "Aud Overnight Low", display = display.data_window)
-plot(i_show_audit ? lon_h_lvl : na, "Aud London High", display = display.data_window)
-plot(i_show_audit ? lon_l_lvl : na, "Aud London Low", display = display.data_window)
-plot(i_show_audit ? or_h_lvl : na, "Aud OR High", display = display.data_window)
-plot(i_show_audit ? or_l_lvl : na, "Aud OR Low", display = display.data_window)
-plot(i_show_audit ? vwap_val : na, "Aud VWAP", display = display.data_window)
-plot(i_show_audit ? sw_h20 : na, "Aud Swing High", display = display.data_window)
-plot(i_show_audit ? sw_l20 : na, "Aud Swing Low", display = display.data_window)
-plot(i_show_audit ? eq_h_lvl : na, "Aud EQ High", display = display.data_window)
-plot(i_show_audit ? eq_l_lvl : na, "Aud EQ Low", display = display.data_window)
-plot(i_show_audit ? fvg_up_lvl : na, "Aud FVG Upper", display = display.data_window)
-plot(i_show_audit ? fvg_lo_lvl : na, "Aud FVG Lower", display = display.data_window)
-plot(i_show_audit ? pd_h : na, "Aud Prev Day High", display = display.data_window)
-plot(i_show_audit ? pd_l : na, "Aud Prev Day Low", display = display.data_window)
-plot(i_show_audit ? pw_h : na, "Aud Prev Week High", display = display.data_window)
-plot(i_show_audit ? pw_l : na, "Aud Prev Week Low", display = display.data_window)
-plot(i_show_audit ? float(cnt_intra) : na, "Aud N Intraday", display = display.data_window)
-plot(i_show_audit ? float(cnt_daily) : na, "Aud N Daily Week", display = display.data_window)
-plot(i_show_audit ? float(cnt_local) : na, "Aud N Local", display = display.data_window)
 
 // ═══════════════════════════════════════════════════════════════════
 // END
