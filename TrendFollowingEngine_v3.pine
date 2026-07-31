@@ -340,6 +340,22 @@ bool reAccelLong  = fastEmaRising  and close > close[1] and rocAtr > 0.0
 bool reAccelShort = fastEmaFalling and close < close[1] and rocAtr < 0.0
 
 //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STATE VARIABLES — declared before scoring so latched setup credit is
+// available to the trigger-quality score on every bar, not just the
+// one bar the raw setup trigger is true.
+// 0 = idle, 1 = trend qualified, 2 = setup observed, 3 = re-accel confirmed,
+// 4 = fired (awaiting rearm).
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var int longState  = 0
+var int shortState = 0
+
+var string longSetupTypeVar  = "NONE"
+var string shortSetupTypeVar = "NONE"
+
+var bool longSetupLatched  = false
+var bool shortSetupLatched = false
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // SCORING — four independent groups, no double-counted components, sum = 100
 //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Regime quality (max 35) — direction-agnostic, shared by both sides.
@@ -360,12 +376,34 @@ float slopeScoreShort = slopeForShort < 0.0 ? f_norm(-slopeForShort, slopeNormLo
 float alignScoreLong  = (aboveRAP ? 10.0 : 0.0) + diScoreLong  + slopeScoreLong
 float alignScoreShort = (belowRAP ? 10.0 : 0.0) + diScoreShort + slopeScoreShort
 
-// Trigger quality (max 20).
-float momScoreLong  = rocAtr > 0.0 ? f_norm(rocAtr, momNormLo, momNormHi) * 10.0  : 0.0
-float momScoreShort = rocAtr < 0.0 ? f_norm(-rocAtr, momNormLo, momNormHi) * 10.0 : 0.0
+// Trigger quality (max 20). Setup credit latches once observed so the
+// score doesn't collapse back to 0 on the bar after a one-bar setup
+// event, before the state machine has reached the fire gate.
+float momScoreLong =
+     rocAtr > 0.0
+         ? f_norm(rocAtr, momNormLo, momNormHi) * 10.0
+         : 0.0
 
-float triggerScoreLong  = (setupTriggerLong  ? 10.0 : 0.0) + momScoreLong
-float triggerScoreShort = (setupTriggerShort ? 10.0 : 0.0) + momScoreShort
+float momScoreShort =
+     rocAtr < 0.0
+         ? f_norm(-rocAtr, momNormLo, momNormHi) * 10.0
+         : 0.0
+
+bool setupCreditLong =
+     setupTriggerLong or
+     longSetupLatched
+
+bool setupCreditShort =
+     setupTriggerShort or
+     shortSetupLatched
+
+float triggerScoreLong =
+     (setupCreditLong ? 10.0 : 0.0) +
+     momScoreLong
+
+float triggerScoreShort =
+     (setupCreditShort ? 10.0 : 0.0) +
+     momScoreShort
 
 // Tradeability & extension (max 15).
 float tradeScoreLong =
@@ -428,15 +466,10 @@ bool cooldownOKLong  = barsSinceLong  >= cooldownBars
 bool cooldownOKShort = barsSinceShort >= cooldownBars
 
 //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// STATE MACHINE — persistent, mutated only on confirmed bars
+// FROZEN TRADE STATE — persistent, mutated only on confirmed bars
+// (longState/shortState/longSetupTypeVar/shortSetupTypeVar/latches are
+// declared earlier, above the scoring section)
 //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 0 = idle, 1 = trend qualified, 2 = setup observed, 3 = re-accel confirmed,
-// 4 = fired (awaiting rearm).
-var int longState  = 0
-var int shortState = 0
-var string longSetupTypeVar  = "NONE"
-var string shortSetupTypeVar = "NONE"
-
 var float frozenEntry      = na
 var float frozenAtrAtEntry = na
 var float frozenStop       = na
@@ -457,80 +490,95 @@ var string lastOutcome    = "NONE"
 bool longSignalEdge  = false
 bool shortSignalEdge = false
 
-bool longFinalGateOK =
-     trendScoreLong >= trendScoreFire and
-     cooldownOKLong and
-     not shockBlockActive and
-     (longSetupTypeVar == "BREAKOUT" ? longExtOKBreakout :
-      longSetupTypeVar == "PULLBACK" ? longExtOKPullback :
-      false)
-
-bool shortFinalGateOK =
-     trendScoreShort >= trendScoreFire and
-     cooldownOKShort and
-     not shockBlockActive and
-     (shortSetupTypeVar == "BREAKOUT" ? shortExtOKBreakout :
-      shortSetupTypeVar == "PULLBACK" ? shortExtOKPullback :
-      false)
-
 if barstate.isconfirmed
+    longSignalEdge  := false
+    shortSignalEdge := false
+
     // ---- LONG STATE MACHINE ----
-    if longState == 0
-        if bullTrendBase
-            longState := 1
-    else if longState == 1
-        if not bullTrendBase
-            longState := 0
-        else if setupTriggerLong
-            longSetupTypeVar := setupCandidateLong
-            longState := 2
-    else if longState == 2
-        if not bullTrendBase
-            longState := 0
-            longSetupTypeVar := "NONE"
-        else if reAccelLong
-            longState := 3
-    else if longState == 3
-        if not bullTrendBase
-            longState := 0
-            longSetupTypeVar := "NONE"
-        else if longFinalGateOK
-            longSignalEdge := true
-            lastLongSignalBar := bar_index
-            longState := 4
-    else if longState == 4
-        if (not bullTrendBase) or (bar_index - lastLongSignalBar >= cooldownBars)
-            longState := 0
-            longSetupTypeVar := "NONE"
+    // Sequential ifs (not if/else-if) so more than one state transition —
+    // qualify, setup, re-accel, fire — can happen on the same confirmed bar.
+    if longState > 0 and not bullTrendBase
+        longState := 0
+        longSetupTypeVar := "NONE"
+        longSetupLatched := false
+
+    if longState == 0 and bullTrendBase
+        longState := 1
+
+    if longState == 1 and bullTrendBase and setupTriggerLong
+        longSetupTypeVar := setupCandidateLong
+        longSetupLatched := true
+        longState := 2
+
+    if longState == 2 and bullTrendBase and reAccelLong
+        longState := 3
+
+    bool longExtensionGate =
+         longSetupTypeVar == "BREAKOUT"
+             ? longExtOKBreakout
+             : longSetupTypeVar == "PULLBACK"
+                 ? longExtOKPullback
+                 : false
+
+    bool longFinalGateNow =
+         longState == 3 and
+         bullTrendBase and
+         trendScoreLong >= trendScoreFire and
+         cooldownOKLong and
+         not shockBlockActive and
+         longExtensionGate
+
+    if longFinalGateNow
+        longSignalEdge := true
+        lastLongSignalBar := bar_index
+        longState := 4
+
+    if longState == 4 and (not bullTrendBase or bar_index - lastLongSignalBar >= cooldownBars)
+        longState := 0
+        longSetupTypeVar := "NONE"
+        longSetupLatched := false
 
     // ---- SHORT STATE MACHINE ----
-    if shortState == 0
-        if bearTrendBase
-            shortState := 1
-    else if shortState == 1
-        if not bearTrendBase
-            shortState := 0
-        else if setupTriggerShort
-            shortSetupTypeVar := setupCandidateShort
-            shortState := 2
-    else if shortState == 2
-        if not bearTrendBase
-            shortState := 0
-            shortSetupTypeVar := "NONE"
-        else if reAccelShort
-            shortState := 3
-    else if shortState == 3
-        if not bearTrendBase
-            shortState := 0
-            shortSetupTypeVar := "NONE"
-        else if shortFinalGateOK
-            shortSignalEdge := true
-            lastShortSignalBar := bar_index
-            shortState := 4
-    else if shortState == 4
-        if (not bearTrendBase) or (bar_index - lastShortSignalBar >= cooldownBars)
-            shortState := 0
-            shortSetupTypeVar := "NONE"
+    if shortState > 0 and not bearTrendBase
+        shortState := 0
+        shortSetupTypeVar := "NONE"
+        shortSetupLatched := false
+
+    if shortState == 0 and bearTrendBase
+        shortState := 1
+
+    if shortState == 1 and bearTrendBase and setupTriggerShort
+        shortSetupTypeVar := setupCandidateShort
+        shortSetupLatched := true
+        shortState := 2
+
+    if shortState == 2 and bearTrendBase and reAccelShort
+        shortState := 3
+
+    bool shortExtensionGate =
+         shortSetupTypeVar == "BREAKOUT"
+             ? shortExtOKBreakout
+             : shortSetupTypeVar == "PULLBACK"
+                 ? shortExtOKPullback
+                 : false
+
+    bool shortFinalGateNow =
+         shortState == 3 and
+         bearTrendBase and
+         trendScoreShort >= trendScoreFire and
+         cooldownOKShort and
+         not shockBlockActive and
+         shortExtensionGate
+
+    if shortFinalGateNow
+        shortSignalEdge := true
+        lastShortSignalBar := bar_index
+        shortState := 4
+
+    if shortState == 4 and (not bearTrendBase or bar_index - lastShortSignalBar >= cooldownBars)
+        shortState := 0
+        shortSetupTypeVar := "NONE"
+        shortSetupLatched := false
 
     // ---- FROZEN TRADE MANAGEMENT ----
     if frozenActive
@@ -710,7 +758,9 @@ string longBlocker =
      (rvolActive and rvol < rvolTrendMin) ? "RVOL LOW" :
      longState < 2          ? "NO SETUP" :
      longState == 2          ? "AWAIT REACCEL" :
-     longState == 3 and not longFinalGateOK ? "GATE FAIL" :
+     longState == 3 and trendScoreLong < trendScoreFire ? "SCORE LOW" :
+     longState == 3 and longSetupTypeVar == "PULLBACK" and not longExtOKPullback ? "TOO EXTENDED" :
+     longState == 3 and longSetupTypeVar == "BREAKOUT" and not longExtOKBreakout ? "TOO EXTENDED" :
      "CLEAR"
 
 string shortBlocker =
@@ -724,7 +774,9 @@ string shortBlocker =
      (rvolActive and rvol < rvolTrendMin) ? "RVOL LOW" :
      shortState < 2          ? "NO SETUP" :
      shortState == 2          ? "AWAIT REACCEL" :
-     shortState == 3 and not shortFinalGateOK ? "GATE FAIL" :
+     shortState == 3 and trendScoreShort < trendScoreFire ? "SCORE LOW" :
+     shortState == 3 and shortSetupTypeVar == "PULLBACK" and not shortExtOKPullback ? "TOO EXTENDED" :
+     shortState == 3 and shortSetupTypeVar == "BREAKOUT" and not shortExtOKBreakout ? "TOO EXTENDED" :
      "CLEAR"
 
 string htfStateText =
