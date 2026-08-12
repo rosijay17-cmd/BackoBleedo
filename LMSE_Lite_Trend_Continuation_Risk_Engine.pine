@@ -1,0 +1,2098 @@
+// This Pine Script® code is subject to the terms of the
+// Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+//@version=6
+strategy(
+     title                   = "LMSE-Lite Trend Continuation Risk Engine — Fixed",
+     shorttitle              = "LMSELite FIX",
+     overlay                 = true,
+     pyramiding              = 0,
+     process_orders_on_close = true,
+     calc_on_every_tick      = true,
+     calc_on_order_fills     = true,
+     initial_capital         = 50000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.02,
+     slippage                = 1,
+     max_labels_count        = 200)
+
+// ═══════════════════════════════════════════════════════════════════
+// INPUT GROUPS
+// ═══════════════════════════════════════════════════════════════════
+
+const string GRP_SIGNAL  = "01 — Signal Filters"
+const string GRP_TIMING  = "02 — Entry Timing"
+const string GRP_FREQ    = "03 — Trade Frequency"
+const string GRP_SESSION = "04 — Trading Session"
+const string GRP_SIZE    = "05 — Position Sizing"
+const string GRP_RISK    = "06 — Risk Management"
+const string GRP_TRAIL   = "07 — Trailing Stop"
+const string GRP_VISUAL  = "08 — Visuals"
+const string GRP_ALERTS  = "09 — Alerts"
+
+// ═══════════════════════════════════════════════════════════════════
+// SIGNAL INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+int adxLen = input.int(
+     14,
+     "ADX Length",
+     minval = 2,
+     group = GRP_SIGNAL)
+
+float adxMin = input.float(
+     20.0,
+     "ADX Minimum",
+     minval = 1.0,
+     step = 0.5,
+     group = GRP_SIGNAL)
+
+int rocLen = input.int(
+     14,
+     "ROC Length",
+     minval = 2,
+     group = GRP_SIGNAL)
+
+int bopLen = input.int(
+     21,
+     "BOP Smoothing",
+     minval = 2,
+     group = GRP_SIGNAL)
+
+int atrLen = input.int(
+     14,
+     "ATR Length",
+     minval = 2,
+     group = GRP_SIGNAL)
+
+int atrBaseLen = input.int(
+     50,
+     "ATR Baseline",
+     minval = 10,
+     group = GRP_SIGNAL)
+
+float atrFactor = input.float(
+     0.80,
+     "Minimum ATR Expansion",
+     minval = 0.10,
+     step = 0.05,
+     group = GRP_SIGNAL)
+
+float atrMaxFactor = input.float(
+     2.00,
+     "Maximum ATR Expansion",
+     minval = 0.50,
+     step = 0.05,
+     group = GRP_SIGNAL)
+
+float minDQStrength = input.float(
+     0.25,
+     "Minimum DQ Strength",
+     minval = 0.0,
+     maxval = 1.0,
+     step = 0.05,
+     group = GRP_SIGNAL)
+
+bool requireEMAAlignment = input.bool(
+     true,
+     "Require EMA 20 / EMA 50 Alignment",
+     group = GRP_SIGNAL)
+
+bool requireDIAlignment = input.bool(
+     true,
+     "Require DI Alignment",
+     group = GRP_SIGNAL)
+
+bool requirePriceEMA = input.bool(
+     true,
+     "Require Price Beyond EMA 20",
+     group = GRP_SIGNAL)
+
+bool blockHighFailure = input.bool(
+     false,
+     "Block High-Failure Setups",
+     group = GRP_SIGNAL)
+
+float pFailCap = input.float(
+     0.45,
+     "Failure Probability Cap",
+     minval = 0.0,
+     maxval = 1.0,
+     step = 0.05,
+     group = GRP_SIGNAL)
+
+// ═══════════════════════════════════════════════════════════════════
+// ENTRY TIMING INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+string entryTriggerMode = input.string(
+     "Pullback / Reclaim",
+     "Entry Trigger",
+     options = [
+          "EMA Cross",
+          "Pullback / Reclaim",
+          "Breakout",
+          "Cross Or Pullback",
+          "Pullback Or Breakout",
+          "Any"
+     ],
+     group = GRP_TIMING)
+
+int setupConfirmBars = input.int(
+     1,
+     "Setup Confirmation Bars",
+     minval = 1,
+     maxval = 10,
+     group = GRP_TIMING)
+
+int maximumEntryDelayBars = input.int(
+     0,
+     "Maximum Entry Delay — Bars",
+     minval = 0,
+     maxval = 3,
+     tooltip = "0 requires entry on the first valid trigger bar. 1 allows only the next bar.",
+     group = GRP_TIMING)
+
+bool requireFreshDelayedTrigger = input.bool(
+     true,
+     "Require Fresh Trigger On Delayed Entry",
+     tooltip = "A delayed entry must produce a new breakout or reclaim instead of entering passively.",
+     group = GRP_TIMING)
+
+float maxEntryExtensionATR = input.float(
+     1.00,
+     "Maximum Entry Extension — ATR",
+     minval = 0.10,
+     maxval = 5.0,
+     step = 0.05,
+     tooltip = "Rejects entries too far from EMA 20.",
+     group = GRP_TIMING)
+
+float pullbackToleranceATR = input.float(
+     0.25,
+     "Pullback EMA Tolerance — ATR",
+     minval = 0.0,
+     maxval = 2.0,
+     step = 0.05,
+     group = GRP_TIMING)
+
+int breakoutLookback = input.int(
+     5,
+     "Breakout Lookback",
+     minval = 1,
+     maxval = 50,
+     group = GRP_TIMING)
+
+// ═══════════════════════════════════════════════════════════════════
+// FREQUENCY INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+int cooldownBars = input.int(
+     20,
+     "Cooldown Bars After Trade Closes",
+     minval = 0,
+     maxval = 200,
+     group = GRP_FREQ)
+
+int maxTradesPerDay = input.int(
+     2,
+     "Maximum Trades Per NY Day",
+     minval = 1,
+     maxval = 20,
+     group = GRP_FREQ)
+
+bool requireSetupReset = input.bool(
+     true,
+     "Require Setup Reset Before Re-entry",
+     group = GRP_FREQ)
+
+// ═══════════════════════════════════════════════════════════════════
+// SESSION INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+string tradeSession = input.session(
+     "0935-1555",
+     "Entry Session",
+     tooltip = "New York time.",
+     group = GRP_SESSION)
+
+string sessionTimezone = input.string(
+     "America/New_York",
+     "Session Timezone",
+     group = GRP_SESSION)
+
+bool closeAtSessionEnd = input.bool(
+     true,
+     "Close Position At Session End",
+     group = GRP_SESSION)
+
+// ═══════════════════════════════════════════════════════════════════
+// POSITION SIZING
+// ═══════════════════════════════════════════════════════════════════
+
+float baseQty = input.float(
+     1.0,
+     "Base Contracts",
+     minval = 1.0,
+     step = 1.0,
+     group = GRP_SIZE)
+
+bool allowLong = input.bool(
+     true,
+     "Allow Longs",
+     group = GRP_SIZE)
+
+bool allowShort = input.bool(
+     true,
+     "Allow Shorts",
+     group = GRP_SIZE)
+
+string sizingMode = input.string(
+     "Fixed",
+     "Sizing Mode",
+     options = [
+          "Fixed",
+          "DQ Linear",
+          "DQ Piecewise",
+          "Risk %",
+          "Risk $"
+     ],
+     group = GRP_SIZE)
+
+float minMult = input.float(
+     0.25,
+     "Minimum DQ Multiplier",
+     minval = 0.05,
+     step = 0.05,
+     group = GRP_SIZE)
+
+float maxMult = input.float(
+     1.50,
+     "Maximum DQ Multiplier",
+     minval = 0.25,
+     step = 0.05,
+     group = GRP_SIZE)
+
+float riskPerTradePct = input.float(
+     0.50,
+     "Risk Per Trade %",
+     minval = 0.05,
+     maxval = 10.0,
+     step = 0.05,
+     group = GRP_SIZE)
+
+float maxRiskDollars = input.float(
+     500.0,
+     "Maximum Risk $",
+     minval = 1.0,
+     step = 25.0,
+     group = GRP_SIZE)
+
+// ═══════════════════════════════════════════════════════════════════
+// RISK MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════
+
+float stopATR = input.float(
+     1.25,
+     "ATR Stop",
+     minval = 0.1,
+     step = 0.1,
+     group = GRP_RISK)
+
+float highFailureStopMultiplier = input.float(
+     0.70,
+     "High-Failure Stop Multiplier",
+     minval = 0.10,
+     maxval = 1.0,
+     step = 0.05,
+     group = GRP_RISK)
+
+float tp1R = input.float(
+     1.0,
+     "TP1 Reward / Risk",
+     minval = 0.25,
+     step = 0.25,
+     group = GRP_RISK)
+
+float tp2R = input.float(
+     3.0,
+     "TP2 Reward / Risk",
+     minval = 0.50,
+     step = 0.25,
+     group = GRP_RISK)
+
+float tp1Qty = input.float(
+     50.0,
+     "TP1 Quantity %",
+     minval = 1.0,
+     maxval = 99.0,
+     step = 1.0,
+     group = GRP_RISK)
+
+bool useBreakEven = input.bool(
+     true,
+     "Move Stop To Break-Even After TP1",
+     group = GRP_RISK)
+
+int breakEvenOffsetTicks = input.int(
+     0,
+     "Break-Even Offset — Ticks",
+     minval = 0,
+     maxval = 100,
+     group = GRP_RISK)
+
+int maximumHoldingBars = input.int(
+     80,
+     "Maximum Holding Bars",
+     minval = 1,
+     maxval = 1000,
+     group = GRP_RISK)
+
+// ═══════════════════════════════════════════════════════════════════
+// TRAILING STOP
+// ═══════════════════════════════════════════════════════════════════
+
+bool useTrail = input.bool(
+     true,
+     "Use Persistence Trail After TP1",
+     group = GRP_TRAIL)
+
+float lowPersistence = input.float(
+     8.0,
+     "Low Persistence",
+     minval = 1.0,
+     group = GRP_TRAIL)
+
+float highPersistence = input.float(
+     20.0,
+     "High Persistence",
+     minval = 2.0,
+     group = GRP_TRAIL)
+
+float tightTrailATR = input.float(
+     1.0,
+     "Tight Trail ATR",
+     minval = 0.1,
+     step = 0.1,
+     group = GRP_TRAIL)
+
+float baseTrailATR = input.float(
+     1.5,
+     "Base Trail ATR",
+     minval = 0.1,
+     step = 0.1,
+     group = GRP_TRAIL)
+
+float looseTrailATR = input.float(
+     2.0,
+     "Loose Trail ATR",
+     minval = 0.1,
+     step = 0.1,
+     group = GRP_TRAIL)
+
+// ═══════════════════════════════════════════════════════════════════
+// VISUALS
+// ═══════════════════════════════════════════════════════════════════
+
+bool showSignals = input.bool(
+     true,
+     "Show Entry Signals",
+     group = GRP_VISUAL)
+
+bool showSetupMarkers = input.bool(
+     false,
+     "Show Raw Setup Markers",
+     group = GRP_VISUAL)
+
+bool showTradeLevels = input.bool(
+     true,
+     "Show Active Trade Levels",
+     group = GRP_VISUAL)
+
+bool showDashboard = input.bool(
+     true,
+     "Show Dashboard",
+     group = GRP_VISUAL)
+
+string dashPos = input.string(
+     "Top Right",
+     "Dashboard Position",
+     options = [
+          "Top Right",
+          "Top Left",
+          "Bottom Right",
+          "Bottom Left"
+     ],
+     group = GRP_VISUAL)
+
+string dashFont = input.string(
+     "Phone",
+     "Dashboard Font Size",
+     options = [
+          "Compact",
+          "Phone",
+          "Large"
+     ],
+     group = GRP_VISUAL)
+
+// ═══════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════
+
+bool enableDynamicAlerts = input.bool(
+     true,
+     "Enable Dynamic alert() Calls",
+     group = GRP_ALERTS)
+
+// ═══════════════════════════════════════════════════════════════════
+// COLORS
+// ═══════════════════════════════════════════════════════════════════
+
+color C_NAVY   = color.rgb(8, 16, 31)
+color C_CARD   = color.rgb(20, 32, 53)
+color C_ALT    = color.rgb(27, 41, 65)
+color C_BLUE   = color.rgb(75, 145, 247)
+color C_PURPLE = color.rgb(156, 90, 235)
+color C_GREEN  = color.rgb(34, 197, 94)
+color C_ORANGE = color.rgb(245, 158, 11)
+color C_RED    = color.rgb(239, 68, 68)
+color C_GRAY   = color.rgb(100, 116, 139)
+color C_WHITE  = color.rgb(245, 248, 252)
+
+// ═══════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+f_clamp(float value, float minimum, float maximum) =>
+    math.max(
+         minimum,
+         math.min(maximum, value))
+
+f_norm(float value, float minimum, float maximum) =>
+    f_clamp(
+         (value - minimum) /
+         math.max(maximum - minimum, 0.000001),
+         0.0,
+         1.0)
+
+f_price(float value) =>
+    na(value)
+         ? "—"
+         : str.tostring(value, format.mintick)
+
+f_number(float value) =>
+    na(value)
+         ? "—"
+         : str.tostring(value, "#.00")
+
+// ═══════════════════════════════════════════════════════════════════
+// INDICATORS
+// ═══════════════════════════════════════════════════════════════════
+
+float atr = ta.atr(atrLen)
+float atrBase = ta.sma(atr, atrBaseLen)
+
+float atrExpansion =
+     not na(atrBase) and atrBase > 0.0
+         ? atr / atrBase
+         : na
+
+[plusDI, minusDI, adx] =
+     ta.dmi(adxLen, adxLen)
+
+float roc =
+     ta.roc(close, rocLen)
+
+float candleRange =
+     math.max(
+          high - low,
+          syminfo.mintick)
+
+float bopRaw =
+     (close - open) /
+     candleRange
+
+float bop =
+     ta.ema(bopRaw, bopLen)
+
+float emaFast =
+     ta.ema(close, 20)
+
+float emaSlow =
+     ta.ema(close, 50)
+
+bool dataReady =
+     not na(atrExpansion) and
+     not na(adx) and
+     not na(roc) and
+     not na(bop) and
+     not na(emaFast) and
+     not na(emaSlow)
+
+// ═══════════════════════════════════════════════════════════════════
+// DIRECTIONAL QUALITY
+// ═══════════════════════════════════════════════════════════════════
+
+float trendScore =
+     f_norm(
+          adx,
+          adxMin,
+          adxMin + 25.0)
+
+float atrScore =
+     f_norm(
+          atrExpansion,
+          atrFactor,
+          atrFactor + 0.80)
+
+float rocScore =
+     f_norm(
+          math.abs(roc),
+          0.0,
+          0.60)
+
+float bopScore =
+     f_norm(
+          math.abs(bop),
+          0.0,
+          0.40)
+
+float emaSeparation =
+     atr > 0.0
+         ? math.abs(emaFast - emaSlow) / atr
+         : 0.0
+
+float emaStrength =
+     f_norm(
+          emaSeparation,
+          0.05,
+          0.50)
+
+float direction =
+     roc > 0.0 and bop > 0.0
+         ? 1.0
+         : roc < 0.0 and bop < 0.0
+             ? -1.0
+             : 0.0
+
+float quality =
+     0.30 * trendScore +
+     0.25 * atrScore +
+     0.20 * rocScore +
+     0.15 * bopScore +
+     0.10 * emaStrength
+
+float dq =
+     f_clamp(
+          direction * quality,
+          -1.0,
+          1.0)
+
+float dqStrength =
+     math.abs(dq)
+
+// ═══════════════════════════════════════════════════════════════════
+// FAILURE AND PERSISTENCE PROXIES
+// ═══════════════════════════════════════════════════════════════════
+
+float chopRisk =
+     adx < adxMin
+         ? 0.35
+         : 0.0
+
+float weakVolRisk =
+     atrExpansion < atrFactor
+         ? 0.25
+         : 0.0
+
+float hotVolRisk =
+     atrExpansion > atrMaxFactor
+         ? 0.20
+         : 0.0
+
+float momentumConflict =
+     (
+          roc > 0.0 and bop < 0.0
+     ) or (
+          roc < 0.0 and bop > 0.0
+     )
+         ? 0.25
+         : 0.0
+
+float emaConflict =
+     direction > 0.0 and close < emaFast
+         ? 0.15
+         : direction < 0.0 and close > emaFast
+             ? 0.15
+             : 0.0
+
+float weakQualityRisk =
+     (1.0 - dqStrength) * 0.20
+
+float pFailLite =
+     f_clamp(
+          chopRisk +
+          weakVolRisk +
+          hotVolRisk +
+          momentumConflict +
+          emaConflict +
+          weakQualityRisk,
+          0.0,
+          1.0)
+
+float persistence =
+     f_clamp(
+          5.0 +
+          trendScore * 12.0 +
+          atrScore * 8.0 -
+          pFailLite * 8.0,
+          1.0,
+          30.0)
+
+// ═══════════════════════════════════════════════════════════════════
+// POSITION SIZING
+// ═══════════════════════════════════════════════════════════════════
+
+float riskMultiplier =
+     sizingMode == "Fixed" or
+     sizingMode == "Risk %" or
+     sizingMode == "Risk $"
+         ? 1.0
+         : sizingMode == "DQ Linear"
+             ? f_clamp(
+                  minMult +
+                  dqStrength *
+                  (maxMult - minMult),
+                  minMult,
+                  maxMult)
+             : dqStrength < 0.15
+                 ? 0.25
+                 : dqStrength < 0.25
+                     ? 0.50
+                     : dqStrength < 0.40
+                         ? 1.00
+                         : dqStrength < 0.60
+                             ? 1.25
+                             : 1.50
+
+float dqQty =
+     math.max(
+          1.0,
+          math.round(
+               baseQty *
+               riskMultiplier))
+
+float pointValue =
+     not na(syminfo.pointvalue) and
+     syminfo.pointvalue > 0.0
+         ? syminfo.pointvalue
+         : 1.0
+
+bool useDollarSizing =
+     sizingMode == "Risk %" or
+     sizingMode == "Risk $"
+
+float riskBudget =
+     sizingMode == "Risk %"
+         ? strategy.equity *
+           riskPerTradePct /
+           100.0
+         : maxRiskDollars
+
+// ═══════════════════════════════════════════════════════════════════
+// SESSION AND DAILY LIMITS
+// ═══════════════════════════════════════════════════════════════════
+
+bool inTradeSession =
+     not na(
+          time(
+               timeframe.period,
+               tradeSession,
+               sessionTimezone))
+
+bool sessionEndBar =
+     not inTradeSession and
+     inTradeSession[1]
+
+int dayIdentifier =
+     year(time, sessionTimezone) * 10000 +
+     month(time, sessionTimezone) * 100 +
+     dayofmonth(time, sessionTimezone)
+
+bool newTradingDay =
+     barstate.isfirst or
+     dayIdentifier != dayIdentifier[1]
+
+var int tradesToday = 0
+
+if newTradingDay
+    tradesToday := 0
+
+bool dailyTradeLimitPass =
+     tradesToday < maxTradesPerDay
+
+// ═══════════════════════════════════════════════════════════════════
+// COOLDOWN
+// ═══════════════════════════════════════════════════════════════════
+
+var int lastClosedTradeBar = na
+
+int barsSinceClosedTrade =
+     na(lastClosedTradeBar)
+         ? 1000000
+         : bar_index -
+           lastClosedTradeBar
+
+bool cooldownPass =
+     barsSinceClosedTrade >= cooldownBars
+
+int cooldownRemaining =
+     cooldownPass
+         ? 0
+         : math.max(
+              cooldownBars -
+              barsSinceClosedTrade,
+              0)
+
+// ═══════════════════════════════════════════════════════════════════
+// SETUP CONDITIONS
+// ═══════════════════════════════════════════════════════════════════
+
+bool trendRegimePass =
+     dataReady and
+     adx >= adxMin and
+     atrExpansion >= atrFactor and
+     atrExpansion <= atrMaxFactor
+
+bool longEMAAligned =
+     not requireEMAAlignment or
+     emaFast > emaSlow
+
+bool shortEMAAligned =
+     not requireEMAAlignment or
+     emaFast < emaSlow
+
+bool longDIAligned =
+     not requireDIAlignment or
+     plusDI > minusDI
+
+bool shortDIAligned =
+     not requireDIAlignment or
+     minusDI > plusDI
+
+bool longPriceAligned =
+     not requirePriceEMA or
+     close > emaFast
+
+bool shortPriceAligned =
+     not requirePriceEMA or
+     close < emaFast
+
+bool failurePass =
+     not blockHighFailure or
+     pFailLite <= pFailCap
+
+bool commonSetupPass =
+     inTradeSession and
+     dailyTradeLimitPass and
+     cooldownPass and
+     trendRegimePass and
+     failurePass
+
+bool longSetupState =
+     allowLong and
+     commonSetupPass and
+     roc > 0.0 and
+     bop > 0.0 and
+     dq > 0.0 and
+     dqStrength >= minDQStrength and
+     longEMAAligned and
+     longDIAligned and
+     longPriceAligned
+
+bool shortSetupState =
+     allowShort and
+     commonSetupPass and
+     roc < 0.0 and
+     bop < 0.0 and
+     dq < 0.0 and
+     dqStrength >= minDQStrength and
+     shortEMAAligned and
+     shortDIAligned and
+     shortPriceAligned
+
+// ═══════════════════════════════════════════════════════════════════
+// SETUP CONFIRMATION AND LATCHING
+// ═══════════════════════════════════════════════════════════════════
+
+var int longSetupCount = 0
+var int shortSetupCount = 0
+
+var bool longSetupLatched = false
+var bool shortSetupLatched = false
+
+var int longSetupReadyBar = na
+var int shortSetupReadyBar = na
+
+if barstate.isconfirmed
+    longSetupCount :=
+         longSetupState
+             ? longSetupCount + 1
+             : 0
+
+    shortSetupCount :=
+         shortSetupState
+             ? shortSetupCount + 1
+             : 0
+
+    bool newLongSetupReady =
+         longSetupCount >= setupConfirmBars and
+         longSetupCount[1] < setupConfirmBars
+
+    bool newShortSetupReady =
+         shortSetupCount >= setupConfirmBars and
+         shortSetupCount[1] < setupConfirmBars
+
+    if newLongSetupReady
+        longSetupLatched := true
+        longSetupReadyBar := bar_index
+
+    if newShortSetupReady
+        shortSetupLatched := true
+        shortSetupReadyBar := bar_index
+
+    if not longSetupState
+        longSetupLatched := false
+        longSetupReadyBar := na
+
+    if not shortSetupState
+        shortSetupLatched := false
+        shortSetupReadyBar := na
+
+int longSetupAge =
+     longSetupLatched and
+     not na(longSetupReadyBar)
+         ? bar_index -
+           longSetupReadyBar
+         : -1
+
+int shortSetupAge =
+     shortSetupLatched and
+     not na(shortSetupReadyBar)
+         ? bar_index -
+           shortSetupReadyBar
+         : -1
+
+bool longEntryWindowOpen =
+     longSetupLatched and
+     longSetupAge >= 0 and
+     longSetupAge <= maximumEntryDelayBars
+
+bool shortEntryWindowOpen =
+     shortSetupLatched and
+     shortSetupAge >= 0 and
+     shortSetupAge <= maximumEntryDelayBars
+
+// ═══════════════════════════════════════════════════════════════════
+// INDEPENDENT RE-ARMING
+// ═══════════════════════════════════════════════════════════════════
+
+var bool longArmed = true
+var bool shortArmed = true
+
+if not longSetupState
+    longArmed := true
+
+if not shortSetupState
+    shortArmed := true
+
+// ═══════════════════════════════════════════════════════════════════
+// ENTRY TRIGGERS
+// ═══════════════════════════════════════════════════════════════════
+
+float emaExtensionATR =
+     atr > 0.0
+         ? (close - emaFast) / atr
+         : na
+
+bool longExtensionPass =
+     not na(emaExtensionATR) and
+     emaExtensionATR >= 0.0 and
+     emaExtensionATR <= maxEntryExtensionATR
+
+bool shortExtensionPass =
+     not na(emaExtensionATR) and
+     emaExtensionATR <= 0.0 and
+     -emaExtensionATR <= maxEntryExtensionATR
+
+bool longEMACross =
+     ta.crossover(
+          emaFast,
+          emaSlow) and
+     close > emaFast
+
+bool shortEMACross =
+     ta.crossunder(
+          emaFast,
+          emaSlow) and
+     close < emaFast
+
+bool longPullbackReclaim =
+     low <=
+     emaFast +
+     atr * pullbackToleranceATR and
+     close > emaFast and
+     close > open and
+     close > close[1]
+
+bool shortPullbackReclaim =
+     high >=
+     emaFast -
+     atr * pullbackToleranceATR and
+     close < emaFast and
+     close < open and
+     close < close[1]
+
+float priorBreakoutHigh =
+     ta.highest(
+          high[1],
+          breakoutLookback)
+
+float priorBreakoutLow =
+     ta.lowest(
+          low[1],
+          breakoutLookback)
+
+bool longBreakout =
+     close > priorBreakoutHigh and
+     close > open
+
+bool shortBreakout =
+     close < priorBreakoutLow and
+     close < open
+
+bool longSelectedTrigger =
+     entryTriggerMode == "EMA Cross"
+         ? longEMACross
+         : entryTriggerMode == "Pullback / Reclaim"
+             ? longPullbackReclaim
+             : entryTriggerMode == "Breakout"
+                 ? longBreakout
+                 : entryTriggerMode == "Cross Or Pullback"
+                     ? longEMACross or
+                       longPullbackReclaim
+                     : entryTriggerMode == "Pullback Or Breakout"
+                         ? longPullbackReclaim or
+                           longBreakout
+                         : longEMACross or
+                           longPullbackReclaim or
+                           longBreakout
+
+bool shortSelectedTrigger =
+     entryTriggerMode == "EMA Cross"
+         ? shortEMACross
+         : entryTriggerMode == "Pullback / Reclaim"
+             ? shortPullbackReclaim
+             : entryTriggerMode == "Breakout"
+                 ? shortBreakout
+                 : entryTriggerMode == "Cross Or Pullback"
+                     ? shortEMACross or
+                       shortPullbackReclaim
+                     : entryTriggerMode == "Pullback Or Breakout"
+                         ? shortPullbackReclaim or
+                           shortBreakout
+                         : shortEMACross or
+                           shortPullbackReclaim or
+                           shortBreakout
+
+// EMA Cross mode is evaluated directly because waiting for a setup
+// counter after the cross can make the signal late.
+bool directLongCrossSetup =
+     allowLong and
+     commonSetupPass and
+     longEMAAligned and
+     longDIAligned and
+     longPriceAligned and
+     longEMACross
+
+bool directShortCrossSetup =
+     allowShort and
+     commonSetupPass and
+     shortEMAAligned and
+     shortDIAligned and
+     shortPriceAligned and
+     shortEMACross
+
+bool delayedLongTriggerFresh =
+     longSetupAge == 0 or
+     (
+          longSetupAge == 1 and
+          (
+               longPullbackReclaim or
+               longBreakout
+          )
+     )
+
+bool delayedShortTriggerFresh =
+     shortSetupAge == 0 or
+     (
+          shortSetupAge == 1 and
+          (
+               shortPullbackReclaim or
+               shortBreakout
+          )
+     )
+
+bool longFreshTriggerPass =
+     not requireFreshDelayedTrigger or
+     delayedLongTriggerFresh
+
+bool shortFreshTriggerPass =
+     not requireFreshDelayedTrigger or
+     delayedShortTriggerFresh
+
+bool longTriggerQualified =
+     entryTriggerMode == "EMA Cross"
+         ? directLongCrossSetup
+         : longEntryWindowOpen and
+           longSelectedTrigger and
+           longFreshTriggerPass
+
+bool shortTriggerQualified =
+     entryTriggerMode == "EMA Cross"
+         ? directShortCrossSetup
+         : shortEntryWindowOpen and
+           shortSelectedTrigger and
+           shortFreshTriggerPass
+
+// ═══════════════════════════════════════════════════════════════════
+// CANDIDATE STOPS AND ORDER SIZE
+// ═══════════════════════════════════════════════════════════════════
+
+float rawLongStop =
+     close -
+     atr * stopATR
+
+float rawShortStop =
+     close +
+     atr * stopATR
+
+float adjustedLongStop =
+     pFailLite > pFailCap
+         ? close -
+           (close - rawLongStop) *
+           highFailureStopMultiplier
+         : rawLongStop
+
+float adjustedShortStop =
+     pFailLite > pFailCap
+         ? close +
+           (rawShortStop - close) *
+           highFailureStopMultiplier
+         : rawShortStop
+
+float candidateLongRisk =
+     close -
+     adjustedLongStop
+
+float candidateShortRisk =
+     adjustedShortStop -
+     close
+
+float longRiskQty =
+     useDollarSizing and
+     candidateLongRisk > syminfo.mintick
+         ? math.floor(
+              riskBudget /
+              (
+                   candidateLongRisk *
+                   pointValue
+              ))
+         : dqQty
+
+float shortRiskQty =
+     useDollarSizing and
+     candidateShortRisk > syminfo.mintick
+         ? math.floor(
+              riskBudget /
+              (
+                   candidateShortRisk *
+                   pointValue
+              ))
+         : dqQty
+
+bool longSizePass =
+     not useDollarSizing or
+     longRiskQty >= 1.0
+
+bool shortSizePass =
+     not useDollarSizing or
+     shortRiskQty >= 1.0
+
+float longOrderQty =
+     useDollarSizing
+         ? longRiskQty
+         : dqQty
+
+float shortOrderQty =
+     useDollarSizing
+         ? shortRiskQty
+         : dqQty
+
+// ═══════════════════════════════════════════════════════════════════
+// BLOCKER DIAGNOSTICS
+// ═══════════════════════════════════════════════════════════════════
+
+string longBlocker =
+     not allowLong ? "LONGS OFF" :
+     not inTradeSession ? "SESSION" :
+     not dailyTradeLimitPass ? "TRADE LIMIT" :
+     not cooldownPass ? "COOLDOWN" :
+     not dataReady ? "DATA" :
+     adx < adxMin ? "ADX LOW" :
+     atrExpansion < atrFactor ? "ATR LOW" :
+     atrExpansion > atrMaxFactor ? "ATR HOT" :
+     roc <= 0.0 ? "ROC" :
+     bop <= 0.0 ? "BOP" :
+     dq <= 0.0 ? "DQ DIRECTION" :
+     dqStrength < minDQStrength ? "DQ WEAK" :
+     not longEMAAligned ? "EMA ALIGN" :
+     not longDIAligned ? "DI ALIGN" :
+     not longPriceAligned ? "PRICE / EMA" :
+     not failurePass ? "FAIL RISK" :
+     entryTriggerMode != "EMA Cross" and
+     not longEntryWindowOpen ? "NO FRESH SETUP" :
+     not longTriggerQualified ? "NO TRIGGER" :
+     not longExtensionPass ? "ENTRY EXTENDED" :
+     requireSetupReset and
+     not longArmed ? "REARM" :
+     not longSizePass ? "SIZE" :
+     strategy.position_size != 0 ? "POSITION OPEN" :
+     "CLEAR"
+
+string shortBlocker =
+     not allowShort ? "SHORTS OFF" :
+     not inTradeSession ? "SESSION" :
+     not dailyTradeLimitPass ? "TRADE LIMIT" :
+     not cooldownPass ? "COOLDOWN" :
+     not dataReady ? "DATA" :
+     adx < adxMin ? "ADX LOW" :
+     atrExpansion < atrFactor ? "ATR LOW" :
+     atrExpansion > atrMaxFactor ? "ATR HOT" :
+     roc >= 0.0 ? "ROC" :
+     bop >= 0.0 ? "BOP" :
+     dq >= 0.0 ? "DQ DIRECTION" :
+     dqStrength < minDQStrength ? "DQ WEAK" :
+     not shortEMAAligned ? "EMA ALIGN" :
+     not shortDIAligned ? "DI ALIGN" :
+     not shortPriceAligned ? "PRICE / EMA" :
+     not failurePass ? "FAIL RISK" :
+     entryTriggerMode != "EMA Cross" and
+     not shortEntryWindowOpen ? "NO FRESH SETUP" :
+     not shortTriggerQualified ? "NO TRIGGER" :
+     not shortExtensionPass ? "ENTRY EXTENDED" :
+     requireSetupReset and
+     not shortArmed ? "REARM" :
+     not shortSizePass ? "SIZE" :
+     strategy.position_size != 0 ? "POSITION OPEN" :
+     "CLEAR"
+
+// ═══════════════════════════════════════════════════════════════════
+// FINAL ENTRY SIGNALS
+// ═══════════════════════════════════════════════════════════════════
+
+bool flat =
+     strategy.position_size == 0
+
+bool longEntry =
+     barstate.isconfirmed and
+     flat and
+     longTriggerQualified and
+     longExtensionPass and
+     longSizePass and
+     (
+          not requireSetupReset or
+          longArmed
+     )
+
+bool shortEntry =
+     barstate.isconfirmed and
+     flat and
+     shortTriggerQualified and
+     shortExtensionPass and
+     shortSizePass and
+     (
+          not requireSetupReset or
+          shortArmed
+     ) and
+     not longEntry
+
+// ═══════════════════════════════════════════════════════════════════
+// TRADE STATE
+// ═══════════════════════════════════════════════════════════════════
+
+var float pendingStop = na
+
+var float entryPrice = na
+var float initialRisk = na
+
+var float longStop = na
+var float shortStop = na
+
+var float tp1Price = na
+var float tp2Price = na
+
+var bool tp1Hit = false
+var bool breakEvenActive = false
+var bool trailingActive = false
+
+var float highestSinceEntry = na
+var float lowestSinceEntry = na
+
+var int entryBar = na
+
+// ═══════════════════════════════════════════════════════════════════
+// ENTRIES
+// ═══════════════════════════════════════════════════════════════════
+
+if longEntry
+    pendingStop := adjustedLongStop
+
+    tradesToday += 1
+    longArmed := false
+
+    longSetupLatched := false
+    longSetupReadyBar := na
+
+    strategy.entry(
+         "Long",
+         strategy.long,
+         qty = longOrderQty,
+         comment = "LMSE Long")
+
+    if enableDynamicAlerts
+        alert(
+             "🔵 BULLISH — LONG ENTRY\n" +
+             "BIAS: BULLISH ▲\n" +
+             syminfo.ticker +
+             " | " +
+             timeframe.period +
+             "\nDQ: " +
+             str.tostring(dq, "#.00") +
+             "\nADX: " +
+             str.tostring(adx, "#.0") +
+             "\nATR Exp: " +
+             str.tostring(atrExpansion, "#.00") +
+             "\nCandidate stop: " +
+             str.tostring(
+                  adjustedLongStop,
+                  format.mintick),
+             alert.freq_once_per_bar_close)
+
+if shortEntry
+    pendingStop := adjustedShortStop
+
+    tradesToday += 1
+    shortArmed := false
+
+    shortSetupLatched := false
+    shortSetupReadyBar := na
+
+    strategy.entry(
+         "Short",
+         strategy.short,
+         qty = shortOrderQty,
+         comment = "LMSE Short")
+
+    if enableDynamicAlerts
+        alert(
+             "🟣 BEARISH — SHORT ENTRY\n" +
+             "BIAS: BEARISH ▼\n" +
+             syminfo.ticker +
+             " | " +
+             timeframe.period +
+             "\nDQ: " +
+             str.tostring(dq, "#.00") +
+             "\nADX: " +
+             str.tostring(adx, "#.0") +
+             "\nATR Exp: " +
+             str.tostring(atrExpansion, "#.00") +
+             "\nCandidate stop: " +
+             str.tostring(
+                  adjustedShortStop,
+                  format.mintick),
+             alert.freq_once_per_bar_close)
+
+// ═══════════════════════════════════════════════════════════════════
+// FILL DETECTION
+// ═══════════════════════════════════════════════════════════════════
+
+bool longFill =
+     strategy.position_size > 0 and
+     strategy.position_size[1] <= 0
+
+bool shortFill =
+     strategy.position_size < 0 and
+     strategy.position_size[1] >= 0
+
+if longFill
+    entryPrice :=
+         strategy.position_avg_price
+
+    longStop :=
+         not na(pendingStop)
+             ? pendingStop
+             : entryPrice -
+               atr * stopATR
+
+    initialRisk :=
+         entryPrice -
+         longStop
+
+    tp1Price :=
+         entryPrice +
+         initialRisk * tp1R
+
+    tp2Price :=
+         entryPrice +
+         initialRisk * tp2R
+
+    highestSinceEntry := high
+    lowestSinceEntry := low
+
+    entryBar := bar_index
+
+    tp1Hit := false
+    breakEvenActive := false
+    trailingActive := false
+
+if shortFill
+    entryPrice :=
+         strategy.position_avg_price
+
+    shortStop :=
+         not na(pendingStop)
+             ? pendingStop
+             : entryPrice +
+               atr * stopATR
+
+    initialRisk :=
+         shortStop -
+         entryPrice
+
+    tp1Price :=
+         entryPrice -
+         initialRisk * tp1R
+
+    tp2Price :=
+         entryPrice -
+         initialRisk * tp2R
+
+    highestSinceEntry := high
+    lowestSinceEntry := low
+
+    entryBar := bar_index
+
+    tp1Hit := false
+    breakEvenActive := false
+    trailingActive := false
+
+// ═══════════════════════════════════════════════════════════════════
+// TP1 DETECTION
+// ═══════════════════════════════════════════════════════════════════
+
+if strategy.position_size > 0 and
+   not tp1Hit and
+   not na(tp1Price) and
+   high >= tp1Price
+
+    tp1Hit := true
+
+if strategy.position_size < 0 and
+   not tp1Hit and
+   not na(tp1Price) and
+   low <= tp1Price
+
+    tp1Hit := true
+
+// ═══════════════════════════════════════════════════════════════════
+// BREAK-EVEN AND TRAILING MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════
+
+float breakEvenOffset =
+     breakEvenOffsetTicks *
+     syminfo.mintick
+
+float trailMultiplier =
+     persistence < lowPersistence
+         ? tightTrailATR
+         : persistence > highPersistence
+             ? looseTrailATR
+             : baseTrailATR
+
+if strategy.position_size > 0
+    highestSinceEntry :=
+         math.max(
+              nz(highestSinceEntry, high),
+              high)
+
+    lowestSinceEntry :=
+         math.min(
+              nz(lowestSinceEntry, low),
+              low)
+
+    if tp1Hit and useBreakEven
+        longStop :=
+             math.max(
+                  longStop,
+                  entryPrice +
+                  breakEvenOffset)
+
+        breakEvenActive := true
+
+    if tp1Hit and useTrail
+        float proposedLongTrail =
+             highestSinceEntry -
+             atr * trailMultiplier
+
+        longStop :=
+             math.max(
+                  longStop,
+                  proposedLongTrail)
+
+        trailingActive := true
+
+if strategy.position_size < 0
+    highestSinceEntry :=
+         math.max(
+              nz(highestSinceEntry, high),
+              high)
+
+    lowestSinceEntry :=
+         math.min(
+              nz(lowestSinceEntry, low),
+              low)
+
+    if tp1Hit and useBreakEven
+        shortStop :=
+             math.min(
+                  shortStop,
+                  entryPrice -
+                  breakEvenOffset)
+
+        breakEvenActive := true
+
+    if tp1Hit and useTrail
+        float proposedShortTrail =
+             lowestSinceEntry +
+             atr * trailMultiplier
+
+        shortStop :=
+             math.min(
+                  shortStop,
+                  proposedShortTrail)
+
+        trailingActive := true
+
+// ═══════════════════════════════════════════════════════════════════
+// EXITS
+// ═══════════════════════════════════════════════════════════════════
+
+if strategy.position_size > 0
+    strategy.exit(
+         "L-TP1",
+         from_entry = "Long",
+         qty_percent = tp1Qty,
+         stop = longStop,
+         limit = tp1Price)
+
+    strategy.exit(
+         "L-TP2",
+         from_entry = "Long",
+         qty_percent = 100.0 - tp1Qty,
+         stop = longStop,
+         limit = tp2Price)
+
+if strategy.position_size < 0
+    strategy.exit(
+         "S-TP1",
+         from_entry = "Short",
+         qty_percent = tp1Qty,
+         stop = shortStop,
+         limit = tp1Price)
+
+    strategy.exit(
+         "S-TP2",
+         from_entry = "Short",
+         qty_percent = 100.0 - tp1Qty,
+         stop = shortStop,
+         limit = tp2Price)
+
+// ═══════════════════════════════════════════════════════════════════
+// TIME AND SESSION EXITS
+// ═══════════════════════════════════════════════════════════════════
+
+int barsInTrade =
+     strategy.position_size != 0 and
+     not na(entryBar)
+         ? bar_index -
+           entryBar
+         : 0
+
+if strategy.position_size != 0 and
+   barsInTrade >= maximumHoldingBars
+
+    strategy.close_all(
+         comment = "LMSE Time Stop",
+         immediately = true)
+
+if closeAtSessionEnd and
+   sessionEndBar and
+   strategy.position_size != 0
+
+    strategy.close_all(
+         comment = "LMSE Session Close",
+         immediately = true)
+
+// ═══════════════════════════════════════════════════════════════════
+// CLOSED-TRADE RESET
+// ═══════════════════════════════════════════════════════════════════
+
+bool positionJustClosed =
+     strategy.position_size == 0 and
+     strategy.position_size[1] != 0
+
+if positionJustClosed
+    lastClosedTradeBar := bar_index
+
+    pendingStop := na
+
+    entryPrice := na
+    initialRisk := na
+
+    longStop := na
+    shortStop := na
+
+    tp1Price := na
+    tp2Price := na
+
+    highestSinceEntry := na
+    lowestSinceEntry := na
+
+    entryBar := na
+
+    tp1Hit := false
+    breakEvenActive := false
+    trailingActive := false
+
+// ═══════════════════════════════════════════════════════════════════
+// PLOTS
+// ═══════════════════════════════════════════════════════════════════
+
+plot(
+     emaFast,
+     "EMA 20",
+     color = color.new(C_BLUE, 10),
+     linewidth = 2)
+
+plot(
+     emaSlow,
+     "EMA 50",
+     color = color.new(C_ORANGE, 10),
+     linewidth = 2)
+
+float activeStop =
+     strategy.position_size > 0
+         ? longStop
+         : strategy.position_size < 0
+             ? shortStop
+             : na
+
+plot(
+     showTradeLevels and
+     strategy.position_size != 0
+         ? entryPrice
+         : na,
+     "Active Entry",
+     color = color.white,
+     linewidth = 1,
+     style = plot.style_linebr)
+
+plot(
+     showTradeLevels
+         ? activeStop
+         : na,
+     "Active Stop",
+     color = C_RED,
+     linewidth = 2,
+     style = plot.style_linebr)
+
+plot(
+     showTradeLevels and
+     strategy.position_size != 0
+         ? tp1Price
+         : na,
+     "TP1",
+     color = color.new(C_GREEN, 35),
+     linewidth = 1,
+     style = plot.style_linebr)
+
+plot(
+     showTradeLevels and
+     strategy.position_size != 0
+         ? tp2Price
+         : na,
+     "TP2",
+     color = C_GREEN,
+     linewidth = 2,
+     style = plot.style_linebr)
+
+plotshape(
+     showSignals and longEntry,
+     title = "Long Entry",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = C_BLUE,
+     textcolor = color.white,
+     text = "LONG",
+     size = size.small)
+
+plotshape(
+     showSignals and shortEntry,
+     title = "Short Entry",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = C_PURPLE,
+     textcolor = color.white,
+     text = "SHORT",
+     size = size.small)
+
+plotshape(
+     showSetupMarkers and longSetupState,
+     title = "Raw Long Setup",
+     style = shape.circle,
+     location = location.belowbar,
+     color = color.new(C_BLUE, 60),
+     size = size.tiny)
+
+plotshape(
+     showSetupMarkers and shortSetupState,
+     title = "Raw Short Setup",
+     style = shape.circle,
+     location = location.abovebar,
+     color = color.new(C_PURPLE, 60),
+     size = size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════════
+
+resolvedDashboardPosition =
+     dashPos == "Top Left"
+         ? position.top_left
+         : dashPos == "Bottom Right"
+             ? position.bottom_right
+             : dashPos == "Bottom Left"
+                 ? position.bottom_left
+                 : position.top_right
+
+dashboardTextSize =
+     dashFont == "Large"
+         ? size.normal
+         : dashFont == "Phone"
+             ? size.small
+             : size.tiny
+
+var table dashboard = table.new(
+     position = resolvedDashboardPosition,
+     columns = 2,
+     rows = 16,
+     bgcolor = C_NAVY,
+     border_width = 1,
+     border_color = color.rgb(55, 72, 95),
+     frame_width = 2,
+     frame_color = C_BLUE)
+
+f_dashboardRow(
+     int row,
+     string labelText,
+     string valueText,
+     color valueBackground) =>
+
+    table.cell(
+         dashboard,
+         0,
+         row,
+         labelText,
+         bgcolor =
+              row % 2 == 0
+                  ? C_CARD
+                  : C_ALT,
+         text_color = C_WHITE,
+         text_size = dashboardTextSize,
+         text_halign = text.align_left)
+
+    table.cell(
+         dashboard,
+         1,
+         row,
+         valueText,
+         bgcolor = valueBackground,
+         text_color = color.white,
+         text_size = dashboardTextSize,
+         text_halign = text.align_right)
+
+string positionText =
+     strategy.position_size > 0
+         ? "LONG"
+         : strategy.position_size < 0
+             ? "SHORT"
+             : "FLAT"
+
+color positionColor =
+     strategy.position_size > 0
+         ? C_BLUE
+         : strategy.position_size < 0
+             ? C_PURPLE
+             : C_GRAY
+
+string directionalBias =
+     dq > 0.0
+         ? "LONG"
+         : dq < 0.0
+             ? "SHORT"
+             : "MIXED"
+
+color directionalColor =
+     dq > 0.0
+         ? C_BLUE
+         : dq < 0.0
+             ? C_PURPLE
+             : C_ORANGE
+
+string activeBlocker =
+     dq > 0.0
+         ? longBlocker
+         : dq < 0.0
+             ? shortBlocker
+             : "NO DIRECTION"
+
+color blockerColor =
+     activeBlocker == "CLEAR"
+         ? C_GREEN
+         : activeBlocker == "NO DIRECTION" or
+           activeBlocker == "NO FRESH SETUP" or
+           activeBlocker == "NO TRIGGER"
+             ? C_GRAY
+             : activeBlocker == "COOLDOWN"
+                 ? C_ORANGE
+                 : C_RED
+
+string setupText =
+     longSetupLatched
+         ? "L " +
+           str.tostring(longSetupAge) +
+           "/" +
+           str.tostring(maximumEntryDelayBars)
+         : shortSetupLatched
+             ? "S " +
+               str.tostring(shortSetupAge) +
+               "/" +
+               str.tostring(maximumEntryDelayBars)
+             : "—"
+
+color setupColor =
+     longSetupLatched
+         ? C_BLUE
+         : shortSetupLatched
+             ? C_PURPLE
+             : C_GRAY
+
+string managementText =
+     strategy.position_size == 0
+         ? "INACTIVE"
+         : trailingActive
+             ? "TRAILING"
+             : breakEvenActive
+                 ? "BREAK-EVEN"
+                 : tp1Hit
+                     ? "TP1 HIT"
+                     : "INITIAL RISK"
+
+color managementColor =
+     strategy.position_size == 0
+         ? C_GRAY
+         : trailingActive
+             ? C_GREEN
+             : breakEvenActive
+                 ? C_BLUE
+                 : tp1Hit
+                     ? C_GREEN
+                     : C_ORANGE
+
+string sessionText =
+     inTradeSession
+         ? "OPEN"
+         : "CLOSED"
+
+color sessionColor =
+     inTradeSession
+         ? C_GREEN
+         : C_RED
+
+string cooldownText =
+     cooldownPass
+         ? "READY"
+         : str.tostring(cooldownRemaining) +
+           " BARS"
+
+color cooldownColor =
+     cooldownPass
+         ? C_GREEN
+         : C_ORANGE
+
+string activeLevelsText =
+     f_price(activeStop) +
+     " / " +
+     f_price(tp1Price)
+
+// Surfaces the "Enable Dynamic alert() Calls" toggle on the dashboard —
+// if this is off, entry labels can still plot but no alert() message
+// will ever be sent, which looks identical to a broken alert.
+string alertsStatusText =
+     not enableDynamicAlerts
+         ? "OFF"
+         : "ON"
+
+color alertsStatusColor =
+     not enableDynamicAlerts
+         ? C_RED
+         : C_GREEN
+
+if showDashboard and barstate.islast
+    table.clear(
+         dashboard,
+         0,
+         0,
+         1,
+         15)
+
+    f_dashboardRow(
+         0,
+         "LMSE-LITE",
+         "LIVE",
+         C_BLUE)
+
+    f_dashboardRow(
+         1,
+         "POSITION",
+         positionText,
+         positionColor)
+
+    f_dashboardRow(
+         2,
+         "BIAS",
+         directionalBias,
+         directionalColor)
+
+    f_dashboardRow(
+         3,
+         "BLOCKER",
+         activeBlocker,
+         blockerColor)
+
+    f_dashboardRow(
+         4,
+         "SETUP AGE",
+         setupText,
+         setupColor)
+
+    f_dashboardRow(
+         5,
+         "SESSION",
+         sessionText,
+         sessionColor)
+
+    f_dashboardRow(
+         6,
+         "TRADES",
+         str.tostring(tradesToday) +
+         "/" +
+         str.tostring(maxTradesPerDay),
+         dailyTradeLimitPass
+             ? C_CARD
+             : C_RED)
+
+    f_dashboardRow(
+         7,
+         "ADX",
+         str.tostring(adx, "#.0") +
+         " / " +
+         str.tostring(adxMin, "#.0"),
+         adx >= adxMin
+             ? C_GREEN
+             : C_RED)
+
+    f_dashboardRow(
+         8,
+         "ATR EXP",
+         f_number(atrExpansion),
+         atrExpansion >= atrFactor and
+         atrExpansion <= atrMaxFactor
+             ? C_GREEN
+             : C_ORANGE)
+
+    f_dashboardRow(
+         9,
+         "ROC / BOP",
+         str.tostring(roc, "#.00") +
+         " / " +
+         str.tostring(bop, "#.00"),
+         directionalColor)
+
+    f_dashboardRow(
+         10,
+         "DQ",
+         str.tostring(dq, "#.00"),
+         dqStrength >= minDQStrength
+             ? directionalColor
+             : C_RED)
+
+    f_dashboardRow(
+         11,
+         "FAIL RISK",
+         str.tostring(pFailLite, "#.00"),
+         pFailLite <= pFailCap
+             ? C_GREEN
+             : C_RED)
+
+    f_dashboardRow(
+         12,
+         "PERSISTENCE",
+         str.tostring(persistence, "#.0"),
+         persistence >= highPersistence
+             ? C_GREEN
+             : persistence <= lowPersistence
+                 ? C_ORANGE
+                 : C_CARD)
+
+    f_dashboardRow(
+         13,
+         "COOLDOWN",
+         cooldownText,
+         cooldownColor)
+
+    f_dashboardRow(
+         14,
+         "STOP / TP1",
+         activeLevelsText,
+         managementColor)
+
+    f_dashboardRow(
+         15,
+         "ALERTS",
+         alertsStatusText,
+         alertsStatusColor)
+
+if not showDashboard and barstate.islast
+    table.clear(
+         dashboard,
+         0,
+         0,
+         1,
+         15)
+
+// ═══════════════════════════════════════════════════════════════════
+// ALERT CONDITIONS
+//
+// IMPORTANT — how to actually receive these notifications:
+// When you create the TradingView alert, set "Condition" to this
+// script, then pick ONE of:
+//   • "Any alert() function call" — fires the dynamic alert() messages
+//     above, which state the live bias (BULLISH/BEARISH), DQ, ADX,
+//     ATR expansion and candidate stop. This is the recommended option
+//     if you want full context per trade.
+//   • One of the named conditions below (e.g. "LMSE Long Entry
+//     (Bullish)") — fires a fixed static message tied to that specific
+//     condition only.
+// Picking "Order fills" instead of one of the above will NOT trigger
+// on these entry signals, and alerts never fire retroactively for
+// bars that already closed before the alert was created — only from
+// the moment the alert is created onward.
+// ═══════════════════════════════════════════════════════════════════
+
+alertcondition(
+     longEntry,
+     title = "LMSE Long Entry (Bullish)",
+     message = "🔵 BULLISH — LMSE-Lite LONG entry — {{ticker}} {{interval}}")
+
+alertcondition(
+     shortEntry,
+     title = "LMSE Short Entry (Bearish)",
+     message = "🟣 BEARISH — LMSE-Lite SHORT entry — {{ticker}} {{interval}}")
+
+alertcondition(
+     longEntry or shortEntry,
+     title = "LMSE Any Entry (Check Chart For Bias)",
+     message = "LMSE-Lite entry — {{ticker}} {{interval}} — see chart/dashboard for BULLISH or BEARISH bias")
+
+alertcondition(
+     positionJustClosed,
+     title = "LMSE Position Closed",
+     message = "LMSE-Lite position closed — {{ticker}} {{interval}}")
+
+alertcondition(
+     dqStrength >= 0.60,
+     title = "LMSE High DQ",
+     message = "LMSE-Lite high directional quality — {{ticker}}")
+
+alertcondition(
+     pFailLite > pFailCap,
+     title = "LMSE High Failure Risk",
+     message = "LMSE-Lite high failure risk — {{ticker}}")
+
+// ═══════════════════════════════════════════════════════════════════
+// DATA WINDOW
+// ═══════════════════════════════════════════════════════════════════
+
+plot(
+     dq,
+     "DQ",
+     display = display.data_window)
+
+plot(
+     dqStrength,
+     "DQ Strength",
+     display = display.data_window)
+
+plot(
+     pFailLite,
+     "Failure Proxy",
+     display = display.data_window)
+
+plot(
+     persistence,
+     "Persistence",
+     display = display.data_window)
+
+plot(
+     atrExpansion,
+     "ATR Expansion",
+     display = display.data_window)
+
+plot(
+     emaExtensionATR,
+     "EMA Extension ATR",
+     display = display.data_window)
+
+plot(
+     float(longSetupAge),
+     "Long Setup Age",
+     display = display.data_window)
+
+plot(
+     float(shortSetupAge),
+     "Short Setup Age",
+     display = display.data_window)
