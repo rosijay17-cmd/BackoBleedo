@@ -1,6 +1,6 @@
 //@version=6
 strategy(
-     title="MNQ One-and-Done Confirmed Expansion v1",
+     title="MNQ One-and-Done Confirmed Expansion v1.2",
      shorttitle="MNQ1DONE",
      overlay=true,
      pyramiding=0,
@@ -19,7 +19,7 @@ strategy(
 )
 
 //=============================================================================
-// MNQ ONE-AND-DONE CONFIRMED EXPANSION
+// MNQ ONE-AND-DONE CONFIRMED EXPANSION v1.2
 //=============================================================================
 // Intended chart: 5 minutes
 // Intended instrument: MNQ continuous or current MNQ contract
@@ -31,6 +31,20 @@ strategy(
 //   4. Enter on the first confirmed re-expansion through the pullback trigger.
 //   5. Exit at 0.75R, the structural stop, or the close of the next 5m bar.
 //   6. Lock the strategy for the rest of the day after the first setup/trade.
+//
+// v1.2 CRITICAL FIX:
+//   Section 19 (pullback/cancellation checks) previously ran on the SAME bar
+//   a breakout qualified setupPhase to 1. On that bar, longPullbackDepth /
+//   shortPullbackDepth measured the breakout candle's OWN low/high against
+//   itself (breakoutHigh - low) / breakoutRange, which evaluates to roughly
+//   1.00 -- comfortably past the 0.50 maximum -- so every setup was
+//   cancelled as "PULLBACK TOO DEEP" one Pine calculation after it was
+//   created, before the pullback logic ever ran on a real subsequent bar.
+//   Section 19's guard is now "if setupActive and afterBreakoutBar and
+//   barstate.isconfirmed", matching the guard Sections 20 and 22 already
+//   used. Pullback depth, range defense, and opposing-reversal checks can
+//   now only evaluate starting on the first confirmed 5-minute bar AFTER
+//   the breakout bar -- never on the breakout bar itself.
 //
 // PickMyTrade:
 //   Generate a FLAT POSITION STRATEGY alert in PickMyTrade.
@@ -187,13 +201,11 @@ f_yesNo(bool value) =>
 //=============================================================================
 // 10. TIMEFRAME AND SYMBOL VALIDATION
 //=============================================================================
-// FIX: hard runtime.error() calls were replaced with soft, dashboard-visible
-// gating. A runtime.error() aborts the ENTIRE script for that bar (and every
-// bar after it keeps re-hitting the same abort), which produces exactly the
-// symptom "no entries on chart" with no other clue -- nothing plots, nothing
-// signals, and it is easy to miss the small error banner. Instead we now
-// compute clean booleans, fold them into the entry gate, and surface the
-// exact reason on the dashboard's BLOCKER row.
+// A hard runtime.error() would abort the ENTIRE script for that bar (and
+// every bar after), which produces "no entries on chart" with no other
+// clue -- nothing plots, nothing signals, and it is easy to miss the small
+// error banner. Instead we compute clean booleans, fold them into the
+// entry gate, and surface the exact reason on the dashboard's BLOCKER row.
 
 bool chartIs5m = timeframe.isminutes and timeframe.multiplier == 5
 bool symbolIsMNQ = str.contains(str.upper(syminfo.root), "MNQ") or str.contains(str.upper(syminfo.ticker), "MNQ")
@@ -217,27 +229,13 @@ int rangeEndMOD = f_sessionEndMOD(openingRangeSession)
 int entryStartMOD = f_sessionStartMOD(entryWindowSession)
 int entryEndMOD = f_sessionEndMOD(entryWindowSession)
 
-// FIX (round 2): a fixed "runway" buffer (originally 30 min, then reduced to
-// (maximumPullbackBars+1)*5 = 15 min) was removed entirely. Confirmed by the
-// LAST MISS diagnostic ("LONG: TOO LATE IN WINDOW" / BLOCKER "ENTRY WINDOW
-// CLOSED"): a genuine, qualifying breakout that completed late inside the
-// entry window was still rejected because there was not enough buffer left
-// before the window's nominal close for the whole pullback sequence to
-// theoretically fit. NEW setup detection still only starts inside
-// entryWindowSession (see breakoutAvailable below) -- that behavioral rule
-// ("only look for an opening-range break in this window") is unchanged.
-// What changed is that an ALREADY-DETECTED setup is no longer killed the
-// instant the clock crosses the entry-window boundary; it now runs to
-// completion against the full regular trading session, bounded the same way
-// it always was by its own pullback-bar-count timeout (maximumPullbackBars)
-// and by cancelOnOppositeBreak/depth/reversal checks.
-
 int barOpenMOD = hour(time, sessionTimezone) * 60 + minute(time, sessionTimezone)
 int barCloseMOD = hour(time_close, sessionTimezone) * 60 + minute(time_close, sessionTimezone)
 
 bool inTradingSession = not na(time(timeframe.period, tradingSession, sessionTimezone))
 bool inOpeningRange = not na(time(timeframe.period, openingRangeSession, sessionTimezone))
 bool inEntryWindow = not na(time(timeframe.period, entryWindowSession, sessionTimezone))
+bool entryWindowJustEnded = not inEntryWindow and inEntryWindow[1]
 bool tradingSessionJustEnded = not inTradingSession and inTradingSession[1]
 
 int nyDayId = year(time, sessionTimezone) * 10000 + month(time, sessionTimezone) * 100 + dayofmonth(time, sessionTimezone)
@@ -348,10 +346,10 @@ int completed15Slot = completed15StartMOD >= tradingStartMOD ? int(math.floor(fl
 //=============================================================================
 // 16. SAME-TIME-OF-DAY 15M RVOL
 //=============================================================================
-// FIX: availableSamples is now computed for the current slot on every bar
-// (not only on a completion event), so callers can show a live "samples
-// collected so far" readout instead of it only ever being non-zero for the
-// single tick a 15m candle actually completes on.
+// availableSamples is computed for the current slot on every bar (not only
+// on a completion event), so callers can show a live "samples collected so
+// far" readout instead of it only ever being non-zero for the single tick a
+// 15m candle actually completes on.
 
 f_sameSlotRvol(float completedVolume, int currentSlot, bool completionEvent, int lookbackSessions) =>
     int slotCount = math.max(1, int(math.ceil(float(tradingEndMOD - tradingStartMOD) / 15.0)))
@@ -420,6 +418,9 @@ bool bearishBreakoutQuality = completed15Close < completed15Open and bearishBrea
 //=============================================================================
 // 18. ONE-SETUP / ONE-TRADE DAILY STATE
 //=============================================================================
+// Daily state (this section) resets every New York trading day. Historical
+// counters (Section 18B) are declared separately and never reset -- they
+// persist for the life of the chart.
 
 var bool setupConsumedToday = false
 var bool tradedToday = false
@@ -468,27 +469,48 @@ bool bearishBreakoutEvent = completed15mEvent and completedAfterRange and breako
 
 
 //=============================================================================
-// 18B. WHY THE LAST CANDLE DID NOT QUALIFY
+// 18B. RAW BREAKOUT DIAGNOSTICS, REJECTION REASONS, AND HISTORICAL COUNTERS
 //=============================================================================
-// FIX: this is the missing piece that made "WAIT BREAKOUT" a black box.
-// Every time a 15m candle completes without qualifying, this records the
-// FIRST gate (in priority order) that rejected it, for whichever direction
-// the candle actually closed. It survives on the dashboard until the next
-// completed candle overwrites it, so a screenshot taken any time later still
-// shows exactly why the last real breakout attempt was rejected.
+// Definitions (fixed, do not confuse with each other):
+//   Raw Breakout    - a completed 15m candle, during the authorized setup
+//                      window, with the opening range ready, that is
+//                      directionally bullish or bearish AND whose close
+//                      actually cleared the applicable opening-range
+//                      boundary plus the breakout buffer. Independent of
+//                      quality filters and of same-day availability, so a
+//                      second attempt on a day a setup was already used
+//                      still counts as a raw breakout.
+//   Qualified Setup - a raw breakout that also passed every quality filter
+//                      AND was available to become an active setup (this is
+//                      exactly bullishBreakoutEvent / bearishBreakoutEvent).
+//   Cancelled Setup - a qualified setup that was later cancelled without an
+//                      entry (Section 22's cancellation finalization).
+//   Entry           - a strategy entry order was submitted (Section 21).
+//
+// An ordinary candle that never cleared the range boundary is NEVER treated
+// as a rejected breakout -- rawBreakoutEvent requires the close to have
+// actually cleared the boundary before anything is recorded as raw, let
+// alone rejected.
+
+var int countRawBreakouts = 0
+var int countQualifiedSetups = 0
+var int countCancelledSetups = 0
+var int countEntries = 0
+
+bool inAuthorizedSetupWindow = completed15mEvent and rangeReady and inEntryWindow and completedAfterRange
+int rawBreakoutDirection = inAuthorizedSetupWindow ? (completed15Close > completed15Open ? 1 : completed15Close < completed15Open ? -1 : 0) : 0
+bool rawBreakoutCleared = rawBreakoutDirection == 1 ? bullishBreakoutPrice : rawBreakoutDirection == -1 ? bearishBreakoutPrice : false
+bool rawBreakoutEvent = rawBreakoutDirection != 0 and rawBreakoutCleared
+bool rejectedRawBreakout = rawBreakoutEvent and not bullishBreakoutEvent and not bearishBreakoutEvent
 
 f_breakoutRejectReason(int direction) =>
     string reason = "NONE"
 
-    if not completedAfterRange
-        reason := "BEFORE RANGE COMPLETE"
-    else if not breakoutAvailable
-        reason := "SETUP UNAVAILABLE"
+    if not breakoutAvailable
+        reason := setupConsumedToday or tradedToday ? "DAILY LIMIT USED" : strategy.position_size != 0 ? "POSITION OPEN" : not environmentValid ? "ENVIRONMENT INVALID" : "SETUP UNAVAILABLE"
     else if direction == 1
         if not breakoutOpenPass
             reason := "OPEN TOO FAR OUTSIDE RANGE"
-        else if not bullishBreakoutPrice
-            reason := "CLOSE DID NOT CLEAR RANGE"
         else if not breakoutBodyPass
             reason := "BODY TOO SMALL"
         else if completed15BullCloseLocation < minimumCloseLocation
@@ -512,8 +534,6 @@ f_breakoutRejectReason(int direction) =>
     else if direction == -1
         if not breakoutOpenPass
             reason := "OPEN TOO FAR OUTSIDE RANGE"
-        else if not bearishBreakoutPrice
-            reason := "CLOSE DID NOT CLEAR RANGE"
         else if not breakoutBodyPass
             reason := "BODY TOO SMALL"
         else if completed15BearCloseLocation < minimumCloseLocation
@@ -539,16 +559,19 @@ f_breakoutRejectReason(int direction) =>
 
 var string lastBreakoutRejectReason = "NONE YET"
 var int lastBreakoutRejectBar = na
+var string lastBreakoutTestText = "NONE YET"
 
-if completed15mEvent and not bullishBreakoutEvent and not bearishBreakoutEvent
-    int candidateDirection = completed15Close > completed15Open ? 1 : completed15Close < completed15Open ? -1 : 0
+if rawBreakoutEvent
+    countRawBreakouts += 1
+    lastBreakoutTestText := (rawBreakoutDirection == 1 ? "LONG: " : "SHORT: ") + (rejectedRawBreakout ? "REJECTED" : "QUALIFIED")
 
-    if candidateDirection != 0
-        lastBreakoutRejectReason := (candidateDirection == 1 ? "LONG: " : "SHORT: ") + f_breakoutRejectReason(candidateDirection)
+    if rejectedRawBreakout
+        lastBreakoutRejectReason := (rawBreakoutDirection == 1 ? "LONG: " : "SHORT: ") + f_breakoutRejectReason(rawBreakoutDirection)
         lastBreakoutRejectBar := bar_index
 
 
 if bullishBreakoutEvent or bearishBreakoutEvent
+    countQualifiedSetups += 1
     setupConsumedToday := true
     setupPhase := 1
     setupDirection := bullishBreakoutEvent ? 1 : -1
@@ -596,15 +619,20 @@ bool shortPullbackCandidate = setupDirection == -1 and (close >= open or high > 
 bool cancelSetup = false
 string cancellationReason = "NONE"
 
-if setupActive and barstate.isconfirmed
-    // FIX (round 2): previously cancelled the moment inEntryWindow went
-    // false, killing an in-progress pullback purely for crossing the entry
-    // window's clock boundary. An already-detected setup is now only
-    // cancelled if the whole regular trading session ends; the pullback's
-    // own bar-count timeout (below) already bounds how long it can run.
-    if not inTradingSession
+// v1.2 CRITICAL FIX: added "afterBreakoutBar" to this guard. Without it,
+// this block ran on the SAME bar a breakout had just set setupPhase to 1.
+// On that bar longPullbackDepth/shortPullbackDepth measured the breakout
+// candle's own low/high against itself (approximately 1.00, versus a 0.50
+// maximum), so every qualified setup was immediately self-cancelled as
+// "PULLBACK TOO DEEP" before the pullback logic ever ran on a real
+// subsequent bar. Pullback depth, range defense, and opposing-reversal
+// checks must never evaluate on the breakout-detection bar -- they now
+// start on the first confirmed 5-minute bar after it, exactly like
+// Sections 20 and 22 already required.
+if setupActive and afterBreakoutBar and barstate.isconfirmed
+    if not inEntryWindow
         cancelSetup := true
-        cancellationReason := "SESSION CLOSED"
+        cancellationReason := "ENTRY WINDOW CLOSED"
     else if setupDirection == 1 and not longRangeDefense
         cancelSetup := true
         cancellationReason := "CLOSED BACK IN RANGE"
@@ -623,6 +651,14 @@ if setupActive and barstate.isconfirmed
     else if setupDirection == -1 and strongBullReversal
         cancelSetup := true
         cancellationReason := "STRONG BULL REVERSAL"
+
+// Debug-marker edge flags for the pullback/trigger mechanics. Declared here
+// (fresh false every bar) and set true in Section 22 at the exact bar each
+// event happens, then plotted unconditionally (gated by showDebugMarkers)
+// in Section 28.
+bool pb1Event = false
+bool pb2Event = false
+bool trgEvent = false
 
 
 //=============================================================================
@@ -659,7 +695,9 @@ float proposedShortRiskDollars = not na(proposedShortRisk) ? proposedShortRisk *
 bool longRiskPass = not na(proposedLongRisk) and proposedLongRisk >= minimumRiskDistance and proposedLongRisk <= atr5 * maximumStopATR and proposedLongRiskDollars <= maximumRiskDollars
 bool shortRiskPass = not na(proposedShortRisk) and proposedShortRisk >= minimumRiskDistance and proposedShortRisk <= atr5 * maximumStopATR and proposedShortRiskDollars <= maximumRiskDollars
 
-bool commonEntryPass = barstate.isconfirmed and environmentValid and setupPhase == 2 and inTradingSession and strategy.position_size == 0 and not tradedToday and not cancelSetup and lowSignalChurn and entryEfficiencyPass
+// Restored per spec: entries are only authorized inside the 10:00-11:00 ET
+// entry window, not merely the full regular trading session.
+bool commonEntryPass = barstate.isconfirmed and environmentValid and setupPhase == 2 and inEntryWindow and strategy.position_size == 0 and not tradedToday and not cancelSetup and lowSignalChurn and entryEfficiencyPass
 bool longEntry = commonEntryPass and setupDirection == 1 and longTriggerPricePass and longTriggerDirectionPass and longChasePass and longRiskPass
 bool shortEntry = commonEntryPass and setupDirection == -1 and shortTriggerPricePass and shortTriggerDirectionPass and shortChasePass and shortRiskPass and not longEntry
 
@@ -692,6 +730,7 @@ if longEntry
     pmtTargetValue := pendingTarget
     tradedToday := true
     tradesToday += 1
+    countEntries += 1
     setupPhase := 0
     lastExitReason := "NONE"
     strategy.entry("Long", strategy.long, qty=contracts, comment="ONE-AND-DONE LONG", alert_message="MNQ1DONE LONG ENTRY")
@@ -704,6 +743,7 @@ if shortEntry
     pmtTargetValue := pendingTarget
     tradedToday := true
     tradesToday += 1
+    countEntries += 1
     setupPhase := 0
     lastExitReason := "NONE"
     strategy.entry("Short", strategy.short, qty=contracts, comment="ONE-AND-DONE SHORT", alert_message="MNQ1DONE SHORT ENTRY")
@@ -745,6 +785,8 @@ if setupActive and afterBreakoutBar and barstate.isconfirmed and not longEntry a
             pullbackBars := 1
             pullbackExtreme := setupDirection == 1 ? low : high
             pullbackTrigger := setupDirection == 1 ? high : low
+            pb1Event := true
+            trgEvent := true
         else if setupAge >= maximumPullbackBars
             cancelSetup := true
             cancellationReason := "NO CONTROLLED PULLBACK"
@@ -756,11 +798,14 @@ if setupActive and afterBreakoutBar and barstate.isconfirmed and not longEntry a
             pullbackBars += 1
             pullbackExtreme := setupDirection == 1 ? math.min(pullbackExtreme, low) : math.max(pullbackExtreme, high)
             pullbackTrigger := setupDirection == 1 ? high : low
+            pb2Event := true
+            trgEvent := true
         else
             cancelSetup := true
             cancellationReason := "PULLBACK EXPIRED"
 
 if cancelSetup and setupPhase > 0
+    countCancelledSetups += 1
     setupPhase := 0
     lastCancellationReason := cancellationReason
     pullbackTrigger := na
@@ -866,16 +911,16 @@ if strategy.position_size == 0 and not longEntry and not shortEntry
 
 
 //=============================================================================
-// 26. END-OF-SESSION LOCK
+// 26. END-OF-ENTRY-WINDOW LOCK
 //=============================================================================
-// FIX (round 2): was keyed to entryWindowJustEnded, killing an in-progress
-// setup the instant the narrower entry window closed. Now keyed to the
-// regular trading session ending instead, matching Section 19's
-// cancellation check above -- see that section's comment for why.
+// Restored per spec: an active setup that has not triggered by the end of
+// the authorized entry window is cancelled as ENTRY WINDOW CLOSED, not
+// carried forward to the end of the full regular trading session.
 
-if tradingSessionJustEnded and setupPhase > 0
+if entryWindowJustEnded and setupPhase > 0
+    countCancelledSetups += 1
     setupPhase := 0
-    lastCancellationReason := "SESSION CLOSED"
+    lastCancellationReason := "ENTRY WINDOW CLOSED"
     pullbackTrigger := na
     pullbackExtreme := na
 
@@ -885,8 +930,7 @@ if tradingSessionJustEnded and setupPhase > 0
 //=============================================================================
 
 bool dailyLocked = tradedToday or (setupConsumedToday and setupPhase == 0)
-bool newSetupWindowOpen = inEntryWindow
-string systemState = strategy.position_size != 0 ? "IN TRADE" : tradedToday ? "LOCKED - TRADE DONE" : setupPhase == 2 ? "TRIGGER READY" : setupPhase == 1 ? "WAIT PULLBACK" : setupConsumedToday ? "LOCKED - SETUP DONE" : not rangeReady ? "BUILD RANGE" : newSetupWindowOpen ? "WAIT 15M BREAKOUT" : "OUTSIDE WINDOW"
+string systemState = strategy.position_size != 0 ? "IN TRADE" : tradedToday ? "LOCKED - TRADE DONE" : setupPhase == 2 ? "TRIGGER READY" : setupPhase == 1 ? "WAIT PULLBACK" : setupConsumedToday ? "LOCKED - SETUP DONE" : not rangeReady ? "BUILD RANGE" : inEntryWindow ? "WAIT 15M BREAKOUT" : "OUTSIDE WINDOW"
 color systemColor = strategy.position_size != 0 ? C_BULL : dailyLocked ? C_STOP : setupPhase > 0 ? C_READY : C_NEUTRAL
 
 string structureText = confirmedLongStructure ? "BULL" : confirmedShortStructure ? "BEAR" : "NEUTRAL"
@@ -895,20 +939,11 @@ color structureColor = confirmedLongStructure ? C_BULL : confirmedShortStructure
 string setupSideText = setupDirection == 1 ? "LONG" : setupDirection == -1 ? "SHORT" : "NONE"
 color setupSideColor = setupDirection == 1 ? C_BULL : setupDirection == -1 ? C_BEAR : C_NEUTRAL
 
-// FIX: the RVOL cold-start gate (completed15RvolPass, which requires
-// minimumRvolSamples prior same-time-of-day observations before it can ever
-// pass) was previously invisible in blockerText -- every day it blocked a
-// breakout, the dashboard just said the generic "WAIT BREAKOUT", giving no
-// hint that the real reason was "not enough trading history at this time
-// slot yet". It is now reported explicitly, and the FIX for the
-// runtime.error() calls is reported first since it is a hard stop.
-// FIX (round 2): "not inEntryWindow" used to short-circuit this whole chain
-// regardless of setupPhase, so an already-armed setup that was legitimately
-// still running past the entry window's clock boundary got mislabeled
-// "ENTRY WINDOW CLOSED" even though it was progressing normally. The window
-// check now only applies when there is no active setup (setupPhase == 0);
-// an in-progress setup instead falls through to the pullback/trigger rows
-// below, and is only ever cancelled by SESSION CLOSED (see Section 19/26).
+// The window check only applies when there is no active setup (setupPhase
+// == 0); an in-progress setup instead falls through to the pullback/trigger
+// rows below, and is cancelled by Section 19/26 with the specific
+// ENTRY WINDOW CLOSED reason (visible in the LAST CANCELLATION row) rather
+// than being mislabeled here.
 string blockerText = "CLEAR"
 if not chartIs5m
     blockerText := "INVALID CHART - NEED 5M"
@@ -918,8 +953,8 @@ else if not rangeReady
     blockerText := "RANGE NOT READY"
 else if dailyLocked
     blockerText := "DAILY LOCK"
-else if setupPhase == 0 and not newSetupWindowOpen
-    blockerText := "SETUP WINDOW CLOSED"
+else if setupPhase == 0 and not inEntryWindow
+    blockerText := "ENTRY WINDOW CLOSED"
 else if not confirmedVolatilityRegime
     blockerText := "VOLATILITY REGIME"
 else if not lowSignalChurn
@@ -937,6 +972,8 @@ else
 
 string processText = dailyLocked ? "DONE - CLOSE PLATFORM" : setupPhase > 0 ? "HANDS OFF - AUTOMATED" : "WAITING IS THE TRADE"
 
+string countersText = str.tostring(countRawBreakouts) + " / " + str.tostring(countQualifiedSetups) + " / " + str.tostring(countCancelledSetups) + " / " + str.tostring(countEntries)
+
 
 //=============================================================================
 // 28. COMPACT VISUALS
@@ -952,25 +989,36 @@ plot(showTrendEma ? confirmedSlow15 : na, "Confirmed 15M Slow EMA", color=color.
 plot(pmtStopValue, "PMT Stop", color=C_STOP, linewidth=2, style=plot.style_linebr)
 plot(pmtTargetValue, "PMT Target", color=C_READY, linewidth=2, style=plot.style_linebr)
 
+// Qualified breakout and entry markers remain visible regardless of
+// showDebugMarkers.
 plotshape(bullishBreakoutEvent, title="Qualified Bullish Breakout", style=shape.labelup, location=location.belowbar, color=C_BULL, textcolor=color.white, text="BO", size=size.tiny)
 plotshape(bearishBreakoutEvent, title="Qualified Bearish Breakout", style=shape.labeldown, location=location.abovebar, color=C_BEAR, textcolor=color.white, text="BO", size=size.tiny)
 plotshape(longEntry, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=C_READY, text="L", size=size.small)
 plotshape(shortEntry, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=C_STOP, text="S", size=size.small)
-plotshape(showDebugMarkers and cancelSetup, title="Setup Cancelled", style=shape.xcross, location=location.abovebar, color=C_WAIT, size=size.tiny)
+
+// Debug-only markers: raw breakout attempts, rejections, pullback bars,
+// trigger-ready events, and cancellations. Only shown when showDebugMarkers
+// is enabled.
+plotshape(showDebugMarkers and rawBreakoutEvent, title="Raw Breakout", style=shape.circle, location=rawBreakoutDirection == 1 ? location.belowbar : location.abovebar, color=color.new(C_NEUTRAL, 20), text="RAW", size=size.tiny)
+plotshape(showDebugMarkers and rejectedRawBreakout, title="Rejected Raw Breakout", style=shape.xcross, location=rawBreakoutDirection == 1 ? location.belowbar : location.abovebar, color=C_WAIT, text="REJ", size=size.tiny)
+plotshape(showDebugMarkers and pb1Event, title="Pullback Bar 1 Accepted", style=shape.circle, location=location.belowbar, color=setupSideColor, text="PB1", size=size.tiny)
+plotshape(showDebugMarkers and pb2Event, title="Pullback Bar 2 Accepted", style=shape.circle, location=location.belowbar, color=setupSideColor, text="PB2", size=size.tiny)
+plotshape(showDebugMarkers and trgEvent, title="Pullback Trigger Ready", style=shape.diamond, location=location.abovebar, color=C_READY, text="TRG", size=size.tiny)
+plotshape(showDebugMarkers and cancelSetup, title="Setup Cancelled", style=shape.xcross, location=location.abovebar, color=C_WAIT, text="X", size=size.tiny)
 
 
 //=============================================================================
 // 29. BEHAVIORAL DASHBOARD
 //=============================================================================
 
-var table dashboard = table.new(position.top_right, 2, 14, border_width=1)
+var table dashboard = table.new(position.top_right, 2, 17, border_width=1)
 
 f_dashCell(int row, string labelText, string valueText, color valueColor) =>
     table.cell(dashboard, 0, row, labelText, text_color=color.white, bgcolor=color.new(C_NEUTRAL, 30), text_size=size.small, text_halign=text.align_left)
     table.cell(dashboard, 1, row, valueText, text_color=color.white, bgcolor=color.new(valueColor, 30), text_size=size.small, text_halign=text.align_right)
 
 if barstate.islast
-    table.clear(dashboard, 0, 0, 1, 13)
+    table.clear(dashboard, 0, 0, 1, 16)
 
     if showDashboard
         string rangeText = rangeReady ? f_price(frozenRangeLow) + " - " + f_price(frozenRangeHigh) : "BUILDING"
@@ -982,7 +1030,7 @@ if barstate.islast
 
         f_dashCell(0, "ONE-AND-DONE", systemState, systemColor)
         f_dashCell(1, "PROCESS", processText, dailyLocked ? C_STOP : C_READY)
-        f_dashCell(2, "NEW SETUP WINDOW", inEntryWindow ? "AUTHORIZED" : "CLOSED", inEntryWindow ? C_READY : C_NEUTRAL)
+        f_dashCell(2, "ENTRY WINDOW", inEntryWindow ? "AUTHORIZED" : "CLOSED", inEntryWindow ? C_READY : C_NEUTRAL)
         f_dashCell(3, "OPENING RANGE", rangeText, rangeReady ? C_WAIT : C_NEUTRAL)
         f_dashCell(4, "15M STRUCTURE", structureText, structureColor)
         f_dashCell(5, "SIDE / PHASE", setupSideText + " / " + str.tostring(setupPhase), setupSideColor)
@@ -994,6 +1042,9 @@ if barstate.islast
         f_dashCell(11, "BLOCKER", blockerText, blockerText == "CLEAR" ? C_READY : C_WAIT)
         f_dashCell(12, "PICKMYTRADE", automationText, automationEnabled ? C_READY : C_NEUTRAL)
         f_dashCell(13, "LAST MISS", lastBreakoutRejectReason, lastBreakoutRejectReason == "NONE YET" ? C_NEUTRAL : C_STOP)
+        f_dashCell(14, "LAST BREAKOUT TEST", lastBreakoutTestText, lastBreakoutTestText == "NONE YET" ? C_NEUTRAL : (str.contains(lastBreakoutTestText, "QUALIFIED") ? C_READY : C_WAIT))
+        f_dashCell(15, "LAST CANCELLATION", lastCancellationReason, lastCancellationReason == "NONE" ? C_NEUTRAL : C_STOP)
+        f_dashCell(16, "RAW / SETUP / CANCEL / ENTRY", countersText, C_NEUTRAL)
 
 
 //=============================================================================
@@ -1012,3 +1063,7 @@ plot(entryEfficiency, "5M Entry Efficiency", display=display.data_window)
 plot(float(setupPhase), "Setup Phase", display=display.data_window)
 plot(float(setupAge), "Setup Age", display=display.data_window)
 plot(tradedToday ? 1.0 : 0.0, "Daily Trade Lock", display=display.data_window)
+plot(float(countRawBreakouts), "Count Raw Breakouts", display=display.data_window)
+plot(float(countQualifiedSetups), "Count Qualified Setups", display=display.data_window)
+plot(float(countCancelledSetups), "Count Cancelled Setups", display=display.data_window)
+plot(float(countEntries), "Count Entries", display=display.data_window)
