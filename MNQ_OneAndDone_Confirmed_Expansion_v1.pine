@@ -82,8 +82,8 @@ float maximumOpposingWick = input.float(0.20, "Maximum Opposing Wick / Range", m
 float minimumBreakoutATR = input.float(0.80, "Minimum Breakout Range / 15M ATR", minval=0.10, maxval=5.0, step=0.05, group=G_BREAKOUT)
 float maximumBreakoutATR = input.float(1.80, "Maximum Breakout Range / 15M ATR", minval=0.25, maxval=5.0, step=0.05, group=G_BREAKOUT)
 bool useMaximumBreakoutATR = input.bool(false, "Cap Breakout Range / 15M ATR", tooltip="OFF (default) lets a large, fast expansion candle qualify instead of being rejected purely for being bigger than the ATR ceiling.", group=G_BREAKOUT)
-bool requireOpenInsideRange = input.bool(true, "Require Breakout Open Inside Opening Range", group=G_BREAKOUT)
-float breakoutOpenToleranceATR = input.float(0.25, "Breakout Open Tolerance Beyond Range - ATR", minval=0.0, maxval=2.0, step=0.05, tooltip="Lets the qualifying candle's open already sit up to this many 15M ATR beyond the opening range, so a fast move that started moving before the candle opened is not rejected purely on that basis.", group=G_BREAKOUT)
+bool requireOpenInsideRange = input.bool(false, "Require Breakout Open Inside Opening Range", tooltip="OFF (default). A genuinely fast expansion candle routinely opens well beyond the opening range by the time it completes -- confirmed diagnostics showed this rejecting real breakouts (\"OPEN TOO FAR OUTSIDE RANGE\") even with a 0.25 ATR tolerance. Turn ON only if you specifically want to exclude candles that opened outside the range.", group=G_BREAKOUT)
+float breakoutOpenToleranceATR = input.float(1.00, "Breakout Open Tolerance Beyond Range - ATR", minval=0.0, maxval=5.0, step=0.05, tooltip="Only used when Require Breakout Open Inside Opening Range is ON. Lets the qualifying candle's open already sit up to this many 15M ATR beyond the opening range, so a fast move that started moving before the candle opened is not rejected purely on that basis.", group=G_BREAKOUT)
 
 
 //=============================================================================
