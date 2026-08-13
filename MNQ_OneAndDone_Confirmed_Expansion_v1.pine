@@ -999,8 +999,13 @@ plotshape(shortEntry, title="Short Entry", style=shape.triangledown, location=lo
 // Debug-only markers: raw breakout attempts, rejections, pullback bars,
 // trigger-ready events, and cancellations. Only shown when showDebugMarkers
 // is enabled.
-plotshape(showDebugMarkers and rawBreakoutEvent, title="Raw Breakout", style=shape.circle, location=rawBreakoutDirection == 1 ? location.belowbar : location.abovebar, color=color.new(C_NEUTRAL, 20), text="RAW", size=size.tiny)
-plotshape(showDebugMarkers and rejectedRawBreakout, title="Rejected Raw Breakout", style=shape.xcross, location=rawBreakoutDirection == 1 ? location.belowbar : location.abovebar, color=C_WAIT, text="REJ", size=size.tiny)
+// plotshape's location= argument must be an input (compile-time) constant --
+// it cannot be a per-bar series value, so the long/short cases are split
+// into separate calls instead of a single ternary-driven location.
+plotshape(showDebugMarkers and rawBreakoutEvent and rawBreakoutDirection == 1, title="Raw Breakout Long", style=shape.circle, location=location.belowbar, color=color.new(C_NEUTRAL, 20), text="RAW", size=size.tiny)
+plotshape(showDebugMarkers and rawBreakoutEvent and rawBreakoutDirection == -1, title="Raw Breakout Short", style=shape.circle, location=location.abovebar, color=color.new(C_NEUTRAL, 20), text="RAW", size=size.tiny)
+plotshape(showDebugMarkers and rejectedRawBreakout and rawBreakoutDirection == 1, title="Rejected Raw Breakout Long", style=shape.xcross, location=location.belowbar, color=C_WAIT, text="REJ", size=size.tiny)
+plotshape(showDebugMarkers and rejectedRawBreakout and rawBreakoutDirection == -1, title="Rejected Raw Breakout Short", style=shape.xcross, location=location.abovebar, color=C_WAIT, text="REJ", size=size.tiny)
 plotshape(showDebugMarkers and pb1Event, title="Pullback Bar 1 Accepted", style=shape.circle, location=location.belowbar, color=setupSideColor, text="PB1", size=size.tiny)
 plotshape(showDebugMarkers and pb2Event, title="Pullback Bar 2 Accepted", style=shape.circle, location=location.belowbar, color=setupSideColor, text="PB2", size=size.tiny)
 plotshape(showDebugMarkers and trgEvent, title="Pullback Trigger Ready", style=shape.diamond, location=location.abovebar, color=C_READY, text="TRG", size=size.tiny)
