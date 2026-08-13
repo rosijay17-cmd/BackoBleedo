@@ -217,15 +217,20 @@ int rangeEndMOD = f_sessionEndMOD(openingRangeSession)
 int entryStartMOD = f_sessionStartMOD(entryWindowSession)
 int entryEndMOD = f_sessionEndMOD(entryWindowSession)
 
-// FIX: this runway buffer previously was a fixed 30 minutes, which only left
-// the 10:00 and 10:15 fifteen-minute candles eligible to start a setup inside
-// the default 1000-1100 entry window (entryEndMOD - 30 = 10:30, and a
-// qualifying candle must START at or before that). That silently discarded
-// roughly half of the entry window before any quality filter even ran. The
-// buffer now scales with the actual pullback sequence length (pullback bars
-// plus one bar to test the trigger), so it stays safe but stops wasting the
-// window by a fixed, oversized margin.
-int breakoutRunwayMinutes = (maximumPullbackBars + 1) * 5
+// FIX (round 2): a fixed "runway" buffer (originally 30 min, then reduced to
+// (maximumPullbackBars+1)*5 = 15 min) was removed entirely. Confirmed by the
+// LAST MISS diagnostic ("LONG: TOO LATE IN WINDOW" / BLOCKER "ENTRY WINDOW
+// CLOSED"): a genuine, qualifying breakout that completed late inside the
+// entry window was still rejected because there was not enough buffer left
+// before the window's nominal close for the whole pullback sequence to
+// theoretically fit. NEW setup detection still only starts inside
+// entryWindowSession (see breakoutAvailable below) -- that behavioral rule
+// ("only look for an opening-range break in this window") is unchanged.
+// What changed is that an ALREADY-DETECTED setup is no longer killed the
+// instant the clock crosses the entry-window boundary; it now runs to
+// completion against the full regular trading session, bounded the same way
+// it always was by its own pullback-bar-count timeout (maximumPullbackBars)
+// and by cancelOnOppositeBreak/depth/reversal checks.
 
 int barOpenMOD = hour(time, sessionTimezone) * 60 + minute(time, sessionTimezone)
 int barCloseMOD = hour(time_close, sessionTimezone) * 60 + minute(time_close, sessionTimezone)
@@ -233,7 +238,6 @@ int barCloseMOD = hour(time_close, sessionTimezone) * 60 + minute(time_close, se
 bool inTradingSession = not na(time(timeframe.period, tradingSession, sessionTimezone))
 bool inOpeningRange = not na(time(timeframe.period, openingRangeSession, sessionTimezone))
 bool inEntryWindow = not na(time(timeframe.period, entryWindowSession, sessionTimezone))
-bool entryWindowJustEnded = not inEntryWindow and inEntryWindow[1]
 bool tradingSessionJustEnded = not inTradingSession and inTradingSession[1]
 
 int nyDayId = year(time, sessionTimezone) * 10000 + month(time, sessionTimezone) * 100 + dayofmonth(time, sessionTimezone)
@@ -459,9 +463,8 @@ if newNyDay and barstate.isnew
     pullbackTrigger := na
 
 bool breakoutAvailable = environmentValid and rangeReady and inEntryWindow and not setupConsumedToday and not tradedToday and strategy.position_size == 0
-bool enoughTimeForPullbackSequence = completed15StartMOD <= entryEndMOD - breakoutRunwayMinutes
-bool bullishBreakoutEvent = completed15mEvent and completedAfterRange and enoughTimeForPullbackSequence and breakoutAvailable and bullishBreakoutQuality
-bool bearishBreakoutEvent = completed15mEvent and completedAfterRange and enoughTimeForPullbackSequence and breakoutAvailable and bearishBreakoutQuality and not bullishBreakoutEvent
+bool bullishBreakoutEvent = completed15mEvent and completedAfterRange and breakoutAvailable and bullishBreakoutQuality
+bool bearishBreakoutEvent = completed15mEvent and completedAfterRange and breakoutAvailable and bearishBreakoutQuality and not bullishBreakoutEvent
 
 
 //=============================================================================
@@ -479,8 +482,6 @@ f_breakoutRejectReason(int direction) =>
 
     if not completedAfterRange
         reason := "BEFORE RANGE COMPLETE"
-    else if not enoughTimeForPullbackSequence
-        reason := "TOO LATE IN WINDOW"
     else if not breakoutAvailable
         reason := "SETUP UNAVAILABLE"
     else if direction == 1
@@ -596,9 +597,14 @@ bool cancelSetup = false
 string cancellationReason = "NONE"
 
 if setupActive and barstate.isconfirmed
-    if not inEntryWindow
+    // FIX (round 2): previously cancelled the moment inEntryWindow went
+    // false, killing an in-progress pullback purely for crossing the entry
+    // window's clock boundary. An already-detected setup is now only
+    // cancelled if the whole regular trading session ends; the pullback's
+    // own bar-count timeout (below) already bounds how long it can run.
+    if not inTradingSession
         cancelSetup := true
-        cancellationReason := "ENTRY WINDOW CLOSED"
+        cancellationReason := "SESSION CLOSED"
     else if setupDirection == 1 and not longRangeDefense
         cancelSetup := true
         cancellationReason := "CLOSED BACK IN RANGE"
@@ -653,7 +659,7 @@ float proposedShortRiskDollars = not na(proposedShortRisk) ? proposedShortRisk *
 bool longRiskPass = not na(proposedLongRisk) and proposedLongRisk >= minimumRiskDistance and proposedLongRisk <= atr5 * maximumStopATR and proposedLongRiskDollars <= maximumRiskDollars
 bool shortRiskPass = not na(proposedShortRisk) and proposedShortRisk >= minimumRiskDistance and proposedShortRisk <= atr5 * maximumStopATR and proposedShortRiskDollars <= maximumRiskDollars
 
-bool commonEntryPass = barstate.isconfirmed and environmentValid and setupPhase == 2 and inEntryWindow and strategy.position_size == 0 and not tradedToday and not cancelSetup and lowSignalChurn and entryEfficiencyPass
+bool commonEntryPass = barstate.isconfirmed and environmentValid and setupPhase == 2 and inTradingSession and strategy.position_size == 0 and not tradedToday and not cancelSetup and lowSignalChurn and entryEfficiencyPass
 bool longEntry = commonEntryPass and setupDirection == 1 and longTriggerPricePass and longTriggerDirectionPass and longChasePass and longRiskPass
 bool shortEntry = commonEntryPass and setupDirection == -1 and shortTriggerPricePass and shortTriggerDirectionPass and shortChasePass and shortRiskPass and not longEntry
 
@@ -860,12 +866,16 @@ if strategy.position_size == 0 and not longEntry and not shortEntry
 
 
 //=============================================================================
-// 26. END-OF-WINDOW LOCK
+// 26. END-OF-SESSION LOCK
 //=============================================================================
+// FIX (round 2): was keyed to entryWindowJustEnded, killing an in-progress
+// setup the instant the narrower entry window closed. Now keyed to the
+// regular trading session ending instead, matching Section 19's
+// cancellation check above -- see that section's comment for why.
 
-if entryWindowJustEnded and setupPhase > 0
+if tradingSessionJustEnded and setupPhase > 0
     setupPhase := 0
-    lastCancellationReason := "ENTRY WINDOW CLOSED"
+    lastCancellationReason := "SESSION CLOSED"
     pullbackTrigger := na
     pullbackExtreme := na
 
@@ -875,8 +885,8 @@ if entryWindowJustEnded and setupPhase > 0
 //=============================================================================
 
 bool dailyLocked = tradedToday or (setupConsumedToday and setupPhase == 0)
-bool newSetupWindowOpen = inEntryWindow and barOpenMOD <= entryEndMOD - breakoutRunwayMinutes
-string systemState = strategy.position_size != 0 ? "IN TRADE" : tradedToday ? "LOCKED - TRADE DONE" : setupPhase == 2 ? "TRIGGER READY" : setupPhase == 1 ? "WAIT PULLBACK" : setupConsumedToday ? "LOCKED - SETUP DONE" : not rangeReady ? "BUILD RANGE" : newSetupWindowOpen ? "WAIT 15M BREAKOUT" : inEntryWindow ? "NO NEW SETUPS" : "OUTSIDE WINDOW"
+bool newSetupWindowOpen = inEntryWindow
+string systemState = strategy.position_size != 0 ? "IN TRADE" : tradedToday ? "LOCKED - TRADE DONE" : setupPhase == 2 ? "TRIGGER READY" : setupPhase == 1 ? "WAIT PULLBACK" : setupConsumedToday ? "LOCKED - SETUP DONE" : not rangeReady ? "BUILD RANGE" : newSetupWindowOpen ? "WAIT 15M BREAKOUT" : "OUTSIDE WINDOW"
 color systemColor = strategy.position_size != 0 ? C_BULL : dailyLocked ? C_STOP : setupPhase > 0 ? C_READY : C_NEUTRAL
 
 string structureText = confirmedLongStructure ? "BULL" : confirmedShortStructure ? "BEAR" : "NEUTRAL"
@@ -892,6 +902,13 @@ color setupSideColor = setupDirection == 1 ? C_BULL : setupDirection == -1 ? C_B
 // hint that the real reason was "not enough trading history at this time
 // slot yet". It is now reported explicitly, and the FIX for the
 // runtime.error() calls is reported first since it is a hard stop.
+// FIX (round 2): "not inEntryWindow" used to short-circuit this whole chain
+// regardless of setupPhase, so an already-armed setup that was legitimately
+// still running past the entry window's clock boundary got mislabeled
+// "ENTRY WINDOW CLOSED" even though it was progressing normally. The window
+// check now only applies when there is no active setup (setupPhase == 0);
+// an in-progress setup instead falls through to the pullback/trigger rows
+// below, and is only ever cancelled by SESSION CLOSED (see Section 19/26).
 string blockerText = "CLEAR"
 if not chartIs5m
     blockerText := "INVALID CHART - NEED 5M"
@@ -899,8 +916,6 @@ else if requireMNQ and not symbolIsMNQ
     blockerText := "NOT MNQ"
 else if not rangeReady
     blockerText := "RANGE NOT READY"
-else if not inEntryWindow
-    blockerText := "ENTRY WINDOW CLOSED"
 else if dailyLocked
     blockerText := "DAILY LOCK"
 else if setupPhase == 0 and not newSetupWindowOpen
@@ -967,7 +982,7 @@ if barstate.islast
 
         f_dashCell(0, "ONE-AND-DONE", systemState, systemColor)
         f_dashCell(1, "PROCESS", processText, dailyLocked ? C_STOP : C_READY)
-        f_dashCell(2, "WINDOW", inEntryWindow ? "AUTHORIZED" : "CLOSED", inEntryWindow ? C_READY : C_NEUTRAL)
+        f_dashCell(2, "NEW SETUP WINDOW", inEntryWindow ? "AUTHORIZED" : "CLOSED", inEntryWindow ? C_READY : C_NEUTRAL)
         f_dashCell(3, "OPENING RANGE", rangeText, rangeReady ? C_WAIT : C_NEUTRAL)
         f_dashCell(4, "15M STRUCTURE", structureText, structureColor)
         f_dashCell(5, "SIDE / PHASE", setupSideText + " / " + str.tostring(setupPhase), setupSideColor)
