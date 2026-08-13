@@ -1,0 +1,909 @@
+//@version=6
+strategy(
+     title="MNQ One-and-Done Confirmed Expansion v1",
+     shorttitle="MNQ1DONE",
+     overlay=true,
+     pyramiding=0,
+     initial_capital=50000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=2.50,
+     slippage=1,
+     process_orders_on_close=true,
+     calc_on_order_fills=true,
+     calc_on_every_tick=true,
+     max_bars_back=5000,
+     max_labels_count=100,
+     max_lines_count=50
+)
+
+//=============================================================================
+// MNQ ONE-AND-DONE CONFIRMED EXPANSION
+//=============================================================================
+// Intended chart: 5 minutes
+// Intended instrument: MNQ continuous or current MNQ contract
+//
+// Sequence:
+//   1. Build the 09:30-10:00 ET opening range.
+//   2. Qualify one completed 15-minute breakout candle.
+//   3. Require a controlled one- or two-bar 5-minute pullback.
+//   4. Enter on the first confirmed re-expansion through the pullback trigger.
+//   5. Exit at 0.75R, the structural stop, or the close of the next 5m bar.
+//   6. Lock the strategy for the rest of the day after the first setup/trade.
+//
+// PickMyTrade:
+//   Generate a FLAT POSITION STRATEGY alert in PickMyTrade.
+//   Configure Stop Loss price as:  {{plot("PMT Stop")}}
+//   Configure Take Profit price as: {{plot("PMT Target")}}
+//   Configure pyramid/same-direction stacking OFF and reverse-order-close OFF.
+//   Use PickMyTrade's generated JSON without manually editing credentials.
+//   In TradingView choose this strategy -> Order fills only, then paste the
+//   generated JSON and PickMyTrade webhook URL. Test in simulation first.
+//
+// Realtime calculations are enabled for order-fill synchronization, but every
+// setup and entry decision is gated by barstate.isconfirmed.
+//=============================================================================
+
+
+//=============================================================================
+// 01. INPUT GROUPS
+//=============================================================================
+
+const string G_SESSION = "01 - Session"
+const string G_BREAKOUT = "02 - Confirmed 15M Breakout"
+const string G_PULLBACK = "03 - Controlled 5M Pullback"
+const string G_CONTEXT = "04 - Structure and Volatility"
+const string G_VOLUME = "05 - Same-Time RVOL"
+const string G_RISK = "06 - Risk and Exit"
+const string G_AUTOMATION = "07 - PickMyTrade Automation"
+const string G_DISPLAY = "08 - Dashboard and Display"
+
+
+//=============================================================================
+// 02. SESSION INPUTS
+//=============================================================================
+
+string sessionTimezone = input.string("America/New_York", "Session Timezone", group=G_SESSION)
+string tradingSession = input.session("0930-1600", "Regular Trading Session", group=G_SESSION)
+string openingRangeSession = input.session("0930-1000", "Opening Range", group=G_SESSION)
+string entryWindowSession = input.session("1000-1100", "Authorized Entry Window", group=G_SESSION)
+bool requireMNQ = input.bool(true, "Require MNQ Symbol", group=G_SESSION)
+
+
+//=============================================================================
+// 03. BREAKOUT QUALITY INPUTS
+//=============================================================================
+
+int breakoutBufferTicks = input.int(2, "Close Beyond Range - Ticks", minval=0, maxval=40, group=G_BREAKOUT)
+float minimumBodyPercent = input.float(60.0, "Minimum Body Percent", minval=40.0, maxval=100.0, step=5.0, group=G_BREAKOUT)
+float minimumCloseLocation = input.float(0.80, "Minimum Directional Close Location", minval=0.50, maxval=1.00, step=0.05, group=G_BREAKOUT)
+float maximumOpposingWick = input.float(0.20, "Maximum Opposing Wick / Range", minval=0.0, maxval=0.50, step=0.05, group=G_BREAKOUT)
+float minimumBreakoutATR = input.float(0.80, "Minimum Breakout Range / 15M ATR", minval=0.10, maxval=5.0, step=0.05, group=G_BREAKOUT)
+float maximumBreakoutATR = input.float(1.80, "Maximum Breakout Range / 15M ATR", minval=0.25, maxval=5.0, step=0.05, group=G_BREAKOUT)
+bool requireOpenInsideRange = input.bool(true, "Require Breakout Open Inside Opening Range", group=G_BREAKOUT)
+
+
+//=============================================================================
+// 04. CONTROLLED PULLBACK INPUTS
+//=============================================================================
+
+int maximumPullbackBars = input.int(2, "Maximum Pullback Bars", minval=1, maxval=2, group=G_PULLBACK)
+float maximumPullbackDepth = input.float(0.50, "Maximum Pullback Depth Of Breakout Candle", minval=0.20, maxval=0.80, step=0.05, group=G_PULLBACK)
+float opposingReversalATR = input.float(0.80, "Strong Opposing Bar - ATR", minval=0.25, maxval=2.0, step=0.05, group=G_PULLBACK)
+float chaseDistanceATR = input.float(0.15, "Maximum Chase Distance - ATR", minval=0.0, maxval=1.0, step=0.05, group=G_PULLBACK)
+bool requireTriggerBarDirection = input.bool(true, "Require Directional Trigger Bar", group=G_PULLBACK)
+bool requireTriggerCloseBeyond = input.bool(true, "Require Trigger-Bar Close Beyond Level", group=G_PULLBACK)
+
+
+//=============================================================================
+// 05. STRUCTURE AND VOLATILITY INPUTS
+//=============================================================================
+
+int fastEmaLength = input.int(20, "15M Fast EMA", minval=2, group=G_CONTEXT)
+int slowEmaLength = input.int(50, "15M Slow EMA", minval=3, group=G_CONTEXT)
+int emaSlopeLookback = input.int(3, "15M Fast EMA Slope Lookback", minval=1, maxval=10, group=G_CONTEXT)
+int atrLength = input.int(14, "ATR Length", minval=2, group=G_CONTEXT)
+int atrBaselineLength = input.int(50, "ATR Baseline Length", minval=10, maxval=300, group=G_CONTEXT)
+float minimumATRExpansion = input.float(0.80, "Minimum ATR / Baseline ATR", minval=0.10, maxval=5.0, step=0.05, group=G_CONTEXT)
+float maximumATRExpansion = input.float(2.25, "Maximum ATR / Baseline ATR", minval=0.25, maxval=8.0, step=0.05, group=G_CONTEXT)
+int structureLookback = input.int(10, "15M Directional Structure Lookback", minval=3, maxval=40, group=G_CONTEXT)
+float minimumStructureEfficiency = input.float(0.25, "Minimum 15M Structure Efficiency", minval=0.0, maxval=1.0, step=0.01, group=G_CONTEXT)
+float minimumDirectionalReturnATR = input.float(0.50, "Minimum 15M Directional Return / ATR", minval=0.0, maxval=5.0, step=0.10, group=G_CONTEXT)
+int signalVolatilityLength = input.int(12, "5M Signal-Churn Length", minval=3, maxval=50, group=G_CONTEXT)
+float maximumSignalVolatility = input.float(0.45, "Maximum 5M Signal Churn", minval=0.0, maxval=1.0, step=0.05, group=G_CONTEXT)
+int entryEfficiencyLength = input.int(8, "5M Entry Efficiency Length", minval=3, maxval=30, group=G_CONTEXT)
+float minimumEntryEfficiency = input.float(0.20, "Minimum 5M Entry Efficiency", minval=0.0, maxval=1.0, step=0.01, group=G_CONTEXT)
+
+
+//=============================================================================
+// 06. SAME-TIME-OF-DAY RVOL INPUTS
+//=============================================================================
+
+int rvolLookbackSessions = input.int(20, "Same-Slot Lookback Sessions", minval=5, maxval=60, group=G_VOLUME)
+int minimumRvolSamples = input.int(5, "Minimum Same-Slot Observations", minval=1, maxval=20, group=G_VOLUME)
+float minimumBreakoutRvol = input.float(1.20, "Minimum 15M Same-Slot RVOL", minval=0.10, maxval=5.0, step=0.05, group=G_VOLUME)
+float maximumBreakoutRvol = input.float(3.50, "Maximum 15M Same-Slot RVOL", minval=0.50, maxval=10.0, step=0.25, group=G_VOLUME)
+
+
+//=============================================================================
+// 07. RISK AND EXIT INPUTS
+//=============================================================================
+
+int contracts = input.int(1, "MNQ Contracts", minval=1, maxval=1, tooltip="Hard-capped at one contract during behavioral retraining.", group=G_RISK)
+float accountReference = input.float(50000.0, "Account Reference Value", minval=1000.0, step=1000.0, group=G_RISK)
+float maximumRiskPercent = input.float(0.25, "Maximum Account Risk Percent", minval=0.05, maxval=1.0, step=0.05, group=G_RISK)
+float pullbackStopBufferATR = input.float(0.10, "Stop Buffer Beyond Pullback - ATR", minval=0.0, maxval=0.50, step=0.05, group=G_RISK)
+float maximumStopATR = input.float(1.00, "Maximum Stop Distance - 5M ATR", minval=0.25, maxval=3.0, step=0.05, group=G_RISK)
+int minimumStopTicks = input.int(4, "Minimum Stop Distance - Ticks", minval=1, maxval=100, group=G_RISK)
+float targetR = input.float(0.75, "One-Expansion Target - R", minval=0.25, maxval=1.50, step=0.25, group=G_RISK)
+bool exitAfterNextBar = input.bool(true, "Exit At Close Of First Full 5M Bar", group=G_RISK)
+
+
+//=============================================================================
+// 08. AUTOMATION AND DISPLAY INPUTS
+//=============================================================================
+
+bool automationEnabled = input.bool(false, "PickMyTrade Automation Armed", tooltip="Dashboard reminder only. Actual execution requires a PickMyTrade-generated TradingView strategy alert.", group=G_AUTOMATION)
+bool enableInformationalAlerts = input.bool(false, "Enable Setup And Discipline alert() Messages", tooltip="Keep OFF for the PickMyTrade order-fill webhook alert. Use a separate notification-only alert if desired.", group=G_AUTOMATION)
+bool showDashboard = input.bool(true, "Show Behavioral Dashboard", group=G_DISPLAY)
+bool showOpeningRange = input.bool(true, "Show Opening Range", group=G_DISPLAY)
+bool showTrigger = input.bool(true, "Show Pullback Trigger", group=G_DISPLAY)
+bool showTrendEma = input.bool(true, "Show 15M Context EMAs", group=G_DISPLAY)
+bool showDebugMarkers = input.bool(false, "Show Debug Markers", group=G_DISPLAY)
+
+
+//=============================================================================
+// 09. COLORS AND HELPERS
+//=============================================================================
+
+color C_BULL = color.rgb(0, 145, 255)
+color C_BEAR = color.rgb(160, 90, 235)
+color C_READY = color.rgb(20, 185, 105)
+color C_WAIT = color.rgb(245, 155, 25)
+color C_STOP = color.rgb(240, 65, 80)
+color C_NEUTRAL = color.rgb(95, 110, 130)
+
+f_safeDiv(float numerator, float denominator, float fallback) =>
+    denominator != 0.0 ? numerator / denominator : fallback
+
+f_sessionStartMOD(string sessionValue) =>
+    int(str.tonumber(str.substring(sessionValue, 0, 2))) * 60 + int(str.tonumber(str.substring(sessionValue, 2, 4)))
+
+f_sessionEndMOD(string sessionValue) =>
+    int(str.tonumber(str.substring(sessionValue, 5, 7))) * 60 + int(str.tonumber(str.substring(sessionValue, 7, 9)))
+
+f_price(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+f_yesNo(bool value) =>
+    value ? "YES" : "NO"
+
+
+//=============================================================================
+// 10. TIMEFRAME AND SYMBOL VALIDATION
+//=============================================================================
+// FIX: hard runtime.error() calls were replaced with soft, dashboard-visible
+// gating. A runtime.error() aborts the ENTIRE script for that bar (and every
+// bar after it keeps re-hitting the same abort), which produces exactly the
+// symptom "no entries on chart" with no other clue -- nothing plots, nothing
+// signals, and it is easy to miss the small error banner. Instead we now
+// compute clean booleans, fold them into the entry gate, and surface the
+// exact reason on the dashboard's BLOCKER row.
+
+bool chartIs5m = timeframe.isminutes and timeframe.multiplier == 5
+bool symbolIsMNQ = str.contains(str.upper(syminfo.root), "MNQ") or str.contains(str.upper(syminfo.ticker), "MNQ")
+bool environmentValid = chartIs5m and (not requireMNQ or symbolIsMNQ)
+
+var label environmentWarning = na
+
+if barstate.isfirst and not environmentValid
+    string warningText = not chartIs5m ? "MNQ1DONE: switch to a 5-minute chart." : "MNQ1DONE: symbol does not contain \"MNQ\" (disable Require MNQ Symbol to override)."
+    environmentWarning := label.new(bar_index, high, warningText, style=label.style_label_down, color=C_STOP, textcolor=color.white, size=size.normal)
+
+
+//=============================================================================
+// 11. SESSION STATE
+//=============================================================================
+
+int tradingStartMOD = f_sessionStartMOD(tradingSession)
+int tradingEndMOD = f_sessionEndMOD(tradingSession)
+int rangeStartMOD = f_sessionStartMOD(openingRangeSession)
+int rangeEndMOD = f_sessionEndMOD(openingRangeSession)
+int entryStartMOD = f_sessionStartMOD(entryWindowSession)
+int entryEndMOD = f_sessionEndMOD(entryWindowSession)
+
+// FIX: this runway buffer previously was a fixed 30 minutes, which only left
+// the 10:00 and 10:15 fifteen-minute candles eligible to start a setup inside
+// the default 1000-1100 entry window (entryEndMOD - 30 = 10:30, and a
+// qualifying candle must START at or before that). That silently discarded
+// roughly half of the entry window before any quality filter even ran. The
+// buffer now scales with the actual pullback sequence length (pullback bars
+// plus one bar to test the trigger), so it stays safe but stops wasting the
+// window by a fixed, oversized margin.
+int breakoutRunwayMinutes = (maximumPullbackBars + 1) * 5
+
+int barOpenMOD = hour(time, sessionTimezone) * 60 + minute(time, sessionTimezone)
+int barCloseMOD = hour(time_close, sessionTimezone) * 60 + minute(time_close, sessionTimezone)
+
+bool inTradingSession = not na(time(timeframe.period, tradingSession, sessionTimezone))
+bool inOpeningRange = not na(time(timeframe.period, openingRangeSession, sessionTimezone))
+bool inEntryWindow = not na(time(timeframe.period, entryWindowSession, sessionTimezone))
+bool entryWindowJustEnded = not inEntryWindow and inEntryWindow[1]
+bool tradingSessionJustEnded = not inTradingSession and inTradingSession[1]
+
+int nyDayId = year(time, sessionTimezone) * 10000 + month(time, sessionTimezone) * 100 + dayofmonth(time, sessionTimezone)
+bool newNyDay = barstate.isfirst or nyDayId != nyDayId[1]
+
+
+//=============================================================================
+// 12. OPENING RANGE
+//=============================================================================
+
+var float developingRangeHigh = na
+var float developingRangeLow = na
+var float frozenRangeHigh = na
+var float frozenRangeLow = na
+var bool rangeReady = false
+
+if newNyDay and barstate.isnew
+    developingRangeHigh := na
+    developingRangeLow := na
+    frozenRangeHigh := na
+    frozenRangeLow := na
+    rangeReady := false
+
+if inOpeningRange and barstate.isconfirmed
+    developingRangeHigh := na(developingRangeHigh) ? high : math.max(developingRangeHigh, high)
+    developingRangeLow := na(developingRangeLow) ? low : math.min(developingRangeLow, low)
+
+    if barCloseMOD == rangeEndMOD
+        frozenRangeHigh := developingRangeHigh
+        frozenRangeLow := developingRangeLow
+        rangeReady := not na(frozenRangeHigh) and not na(frozenRangeLow) and frozenRangeHigh > frozenRangeLow
+
+
+//=============================================================================
+// 13. CONFIRMED PRIOR-15M CONTEXT
+//=============================================================================
+
+f_confirmed15Context() =>
+    float localFast = ta.ema(close, fastEmaLength)
+    float localSlow = ta.ema(close, slowEmaLength)
+    float localAtr = ta.atr(atrLength)
+    float localAtrBaseline = ta.sma(localAtr, atrBaselineLength)
+    float localAtrExpansion = not na(localAtrBaseline) and localAtrBaseline > 0 ? localAtr / localAtrBaseline : na
+    float localPath = math.sum(math.abs(ta.change(close)), structureLookback)
+    float localEfficiency = not na(localPath) and localPath > 0 ? math.abs(close - close[structureLookback]) / localPath : na
+    float localDirectionalReturn = not na(localAtr) and localAtr > 0 ? (close - close[structureLookback]) / localAtr : na
+    [localFast[1], localSlow[1], (localFast - localFast[emaSlopeLookback])[1], localAtr[1], localAtrExpansion[1], localEfficiency[1], localDirectionalReturn[1], close[1]]
+
+[confirmedFast15, confirmedSlow15, confirmedFastSlope15, confirmedATR15, confirmedATRExpansion15, confirmedEfficiency15, confirmedDirectionalReturn15, confirmedClose15] = request.security(
+     syminfo.tickerid,
+     "15",
+     f_confirmed15Context(),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on
+)
+
+bool confirmedLongStructure = not na(confirmedFast15) and not na(confirmedSlow15) and not na(confirmedEfficiency15) and not na(confirmedDirectionalReturn15) and confirmedFast15 > confirmedSlow15 and confirmedClose15 > confirmedFast15 and confirmedFastSlope15 > 0 and confirmedEfficiency15 >= minimumStructureEfficiency and confirmedDirectionalReturn15 >= minimumDirectionalReturnATR
+bool confirmedShortStructure = not na(confirmedFast15) and not na(confirmedSlow15) and not na(confirmedEfficiency15) and not na(confirmedDirectionalReturn15) and confirmedFast15 < confirmedSlow15 and confirmedClose15 < confirmedFast15 and confirmedFastSlope15 < 0 and confirmedEfficiency15 >= minimumStructureEfficiency and confirmedDirectionalReturn15 <= -minimumDirectionalReturnATR
+bool confirmedVolatilityRegime = not na(confirmedATRExpansion15) and confirmedATRExpansion15 >= minimumATRExpansion and confirmedATRExpansion15 <= maximumATRExpansion
+
+
+//=============================================================================
+// 14. CURRENT 5M QUALITY STATE
+//=============================================================================
+
+float atr5 = ta.atr(atrLength)
+float emaFast5 = ta.ema(close, fastEmaLength)
+float emaSlow5 = ta.ema(close, slowEmaLength)
+int signalState = close > emaFast5 and emaFast5 > emaSlow5 ? 1 : close < emaFast5 and emaFast5 < emaSlow5 ? -1 : 0
+int priorSignalState = signalState[1]
+float transitionWeight = na(priorSignalState) ? 0.0 : signalState == priorSignalState ? 0.0 : math.abs(signalState - priorSignalState) == 2 ? 1.0 : 0.5
+float signalVolatility = math.sum(transitionWeight, signalVolatilityLength) / signalVolatilityLength
+
+float entryPath = math.sum(math.abs(ta.change(close)), entryEfficiencyLength)
+float entryEfficiency = not na(entryPath) and entryPath > 0 ? math.abs(close - close[entryEfficiencyLength]) / entryPath : na
+
+bool lowSignalChurn = not na(signalVolatility) and signalVolatility <= maximumSignalVolatility
+bool entryEfficiencyPass = not na(entryEfficiency) and entryEfficiency >= minimumEntryEfficiency
+
+
+//=============================================================================
+// 15. COMPLETED 15M CANDLE RECONSTRUCTION FROM 5M BARS
+//=============================================================================
+// The 5m bar whose closing timestamp falls on a 15-minute boundary completes
+// the exact 15m candle. This avoids waiting one additional 5m bar to learn that
+// the 15m candle has closed.
+
+bool validRthFiveMinuteBar = barOpenMOD >= tradingStartMOD and barOpenMOD < tradingEndMOD
+bool completed15mEvent = barstate.isconfirmed and validRthFiveMinuteBar and (barCloseMOD - tradingStartMOD) % 15 == 0 and bar_index >= 2
+
+float completed15Open = open[2]
+float completed15High = math.max(high, math.max(high[1], high[2]))
+float completed15Low = math.min(low, math.min(low[1], low[2]))
+float completed15Close = close
+float completed15Volume = volume + volume[1] + volume[2]
+float completed15Range = math.max(completed15High - completed15Low, syminfo.mintick)
+float completed15Body = math.abs(completed15Close - completed15Open)
+float completed15BodyPercent = f_safeDiv(completed15Body, completed15Range, 0.0) * 100.0
+float completed15BullCloseLocation = f_safeDiv(completed15Close - completed15Low, completed15Range, 0.0)
+float completed15BearCloseLocation = f_safeDiv(completed15High - completed15Close, completed15Range, 0.0)
+float completed15BullOpposingWick = f_safeDiv(math.min(completed15Open, completed15Close) - completed15Low, completed15Range, 1.0)
+float completed15BearOpposingWick = f_safeDiv(completed15High - math.max(completed15Open, completed15Close), completed15Range, 1.0)
+float completed15AtrRatio = not na(confirmedATR15) and confirmedATR15 > 0 ? completed15Range / confirmedATR15 : na
+int completed15StartMOD = barOpenMOD - 10
+int completed15Slot = completed15StartMOD >= tradingStartMOD ? int(math.floor(float(completed15StartMOD - tradingStartMOD) / 15.0)) : -1
+
+
+//=============================================================================
+// 16. SAME-TIME-OF-DAY 15M RVOL
+//=============================================================================
+// FIX: availableSamples is now computed for the current slot on every bar
+// (not only on a completion event), so callers can show a live "samples
+// collected so far" readout instead of it only ever being non-zero for the
+// single tick a 15m candle actually completes on.
+
+f_sameSlotRvol(float completedVolume, int currentSlot, bool completionEvent, int lookbackSessions) =>
+    int slotCount = math.max(1, int(math.ceil(float(tradingEndMOD - tradingStartMOD) / 15.0)))
+    int requiredSize = slotCount * lookbackSessions
+    var array<float> samples = array.new_float(0)
+    var array<int> cursors = array.new_int(0)
+    var int lastStoredCloseTime = na
+
+    if array.size(samples) != requiredSize
+        array.clear(samples)
+        array.clear(cursors)
+        for sampleIndex = 0 to requiredSize - 1
+            array.push(samples, na)
+        for slotIndex = 0 to slotCount - 1
+            array.push(cursors, 0)
+
+    float baseline = na
+    float rvol = na
+    int availableSamples = 0
+
+    if currentSlot >= 0 and currentSlot < slotCount
+        float sampleSum = 0.0
+        for historyIndex = 0 to lookbackSessions - 1
+            float historicalVolume = array.get(samples, currentSlot * lookbackSessions + historyIndex)
+            if not na(historicalVolume)
+                sampleSum += historicalVolume
+                availableSamples += 1
+
+        if completionEvent
+            if availableSamples > 0
+                baseline := sampleSum / availableSamples
+                if baseline > 0
+                    rvol := completedVolume / baseline
+
+            if na(lastStoredCloseTime) or time_close != lastStoredCloseTime
+                int cursor = array.get(cursors, currentSlot)
+                array.set(samples, currentSlot * lookbackSessions + cursor, completedVolume)
+                array.set(cursors, currentSlot, (cursor + 1) % lookbackSessions)
+                lastStoredCloseTime := time_close
+
+    [rvol, baseline, availableSamples]
+
+[completed15Rvol, completed15RvolBaseline, completed15RvolSamples] = f_sameSlotRvol(completed15Volume, completed15Slot, completed15mEvent, rvolLookbackSessions)
+bool completed15RvolWarm = completed15RvolSamples >= minimumRvolSamples
+bool completed15RvolPass = completed15RvolWarm and not na(completed15Rvol) and completed15Rvol >= minimumBreakoutRvol and completed15Rvol <= maximumBreakoutRvol
+
+
+//=============================================================================
+// 17. BREAKOUT QUALIFICATION
+//=============================================================================
+
+float breakoutBuffer = breakoutBufferTicks * syminfo.mintick
+bool completedAfterRange = completed15StartMOD >= rangeEndMOD
+bool breakoutOpenPass = not requireOpenInsideRange or (not na(frozenRangeHigh) and not na(frozenRangeLow) and completed15Open >= frozenRangeLow and completed15Open <= frozenRangeHigh)
+bool breakoutBodyPass = completed15BodyPercent >= minimumBodyPercent
+bool breakoutAtrPass = not na(completed15AtrRatio) and completed15AtrRatio >= minimumBreakoutATR and completed15AtrRatio <= maximumBreakoutATR
+
+bool bullishBreakoutPrice = not na(frozenRangeHigh) and completed15Close >= frozenRangeHigh + breakoutBuffer
+bool bearishBreakoutPrice = not na(frozenRangeLow) and completed15Close <= frozenRangeLow - breakoutBuffer
+
+bool bullishBreakoutQuality = completed15Close > completed15Open and bullishBreakoutPrice and breakoutOpenPass and breakoutBodyPass and completed15BullCloseLocation >= minimumCloseLocation and completed15BullOpposingWick <= maximumOpposingWick and breakoutAtrPass and completed15RvolPass and confirmedLongStructure and confirmedVolatilityRegime and lowSignalChurn
+bool bearishBreakoutQuality = completed15Close < completed15Open and bearishBreakoutPrice and breakoutOpenPass and breakoutBodyPass and completed15BearCloseLocation >= minimumCloseLocation and completed15BearOpposingWick <= maximumOpposingWick and breakoutAtrPass and completed15RvolPass and confirmedShortStructure and confirmedVolatilityRegime and lowSignalChurn
+
+
+//=============================================================================
+// 18. ONE-SETUP / ONE-TRADE DAILY STATE
+//=============================================================================
+
+var bool setupConsumedToday = false
+var bool tradedToday = false
+var int tradesToday = 0
+var string lastCancellationReason = "NONE"
+
+// setupPhase: 0 = idle, 1 = waiting for pullback, 2 = trigger ready
+var int setupPhase = 0
+var int setupDirection = 0
+var int setupDetectionBar = na
+var int pullbackBars = 0
+
+var float breakoutOpen = na
+var float breakoutHigh = na
+var float breakoutLow = na
+var float breakoutClose = na
+var float breakoutRange = na
+var float setupATR = na
+var float setupRvol = na
+
+var float pullbackExtreme = na
+var float pullbackTrigger = na
+
+if newNyDay and barstate.isnew
+    setupConsumedToday := false
+    tradedToday := false
+    tradesToday := 0
+    lastCancellationReason := "NONE"
+    setupPhase := 0
+    setupDirection := 0
+    setupDetectionBar := na
+    pullbackBars := 0
+    breakoutOpen := na
+    breakoutHigh := na
+    breakoutLow := na
+    breakoutClose := na
+    breakoutRange := na
+    setupATR := na
+    setupRvol := na
+    pullbackExtreme := na
+    pullbackTrigger := na
+
+bool breakoutAvailable = environmentValid and rangeReady and inEntryWindow and not setupConsumedToday and not tradedToday and strategy.position_size == 0
+bool enoughTimeForPullbackSequence = completed15StartMOD <= entryEndMOD - breakoutRunwayMinutes
+bool bullishBreakoutEvent = completed15mEvent and completedAfterRange and enoughTimeForPullbackSequence and breakoutAvailable and bullishBreakoutQuality
+bool bearishBreakoutEvent = completed15mEvent and completedAfterRange and enoughTimeForPullbackSequence and breakoutAvailable and bearishBreakoutQuality and not bullishBreakoutEvent
+
+if bullishBreakoutEvent or bearishBreakoutEvent
+    setupConsumedToday := true
+    setupPhase := 1
+    setupDirection := bullishBreakoutEvent ? 1 : -1
+    setupDetectionBar := bar_index
+    pullbackBars := 0
+    breakoutOpen := completed15Open
+    breakoutHigh := completed15High
+    breakoutLow := completed15Low
+    breakoutClose := completed15Close
+    breakoutRange := completed15Range
+    setupATR := atr5
+    setupRvol := completed15Rvol
+    pullbackExtreme := na
+    pullbackTrigger := na
+    lastCancellationReason := "NONE"
+
+    if enableInformationalAlerts
+        alert("MNQ1DONE SETUP QUALIFIED | " + (bullishBreakoutEvent ? "LONG" : "SHORT") + " | RVOL " + str.tostring(completed15Rvol, "#.00") + " | WAIT FOR CONTROLLED PULLBACK", alert.freq_once_per_bar_close)
+
+
+//=============================================================================
+// 19. CONTROLLED PULLBACK STATE MACHINE
+//=============================================================================
+
+bool setupActive = setupPhase > 0
+int setupAge = setupActive and not na(setupDetectionBar) ? bar_index - setupDetectionBar : -1
+bool afterBreakoutBar = setupActive and setupAge > 0
+
+float longPullbackDepth = setupActive and setupDirection == 1 and not na(breakoutRange) and breakoutRange > 0 ? (breakoutHigh - low) / breakoutRange : na
+float shortPullbackDepth = setupActive and setupDirection == -1 and not na(breakoutRange) and breakoutRange > 0 ? (high - breakoutLow) / breakoutRange : na
+
+bool longRangeDefense = setupDirection == 1 and not na(frozenRangeHigh) and close >= frozenRangeHigh
+bool shortRangeDefense = setupDirection == -1 and not na(frozenRangeLow) and close <= frozenRangeLow
+bool longDepthPass = setupDirection == 1 and not na(longPullbackDepth) and longPullbackDepth <= maximumPullbackDepth
+bool shortDepthPass = setupDirection == -1 and not na(shortPullbackDepth) and shortPullbackDepth <= maximumPullbackDepth
+
+float currentBarRange = math.max(high - low, syminfo.mintick)
+float currentBodyPercent = math.abs(close - open) / currentBarRange
+bool strongBearReversal = close < open and currentBarRange >= atr5 * opposingReversalATR and currentBodyPercent >= 0.60
+bool strongBullReversal = close > open and currentBarRange >= atr5 * opposingReversalATR and currentBodyPercent >= 0.60
+
+bool longPullbackCandidate = setupDirection == 1 and (close <= open or low < low[1])
+bool shortPullbackCandidate = setupDirection == -1 and (close >= open or high > high[1])
+
+bool cancelSetup = false
+string cancellationReason = "NONE"
+
+if setupActive and barstate.isconfirmed
+    if not inEntryWindow
+        cancelSetup := true
+        cancellationReason := "ENTRY WINDOW CLOSED"
+    else if setupDirection == 1 and not longRangeDefense
+        cancelSetup := true
+        cancellationReason := "CLOSED BACK IN RANGE"
+    else if setupDirection == -1 and not shortRangeDefense
+        cancelSetup := true
+        cancellationReason := "CLOSED BACK IN RANGE"
+    else if setupDirection == 1 and not longDepthPass
+        cancelSetup := true
+        cancellationReason := "PULLBACK TOO DEEP"
+    else if setupDirection == -1 and not shortDepthPass
+        cancelSetup := true
+        cancellationReason := "PULLBACK TOO DEEP"
+    else if setupDirection == 1 and strongBearReversal
+        cancelSetup := true
+        cancellationReason := "STRONG BEAR REVERSAL"
+    else if setupDirection == -1 and strongBullReversal
+        cancelSetup := true
+        cancellationReason := "STRONG BULL REVERSAL"
+
+
+//=============================================================================
+// 20. ENTRY TEST BEFORE CURRENT BAR UPDATES THE PULLBACK
+//=============================================================================
+// Conservative chronology: a pullback trigger must already exist before the
+// current bar. If this bar touches the trigger but does not qualify, the setup
+// is cancelled instead of repeatedly offering entries.
+
+bool triggerReady = setupPhase == 2 and afterBreakoutBar and not na(pullbackTrigger)
+bool longTriggerTouched = triggerReady and setupDirection == 1 and high >= pullbackTrigger
+bool shortTriggerTouched = triggerReady and setupDirection == -1 and low <= pullbackTrigger
+
+bool longTriggerPricePass = longTriggerTouched and (not requireTriggerCloseBeyond or close > pullbackTrigger)
+bool shortTriggerPricePass = shortTriggerTouched and (not requireTriggerCloseBeyond or close < pullbackTrigger)
+bool longTriggerDirectionPass = not requireTriggerBarDirection or close > open
+bool shortTriggerDirectionPass = not requireTriggerBarDirection or close < open
+
+float longChaseDistance = triggerReady and setupDirection == 1 ? close - pullbackTrigger : na
+float shortChaseDistance = triggerReady and setupDirection == -1 ? pullbackTrigger - close : na
+bool longChasePass = setupDirection == 1 and not na(longChaseDistance) and longChaseDistance >= 0 and longChaseDistance <= atr5 * chaseDistanceATR
+bool shortChasePass = setupDirection == -1 and not na(shortChaseDistance) and shortChaseDistance >= 0 and shortChaseDistance <= atr5 * chaseDistanceATR
+
+float minimumRiskDistance = minimumStopTicks * syminfo.mintick
+float proposedLongStop = not na(pullbackExtreme) ? pullbackExtreme - atr5 * pullbackStopBufferATR : na
+float proposedShortStop = not na(pullbackExtreme) ? pullbackExtreme + atr5 * pullbackStopBufferATR : na
+float proposedLongRisk = not na(proposedLongStop) ? close - proposedLongStop : na
+float proposedShortRisk = not na(proposedShortStop) ? proposedShortStop - close : na
+
+float maximumRiskDollars = accountReference * maximumRiskPercent / 100.0
+float proposedLongRiskDollars = not na(proposedLongRisk) ? proposedLongRisk * syminfo.pointvalue * contracts : na
+float proposedShortRiskDollars = not na(proposedShortRisk) ? proposedShortRisk * syminfo.pointvalue * contracts : na
+
+bool longRiskPass = not na(proposedLongRisk) and proposedLongRisk >= minimumRiskDistance and proposedLongRisk <= atr5 * maximumStopATR and proposedLongRiskDollars <= maximumRiskDollars
+bool shortRiskPass = not na(proposedShortRisk) and proposedShortRisk >= minimumRiskDistance and proposedShortRisk <= atr5 * maximumStopATR and proposedShortRiskDollars <= maximumRiskDollars
+
+bool commonEntryPass = barstate.isconfirmed and environmentValid and setupPhase == 2 and inEntryWindow and strategy.position_size == 0 and not tradedToday and not cancelSetup and lowSignalChurn and entryEfficiencyPass
+bool longEntry = commonEntryPass and setupDirection == 1 and longTriggerPricePass and longTriggerDirectionPass and longChasePass and longRiskPass
+bool shortEntry = commonEntryPass and setupDirection == -1 and shortTriggerPricePass and shortTriggerDirectionPass and shortChasePass and shortRiskPass and not longEntry
+
+
+//=============================================================================
+// 21. TRADE STATE AND PICKMYTRADE PRICE OUTPUTS
+//=============================================================================
+
+var float pendingStop = na
+var float pendingTarget = na
+var float pendingATR = na
+var float activeEntry = na
+var float initialRisk = na
+var float activeStop = na
+var float activeTarget = na
+var int entryBarIndex = na
+var bool tradeInitialized = false
+var string lastExitReason = "NONE"
+
+// Values remain populated on the signal bar so PickMyTrade named plot
+// placeholders can attach the bracket to the entry immediately.
+var float pmtStopValue = na
+var float pmtTargetValue = na
+
+if longEntry
+    pendingStop := proposedLongStop
+    pendingTarget := close + proposedLongRisk * targetR
+    pendingATR := atr5
+    pmtStopValue := pendingStop
+    pmtTargetValue := pendingTarget
+    tradedToday := true
+    tradesToday += 1
+    setupPhase := 0
+    lastExitReason := "NONE"
+    strategy.entry("Long", strategy.long, qty=contracts, comment="ONE-AND-DONE LONG", alert_message="MNQ1DONE LONG ENTRY")
+
+if shortEntry
+    pendingStop := proposedShortStop
+    pendingTarget := close - proposedShortRisk * targetR
+    pendingATR := atr5
+    pmtStopValue := pendingStop
+    pmtTargetValue := pendingTarget
+    tradedToday := true
+    tradesToday += 1
+    setupPhase := 0
+    lastExitReason := "NONE"
+    strategy.entry("Short", strategy.short, qty=contracts, comment="ONE-AND-DONE SHORT", alert_message="MNQ1DONE SHORT ENTRY")
+
+
+//=============================================================================
+// 22. FAILED-TRIGGER AND PULLBACK UPDATES
+//=============================================================================
+
+if setupPhase == 2 and barstate.isconfirmed and not longEntry and not shortEntry and not cancelSetup
+    bool triggerTouched = longTriggerTouched or shortTriggerTouched
+
+    if triggerTouched
+        cancelSetup := true
+
+        bool chaseBlocked = (longTriggerTouched and not longChasePass) or (shortTriggerTouched and not shortChasePass)
+        bool riskBlocked = (longTriggerTouched and not longRiskPass) or (shortTriggerTouched and not shortRiskPass)
+
+        if chaseBlocked
+            cancellationReason := "CHASE BLOCKED"
+        else if riskBlocked
+            cancellationReason := "RISK BLOCKED"
+        else if not entryEfficiencyPass
+            cancellationReason := "LOW EFFICIENCY"
+        else if not lowSignalChurn
+            cancellationReason := "HIGH SIGNAL CHURN"
+        else
+            cancellationReason := "FAILED TRIGGER CLOSE"
+
+if setupActive and afterBreakoutBar and barstate.isconfirmed and not longEntry and not shortEntry and not cancelSetup
+    if setupPhase == 1
+        bool legRanWithoutPullback = setupDirection == 1 ? high > breakoutHigh + atr5 * chaseDistanceATR : low < breakoutLow - atr5 * chaseDistanceATR
+
+        if legRanWithoutPullback
+            cancelSetup := true
+            cancellationReason := "LEG GONE - NO CHASE"
+        else if longPullbackCandidate or shortPullbackCandidate
+            setupPhase := 2
+            pullbackBars := 1
+            pullbackExtreme := setupDirection == 1 ? low : high
+            pullbackTrigger := setupDirection == 1 ? high : low
+        else if setupAge >= maximumPullbackBars
+            cancelSetup := true
+            cancellationReason := "NO CONTROLLED PULLBACK"
+
+    else if setupPhase == 2
+        // Any bar that fails to trigger but remains structurally valid consumes
+        // the next pullback slot. This prevents an armed setup from lingering.
+        if pullbackBars < maximumPullbackBars
+            pullbackBars += 1
+            pullbackExtreme := setupDirection == 1 ? math.min(pullbackExtreme, low) : math.max(pullbackExtreme, high)
+            pullbackTrigger := setupDirection == 1 ? high : low
+        else
+            cancelSetup := true
+            cancellationReason := "PULLBACK EXPIRED"
+
+if cancelSetup and setupPhase > 0
+    setupPhase := 0
+    lastCancellationReason := cancellationReason
+    pullbackTrigger := na
+    pullbackExtreme := na
+
+    if enableInformationalAlerts
+        alert("MNQ1DONE DAY COMPLETE - NO TRADE | " + cancellationReason, alert.freq_once_per_bar_close)
+
+
+//=============================================================================
+// 23. FILLED POSITION INITIALIZATION
+//=============================================================================
+
+if strategy.position_size == 0
+    tradeInitialized := false
+
+if strategy.position_size > 0 and not tradeInitialized
+    activeEntry := strategy.position_avg_price
+    activeStop := pendingStop
+    initialRisk := activeEntry - activeStop
+
+    bool fillRiskValid = not na(initialRisk) and initialRisk >= minimumRiskDistance and not na(pendingATR) and pendingATR > 0 and initialRisk <= pendingATR * maximumStopATR and initialRisk * syminfo.pointvalue * contracts <= maximumRiskDollars
+
+    if not fillRiskValid
+        lastExitReason := "INVALID FILL RISK"
+        strategy.close("Long", immediately=true, comment="Invalid Fill Risk", alert_message="MNQ1DONE CLOSE LONG - INVALID RISK")
+    else
+        activeTarget := activeEntry + initialRisk * targetR
+        pmtStopValue := activeStop
+        pmtTargetValue := activeTarget
+        entryBarIndex := bar_index
+        tradeInitialized := true
+
+if strategy.position_size < 0 and not tradeInitialized
+    activeEntry := strategy.position_avg_price
+    activeStop := pendingStop
+    initialRisk := activeStop - activeEntry
+
+    bool fillRiskValid = not na(initialRisk) and initialRisk >= minimumRiskDistance and not na(pendingATR) and pendingATR > 0 and initialRisk <= pendingATR * maximumStopATR and initialRisk * syminfo.pointvalue * contracts <= maximumRiskDollars
+
+    if not fillRiskValid
+        lastExitReason := "INVALID FILL RISK"
+        strategy.close("Short", immediately=true, comment="Invalid Fill Risk", alert_message="MNQ1DONE CLOSE SHORT - INVALID RISK")
+    else
+        activeTarget := activeEntry - initialRisk * targetR
+        pmtStopValue := activeStop
+        pmtTargetValue := activeTarget
+        entryBarIndex := bar_index
+        tradeInitialized := true
+
+
+//=============================================================================
+// 24. PROTECTIVE AND ONE-CANDLE EXITS
+//=============================================================================
+
+if strategy.position_size > 0 and tradeInitialized
+    // PickMyTrade must attach the same bracket at entry. Suppress the duplicate
+    // TradingView bracket-fill webhook so it cannot submit a second exit.
+    strategy.exit("Long Bracket", from_entry="Long", stop=activeStop, limit=activeTarget, alert_message="MNQ1DONE CLOSE LONG - BRACKET", disable_alert=true)
+
+if strategy.position_size < 0 and tradeInitialized
+    strategy.exit("Short Bracket", from_entry="Short", stop=activeStop, limit=activeTarget, alert_message="MNQ1DONE CLOSE SHORT - BRACKET", disable_alert=true)
+
+bool nextFullBarClosed = strategy.position_size != 0 and tradeInitialized and not na(entryBarIndex) and bar_index > entryBarIndex and barstate.isconfirmed
+
+if exitAfterNextBar and nextFullBarClosed
+    lastExitReason := "ONE CANDLE EXIT"
+    strategy.close_all(immediately=true, comment="One Candle Exit", alert_message="MNQ1DONE CLOSE - ONE CANDLE")
+
+if tradingSessionJustEnded and strategy.position_size != 0
+    lastExitReason := "SESSION EXIT"
+    strategy.close_all(immediately=true, comment="Session Exit", alert_message="MNQ1DONE CLOSE - SESSION")
+
+
+//=============================================================================
+// 25. POSITION-CLOSED CLEANUP
+//=============================================================================
+
+bool positionJustClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+var int lastProcessedCloseBar = na
+
+if positionJustClosed and (na(lastProcessedCloseBar) or lastProcessedCloseBar != bar_index)
+    if lastExitReason == "NONE"
+        lastExitReason := "STOP OR TARGET"
+
+    lastProcessedCloseBar := bar_index
+    pendingStop := na
+    pendingTarget := na
+    pendingATR := na
+    activeEntry := na
+    initialRisk := na
+    activeStop := na
+    activeTarget := na
+    entryBarIndex := na
+    tradeInitialized := false
+
+    if enableInformationalAlerts
+        alert("MNQ1DONE TRADE COMPLETE | " + lastExitReason + " | PLATFORM CLOSED FOR THE DAY", alert.freq_once_per_bar)
+
+if strategy.position_size == 0 and not longEntry and not shortEntry
+    pmtStopValue := na
+    pmtTargetValue := na
+
+
+//=============================================================================
+// 26. END-OF-WINDOW LOCK
+//=============================================================================
+
+if entryWindowJustEnded and setupPhase > 0
+    setupPhase := 0
+    lastCancellationReason := "ENTRY WINDOW CLOSED"
+    pullbackTrigger := na
+    pullbackExtreme := na
+
+
+//=============================================================================
+// 27. DASHBOARD STATUS LOGIC
+//=============================================================================
+
+bool dailyLocked = tradedToday or (setupConsumedToday and setupPhase == 0)
+bool newSetupWindowOpen = inEntryWindow and barOpenMOD <= entryEndMOD - breakoutRunwayMinutes
+string systemState = strategy.position_size != 0 ? "IN TRADE" : tradedToday ? "LOCKED - TRADE DONE" : setupPhase == 2 ? "TRIGGER READY" : setupPhase == 1 ? "WAIT PULLBACK" : setupConsumedToday ? "LOCKED - SETUP DONE" : not rangeReady ? "BUILD RANGE" : newSetupWindowOpen ? "WAIT 15M BREAKOUT" : inEntryWindow ? "NO NEW SETUPS" : "OUTSIDE WINDOW"
+color systemColor = strategy.position_size != 0 ? C_BULL : dailyLocked ? C_STOP : setupPhase > 0 ? C_READY : C_NEUTRAL
+
+string structureText = confirmedLongStructure ? "BULL" : confirmedShortStructure ? "BEAR" : "NEUTRAL"
+color structureColor = confirmedLongStructure ? C_BULL : confirmedShortStructure ? C_BEAR : C_NEUTRAL
+
+string setupSideText = setupDirection == 1 ? "LONG" : setupDirection == -1 ? "SHORT" : "NONE"
+color setupSideColor = setupDirection == 1 ? C_BULL : setupDirection == -1 ? C_BEAR : C_NEUTRAL
+
+// FIX: the RVOL cold-start gate (completed15RvolPass, which requires
+// minimumRvolSamples prior same-time-of-day observations before it can ever
+// pass) was previously invisible in blockerText -- every day it blocked a
+// breakout, the dashboard just said the generic "WAIT BREAKOUT", giving no
+// hint that the real reason was "not enough trading history at this time
+// slot yet". It is now reported explicitly, and the FIX for the
+// runtime.error() calls is reported first since it is a hard stop.
+string blockerText = "CLEAR"
+if not chartIs5m
+    blockerText := "INVALID CHART - NEED 5M"
+else if requireMNQ and not symbolIsMNQ
+    blockerText := "NOT MNQ"
+else if not rangeReady
+    blockerText := "RANGE NOT READY"
+else if not inEntryWindow
+    blockerText := "ENTRY WINDOW CLOSED"
+else if dailyLocked
+    blockerText := "DAILY LOCK"
+else if setupPhase == 0 and not newSetupWindowOpen
+    blockerText := "SETUP WINDOW CLOSED"
+else if not confirmedVolatilityRegime
+    blockerText := "VOLATILITY REGIME"
+else if not lowSignalChurn
+    blockerText := "SIGNAL CHURN"
+else if setupPhase == 0 and not completed15RvolWarm
+    blockerText := "RVOL WARMUP " + str.tostring(completed15RvolSamples) + "/" + str.tostring(minimumRvolSamples)
+else if setupPhase == 0
+    blockerText := "WAIT BREAKOUT"
+else if setupPhase == 1
+    blockerText := "WAIT PULLBACK"
+else if not entryEfficiencyPass
+    blockerText := "LOW EFFICIENCY"
+else
+    blockerText := "WAIT TRIGGER"
+
+string processText = dailyLocked ? "DONE - CLOSE PLATFORM" : setupPhase > 0 ? "HANDS OFF - AUTOMATED" : "WAITING IS THE TRADE"
+
+
+//=============================================================================
+// 28. COMPACT VISUALS
+//=============================================================================
+
+plot(showOpeningRange and rangeReady ? frozenRangeHigh : na, "Opening Range High", color=C_WAIT, linewidth=2, style=plot.style_stepline)
+plot(showOpeningRange and rangeReady ? frozenRangeLow : na, "Opening Range Low", color=C_WAIT, linewidth=2, style=plot.style_stepline)
+plot(showTrigger and setupPhase == 2 ? pullbackTrigger : na, "Pullback Trigger", color=setupDirection == 1 ? C_BULL : C_BEAR, linewidth=2, style=plot.style_linebr)
+plot(showTrendEma ? confirmedFast15 : na, "Confirmed 15M Fast EMA", color=color.new(C_BULL, 40))
+plot(showTrendEma ? confirmedSlow15 : na, "Confirmed 15M Slow EMA", color=color.new(C_WAIT, 40))
+
+// Keep these exact titles. PickMyTrade's generated JSON can reference them.
+plot(pmtStopValue, "PMT Stop", color=C_STOP, linewidth=2, style=plot.style_linebr)
+plot(pmtTargetValue, "PMT Target", color=C_READY, linewidth=2, style=plot.style_linebr)
+
+plotshape(bullishBreakoutEvent, title="Qualified Bullish Breakout", style=shape.labelup, location=location.belowbar, color=C_BULL, textcolor=color.white, text="BO", size=size.tiny)
+plotshape(bearishBreakoutEvent, title="Qualified Bearish Breakout", style=shape.labeldown, location=location.abovebar, color=C_BEAR, textcolor=color.white, text="BO", size=size.tiny)
+plotshape(longEntry, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=C_READY, text="L", size=size.small)
+plotshape(shortEntry, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=C_STOP, text="S", size=size.small)
+plotshape(showDebugMarkers and cancelSetup, title="Setup Cancelled", style=shape.xcross, location=location.abovebar, color=C_WAIT, size=size.tiny)
+
+
+//=============================================================================
+// 29. BEHAVIORAL DASHBOARD
+//=============================================================================
+
+var table dashboard = table.new(position.top_right, 2, 13, border_width=1)
+
+f_dashCell(int row, string labelText, string valueText, color valueColor) =>
+    table.cell(dashboard, 0, row, labelText, text_color=color.white, bgcolor=color.new(C_NEUTRAL, 30), text_size=size.small, text_halign=text.align_left)
+    table.cell(dashboard, 1, row, valueText, text_color=color.white, bgcolor=color.new(valueColor, 30), text_size=size.small, text_halign=text.align_right)
+
+if barstate.islast
+    table.clear(dashboard, 0, 0, 1, 12)
+
+    if showDashboard
+        string rangeText = rangeReady ? f_price(frozenRangeLow) + " - " + f_price(frozenRangeHigh) : "BUILDING"
+        string pullbackText = setupPhase == 2 ? str.tostring(pullbackBars) + "/" + str.tostring(maximumPullbackBars) : "-"
+        string rvolText = not na(setupRvol) ? str.tostring(setupRvol, "#.00") : not na(completed15Rvol) ? str.tostring(completed15Rvol, "#.00") : "-"
+        string riskText = strategy.position_size != 0 and not na(initialRisk) ? "$" + str.tostring(initialRisk * syminfo.pointvalue * contracts, "#.00") : "MAX $" + str.tostring(maximumRiskDollars, "#.00")
+        string automationText = automationEnabled ? "ARMED - ORDER FILLS" : "OFF / SIM FIRST"
+        string rvolSamplesText = str.tostring(completed15RvolSamples) + "/" + str.tostring(minimumRvolSamples)
+
+        f_dashCell(0, "ONE-AND-DONE", systemState, systemColor)
+        f_dashCell(1, "PROCESS", processText, dailyLocked ? C_STOP : C_READY)
+        f_dashCell(2, "WINDOW", inEntryWindow ? "AUTHORIZED" : "CLOSED", inEntryWindow ? C_READY : C_NEUTRAL)
+        f_dashCell(3, "OPENING RANGE", rangeText, rangeReady ? C_WAIT : C_NEUTRAL)
+        f_dashCell(4, "15M STRUCTURE", structureText, structureColor)
+        f_dashCell(5, "SIDE / PHASE", setupSideText + " / " + str.tostring(setupPhase), setupSideColor)
+        f_dashCell(6, "PULLBACK BARS", pullbackText, setupPhase == 2 ? C_READY : C_NEUTRAL)
+        f_dashCell(7, "TRIGGER", f_price(pullbackTrigger), setupSideColor)
+        f_dashCell(8, "RVOL / CHURN", rvolText + " / " + str.tostring(signalVolatility, "#.00"), lowSignalChurn ? C_READY : C_STOP)
+        f_dashCell(9, "RVOL SAMPLES", rvolSamplesText, completed15RvolWarm ? C_READY : C_WAIT)
+        f_dashCell(10, "RISK / TARGET", riskText + " / " + str.tostring(targetR, "#.00") + "R", C_WAIT)
+        f_dashCell(11, "BLOCKER", blockerText, blockerText == "CLEAR" ? C_READY : C_WAIT)
+        f_dashCell(12, "PICKMYTRADE", automationText, automationEnabled ? C_READY : C_NEUTRAL)
+
+
+//=============================================================================
+// 30. REDUCED DATA-WINDOW DIAGNOSTICS
+//=============================================================================
+
+plot(completed15Rvol, "Completed 15M Same-Slot RVOL", display=display.data_window)
+plot(float(completed15RvolSamples), "15M RVOL Prior Samples", display=display.data_window)
+plot(completed15BodyPercent, "Completed 15M Body Percent", display=display.data_window)
+plot(completed15AtrRatio, "Completed 15M Range / ATR", display=display.data_window)
+plot(confirmedEfficiency15, "Confirmed 15M Structure Efficiency", display=display.data_window)
+plot(confirmedDirectionalReturn15, "Confirmed 15M Directional Return / ATR", display=display.data_window)
+plot(confirmedATRExpansion15, "Confirmed 15M ATR Expansion", display=display.data_window)
+plot(signalVolatility, "5M Signal Churn", display=display.data_window)
+plot(entryEfficiency, "5M Entry Efficiency", display=display.data_window)
+plot(float(setupPhase), "Setup Phase", display=display.data_window)
+plot(float(setupAge), "Setup Age", display=display.data_window)
+plot(tradedToday ? 1.0 : 0.0, "Daily Trade Lock", display=display.data_window)
