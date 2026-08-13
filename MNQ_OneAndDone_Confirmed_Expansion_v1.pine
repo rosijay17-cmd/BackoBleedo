@@ -81,7 +81,9 @@ float minimumCloseLocation = input.float(0.80, "Minimum Directional Close Locati
 float maximumOpposingWick = input.float(0.20, "Maximum Opposing Wick / Range", minval=0.0, maxval=0.50, step=0.05, group=G_BREAKOUT)
 float minimumBreakoutATR = input.float(0.80, "Minimum Breakout Range / 15M ATR", minval=0.10, maxval=5.0, step=0.05, group=G_BREAKOUT)
 float maximumBreakoutATR = input.float(1.80, "Maximum Breakout Range / 15M ATR", minval=0.25, maxval=5.0, step=0.05, group=G_BREAKOUT)
+bool useMaximumBreakoutATR = input.bool(false, "Cap Breakout Range / 15M ATR", tooltip="OFF (default) lets a large, fast expansion candle qualify instead of being rejected purely for being bigger than the ATR ceiling.", group=G_BREAKOUT)
 bool requireOpenInsideRange = input.bool(true, "Require Breakout Open Inside Opening Range", group=G_BREAKOUT)
+float breakoutOpenToleranceATR = input.float(0.25, "Breakout Open Tolerance Beyond Range - ATR", minval=0.0, maxval=2.0, step=0.05, tooltip="Lets the qualifying candle's open already sit up to this many 15M ATR beyond the opening range, so a fast move that started moving before the candle opened is not rejected purely on that basis.", group=G_BREAKOUT)
 
 
 //=============================================================================
@@ -107,6 +109,7 @@ int atrLength = input.int(14, "ATR Length", minval=2, group=G_CONTEXT)
 int atrBaselineLength = input.int(50, "ATR Baseline Length", minval=10, maxval=300, group=G_CONTEXT)
 float minimumATRExpansion = input.float(0.80, "Minimum ATR / Baseline ATR", minval=0.10, maxval=5.0, step=0.05, group=G_CONTEXT)
 float maximumATRExpansion = input.float(2.25, "Maximum ATR / Baseline ATR", minval=0.25, maxval=8.0, step=0.05, group=G_CONTEXT)
+bool useMaximumATRExpansion = input.bool(false, "Cap ATR Expansion", tooltip="OFF (default) allows a highly volatile regime to qualify instead of being rejected as overextended.", group=G_CONTEXT)
 int structureLookback = input.int(10, "15M Directional Structure Lookback", minval=3, maxval=40, group=G_CONTEXT)
 float minimumStructureEfficiency = input.float(0.25, "Minimum 15M Structure Efficiency", minval=0.0, maxval=1.0, step=0.01, group=G_CONTEXT)
 float minimumDirectionalReturnATR = input.float(0.50, "Minimum 15M Directional Return / ATR", minval=0.0, maxval=5.0, step=0.10, group=G_CONTEXT)
@@ -124,6 +127,7 @@ int rvolLookbackSessions = input.int(20, "Same-Slot Lookback Sessions", minval=5
 int minimumRvolSamples = input.int(5, "Minimum Same-Slot Observations", minval=1, maxval=20, group=G_VOLUME)
 float minimumBreakoutRvol = input.float(1.20, "Minimum 15M Same-Slot RVOL", minval=0.10, maxval=5.0, step=0.05, group=G_VOLUME)
 float maximumBreakoutRvol = input.float(3.50, "Maximum 15M Same-Slot RVOL", minval=0.50, maxval=10.0, step=0.25, group=G_VOLUME)
+bool useMaximumBreakoutRvol = input.bool(false, "Cap Breakout RVOL", tooltip="OFF (default) allows very high relative volume to qualify instead of being rejected as a blow-off spike.", group=G_VOLUME)
 
 
 //=============================================================================
@@ -288,7 +292,7 @@ f_confirmed15Context() =>
 
 bool confirmedLongStructure = not na(confirmedFast15) and not na(confirmedSlow15) and not na(confirmedEfficiency15) and not na(confirmedDirectionalReturn15) and confirmedFast15 > confirmedSlow15 and confirmedClose15 > confirmedFast15 and confirmedFastSlope15 > 0 and confirmedEfficiency15 >= minimumStructureEfficiency and confirmedDirectionalReturn15 >= minimumDirectionalReturnATR
 bool confirmedShortStructure = not na(confirmedFast15) and not na(confirmedSlow15) and not na(confirmedEfficiency15) and not na(confirmedDirectionalReturn15) and confirmedFast15 < confirmedSlow15 and confirmedClose15 < confirmedFast15 and confirmedFastSlope15 < 0 and confirmedEfficiency15 >= minimumStructureEfficiency and confirmedDirectionalReturn15 <= -minimumDirectionalReturnATR
-bool confirmedVolatilityRegime = not na(confirmedATRExpansion15) and confirmedATRExpansion15 >= minimumATRExpansion and confirmedATRExpansion15 <= maximumATRExpansion
+bool confirmedVolatilityRegime = not na(confirmedATRExpansion15) and confirmedATRExpansion15 >= minimumATRExpansion and (not useMaximumATRExpansion or confirmedATRExpansion15 <= maximumATRExpansion)
 
 
 //=============================================================================
@@ -388,7 +392,7 @@ f_sameSlotRvol(float completedVolume, int currentSlot, bool completionEvent, int
 
 [completed15Rvol, completed15RvolBaseline, completed15RvolSamples] = f_sameSlotRvol(completed15Volume, completed15Slot, completed15mEvent, rvolLookbackSessions)
 bool completed15RvolWarm = completed15RvolSamples >= minimumRvolSamples
-bool completed15RvolPass = completed15RvolWarm and not na(completed15Rvol) and completed15Rvol >= minimumBreakoutRvol and completed15Rvol <= maximumBreakoutRvol
+bool completed15RvolPass = completed15RvolWarm and not na(completed15Rvol) and completed15Rvol >= minimumBreakoutRvol and (not useMaximumBreakoutRvol or completed15Rvol <= maximumBreakoutRvol)
 
 
 //=============================================================================
@@ -397,9 +401,10 @@ bool completed15RvolPass = completed15RvolWarm and not na(completed15Rvol) and c
 
 float breakoutBuffer = breakoutBufferTicks * syminfo.mintick
 bool completedAfterRange = completed15StartMOD >= rangeEndMOD
-bool breakoutOpenPass = not requireOpenInsideRange or (not na(frozenRangeHigh) and not na(frozenRangeLow) and completed15Open >= frozenRangeLow and completed15Open <= frozenRangeHigh)
+float breakoutOpenTolerance = breakoutOpenToleranceATR * (not na(confirmedATR15) ? confirmedATR15 : 0.0)
+bool breakoutOpenPass = not requireOpenInsideRange or (not na(frozenRangeHigh) and not na(frozenRangeLow) and completed15Open >= frozenRangeLow - breakoutOpenTolerance and completed15Open <= frozenRangeHigh + breakoutOpenTolerance)
 bool breakoutBodyPass = completed15BodyPercent >= minimumBodyPercent
-bool breakoutAtrPass = not na(completed15AtrRatio) and completed15AtrRatio >= minimumBreakoutATR and completed15AtrRatio <= maximumBreakoutATR
+bool breakoutAtrPass = not na(completed15AtrRatio) and completed15AtrRatio >= minimumBreakoutATR and (not useMaximumBreakoutATR or completed15AtrRatio <= maximumBreakoutATR)
 
 bool bullishBreakoutPrice = not na(frozenRangeHigh) and completed15Close >= frozenRangeHigh + breakoutBuffer
 bool bearishBreakoutPrice = not na(frozenRangeLow) and completed15Close <= frozenRangeLow - breakoutBuffer
@@ -457,6 +462,90 @@ bool breakoutAvailable = environmentValid and rangeReady and inEntryWindow and n
 bool enoughTimeForPullbackSequence = completed15StartMOD <= entryEndMOD - breakoutRunwayMinutes
 bool bullishBreakoutEvent = completed15mEvent and completedAfterRange and enoughTimeForPullbackSequence and breakoutAvailable and bullishBreakoutQuality
 bool bearishBreakoutEvent = completed15mEvent and completedAfterRange and enoughTimeForPullbackSequence and breakoutAvailable and bearishBreakoutQuality and not bullishBreakoutEvent
+
+
+//=============================================================================
+// 18B. WHY THE LAST CANDLE DID NOT QUALIFY
+//=============================================================================
+// FIX: this is the missing piece that made "WAIT BREAKOUT" a black box.
+// Every time a 15m candle completes without qualifying, this records the
+// FIRST gate (in priority order) that rejected it, for whichever direction
+// the candle actually closed. It survives on the dashboard until the next
+// completed candle overwrites it, so a screenshot taken any time later still
+// shows exactly why the last real breakout attempt was rejected.
+
+f_breakoutRejectReason(int direction) =>
+    string reason = "NONE"
+
+    if not completedAfterRange
+        reason := "BEFORE RANGE COMPLETE"
+    else if not enoughTimeForPullbackSequence
+        reason := "TOO LATE IN WINDOW"
+    else if not breakoutAvailable
+        reason := "SETUP UNAVAILABLE"
+    else if direction == 1
+        if not breakoutOpenPass
+            reason := "OPEN TOO FAR OUTSIDE RANGE"
+        else if not bullishBreakoutPrice
+            reason := "CLOSE DID NOT CLEAR RANGE"
+        else if not breakoutBodyPass
+            reason := "BODY TOO SMALL"
+        else if completed15BullCloseLocation < minimumCloseLocation
+            reason := "WEAK CLOSE LOCATION"
+        else if completed15BullOpposingWick > maximumOpposingWick
+            reason := "OPPOSING WICK TOO LARGE"
+        else if not breakoutAtrPass
+            reason := "RANGE/ATR OUT OF BOUNDS"
+        else if not completed15RvolWarm
+            reason := "RVOL WARMUP " + str.tostring(completed15RvolSamples) + "/" + str.tostring(minimumRvolSamples)
+        else if not completed15RvolPass
+            reason := "RVOL OUT OF BOUNDS"
+        else if not confirmedLongStructure
+            reason := "15M STRUCTURE NOT BULL"
+        else if not confirmedVolatilityRegime
+            reason := "ATR EXPANSION OUT OF BOUNDS"
+        else if not lowSignalChurn
+            reason := "SIGNAL CHURN"
+        else
+            reason := "QUALIFIED"
+    else if direction == -1
+        if not breakoutOpenPass
+            reason := "OPEN TOO FAR OUTSIDE RANGE"
+        else if not bearishBreakoutPrice
+            reason := "CLOSE DID NOT CLEAR RANGE"
+        else if not breakoutBodyPass
+            reason := "BODY TOO SMALL"
+        else if completed15BearCloseLocation < minimumCloseLocation
+            reason := "WEAK CLOSE LOCATION"
+        else if completed15BearOpposingWick > maximumOpposingWick
+            reason := "OPPOSING WICK TOO LARGE"
+        else if not breakoutAtrPass
+            reason := "RANGE/ATR OUT OF BOUNDS"
+        else if not completed15RvolWarm
+            reason := "RVOL WARMUP " + str.tostring(completed15RvolSamples) + "/" + str.tostring(minimumRvolSamples)
+        else if not completed15RvolPass
+            reason := "RVOL OUT OF BOUNDS"
+        else if not confirmedShortStructure
+            reason := "15M STRUCTURE NOT BEAR"
+        else if not confirmedVolatilityRegime
+            reason := "ATR EXPANSION OUT OF BOUNDS"
+        else if not lowSignalChurn
+            reason := "SIGNAL CHURN"
+        else
+            reason := "QUALIFIED"
+
+    reason
+
+var string lastBreakoutRejectReason = "NONE YET"
+var int lastBreakoutRejectBar = na
+
+if completed15mEvent and not bullishBreakoutEvent and not bearishBreakoutEvent
+    int candidateDirection = completed15Close > completed15Open ? 1 : completed15Close < completed15Open ? -1 : 0
+
+    if candidateDirection != 0
+        lastBreakoutRejectReason := (candidateDirection == 1 ? "LONG: " : "SHORT: ") + f_breakoutRejectReason(candidateDirection)
+        lastBreakoutRejectBar := bar_index
+
 
 if bullishBreakoutEvent or bearishBreakoutEvent
     setupConsumedToday := true
@@ -859,14 +948,14 @@ plotshape(showDebugMarkers and cancelSetup, title="Setup Cancelled", style=shape
 // 29. BEHAVIORAL DASHBOARD
 //=============================================================================
 
-var table dashboard = table.new(position.top_right, 2, 13, border_width=1)
+var table dashboard = table.new(position.top_right, 2, 14, border_width=1)
 
 f_dashCell(int row, string labelText, string valueText, color valueColor) =>
     table.cell(dashboard, 0, row, labelText, text_color=color.white, bgcolor=color.new(C_NEUTRAL, 30), text_size=size.small, text_halign=text.align_left)
     table.cell(dashboard, 1, row, valueText, text_color=color.white, bgcolor=color.new(valueColor, 30), text_size=size.small, text_halign=text.align_right)
 
 if barstate.islast
-    table.clear(dashboard, 0, 0, 1, 12)
+    table.clear(dashboard, 0, 0, 1, 13)
 
     if showDashboard
         string rangeText = rangeReady ? f_price(frozenRangeLow) + " - " + f_price(frozenRangeHigh) : "BUILDING"
@@ -889,6 +978,7 @@ if barstate.islast
         f_dashCell(10, "RISK / TARGET", riskText + " / " + str.tostring(targetR, "#.00") + "R", C_WAIT)
         f_dashCell(11, "BLOCKER", blockerText, blockerText == "CLEAR" ? C_READY : C_WAIT)
         f_dashCell(12, "PICKMYTRADE", automationText, automationEnabled ? C_READY : C_NEUTRAL)
+        f_dashCell(13, "LAST MISS", lastBreakoutRejectReason, lastBreakoutRejectReason == "NONE YET" ? C_NEUTRAL : C_STOP)
 
 
 //=============================================================================
