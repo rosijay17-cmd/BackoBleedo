@@ -1,0 +1,1184 @@
+//@version=6
+strategy("MTF Second-Flip Continuation v1.2 - Signal Volatility", shorttitle="MTF2FLIP v1.2", overlay=true, pyramiding=0, initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.cash_per_contract, commission_value=2.50, slippage=1, process_orders_on_close=true, calc_on_order_fills=true, calc_on_every_tick=false, max_bars_back=5000, max_labels_count=100)
+
+//=============================================================================
+// MTF SECOND-FLIP CONTINUATION v1.2
+//=============================================================================
+// Intended chart: 15-minute
+// Bias: confirmed 1H structure AND confirmed 4H structure
+// Trigger: reconstruct lower-timeframe states relative to the current 15m open
+// Entry: directional flip #2 -> freeze setup -> later fresh prior-bar break
+//
+// v1.2 RESEARCH INTEGRATION
+// 1. Separates raw signal volatility from genuine, excursion-qualified flips.
+// 2. Freezes the breakout and structural-stop levels when flip #2 arms.
+// 3. Invalidates an armed setup after a genuine opposing flip.
+// 4. Expires setups that do not break within a limited number of intrabars.
+// 5. Rejects excessive genuine transitions before entry.
+// 6. Optionally filters high signal churn and low trend quality.
+// 7. Uses compact visuals and alert() calls to reduce plot consumption.
+//
+// IMPORTANT
+// request.security_lower_tf() reconstructs chronology only at the selected
+// lower timeframe. Tick order inside a one-minute OHLC candle is unknowable.
+// "Intrabar Close" remains the preferred non-ambiguous default.
+//=============================================================================
+
+
+//=============================================================================
+// 01. INPUT GROUPS
+//=============================================================================
+
+string G_TF      = "01 - Timeframes"
+string G_BIAS    = "02 - HTF Structure"
+string G_FLIP    = "03 - Flip and Signal Volatility"
+string G_BREAK   = "04 - Breakout"
+string G_SESSION = "05 - Session"
+string G_FILTER  = "06 - Optional Filters"
+string G_RISK    = "07 - Risk Management"
+string G_DAILY   = "08 - Daily Controls"
+string G_VIS     = "09 - Visuals"
+
+
+//=============================================================================
+// 02. TIMEFRAMES
+//=============================================================================
+
+string biasTF1 = input.timeframe("60", "Bias TF 1", group=G_TF)
+string biasTF2 = input.timeframe("240", "Bias TF 2", group=G_TF)
+string intrabarTF = input.timeframe("1", "Intrabar timeframe", group=G_TF)
+
+
+//=============================================================================
+// 03. HTF BIAS
+//=============================================================================
+
+int pivotLength = input.int(3, "HTF pivot length", minval=1, maxval=20, group=G_BIAS)
+
+
+//=============================================================================
+// 04. FLIP AND SIGNAL-VOLATILITY ENGINE
+//=============================================================================
+
+string flipDetectionMode = input.string(
+     "Intrabar Close",
+     "Flip detection mode",
+     options=["Intrabar Close", "Intrabar High/Low Touch"],
+     group=G_FLIP,
+     tooltip="Intrabar Close is preferred. High/Low Touch is approximate when one minute trades on both sides of the 15m open."
+)
+
+bool requireExactlySecondFlip = input.bool(
+     true,
+     "Require exactly second directional flip",
+     group=G_FLIP
+)
+
+float minFlipExcursionATR = input.float(
+     0.05,
+     "Minimum excursion between genuine flips, ATR",
+     minval=0.0,
+     maxval=1.0,
+     step=0.01,
+     group=G_FLIP,
+     tooltip="A candidate state change must move this fraction of the confirmed 15m ATR from the last accepted state price. Zero disables the excursion test."
+)
+
+int maxGenuineTransitions = input.int(
+     4,
+     "Maximum genuine transitions before entry",
+     minval=2,
+     maxval=20,
+     group=G_FLIP,
+     tooltip="A second directional flip normally requires three or four total transitions, depending on the first state observed."
+)
+
+bool invalidateOnOpposingFlip = input.bool(
+     true,
+     "Invalidate armed setup on opposing flip",
+     group=G_FLIP
+)
+
+int maxIntrabarsAfterSecondFlip = input.int(
+     8,
+     "Breakout deadline after flip #2, intrabars",
+     minval=1,
+     maxval=14,
+     group=G_FLIP
+)
+
+bool useSignalVolatilityFilter = input.bool(
+     true,
+     "Use raw signal-volatility filter",
+     group=G_FLIP
+)
+
+int minimumSignalSamples = input.int(
+     6,
+     "Minimum directional samples before churn filter",
+     minval=2,
+     maxval=15,
+     group=G_FLIP
+)
+
+float maximumSignalVolatility = input.float(
+     0.60,
+     "Maximum raw signal volatility",
+     minval=0.05,
+     maxval=1.0,
+     step=0.05,
+     group=G_FLIP,
+     tooltip="Raw directional state changes divided by possible non-neutral transitions. The filter waits for the minimum sample count before enforcing this threshold."
+)
+
+bool useTrendQualityFilter = input.bool(false, "Use market-volatility / signal-churn quality filter", group=G_FLIP)
+
+float minimumTrendQuality = input.float(
+     0.10,
+     "Minimum trend-quality score",
+     minval=0.0,
+     maxval=5.0,
+     step=0.05,
+     group=G_FLIP,
+     tooltip="Trend Quality = current 15m running range / confirmed ATR x (1 - raw signal volatility). Leave the filter off until calibrated on your instrument."
+)
+
+
+//=============================================================================
+// 05. BREAKOUT
+//=============================================================================
+
+string breakMode = input.string(
+     "Prior Candle High/Low",
+     "Break level",
+     options=["Prior Candle High/Low", "Prior 2-Bar Extreme"],
+     group=G_BREAK
+)
+
+string breakConfirmationMode = input.string(
+     "Intrabar Close",
+     "Break confirmation",
+     options=["Intrabar Close", "Intrabar High/Low"],
+     group=G_BREAK
+)
+
+
+//=============================================================================
+// 06. SESSION
+//=============================================================================
+
+string executionSession = input.session("0930-1600", "Execution session", group=G_SESSION)
+string sessionTimezone = input.string("America/New_York", "Session timezone", group=G_SESSION)
+
+int openingDelayMinutes = input.int(
+     5,
+     "Opening delay, minutes",
+     minval=0,
+     maxval=120,
+     group=G_SESSION
+)
+
+bool flattenAtSessionEnd = input.bool(
+     true,
+     "Flatten at session end",
+     group=G_SESSION
+)
+
+
+//=============================================================================
+// 07. OPTIONAL FILTERS
+//=============================================================================
+
+bool useVWAPFilter = input.bool(false, "Use RTH VWAP filter", group=G_FILTER)
+bool useEMAFilter = input.bool(false, "Use EMA filter", group=G_FILTER)
+int emaLength = input.int(50, "EMA length", minval=2, group=G_FILTER)
+
+bool useATRRegimeFilter = input.bool(false, "Use ATR regime filter", group=G_FILTER)
+int atrLength = input.int(14, "ATR length", minval=2, group=G_FILTER)
+int atrBaselineLength = input.int(100, "ATR baseline", minval=20, group=G_FILTER)
+
+float minATRRatio = input.float(
+     0.70,
+     "Minimum ATR ratio",
+     minval=0.10,
+     maxval=5.0,
+     step=0.05,
+     group=G_FILTER
+)
+
+float maxATRRatio = input.float(
+     2.00,
+     "Maximum ATR ratio",
+     minval=0.20,
+     maxval=10.0,
+     step=0.05,
+     group=G_FILTER
+)
+
+bool useEfficiencyFilter = input.bool(false, "Use Efficiency Ratio filter", group=G_FILTER)
+int efficiencyLength = input.int(20, "Efficiency Ratio length", minval=2, maxval=200, group=G_FILTER)
+
+float minimumEfficiency = input.float(
+     0.18,
+     "Minimum Efficiency Ratio",
+     minval=0.0,
+     maxval=1.0,
+     step=0.01,
+     group=G_FILTER
+)
+
+
+//=============================================================================
+// 08. RISK MANAGEMENT
+//=============================================================================
+
+int contracts = input.int(1, "Contracts", minval=1, maxval=100, group=G_RISK)
+
+string stopMode = input.string(
+     "Wider",
+     "Initial stop model",
+     options=["ATR", "Prior Candle", "Wider", "Tighter"],
+     group=G_RISK
+)
+
+float atrStopMultiple = input.float(
+     1.25,
+     "ATR stop multiple",
+     minval=0.10,
+     maxval=10.0,
+     step=0.05,
+     group=G_RISK
+)
+
+float rewardRisk = input.float(
+     2.00,
+     "Reward / Risk",
+     minval=0.25,
+     maxval=10.0,
+     step=0.25,
+     group=G_RISK
+)
+
+bool useBreakEven = input.bool(true, "Use break-even", group=G_RISK)
+
+float breakEvenAtR = input.float(
+     1.00,
+     "Break-even trigger, R",
+     minval=0.25,
+     maxval=5.0,
+     step=0.25,
+     group=G_RISK
+)
+
+bool useTrailingStop = input.bool(false, "Use ATR trailing stop", group=G_RISK)
+
+float trailingATR = input.float(
+     2.00,
+     "Trailing ATR",
+     minval=0.25,
+     maxval=10.0,
+     step=0.25,
+     group=G_RISK
+)
+
+bool useTimeExit = input.bool(true, "Use time exit", group=G_RISK)
+
+int maximumBarsInTrade = input.int(
+     16,
+     "Maximum bars in trade",
+     minval=1,
+     maxval=200,
+     group=G_RISK
+)
+
+
+//=============================================================================
+// 09. DAILY CONTROLS
+//=============================================================================
+
+int maxTradesPerDay = input.int(2, "Maximum trades per RTH session", minval=1, maxval=20, group=G_DAILY)
+int cooldownBars = input.int(0, "Cooldown bars", minval=0, maxval=100, group=G_DAILY)
+
+float dailyLossLimit = input.float(
+     0.0,
+     "Daily loss limit $, 0 = disabled",
+     minval=0.0,
+     step=50.0,
+     group=G_DAILY
+)
+
+
+//=============================================================================
+// 10. VISUALS
+//=============================================================================
+
+bool showDebugMarkers = input.bool(false, "Show debug markers", group=G_VIS)
+bool showDashboard = input.bool(true, "Show compact dashboard", group=G_VIS)
+bool showBiasBackground = input.bool(true, "Show HTF bias background", group=G_VIS)
+
+
+//=============================================================================
+// 11. HELPERS
+//=============================================================================
+
+f_biasName(int biasValue) =>
+    switch biasValue
+        1 => "BULL"
+        -1 => "BEAR"
+        => "NEUTRAL"
+
+f_stateName(int stateValue) =>
+    switch stateValue
+        1 => "BULLISH"
+        -1 => "BEARISH"
+        => "NEUTRAL"
+
+f_yesNo(bool value) =>
+    value ? "YES" : "NO"
+
+f_price(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+f_percent(float value) =>
+    na(value) ? "-" : str.tostring(value * 100.0, "#.0") + "%"
+
+f_number(float value) =>
+    na(value) ? "-" : str.tostring(value, "#.00")
+
+
+// Confirmed pivot structure. A pivot is available only after its right-side
+// confirmation period. The two latest confirmed highs and lows are compared.
+f_structureBias(int len) =>
+    float ph = ta.pivothigh(high, len, len)
+    float pl = ta.pivotlow(low, len, len)
+
+    float latestHigh = ta.valuewhen(not na(ph), ph, 0)
+    float previousHigh = ta.valuewhen(not na(ph), ph, 1)
+    float latestLow = ta.valuewhen(not na(pl), pl, 0)
+    float previousLow = ta.valuewhen(not na(pl), pl, 1)
+
+    bool bullishStructure = not na(latestHigh) and not na(previousHigh) and not na(latestLow) and not na(previousLow) and latestHigh > previousHigh and latestLow > previousLow
+    bool bearishStructure = not na(latestHigh) and not na(previousHigh) and not na(latestLow) and not na(previousLow) and latestHigh < previousHigh and latestLow < previousLow
+
+    bullishStructure ? 1 : bearishStructure ? -1 : 0
+
+
+// RTH VWAP calculated in the lower-timeframe request context.
+f_rthVWAP() =>
+    bool localInSession = not na(time(timeframe.period, executionSession, sessionTimezone))
+    bool localSessionStart = localInSession and not localInSession[1]
+
+    var float cumPV = 0.0
+    var float cumVolume = 0.0
+
+    if localSessionStart
+        cumPV := hlc3 * volume
+        cumVolume := volume
+    else if localInSession
+        cumPV += hlc3 * volume
+        cumVolume += volume
+
+    float localVWAP = na
+    if localInSession and cumVolume > 0
+        localVWAP := cumPV / cumVolume
+
+    localVWAP
+
+
+// Intrabar state relative to the current 15m open.
+f_intrabarState(float execBarOpen, float intrabarHigh, float intrabarLow, float intrabarClose, int previousState, string mode) =>
+    int state = 0
+
+    if mode == "Intrabar Close"
+        if intrabarClose > execBarOpen
+            state := 1
+        else if intrabarClose < execBarOpen
+            state := -1
+    else
+        bool above = intrabarHigh > execBarOpen
+        bool below = intrabarLow < execBarOpen
+
+        if above and not below
+            state := 1
+        else if below and not above
+            state := -1
+        else if above and below
+            if intrabarClose > execBarOpen
+                state := 1
+            else if intrabarClose < execBarOpen
+                state := -1
+            else
+                state := previousState
+
+    state
+
+
+f_longStopCandidate(float signalReference, float atrValue, float structureLow) =>
+    float atrStop = signalReference - atrValue * atrStopMultiple
+    float structuralStop = structureLow - syminfo.mintick * 2.0
+    float result = atrStop
+
+    if stopMode == "Prior Candle"
+        result := structuralStop
+    else if stopMode == "Wider"
+        result := math.min(atrStop, structuralStop)
+    else if stopMode == "Tighter"
+        result := math.max(atrStop, structuralStop)
+
+    result
+
+
+f_shortStopCandidate(float signalReference, float atrValue, float structureHigh) =>
+    float atrStop = signalReference + atrValue * atrStopMultiple
+    float structuralStop = structureHigh + syminfo.mintick * 2.0
+    float result = atrStop
+
+    if stopMode == "Prior Candle"
+        result := structuralStop
+    else if stopMode == "Wider"
+        result := math.max(atrStop, structuralStop)
+    else if stopMode == "Tighter"
+        result := math.min(atrStop, structuralStop)
+
+    result
+
+
+//=============================================================================
+// 12. TIMEFRAME VALIDATION
+//=============================================================================
+
+bool chartIs15m = timeframe.isminutes and timeframe.multiplier == 15
+bool lowerTFValid = timeframe.in_seconds(intrabarTF) < timeframe.in_seconds(timeframe.period)
+
+if barstate.isfirst and not chartIs15m
+    runtime.error("MTF Second-Flip strategy must be used on a 15-minute chart.")
+
+if barstate.isfirst and not lowerTFValid
+    runtime.error("Intrabar timeframe must be lower than the chart timeframe.")
+
+
+//=============================================================================
+// 13. CONFIRMED HTF BIAS
+//=============================================================================
+// [1] is evaluated in the requested HTF context. lookahead_on exposes only
+// that already-completed value during the next HTF candle.
+
+int bias1H = request.security(syminfo.tickerid, biasTF1, f_structureBias(pivotLength)[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+int bias4H = request.security(syminfo.tickerid, biasTF2, f_structureBias(pivotLength)[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+int finalBias = 0
+if bias1H == 1 and bias4H == 1
+    finalBias := 1
+else if bias1H == -1 and bias4H == -1
+    finalBias := -1
+
+
+//=============================================================================
+// 14. EXECUTION-TIMEFRAME FILTER DATA
+//=============================================================================
+
+float ema50 = ta.ema(close, emaLength)
+float atr = ta.atr(atrLength)
+float atrBaseline = ta.sma(atr, atrBaselineLength)
+
+float atrRatio = na
+if not na(atrBaseline) and atrBaseline > 0
+    atrRatio := atr / atrBaseline
+
+float pricePath = math.sum(math.abs(ta.change(close)), efficiencyLength)
+float efficiencyRatio = na
+if not na(pricePath) and pricePath > 0 and bar_index >= efficiencyLength
+    efficiencyRatio := math.abs(close - close[efficiencyLength]) / pricePath
+
+float confirmedEMA = ema50[1]
+bool confirmedEMARising = ema50[1] > ema50[2]
+bool confirmedEMAFalling = ema50[1] < ema50[2]
+float confirmedATR = atr[1]
+float confirmedATRRatio = atrRatio[1]
+float confirmedEfficiency = efficiencyRatio[1]
+
+
+//=============================================================================
+// 15. PRIOR 15-MINUTE LEVELS
+//=============================================================================
+
+float execOpen = open
+float priorHigh = high[1]
+float priorLow = low[1]
+
+float breakHigh = breakMode == "Prior 2-Bar Extreme" ? math.max(high[1], high[2]) : priorHigh
+float breakLow = breakMode == "Prior 2-Bar Extreme" ? math.min(low[1], low[2]) : priorLow
+
+
+//=============================================================================
+// 16. SESSION STATE
+//=============================================================================
+
+bool inExecutionSession = not na(time(timeframe.period, executionSession, sessionTimezone))
+bool executionSessionStart = inExecutionSession and not inExecutionSession[1]
+
+int sessionStartHour = int(str.tonumber(str.substring(executionSession, 0, 2)))
+int sessionStartMinute = int(str.tonumber(str.substring(executionSession, 2, 4)))
+int sessionEndHour = int(str.tonumber(str.substring(executionSession, 5, 7)))
+int sessionEndMinute = int(str.tonumber(str.substring(executionSession, 7, 9)))
+
+int sessionStartMOD = sessionStartHour * 60 + sessionStartMinute
+int sessionEndMOD = sessionEndHour * 60 + sessionEndMinute
+
+int chartHour = hour(time, sessionTimezone)
+int chartMinute = minute(time, sessionTimezone)
+int chartMOD = chartHour * 60 + chartMinute
+int finalExecutionBarStartMOD = sessionEndMOD - 15
+
+bool isFinalSessionBar = inExecutionSession and chartMOD >= finalExecutionBarStartMOD and chartMOD < sessionEndMOD
+
+
+//=============================================================================
+// 17. DAILY CONTROLS
+//=============================================================================
+
+var int tradesToday = 0
+var float dayStartNetProfit = 0.0
+var bool dayHalted = false
+var int lastExitBar = na
+var int lastSignalBar = na
+var int lastSessionResetBar = na
+
+// Guard against repeated resets caused by calc_on_order_fills recalculations.
+if executionSessionStart and (na(lastSessionResetBar) or lastSessionResetBar != bar_index)
+    tradesToday := 0
+    dayStartNetProfit := strategy.netprofit
+    dayHalted := false
+    lastSessionResetBar := bar_index
+
+float dayPnL = strategy.netprofit + strategy.openprofit - dayStartNetProfit
+
+if dailyLossLimit > 0 and dayPnL <= -dailyLossLimit
+    dayHalted := true
+
+bool cooldownPass = na(lastExitBar) or bar_index - lastExitBar > cooldownBars
+bool tradeCountPass = tradesToday < maxTradesPerDay
+bool positionPass = strategy.position_size == 0
+bool signalBarPass = na(lastSignalBar) or lastSignalBar != bar_index
+
+
+//=============================================================================
+// 18. LOWER-TIMEFRAME DATA
+//=============================================================================
+
+[ltfTime, ltfOpen, ltfHigh, ltfLow, ltfClose, ltfVWAP] = request.security_lower_tf(
+     syminfo.tickerid,
+     intrabarTF,
+     [time, open, high, low, close, f_rthVWAP()]
+)
+
+
+//=============================================================================
+// 19. INTRABAR RECONSTRUCTION AND SIGNAL-VOLATILITY CONTROL
+//=============================================================================
+
+int bullFlipCount = 0
+int bearFlipCount = 0
+int rawDirectionalTransitions = 0
+int genuineDirectionalTransitions = 0
+int rejectedMicroTransitions = 0
+int directionalSamples = 0
+
+bool secondBullFlipSeen = false
+bool secondBearFlipSeen = false
+bool longBreakArmed = false
+bool shortBreakArmed = false
+
+bool bullFlip1Event = false
+bool bullFlip2Event = false
+bool bearFlip1Event = false
+bool bearFlip2Event = false
+bool longArmEvent = false
+bool shortArmEvent = false
+bool longInvalidationEvent = false
+bool shortInvalidationEvent = false
+
+bool longEntrySignal = false
+bool shortEntrySignal = false
+
+int currentExecState = 0
+int acceptedNonNeutralState = 0
+int rawPreviousNonNeutralState = 0
+
+int longArmIntrabarIndex = na
+int shortArmIntrabarIndex = na
+int longArmIntrabarTime = na
+int shortArmIntrabarTime = na
+
+int longSignalIntrabarTime = na
+int shortSignalIntrabarTime = na
+
+float lastAcceptedStatePrice = na
+float longFrozenBreakLevel = na
+float shortFrozenBreakLevel = na
+float longFrozenStructureLow = na
+float shortFrozenStructureHigh = na
+
+float longSignalReferencePrice = na
+float shortSignalReferencePrice = na
+float longSignalStructureLow = na
+float shortSignalStructureHigh = na
+float signalRTHVWAP = na
+
+float runningIntrabarHigh = na
+float runningIntrabarLow = na
+float rawSignalVolatility = 0.0
+float genuineSignalVolatility = 0.0
+float marketVolatilityRatio = 0.0
+float trendQuality = 0.0
+
+bool previousLongBreakConfirmed = false
+bool previousShortBreakConfirmed = false
+
+int invalidationCode = 0
+// 0 = none, 1 = opposing flip, 2 = expired, 3 = transition budget
+
+float minimumFlipExcursion = minFlipExcursionATR <= 0.0 ? 0.0 : not na(confirmedATR) ? confirmedATR * minFlipExcursionATR : syminfo.mintick * 2.0
+
+int intrabarCount = array.size(ltfClose)
+
+if intrabarCount > 0
+    for i = 0 to intrabarCount - 1
+        int intrabarTime = array.get(ltfTime, i)
+        float intrabarHigh = array.get(ltfHigh, i)
+        float intrabarLow = array.get(ltfLow, i)
+        float intrabarClose = array.get(ltfClose, i)
+        float intrabarVWAP = array.get(ltfVWAP, i)
+
+        runningIntrabarHigh := na(runningIntrabarHigh) ? intrabarHigh : math.max(runningIntrabarHigh, intrabarHigh)
+        runningIntrabarLow := na(runningIntrabarLow) ? intrabarLow : math.min(runningIntrabarLow, intrabarLow)
+
+        int intrabarHour = hour(intrabarTime, sessionTimezone)
+        int intrabarMinute = minute(intrabarTime, sessionTimezone)
+        int intrabarMOD = intrabarHour * 60 + intrabarMinute
+
+        bool intrabarInSession = intrabarMOD >= sessionStartMOD and intrabarMOD < sessionEndMOD
+        bool openingDelayComplete = intrabarMOD >= sessionStartMOD + openingDelayMinutes
+        bool finalSessionEntryBlocked = flattenAtSessionEnd and intrabarMOD >= finalExecutionBarStartMOD
+        bool intrabarSessionAllowed = intrabarInSession and openingDelayComplete and not finalSessionEntryBlocked
+
+        //---------------------------------------------------------------------
+        // DETERMINE AND PROCESS THIS MINUTE'S STATE FIRST
+        //---------------------------------------------------------------------
+        // Entry is tested later and requires i > arm index. This preserves the
+        // no-same-minute arm/break rule while allowing a new opposing flip to
+        // invalidate the setup before an entry can be accepted.
+
+        int currentState = f_intrabarState(
+             execOpen,
+             intrabarHigh,
+             intrabarLow,
+             intrabarClose,
+             acceptedNonNeutralState,
+             flipDetectionMode
+        )
+
+        bool genuineTransitionThisMinute = false
+        bool bullTransitionThisMinute = false
+        bool bearTransitionThisMinute = false
+        bool longArmedThisMinute = false
+        bool shortArmedThisMinute = false
+
+        if currentState != 0
+            directionalSamples += 1
+
+            if rawPreviousNonNeutralState != 0 and currentState != rawPreviousNonNeutralState
+                rawDirectionalTransitions += 1
+
+            rawPreviousNonNeutralState := currentState
+
+            if acceptedNonNeutralState == 0
+                acceptedNonNeutralState := currentState
+                lastAcceptedStatePrice := intrabarClose
+            else if currentState != acceptedNonNeutralState
+                bool excursionPass = minimumFlipExcursion <= 0.0 or na(lastAcceptedStatePrice) or math.abs(intrabarClose - lastAcceptedStatePrice) >= minimumFlipExcursion
+
+                if excursionPass
+                    int stateBeforeTransition = acceptedNonNeutralState
+
+                    acceptedNonNeutralState := currentState
+                    lastAcceptedStatePrice := intrabarClose
+                    genuineDirectionalTransitions += 1
+                    genuineTransitionThisMinute := true
+
+                    bullTransitionThisMinute := stateBeforeTransition == -1 and currentState == 1
+                    bearTransitionThisMinute := stateBeforeTransition == 1 and currentState == -1
+
+                    if bullTransitionThisMinute
+                        bullFlipCount += 1
+
+                        if bullFlipCount == 1
+                            bullFlip1Event := true
+
+                    if bearTransitionThisMinute
+                        bearFlipCount += 1
+
+                        if bearFlipCount == 1
+                            bearFlip1Event := true
+                else
+                    rejectedMicroTransitions += 1
+
+        currentExecState := acceptedNonNeutralState
+
+        //---------------------------------------------------------------------
+        // SIGNAL VOLATILITY AND MARKET VOLATILITY ARE DISTINCT
+        //---------------------------------------------------------------------
+
+        int possibleTransitions = math.max(directionalSamples - 1, 1)
+        rawSignalVolatility := float(rawDirectionalTransitions) / float(possibleTransitions)
+        genuineSignalVolatility := float(genuineDirectionalTransitions) / float(possibleTransitions)
+
+        float runningRange = not na(runningIntrabarHigh) and not na(runningIntrabarLow) ? runningIntrabarHigh - runningIntrabarLow : 0.0
+        marketVolatilityRatio := not na(confirmedATR) and confirmedATR > 0 ? runningRange / confirmedATR : 0.0
+        trendQuality := marketVolatilityRatio * math.max(0.0, 1.0 - rawSignalVolatility)
+
+        //---------------------------------------------------------------------
+        // INVALIDATE AN EXISTING SETUP BEFORE CONSIDERING A NEW ARM
+        //---------------------------------------------------------------------
+
+        if genuineTransitionThisMinute and invalidateOnOpposingFlip
+            if longBreakArmed and bearTransitionThisMinute
+                longBreakArmed := false
+                longInvalidationEvent := true
+                invalidationCode := 1
+
+            if shortBreakArmed and bullTransitionThisMinute
+                shortBreakArmed := false
+                shortInvalidationEvent := true
+                invalidationCode := 1
+
+        if genuineDirectionalTransitions > maxGenuineTransitions
+            if longBreakArmed
+                longBreakArmed := false
+                longInvalidationEvent := true
+
+            if shortBreakArmed
+                shortBreakArmed := false
+                shortInvalidationEvent := true
+
+            invalidationCode := 3
+
+        //---------------------------------------------------------------------
+        // IDENTIFY DIRECTIONAL FLIP #2 AND FREEZE THE SETUP
+        //---------------------------------------------------------------------
+
+        if bullTransitionThisMinute
+            bool bullishSecondEvent = requireExactlySecondFlip ? bullFlipCount == 2 : bullFlipCount >= 2 and not secondBullFlipSeen
+
+            if bullishSecondEvent
+                bullFlip2Event := true
+                secondBullFlipSeen := true
+
+                if finalBias == 1 and genuineDirectionalTransitions <= maxGenuineTransitions
+                    longBreakArmed := true
+                    longArmEvent := true
+                    longArmedThisMinute := true
+                    longArmIntrabarIndex := i
+                    longArmIntrabarTime := intrabarTime
+                    longFrozenBreakLevel := breakHigh
+                    longFrozenStructureLow := priorLow
+
+        if bearTransitionThisMinute
+            bool bearishSecondEvent = requireExactlySecondFlip ? bearFlipCount == 2 : bearFlipCount >= 2 and not secondBearFlipSeen
+
+            if bearishSecondEvent
+                bearFlip2Event := true
+                secondBearFlipSeen := true
+
+                if finalBias == -1 and genuineDirectionalTransitions <= maxGenuineTransitions
+                    shortBreakArmed := true
+                    shortArmEvent := true
+                    shortArmedThisMinute := true
+                    shortArmIntrabarIndex := i
+                    shortArmIntrabarTime := intrabarTime
+                    shortFrozenBreakLevel := breakLow
+                    shortFrozenStructureHigh := priorHigh
+
+        //---------------------------------------------------------------------
+        // SETUP EXPIRATION
+        //---------------------------------------------------------------------
+
+        if longBreakArmed and not na(longArmIntrabarIndex) and i - longArmIntrabarIndex > maxIntrabarsAfterSecondFlip
+            longBreakArmed := false
+            longInvalidationEvent := true
+            invalidationCode := 2
+
+        if shortBreakArmed and not na(shortArmIntrabarIndex) and i - shortArmIntrabarIndex > maxIntrabarsAfterSecondFlip
+            shortBreakArmed := false
+            shortInvalidationEvent := true
+            invalidationCode := 2
+
+        //---------------------------------------------------------------------
+        // BREAKOUT STATUS USES THE LEVEL FROZEN AT ARMING
+        //---------------------------------------------------------------------
+
+        float activeLongBreakLevel = longBreakArmed and not na(longFrozenBreakLevel) ? longFrozenBreakLevel : breakHigh
+        float activeShortBreakLevel = shortBreakArmed and not na(shortFrozenBreakLevel) ? shortFrozenBreakLevel : breakLow
+
+        bool currentLongBreakConfirmed = breakConfirmationMode == "Intrabar Close" ? intrabarClose > activeLongBreakLevel : intrabarHigh > activeLongBreakLevel
+        bool currentShortBreakConfirmed = breakConfirmationMode == "Intrabar Close" ? intrabarClose < activeShortBreakLevel : intrabarLow < activeShortBreakLevel
+
+        bool freshPostArmLongBreak = longBreakArmed and not longArmedThisMinute and not na(longArmIntrabarIndex) and i > longArmIntrabarIndex and currentLongBreakConfirmed and not previousLongBreakConfirmed
+        bool freshPostArmShortBreak = shortBreakArmed and not shortArmedThisMinute and not na(shortArmIntrabarIndex) and i > shortArmIntrabarIndex and currentShortBreakConfirmed and not previousShortBreakConfirmed
+
+        //---------------------------------------------------------------------
+        // OPTIONAL FILTERS
+        //---------------------------------------------------------------------
+
+        bool longVWAPPass = not useVWAPFilter or (not na(intrabarVWAP) and intrabarClose > intrabarVWAP)
+        bool shortVWAPPass = not useVWAPFilter or (not na(intrabarVWAP) and intrabarClose < intrabarVWAP)
+
+        bool longEMAPass = not useEMAFilter or (not na(confirmedEMA) and intrabarClose > confirmedEMA and confirmedEMARising)
+        bool shortEMAPass = not useEMAFilter or (not na(confirmedEMA) and intrabarClose < confirmedEMA and confirmedEMAFalling)
+
+        bool atrRegimePass = not useATRRegimeFilter or (not na(confirmedATRRatio) and confirmedATRRatio >= minATRRatio and confirmedATRRatio <= maxATRRatio)
+        bool efficiencyPass = not useEfficiencyFilter or (not na(confirmedEfficiency) and confirmedEfficiency >= minimumEfficiency)
+
+        bool enoughChurnSamples = directionalSamples >= minimumSignalSamples
+        bool signalVolatilityPass = not useSignalVolatilityFilter or not enoughChurnSamples or rawSignalVolatility <= maximumSignalVolatility
+        bool trendQualityPass = not useTrendQualityFilter or trendQuality >= minimumTrendQuality
+
+        bool commonEntryPass = intrabarSessionAllowed and not dayHalted and tradeCountPass and cooldownPass and positionPass and signalBarPass
+
+        bool canLongNow = finalBias == 1 and freshPostArmLongBreak and commonEntryPass and longVWAPPass and longEMAPass and atrRegimePass and efficiencyPass and signalVolatilityPass and trendQualityPass
+        bool canShortNow = finalBias == -1 and freshPostArmShortBreak and commonEntryPass and shortVWAPPass and shortEMAPass and atrRegimePass and efficiencyPass and signalVolatilityPass and trendQualityPass
+
+        if not longEntrySignal and not shortEntrySignal
+            if canLongNow
+                longEntrySignal := true
+                longSignalIntrabarTime := intrabarTime
+                longSignalReferencePrice := intrabarClose
+                longSignalStructureLow := longFrozenStructureLow
+                signalRTHVWAP := intrabarVWAP
+                longBreakArmed := false
+            else if canShortNow
+                shortEntrySignal := true
+                shortSignalIntrabarTime := intrabarTime
+                shortSignalReferencePrice := intrabarClose
+                shortSignalStructureHigh := shortFrozenStructureHigh
+                signalRTHVWAP := intrabarVWAP
+                shortBreakArmed := false
+
+        previousLongBreakConfirmed := currentLongBreakConfirmed
+        previousShortBreakConfirmed := currentShortBreakConfirmed
+
+
+//=============================================================================
+// 20. MUTUALLY EXCLUSIVE ENTRY SIGNAL
+//=============================================================================
+
+bool validLongSignal = longEntrySignal and not shortEntrySignal
+bool validShortSignal = shortEntrySignal and not longEntrySignal
+
+var float pendingStop = na
+var int pendingDirection = 0
+
+if validLongSignal
+    pendingStop := f_longStopCandidate(longSignalReferencePrice, confirmedATR, longSignalStructureLow)
+    pendingDirection := 1
+    lastSignalBar := bar_index
+    tradesToday += 1
+
+    strategy.entry(
+         "Long",
+         strategy.long,
+         qty=contracts,
+         comment="Second Flip Long",
+         alert_message="MTF2FLIP v1.2 LONG entry"
+    )
+
+if validShortSignal
+    pendingStop := f_shortStopCandidate(shortSignalReferencePrice, confirmedATR, shortSignalStructureHigh)
+    pendingDirection := -1
+    lastSignalBar := bar_index
+    tradesToday += 1
+
+    strategy.entry(
+         "Short",
+         strategy.short,
+         qty=contracts,
+         comment="Second Flip Short",
+         alert_message="MTF2FLIP v1.2 SHORT entry"
+    )
+
+
+//=============================================================================
+// 21. FILLED POSITION INITIALIZATION
+//=============================================================================
+
+var bool tradeInitialized = false
+var float actualEntry = na
+var float initialRisk = na
+var float activeStop = na
+var float activeTarget = na
+var int entryBarIndex = na
+
+if strategy.position_size == 0
+    tradeInitialized := false
+
+if strategy.position_size > 0 and not tradeInitialized
+    actualEntry := strategy.position_avg_price
+    activeStop := pendingStop
+    initialRisk := actualEntry - activeStop
+
+    if not na(initialRisk) and initialRisk > syminfo.mintick
+        activeTarget := actualEntry + initialRisk * rewardRisk
+        entryBarIndex := bar_index
+        tradeInitialized := true
+    else
+        strategy.close("Long", comment="Invalid Long Risk")
+
+if strategy.position_size < 0 and not tradeInitialized
+    actualEntry := strategy.position_avg_price
+    activeStop := pendingStop
+    initialRisk := activeStop - actualEntry
+
+    if not na(initialRisk) and initialRisk > syminfo.mintick
+        activeTarget := actualEntry - initialRisk * rewardRisk
+        entryBarIndex := bar_index
+        tradeInitialized := true
+    else
+        strategy.close("Short", comment="Invalid Short Risk")
+
+
+//=============================================================================
+// 22. BREAK-EVEN AND ATR TRAILING STOP
+//=============================================================================
+
+bool afterEntryBar = tradeInitialized and not na(entryBarIndex) and bar_index > entryBarIndex
+
+if strategy.position_size > 0 and useBreakEven and afterEntryBar
+    if high >= actualEntry + initialRisk * breakEvenAtR
+        activeStop := math.max(activeStop, actualEntry)
+
+if strategy.position_size < 0 and useBreakEven and afterEntryBar
+    if low <= actualEntry - initialRisk * breakEvenAtR
+        activeStop := math.min(activeStop, actualEntry)
+
+if strategy.position_size > 0 and useTrailingStop and afterEntryBar
+    float longTrail = close - atr * trailingATR
+    activeStop := math.max(activeStop, longTrail)
+
+if strategy.position_size < 0 and useTrailingStop and afterEntryBar
+    float shortTrail = close + atr * trailingATR
+    activeStop := math.min(activeStop, shortTrail)
+
+
+//=============================================================================
+// 23. STOP / TARGET ORDERS
+//=============================================================================
+
+if strategy.position_size > 0 and tradeInitialized
+    strategy.exit(
+         "Long Exit",
+         from_entry="Long",
+         stop=activeStop,
+         limit=activeTarget,
+         alert_message="MTF2FLIP v1.2 LONG exit"
+    )
+
+if strategy.position_size < 0 and tradeInitialized
+    strategy.exit(
+         "Short Exit",
+         from_entry="Short",
+         stop=activeStop,
+         limit=activeTarget,
+         alert_message="MTF2FLIP v1.2 SHORT exit"
+    )
+
+
+//=============================================================================
+// 24. TIME, DAILY-LOSS, AND SESSION EXITS
+//=============================================================================
+
+int barsInTrade = tradeInitialized and not na(entryBarIndex) ? bar_index - entryBarIndex : 0
+bool timeExitReady = useTimeExit and strategy.position_size != 0 and afterEntryBar and barsInTrade >= maximumBarsInTrade
+
+if timeExitReady
+    strategy.close_all(comment="Time Exit")
+
+if dayHalted and strategy.position_size != 0
+    strategy.close_all(comment="Daily Loss Limit")
+
+if flattenAtSessionEnd and isFinalSessionBar and strategy.position_size != 0
+    strategy.close_all(comment="Session Close")
+
+
+//=============================================================================
+// 25. POSITION CLOSED STATE
+//=============================================================================
+
+bool positionClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if positionClosed
+    lastExitBar := bar_index
+    pendingStop := na
+    pendingDirection := 0
+    actualEntry := na
+    initialRisk := na
+    activeStop := na
+    activeTarget := na
+    entryBarIndex := na
+    tradeInitialized := false
+
+
+//=============================================================================
+// 26. COMPACT VISUALS
+//=============================================================================
+
+plot(execOpen, "15m Open", color=color.new(color.blue, 20), linewidth=1)
+plot(breakHigh, "Active Long Break Level", color=color.new(color.green, 35), linewidth=1, style=plot.style_stepline)
+plot(breakLow, "Active Short Break Level", color=color.new(color.red, 35), linewidth=1, style=plot.style_stepline)
+plot(strategy.position_size != 0 ? activeStop : na, "Active Stop", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? activeTarget : na, "Active Target", color=color.lime, linewidth=2, style=plot.style_linebr)
+
+plotshape(validLongSignal, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="L")
+plotshape(validShortSignal, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="S")
+
+plotshape(showDebugMarkers and bullFlip2Event, title="Bull Flip 2", style=shape.diamond, location=location.belowbar, color=color.lime, size=size.tiny, text="B2")
+plotshape(showDebugMarkers and bearFlip2Event, title="Bear Flip 2", style=shape.diamond, location=location.abovebar, color=color.red, size=size.tiny, text="S2")
+plotshape(showDebugMarkers and longInvalidationEvent, title="Long Setup Invalidated", style=shape.xcross, location=location.belowbar, color=color.orange, size=size.tiny, text="X")
+plotshape(showDebugMarkers and shortInvalidationEvent, title="Short Setup Invalidated", style=shape.xcross, location=location.abovebar, color=color.orange, size=size.tiny, text="X")
+
+color biasBackground = na
+if showBiasBackground
+    biasBackground := finalBias == 1 ? color.new(color.green, 95) : finalBias == -1 ? color.new(color.red, 95) : na
+
+bgcolor(biasBackground, title="Confirmed HTF Bias")
+
+
+//=============================================================================
+// 27. COMPACT DASHBOARD
+//=============================================================================
+
+var table dash = table.new(position.top_right, 2, 10, border_width=1)
+
+f_cell(int row, string leftText, string rightText, color valueColor) =>
+    table.cell(dash, 0, row, leftText, text_color=color.white, bgcolor=color.new(color.gray, 72), text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, row, rightText, text_color=color.white, bgcolor=color.new(valueColor, 55), text_size=size.small, text_halign=text.align_right)
+
+color bias1Color = bias1H == 1 ? color.green : bias1H == -1 ? color.red : color.gray
+color bias4Color = bias4H == 1 ? color.green : bias4H == -1 ? color.red : color.gray
+color finalBiasColor = finalBias == 1 ? color.green : finalBias == -1 ? color.red : color.gray
+color stateColor = currentExecState == 1 ? color.green : currentExecState == -1 ? color.red : color.gray
+
+string sessionStatus = "CLOSED"
+color sessionColor = color.gray
+
+if dayHalted
+    sessionStatus := "HALTED"
+    sessionColor := color.red
+else if isFinalSessionBar
+    sessionStatus := "FINAL BAR"
+    sessionColor := color.orange
+else if inExecutionSession
+    if chartMOD < sessionStartMOD + openingDelayMinutes
+        sessionStatus := "OPEN DELAY"
+        sessionColor := color.orange
+    else
+        sessionStatus := "OPEN"
+        sessionColor := color.green
+
+string setupStatus = "WAIT"
+color setupColor = color.gray
+
+if validLongSignal
+    setupStatus := "LONG SIGNAL"
+    setupColor := color.lime
+else if validShortSignal
+    setupStatus := "SHORT SIGNAL"
+    setupColor := color.red
+else if longBreakArmed
+    setupStatus := "LONG ARMED"
+    setupColor := color.green
+else if shortBreakArmed
+    setupStatus := "SHORT ARMED"
+    setupColor := color.red
+else if longInvalidationEvent or shortInvalidationEvent
+    setupStatus := invalidationCode == 1 ? "OPPOSING FLIP" : invalidationCode == 2 ? "EXPIRED" : "TOO MANY FLIPS"
+    setupColor := color.orange
+
+string positionText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+color positionColor = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+
+bool churnPassNow = directionalSamples < minimumSignalSamples or rawSignalVolatility <= maximumSignalVolatility
+color churnColor = churnPassNow ? color.green : color.orange
+color qualityColor = not useTrendQualityFilter or trendQuality >= minimumTrendQuality ? color.green : color.orange
+
+if barstate.islast
+    table.clear(dash, 0, 0, 1, 9)
+
+    if showDashboard
+        f_cell(0, "1H / 4H", f_biasName(bias1H) + " / " + f_biasName(bias4H), bias1H == bias4H ? finalBiasColor : color.orange)
+        f_cell(1, "Final Bias", f_biasName(finalBias), finalBiasColor)
+        f_cell(2, "15m State", f_stateName(currentExecState), stateColor)
+        f_cell(3, "Bull / Bear", str.tostring(bullFlipCount) + " / " + str.tostring(bearFlipCount), color.blue)
+        f_cell(4, "Raw / Genuine", str.tostring(rawDirectionalTransitions) + " / " + str.tostring(genuineDirectionalTransitions), color.blue)
+        f_cell(5, "Signal Vol", f_percent(rawSignalVolatility), churnColor)
+        f_cell(6, "Trend Quality", f_number(trendQuality), qualityColor)
+        f_cell(7, "Setup", setupStatus, setupColor)
+        f_cell(8, "Session / Trades", sessionStatus + "  " + str.tostring(tradesToday) + "/" + str.tostring(maxTradesPerDay), sessionColor)
+        f_cell(9, "Position", positionText, positionColor)
+
+
+//=============================================================================
+// 28. ALERTS
+//=============================================================================
+// alertcondition() calls were removed because they consume plot counts and do
+// not create usable alert triggers in strategies. Select "Any alert() function
+// call" for event alerts, or use strategy order-fill alerts.
+
+if bullFlip1Event
+    alert("MTF2FLIP: Bull flip #1 detected.", alert.freq_all)
+
+if bullFlip2Event
+    alert("MTF2FLIP: Bull flip #2 detected.", alert.freq_all)
+
+if bearFlip1Event
+    alert("MTF2FLIP: Bear flip #1 detected.", alert.freq_all)
+
+if bearFlip2Event
+    alert("MTF2FLIP: Bear flip #2 detected.", alert.freq_all)
+
+if longArmEvent
+    alert("MTF2FLIP: Long setup armed; breakout level frozen.", alert.freq_all)
+
+if shortArmEvent
+    alert("MTF2FLIP: Short setup armed; breakout level frozen.", alert.freq_all)
+
+if longInvalidationEvent
+    alert("MTF2FLIP: Long setup invalidated.", alert.freq_all)
+
+if shortInvalidationEvent
+    alert("MTF2FLIP: Short setup invalidated.", alert.freq_all)
+
+if validLongSignal
+    alert("MTF2FLIP: Long entry signal.", alert.freq_all)
+
+if validShortSignal
+    alert("MTF2FLIP: Short entry signal.", alert.freq_all)
+
+if positionClosed
+    alert("MTF2FLIP: Position closed.", alert.freq_all)
+
+
+//=============================================================================
+// 29. REDUCED DATA-WINDOW DIAGNOSTICS
+//=============================================================================
+
+plot(float(bullFlipCount), "Bull Flip Count", display=display.data_window)
+plot(float(bearFlipCount), "Bear Flip Count", display=display.data_window)
+plot(float(rawDirectionalTransitions), "Raw Directional Transitions", display=display.data_window)
+plot(float(genuineDirectionalTransitions), "Genuine Directional Transitions", display=display.data_window)
+plot(float(rejectedMicroTransitions), "Rejected Micro Transitions", display=display.data_window)
+plot(rawSignalVolatility, "Raw Signal Volatility", display=display.data_window)
+plot(genuineSignalVolatility, "Genuine Signal Volatility", display=display.data_window)
+plot(marketVolatilityRatio, "Market Volatility Ratio", display=display.data_window)
+plot(trendQuality, "Trend Quality", display=display.data_window)
+plot(float(finalBias), "Final HTF Bias", display=display.data_window)
+plot(float(invalidationCode), "Invalidation Code", display=display.data_window)
