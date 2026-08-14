@@ -26,6 +26,7 @@ string GRP_HTF     = "04 - Higher Timeframe"
 string GRP_RISK    = "05 - Risk Management"
 string GRP_SESSION = "06 - Session and Frequency"
 string GRP_DISPLAY = "07 - Display"
+string GRP_ALERTS  = "08 - Alerts"
 
 //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // TREND INPUTS
@@ -402,6 +403,15 @@ bool colorTrendBackground = input.bool(
      true,
      "Color Background By Forecast",
      group=GRP_DISPLAY)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ALERT INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool enableDynamicAlerts = input.bool(
+     true,
+     "Enable Dynamic alert() Calls",
+     tooltip="Fires an explicit alert() call on every entry, labeled BULLISH/BEARISH with symbol, forecast, and stop. Works with a TradingView alert set to 'Any alert() function call'. The named alertcondition()s below work too, and strategy.entry/exit alert_message text works with an 'Order fills' alert -- pick whichever condition you prefer when creating the alert.",
+     group=GRP_ALERTS)
 
 //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // COLORS
@@ -863,7 +873,16 @@ if longEntry
          "Long",
          strategy.long,
          qty=longQuantity,
-         comment="EWMAC Long")
+         comment="EWMAC Long",
+         alert_message="AMSEWMAC BULLISH ENTRY - LONG")
+
+    if enableDynamicAlerts
+        alert(
+             "AMSEWMAC BULLISH ENTRY | LONG | " +
+             syminfo.ticker +
+             " | Forecast " + str.tostring(adjustedForecast, "#.0") +
+             " | Stop " + str.tostring(candidateLongStop, format.mintick),
+             alert.freq_once_per_bar_close)
 
 if shortEntry
     activeEntry := close
@@ -879,7 +898,16 @@ if shortEntry
          "Short",
          strategy.short,
          qty=shortQuantity,
-         comment="EWMAC Short")
+         comment="EWMAC Short",
+         alert_message="AMSEWMAC BEARISH ENTRY - SHORT")
+
+    if enableDynamicAlerts
+        alert(
+             "AMSEWMAC BEARISH ENTRY | SHORT | " +
+             syminfo.ticker +
+             " | Forecast " + str.tostring(adjustedForecast, "#.0") +
+             " | Stop " + str.tostring(candidateShortStop, format.mintick),
+             alert.freq_once_per_bar_close)
 
 //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // TRAILING VALUES
@@ -956,13 +984,15 @@ if strategy.position_size > 0 and not na(activeStop)
     strategy.exit(
          "Long Stop",
          from_entry="Long",
-         stop=activeStop)
+         stop=activeStop,
+         alert_message="AMSEWMAC STOP EXIT - LONG")
 
 if strategy.position_size < 0 and not na(activeStop)
     strategy.exit(
          "Short Stop",
          from_entry="Short",
-         stop=activeStop)
+         stop=activeStop,
+         alert_message="AMSEWMAC STOP EXIT - SHORT")
 
 //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // FORECAST EXITS
@@ -970,12 +1000,14 @@ if strategy.position_size < 0 and not na(activeStop)
 if longForecastExit
     strategy.close(
          "Long",
-         comment="Forecast Exit")
+         comment="Forecast Exit",
+         alert_message="AMSEWMAC FORECAST EXIT - LONG")
 
 if shortForecastExit
     strategy.close(
          "Short",
-         comment="Forecast Exit")
+         comment="Forecast Exit",
+         alert_message="AMSEWMAC FORECAST EXIT - SHORT")
 
 //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // TIME AND SESSION EXITS
@@ -988,12 +1020,14 @@ bool holdingTimeExpired =
 
 if holdingTimeExpired
     strategy.close_all(
-         comment="Time Exit")
+         comment="Time Exit",
+         alert_message="AMSEWMAC TIME EXIT")
 
 if flattenAtSessionEnd and sessionEnded and strategy.position_size != 0
     strategy.close_all(
          comment="Session Exit",
-         immediately=true)
+         immediately=true,
+         alert_message="AMSEWMAC SESSION EXIT")
 
 //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // CLOSED-POSITION RESET
@@ -1165,7 +1199,7 @@ dashPosition =
 var table dash = table.new(
      position=dashPosition,
      columns=2,
-     rows=16,
+     rows=17,
      bgcolor=C_DARK,
      border_color=color.rgb(60, 75, 95),
      border_width=1,
@@ -1414,13 +1448,19 @@ if showDashboard and barstate.islast
          tradeText,
          tradeColor)
 
+    f_row(
+         16,
+         "ALERTS",
+         enableDynamicAlerts ? "ON" : "OFF",
+         enableDynamicAlerts ? C_GOOD : C_NEUTRAL)
+
 if not showDashboard and barstate.islast
     table.clear(
          dash,
          0,
          0,
          1,
-         15)
+         16)
 
 //━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // ALERTS
@@ -1428,12 +1468,12 @@ if not showDashboard and barstate.islast
 alertcondition(
      longEntry,
      title="Adaptive EWMAC Long",
-     message="Adaptive multi-speed EWMAC LONG on {{ticker}} {{interval}}")
+     message="AMSEWMAC BULLISH ENTRY (LONG) on {{ticker}} {{interval}}")
 
 alertcondition(
      shortEntry,
      title="Adaptive EWMAC Short",
-     message="Adaptive multi-speed EWMAC SHORT on {{ticker}} {{interval}}")
+     message="AMSEWMAC BEARISH ENTRY (SHORT) on {{ticker}} {{interval}}")
 
 alertcondition(
      longForecastExit or shortForecastExit,
