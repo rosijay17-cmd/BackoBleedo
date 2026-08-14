@@ -136,7 +136,8 @@ string entryTriggerMode = input.string(
           "Breakout",
           "Cross Or Pullback",
           "Pullback Or Breakout",
-          "Any"
+          "Any",
+          "Liquidity Sweep"
      ],
      group = GRP_TIMING)
 
@@ -183,6 +184,94 @@ int breakoutLookback = input.int(
      "Breakout Lookback",
      minval = 1,
      maxval = 50,
+     group = GRP_TIMING)
+
+// --- Liquidity Sweep entry (Entry Trigger = "Liquidity Sweep") ---
+// Ported from the "Liquidity Entry Zones [trade_w_samet]" indicator.
+// Reuses the ATR / EMA 20 / EMA 50 already computed below — no separate
+// length inputs are needed. "No counter-trend" is enforced at
+// confirmation time using LMSE-Lite's own Directional Quality regime
+// (dq / dqStrength) plus the local EMA stack — see the LIQUIDITY SWEEP
+// ENTRY ENGINE section for the full mechanism.
+
+int sweepPivotLength = input.int(
+     5,
+     "Sweep: Swing Pivot Length",
+     minval = 1,
+     group = GRP_TIMING)
+
+int sweepStoredLevels = input.int(
+     20,
+     "Sweep: Stored Liquidity Levels",
+     minval = 5,
+     maxval = 100,
+     group = GRP_TIMING)
+
+float sweepMinDistanceAtr = input.float(
+     0.10,
+     "Sweep: Minimum Sweep Distance / ATR",
+     minval = 0.01,
+     step = 0.01,
+     group = GRP_TIMING)
+
+string sweepReclaimRule = input.string(
+     "Close Back Inside",
+     "Sweep: Reclaim Rule",
+     options = [
+          "Close Back Inside",
+          "Strong Reclaim"
+     ],
+     group = GRP_TIMING)
+
+float sweepMinWickPercent = input.float(
+     0.35,
+     "Sweep: Minimum Wick %",
+     minval = 0.0,
+     maxval = 1.0,
+     step = 0.01,
+     group = GRP_TIMING)
+
+float sweepMaxBodyPercent = input.float(
+     0.65,
+     "Sweep: Maximum Body %",
+     minval = 0.05,
+     maxval = 1.0,
+     step = 0.01,
+     group = GRP_TIMING)
+
+float sweepMinRangeAtr = input.float(
+     0.20,
+     "Sweep: Minimum Candle Range / ATR",
+     minval = 0.01,
+     step = 0.01,
+     group = GRP_TIMING)
+
+bool sweepRequireBullishBody = input.bool(
+     true,
+     "Sweep: Long Confirmation Must Be Bullish",
+     group = GRP_TIMING)
+
+bool sweepRequireBearishBody = input.bool(
+     true,
+     "Sweep: Short Confirmation Must Be Bearish",
+     group = GRP_TIMING)
+
+int sweepConfirmationWindow = input.int(
+     2,
+     "Sweep: Max Bars After Sweep For Confirmation",
+     minval = 0,
+     maxval = 10,
+     group = GRP_TIMING)
+
+bool sweepRequireMidlineBreak = input.bool(
+     true,
+     "Sweep: Require Sweep Candle Midline Break",
+     group = GRP_TIMING)
+
+int sweepSignalSpacingBars = input.int(
+     10,
+     "Sweep: Minimum Bars Between Sweep Signals",
+     minval = 0,
      group = GRP_TIMING)
 
 // ═══════════════════════════════════════════════════════════════════
@@ -404,6 +493,11 @@ bool showSignals = input.bool(
 bool showSetupMarkers = input.bool(
      false,
      "Show Raw Setup Markers",
+     group = GRP_VISUAL)
+
+bool showSweepMarkers = input.bool(
+     true,
+     "Show Raw Sweep Markers",
      group = GRP_VISUAL)
 
 bool showTradeLevels = input.bool(
@@ -1025,6 +1119,198 @@ bool directShortCrossSetup =
      shortPriceAligned and
      shortEMACross
 
+// ═══════════════════════════════════════════════════════════════════
+// LIQUIDITY SWEEP ENTRY ENGINE
+// ═══════════════════════════════════════════════════════════════════
+// Ported from the "Liquidity Entry Zones [trade_w_samet]" indicator.
+// Reuses the ATR / EMA 20 / EMA 50 already computed in the INDICATORS
+// section above — no separate sweep-specific lengths are needed. This
+// section always runs regardless of entryTriggerMode (cheap: a handful
+// of pivots and a bounded array scan), matching how the other trigger
+// types above are also always computed.
+//
+// "No counter-trend" is enforced entirely inside sweepBuyConfirmed /
+// sweepSellConfirmed below: a sweep can only confirm once BOTH the
+// local EMA 20 / EMA 50 stack AND LMSE-Lite's own Directional Quality
+// regime (dq / dqStrength) already agree with the sweep's direction.
+// Raw sweep detection (validBuySweep / validSellSweep) stays
+// trend-agnostic, exactly like the source indicator — the trend gate
+// is applied only at confirmation.
+// ═══════════════════════════════════════════════════════════════════
+
+float sweepCandleRange = high - low
+float sweepCandleBody  = math.abs(close - open)
+float sweepUpperWick   = high - math.max(open, close)
+float sweepLowerWick   = math.min(open, close) - low
+
+float sweepBodyPercent      = sweepCandleRange > 0 ? sweepCandleBody / sweepCandleRange : 0.0
+float sweepUpperWickPercent = sweepCandleRange > 0 ? sweepUpperWick / sweepCandleRange : 0.0
+float sweepLowerWickPercent = sweepCandleRange > 0 ? sweepLowerWick / sweepCandleRange : 0.0
+
+float sweepMinDistancePx = atr > 0.0 ? sweepMinDistanceAtr * atr : na
+float sweepMinRangePx    = atr > 0.0 ? sweepMinRangeAtr * atr : na
+
+float sweepPivotHigh = ta.pivothigh(high, sweepPivotLength, sweepPivotLength)
+float sweepPivotLow  = ta.pivotlow(low, sweepPivotLength, sweepPivotLength)
+
+var float[] sweepStoredHighLevels = array.new_float()
+var int[]   sweepStoredHighBars   = array.new_int()
+var float[] sweepStoredLowLevels  = array.new_float()
+var int[]   sweepStoredLowBars    = array.new_int()
+
+if not na(sweepPivotHigh)
+    array.push(sweepStoredHighLevels, sweepPivotHigh)
+    array.push(sweepStoredHighBars, bar_index - sweepPivotLength)
+    if array.size(sweepStoredHighLevels) > sweepStoredLevels
+        array.shift(sweepStoredHighLevels)
+        array.shift(sweepStoredHighBars)
+
+if not na(sweepPivotLow)
+    array.push(sweepStoredLowLevels, sweepPivotLow)
+    array.push(sweepStoredLowBars, bar_index - sweepPivotLength)
+    if array.size(sweepStoredLowLevels) > sweepStoredLevels
+        array.shift(sweepStoredLowLevels)
+        array.shift(sweepStoredLowBars)
+
+float sweptHighLevel = na
+int   sweptHighBar   = na
+float sweptLowLevel  = na
+int   sweptLowBar    = na
+
+int sweepHighLevelCount = array.size(sweepStoredHighLevels)
+if sweepHighLevelCount > 0
+    for i = sweepHighLevelCount - 1 to 0
+        float highLevel = array.get(sweepStoredHighLevels, i)
+        int   highBar   = array.get(sweepStoredHighBars, i)
+        if highBar < bar_index and high > highLevel and not na(sweepMinDistancePx) and (high - highLevel) >= sweepMinDistancePx
+            sweptHighLevel := highLevel
+            sweptHighBar   := highBar
+            break
+
+int sweepLowLevelCount = array.size(sweepStoredLowLevels)
+if sweepLowLevelCount > 0
+    for i = sweepLowLevelCount - 1 to 0
+        float lowLevel = array.get(sweepStoredLowLevels, i)
+        int   lowBar   = array.get(sweepStoredLowBars, i)
+        if lowBar < bar_index and low < lowLevel and not na(sweepMinDistancePx) and (lowLevel - low) >= sweepMinDistancePx
+            sweptLowLevel := lowLevel
+            sweptLowBar   := lowBar
+            break
+
+bool sweepBearishReclaim =
+     not na(sweptHighLevel) and
+     (
+         sweepReclaimRule == "Close Back Inside" ?
+         close < sweptHighLevel :
+         close < sweptHighLevel and close < (high + low) / 2.0
+     )
+
+bool sweepBullishReclaim =
+     not na(sweptLowLevel) and
+     (
+         sweepReclaimRule == "Close Back Inside" ?
+         close > sweptLowLevel :
+         close > sweptLowLevel and close > (high + low) / 2.0
+     )
+
+bool validSellSweep =
+     not na(sweptHighLevel) and
+     sweepBearishReclaim and
+     sweepUpperWickPercent >= sweepMinWickPercent and
+     sweepBodyPercent <= sweepMaxBodyPercent and
+     not na(sweepMinRangePx) and
+     sweepCandleRange >= sweepMinRangePx
+
+bool validBuySweep =
+     not na(sweptLowLevel) and
+     sweepBullishReclaim and
+     sweepLowerWickPercent >= sweepMinWickPercent and
+     sweepBodyPercent <= sweepMaxBodyPercent and
+     not na(sweepMinRangePx) and
+     sweepCandleRange >= sweepMinRangePx
+
+var int   sweepPendingBullBar = na
+var float sweepPendingBullMid = na
+
+var int   sweepPendingBearBar = na
+var float sweepPendingBearMid = na
+
+if validBuySweep
+    sweepPendingBullBar := bar_index
+    sweepPendingBullMid := (high + low) / 2.0
+
+if validSellSweep
+    sweepPendingBearBar := bar_index
+    sweepPendingBearMid := (high + low) / 2.0
+
+bool sweepBullWindowOpen = not na(sweepPendingBullBar) and (bar_index - sweepPendingBullBar <= sweepConfirmationWindow)
+bool sweepBearWindowOpen = not na(sweepPendingBearBar) and (bar_index - sweepPendingBearBar <= sweepConfirmationWindow)
+
+// "No counter-trend" gate: local EMA 20 / EMA 50 stack.
+bool sweepLocalLongOk  = close > emaFast and close > emaSlow
+bool sweepLocalShortOk = close < emaFast and close < emaSlow
+
+// "No counter-trend" gate: LMSE-Lite's own Directional Quality regime.
+bool sweepMacroLongOk  = dq > 0.0 and dqStrength >= minDQStrength
+bool sweepMacroShortOk = dq < 0.0 and dqStrength >= minDQStrength
+
+bool sweepBullBodyOk = not sweepRequireBullishBody or close > open
+bool sweepBearBodyOk = not sweepRequireBearishBody or close < open
+bool sweepBullMidOk  = not sweepRequireMidlineBreak or close > sweepPendingBullMid
+bool sweepBearMidOk  = not sweepRequireMidlineBreak or close < sweepPendingBearMid
+
+bool sweepBuyConfirmed =
+     sweepBullWindowOpen and
+     sweepBullBodyOk and
+     sweepLocalLongOk and
+     sweepMacroLongOk and
+     sweepBullMidOk
+
+bool sweepSellConfirmed =
+     sweepBearWindowOpen and
+     sweepBearBodyOk and
+     sweepLocalShortOk and
+     sweepMacroShortOk and
+     sweepBearMidOk
+
+var int sweepLastSignalBar = na
+bool sweepSpacingOK = na(sweepLastSignalBar) or (bar_index - sweepLastSignalBar > sweepSignalSpacingBars)
+
+bool sweepBuySignal  = sweepBuyConfirmed and sweepSpacingOK
+bool sweepSellSignal = sweepSellConfirmed and sweepSpacingOK and not sweepBuySignal
+
+if sweepBuySignal or sweepSellSignal
+    sweepLastSignalBar := bar_index
+
+if sweepBuySignal or (not na(sweepPendingBullBar) and bar_index - sweepPendingBullBar > sweepConfirmationWindow)
+    sweepPendingBullBar := na
+    sweepPendingBullMid := na
+
+if sweepSellSignal or (not na(sweepPendingBearBar) and bar_index - sweepPendingBearBar > sweepConfirmationWindow)
+    sweepPendingBearBar := na
+    sweepPendingBearMid := na
+
+// Liquidity Sweep mode is evaluated directly, the same way EMA Cross
+// is above, because the sweep already carries its own time-boxed
+// confirmation window (sweepConfirmationWindow) — waiting for a
+// separate setup counter on top of that would make an already-timed
+// signal late.
+bool directLongSweepSetup =
+     allowLong and
+     commonSetupPass and
+     longEMAAligned and
+     longDIAligned and
+     longPriceAligned and
+     sweepBuySignal
+
+bool directShortSweepSetup =
+     allowShort and
+     commonSetupPass and
+     shortEMAAligned and
+     shortDIAligned and
+     shortPriceAligned and
+     sweepSellSignal
+
 bool delayedLongTriggerFresh =
      longSetupAge == 0 or
      (
@@ -1056,16 +1342,20 @@ bool shortFreshTriggerPass =
 bool longTriggerQualified =
      entryTriggerMode == "EMA Cross"
          ? directLongCrossSetup
-         : longEntryWindowOpen and
-           longSelectedTrigger and
-           longFreshTriggerPass
+         : entryTriggerMode == "Liquidity Sweep"
+             ? directLongSweepSetup
+             : longEntryWindowOpen and
+               longSelectedTrigger and
+               longFreshTriggerPass
 
 bool shortTriggerQualified =
      entryTriggerMode == "EMA Cross"
          ? directShortCrossSetup
-         : shortEntryWindowOpen and
-           shortSelectedTrigger and
-           shortFreshTriggerPass
+         : entryTriggerMode == "Liquidity Sweep"
+             ? directShortSweepSetup
+             : shortEntryWindowOpen and
+               shortSelectedTrigger and
+               shortFreshTriggerPass
 
 // ═══════════════════════════════════════════════════════════════════
 // CANDIDATE STOPS AND ORDER SIZE
@@ -1163,6 +1453,7 @@ string longBlocker =
      not longPriceAligned ? "PRICE / EMA" :
      not failurePass ? "FAIL RISK" :
      entryTriggerMode != "EMA Cross" and
+     entryTriggerMode != "Liquidity Sweep" and
      not longEntryWindowOpen ? "NO FRESH SETUP" :
      not longTriggerQualified ? "NO TRIGGER" :
      not longExtensionPass ? "ENTRY EXTENDED" :
@@ -1190,6 +1481,7 @@ string shortBlocker =
      not shortPriceAligned ? "PRICE / EMA" :
      not failurePass ? "FAIL RISK" :
      entryTriggerMode != "EMA Cross" and
+     entryTriggerMode != "Liquidity Sweep" and
      not shortEntryWindowOpen ? "NO FRESH SETUP" :
      not shortTriggerQualified ? "NO TRIGGER" :
      not shortExtensionPass ? "ENTRY EXTENDED" :
@@ -1685,6 +1977,22 @@ plotshape(
      color = color.new(C_PURPLE, 60),
      size = size.tiny)
 
+plotshape(
+     showSweepMarkers and validBuySweep,
+     title = "Raw Bull Sweep",
+     style = shape.circle,
+     location = location.belowbar,
+     color = color.new(C_GREEN, 40),
+     size = size.tiny)
+
+plotshape(
+     showSweepMarkers and validSellSweep,
+     title = "Raw Bear Sweep",
+     style = shape.circle,
+     location = location.abovebar,
+     color = color.new(C_RED, 40),
+     size = size.tiny)
+
 // ═══════════════════════════════════════════════════════════════════
 // DASHBOARD
 // ═══════════════════════════════════════════════════════════════════
@@ -1708,7 +2016,7 @@ dashboardTextSize =
 var table dashboard = table.new(
      position = resolvedDashboardPosition,
      columns = 2,
-     rows = 16,
+     rows = 17,
      bgcolor = C_NAVY,
      border_width = 1,
      border_color = color.rgb(55, 72, 95),
@@ -1871,13 +2179,27 @@ color alertsStatusColor =
          ? C_RED
          : C_GREEN
 
+string sweepTrendText =
+     sweepLocalLongOk
+         ? "ABOVE 20/50"
+         : sweepLocalShortOk
+             ? "BELOW 20/50"
+             : "MIXED"
+
+color sweepTrendColor =
+     sweepLocalLongOk
+         ? C_BLUE
+         : sweepLocalShortOk
+             ? C_PURPLE
+             : C_GRAY
+
 if showDashboard and barstate.islast
     table.clear(
          dashboard,
          0,
          0,
          1,
-         15)
+         16)
 
     f_dashboardRow(
          0,
@@ -1996,13 +2318,19 @@ if showDashboard and barstate.islast
          alertsStatusText,
          alertsStatusColor)
 
+    f_dashboardRow(
+         16,
+         "SWEEP TREND",
+         sweepTrendText,
+         sweepTrendColor)
+
 if not showDashboard and barstate.islast
     table.clear(
          dashboard,
          0,
          0,
          1,
-         15)
+         16)
 
 // ═══════════════════════════════════════════════════════════════════
 // ALERT CONDITIONS
