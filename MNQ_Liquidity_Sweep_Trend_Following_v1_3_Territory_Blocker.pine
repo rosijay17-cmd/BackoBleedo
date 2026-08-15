@@ -1,0 +1,1168 @@
+//@version=6
+strategy(
+     title="MNQ Liquidity Sweep Trend Following v1.3 - Territory Blocker",
+     shorttitle="MNQ LSTF v1.3",
+     overlay=true,
+     pyramiding=0,
+     initial_capital=50000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=2.50,
+     slippage=1,
+     process_orders_on_close=true,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false,
+     max_bars_back=5000,
+     max_labels_count=300,
+     max_lines_count=100,
+     max_boxes_count=200
+)
+
+//=============================================================================
+// LIQUIDITY-SWEEP TREND-FOLLOWING STRATEGY
+//=============================================================================
+// Intended starting point: MNQ on a 5-minute chart.
+//
+// Long sequence:
+//   confirmed pivot low -> ATR-sized sweep below it -> close back above it
+//   -> later bullish confirmation -> trend + volume pressure + DI/ADX agree
+//
+// Short sequence is the exact inverse.
+//
+// Important design choices:
+//   - Entries only occur on confirmed bar closes.
+//   - Sequence-safe mode requires confirmation on a later completed candle.
+//   - Base mode retains swept pivots exactly as the source does.
+//   - Higher-timeframe filters use only the prior completed HTF candle.
+//   - "Volume pressure" is an OHLCV allocation estimate, not bid/ask delta.
+//   - The dashboard reports the first active entry blocker.
+//
+// Base sequence:
+//   sweep closes -> arm setup -> next confirmed candle clears midpoint
+//   -> enter immediately -> attach 1.5 ATR stop and 3R target.
+// Risk-distance limits never veto a valid base-mode entry.
+//
+// v1.3 execution territory:
+//   - The sweep and confirmation sequence is unchanged.
+//   - EMA20 above EMA50 with a rising EMA50 establishes BULL territory.
+//   - EMA20 below EMA50 with a falling EMA50 establishes BEAR territory.
+//   - Territory persists through ordinary pullbacks and changes only after
+//     the opposite condition remains confirmed for the selected bar count.
+//   - BULL territory denies shorts; BEAR territory denies longs.
+//   - A denied confirmation is recorded and consumed. It cannot become a
+//     delayed or stale entry on a later candle.
+//=============================================================================
+
+
+//=============================================================================
+// 01. INPUT GROUPS
+//=============================================================================
+
+const string G_PARITY = "00 - Source Parity"
+const string G_SESSION = "01 - Session and Limits"
+const string G_SWEEP = "02 - Liquidity Sweep"
+const string G_CONFIRM = "03 - Entry Confirmation"
+const string G_TREND = "04 - Trend Filters"
+const string G_TERRITORY = "05 - Execution Territory Blocker"
+const string G_VOLUME = "06 - Bull/Bear Volume Pressure"
+const string G_DI = "07 - DI and ADX"
+const string G_RISK = "08 - Risk Management"
+const string G_AUTOMATION = "09 - Automation"
+const string G_DISPLAY = "10 - Dashboard and Display"
+
+bool sourceParityMode = input.bool(true, "SEQUENCE-SAFE BASE MODE", tooltip="ON enforces sweep -> next confirmed candle -> entry. The stop is always 1.5 ATR and cannot veto the entry. Extra HTF, pressure, DI, session and management features remain diagnostic only until this is turned OFF.", group=G_PARITY)
+
+
+//=============================================================================
+// 02. SESSION AND LIMIT INPUTS
+//=============================================================================
+
+string sessionTimezone = input.string("America/New_York", "Session Timezone", group=G_SESSION)
+string tradingSession = input.session("0930-1600", "Trading Session", group=G_SESSION)
+string entrySession = input.session("0935-1530", "Entry Window", group=G_SESSION)
+bool useEntrySession = input.bool(false, "Restrict Signals To Entry Window", tooltip="OFF matches the supplied source, which evaluates signals across the full chart.", group=G_SESSION)
+bool closeAtSessionEnd = input.bool(false, "Close At Session End", group=G_SESSION)
+bool requireMNQ = input.bool(true, "Require MNQ Symbol", group=G_SESSION)
+bool require5mChart = input.bool(true, "Require 5-Minute Chart", group=G_SESSION)
+int maximumTradesPerDay = input.int(100, "Maximum Trades Per Day", minval=1, maxval=100, tooltip="Default is intentionally nonrestrictive for source parity. Lower this after signal behavior is verified.", group=G_SESSION)
+int signalCooldownBars = input.int(10, "Cooldown Bars Between Signals", minval=0, maxval=200, group=G_SESSION)
+
+
+//=============================================================================
+// 03. LIQUIDITY-SWEEP INPUTS
+//=============================================================================
+
+int pivotLength = input.int(5, "Swing Pivot Length", minval=1, maxval=20, group=G_SWEEP)
+int storedLevels = input.int(20, "Stored Liquidity Levels", minval=5, maxval=100, group=G_SWEEP)
+float minimumSweepATR = input.float(0.10, "Minimum Sweep Distance / ATR", minval=0.01, maxval=2.0, step=0.01, group=G_SWEEP)
+string reclaimRule = input.string("Close Back Inside", "Reclaim Rule", options=["Close Back Inside", "Strong Reclaim"], group=G_SWEEP)
+float minimumWickPercent = input.float(0.35, "Minimum Rejection Wick %", minval=0.0, maxval=1.0, step=0.01, group=G_SWEEP)
+float maximumBodyPercent = input.float(0.65, "Maximum Sweep Body %", minval=0.05, maxval=1.0, step=0.01, group=G_SWEEP)
+float minimumCandleRangeATR = input.float(0.20, "Minimum Sweep Range / ATR", minval=0.01, maxval=5.0, step=0.05, group=G_SWEEP)
+
+
+//=============================================================================
+// 04. CONFIRMATION INPUTS
+//=============================================================================
+
+int confirmationWindow = input.int(2, "Maximum Bars After Sweep", minval=0, maxval=10, group=G_CONFIRM)
+string confirmationReference = input.string("Sweep Midpoint", "Confirmation Reference", options=["Sweep Midpoint", "Sweep Extreme"], group=G_CONFIRM)
+bool requireDirectionalBody = input.bool(true, "Require Directional Confirmation Bar", group=G_CONFIRM)
+bool allowSweepBarConfirmation = input.bool(false, "Allow Confirmation On Sweep Bar", tooltip="Used only when Sequence-Safe Base Mode is OFF. Base mode always waits for a later confirmed candle.", group=G_CONFIRM)
+bool consumeSweptLevels = input.bool(false, "Consume Level After Valid Sweep", tooltip="OFF reproduces the supplied indicator. Turn ON to prevent reuse of the same pivot level.", group=G_CONFIRM)
+
+
+//=============================================================================
+// 05. TREND FILTER INPUTS
+//=============================================================================
+
+bool useLocalTrend = input.bool(true, "Use Local EMA Trend", group=G_TREND)
+string localTrendMode = input.string("Source EMA-50", "Local Trend Mode", options=["Source EMA-50", "EMA Stack"], group=G_TREND)
+int localFastLength = input.int(20, "Local Fast EMA", minval=2, group=G_TREND)
+int localSlowLength = input.int(50, "Local Slow EMA", minval=3, group=G_TREND)
+int localSlopeLookback = input.int(3, "Local Fast EMA Slope Lookback", minval=1, maxval=20, group=G_TREND)
+
+bool useHTFTrend = input.bool(false, "Use Confirmed HTF Trend", tooltip="OFF preserves source signals. Turn ON after parity is confirmed.", group=G_TREND)
+string trendTimeframe = input.timeframe("15", "Trend Timeframe", group=G_TREND)
+int htfFastLength = input.int(20, "HTF Fast EMA", minval=2, group=G_TREND)
+int htfSlowLength = input.int(50, "HTF Slow EMA", minval=3, group=G_TREND)
+int htfSlopeLookback = input.int(2, "HTF Fast EMA Slope Lookback", minval=1, maxval=20, group=G_TREND)
+
+
+//=============================================================================
+// 06. EXECUTION-TERRITORY INPUTS
+//=============================================================================
+
+bool useTerritoryBlocker = input.bool(true, "Block Countertrend Executions", tooltip="Leaves the sweep and confirmation sequence unchanged. In established bull territory, only shorts are denied. In established bear territory, only longs are denied.", group=G_TERRITORY)
+int territorySlopeLookback = input.int(5, "EMA-50 Slope Lookback", minval=1, maxval=50, group=G_TERRITORY)
+int territoryConfirmationBars = input.int(2, "Bars To Confirm Territory", minval=1, maxval=10, tooltip="The opposite EMA condition must remain true for this many confirmed chart bars before the persistent territory changes direction.", group=G_TERRITORY)
+bool showBlockedMarkers = input.bool(true, "Show Blocked Confirmation Markers", tooltip="BL means a long confirmation was denied in bear territory. BS means a short confirmation was denied in bull territory.", group=G_TERRITORY)
+
+
+//=============================================================================
+// 07. VOLUME-PRESSURE INPUTS
+//=============================================================================
+
+bool useVolumePressure = input.bool(false, "Enforce Bull/Bear Volume Pressure", tooltip="The pressure calculation and dashboard remain active when this filter is OFF.", group=G_VOLUME)
+int pressureLength = input.int(14, "Pressure Lookback", minval=2, maxval=100, group=G_VOLUME)
+float minimumPressureScore = input.float(5.0, "Minimum Signed Pressure Score", minval=0.0, maxval=100.0, step=1.0, group=G_VOLUME, tooltip="Longs require score at or above this value; shorts require score at or below its negative. This is an OHLCV estimate, not true bid/ask delta.")
+
+
+//=============================================================================
+// 08. DI / ADX INPUTS
+//=============================================================================
+
+bool useDIFilter = input.bool(false, "Enforce DI Score Filter", tooltip="DI score and ADX remain visible when this filter is OFF.", group=G_DI)
+int diLength = input.int(14, "DI Length", minval=2, maxval=100, group=G_DI)
+int adxSmoothing = input.int(14, "ADX Smoothing", minval=2, maxval=100, group=G_DI)
+float minimumDIScore = input.float(5.0, "Minimum Absolute DI Score", minval=0.0, maxval=100.0, step=1.0, group=G_DI)
+float minimumADX = input.float(18.0, "Minimum ADX", minval=0.0, maxval=100.0, step=0.5, group=G_DI)
+
+
+//=============================================================================
+// 08B. CHOP FILTER INPUTS
+//=============================================================================
+
+bool useChopFilter = input.bool(true, "Enforce Chop Filter", tooltip="Blocks ALL new confirmations (long and short) while the market lacks trend strength or is showing high choppiness. This is a risk control, not a source-signal fidelity setting, so it is NOT bypassed by Sequence-Safe Base Mode.", group=G_DI)
+float chopMinimumADX = input.float(15.0, "Minimum ADX (Chop Filter)", minval=0.0, maxval=100.0, step=0.5, tooltip="Reuses the ADX value computed above with its own threshold. Blocks new confirmations while ADX is below this level -- the market isn't trending enough for a breakout/reclaim to be reliable.", group=G_DI)
+int chopLength = input.int(14, "Choppiness Index Length", minval=2, maxval=100, group=G_DI)
+float chopMaximum = input.float(61.8, "Maximum Choppiness Index", minval=0.0, maxval=100.0, step=0.1, tooltip="Blocks new confirmations while the Choppiness Index is above this level -- high readings mean range-bound, non-directional price action. 61.8 is the traditional threshold.", group=G_DI)
+
+
+//=============================================================================
+// 09. RISK INPUTS
+//=============================================================================
+
+int contracts = input.int(1, "MNQ Contracts", minval=1, maxval=1, tooltip="Intentionally capped at one contract for the base model.", group=G_RISK)
+int atrLength = input.int(14, "ATR Length", minval=2, group=G_RISK)
+string stopMode = input.string("Source ATR", "Initial Stop Mode", options=["Source ATR", "Sweep Structure", "Wider Of ATR / Structure"], group=G_RISK)
+float stopLossATRMultiplier = input.float(1.50, "Source Stop Loss ATR Multiplier", minval=0.10, maxval=10.0, step=0.10, group=G_RISK)
+float sweepStopBufferATR = input.float(0.10, "Stop Buffer Beyond Sweep / ATR", minval=0.0, maxval=2.0, step=0.05, group=G_RISK)
+int minimumStopTicks = input.int(4, "Minimum Stop Distance / Ticks", minval=1, maxval=200, group=G_RISK)
+float maximumStopATR = input.float(3.0, "Maximum Stop Distance / ATR", minval=0.25, maxval=10.0, step=0.25, group=G_RISK)
+float targetR = input.float(3.0, "Profit Target / R", minval=0.25, maxval=10.0, step=0.25, group=G_RISK)
+
+bool useBreakEven = input.bool(false, "Use Break-Even", tooltip="OFF matches the supplied source projection.", group=G_RISK)
+float breakEvenAtR = input.float(1.0, "Break-Even Trigger / R", minval=0.25, maxval=5.0, step=0.25, group=G_RISK)
+int breakEvenOffsetTicks = input.int(1, "Break-Even Offset / Ticks", minval=0, maxval=20, group=G_RISK)
+
+bool useATRTrendTrail = input.bool(false, "Use ATR Trend Trail", tooltip="OFF matches the supplied source projection.", group=G_RISK)
+float trailActivationR = input.float(1.5, "Trail Activation / R", minval=0.25, maxval=10.0, step=0.25, group=G_RISK)
+float trailATRMultiple = input.float(1.5, "Trailing ATR Multiple", minval=0.25, maxval=10.0, step=0.25, group=G_RISK)
+
+bool useTimeExit = input.bool(false, "Use Maximum Holding Time", tooltip="OFF matches the supplied source projection.", group=G_RISK)
+int maximumHoldingBars = input.int(24, "Maximum Holding Bars", minval=1, maxval=500, group=G_RISK)
+
+
+//=============================================================================
+// 10. AUTOMATION AND DISPLAY INPUTS
+//=============================================================================
+
+bool automationArmed = input.bool(false, "Webhook Automation Armed", tooltip="Dashboard reminder only. Keep OFF until the strategy has been tested in simulation and your broker bridge alert is configured.", group=G_AUTOMATION)
+bool showDashboard = input.bool(true, "Show Dashboard", group=G_DISPLAY)
+bool showEMAs = input.bool(false, "Show Local EMAs", tooltip="OFF matches the supplied source display.", group=G_DISPLAY)
+bool showLiquidityLevels = input.bool(false, "Show Latest Pivot Liquidity", group=G_DISPLAY)
+bool showTradeProjection = input.bool(true, "Show Entry / Target / Invalidation Projection", group=G_DISPLAY)
+bool showDebugMarkers = input.bool(false, "Show Debug Markers", group=G_DISPLAY)
+
+
+//=============================================================================
+// 10. COLORS AND HELPERS
+//=============================================================================
+
+color C_BULL = color.rgb(0, 145, 255)
+color C_BEAR = color.rgb(165, 85, 235)
+color C_CYAN = color.rgb(34, 211, 238)
+color C_READY = color.rgb(20, 185, 105)
+color C_WAIT = color.rgb(245, 155, 25)
+color C_STOP = color.rgb(240, 65, 80)
+color C_NEUTRAL = color.rgb(95, 110, 130)
+color C_PANEL = color.rgb(13, 18, 27)
+color C_PANEL_ALT = color.rgb(18, 25, 36)
+color C_BORDER = color.rgb(44, 57, 76)
+
+f_safeDiv(float numerator, float denominator, float fallback) =>
+    denominator != 0.0 ? numerator / denominator : fallback
+
+f_price(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+f_signed(float value) =>
+    na(value) ? "-" : (value > 0 ? "+" : "") + str.tostring(value, "#.0")
+
+f_trendName(bool bull, bool bear) =>
+    bull ? "BULL" : bear ? "BEAR" : "NEUTRAL"
+
+f_sessionEndMOD(string sessionValue) =>
+    int(str.tonumber(str.substring(sessionValue, 5, 7))) * 60 + int(str.tonumber(str.substring(sessionValue, 7, 9)))
+
+f_qualityScore(float wickPct, float bodyPct, float rangeATR, bool emaPass, bool reclaimPass, bool midPass) =>
+    float wickScore = minimumWickPercent > 0 ? math.max(0.0, math.min(32.0, wickPct / minimumWickPercent * 32.0)) : 32.0
+    float bodyScore = maximumBodyPercent > 0 ? math.max(0.0, math.min(24.0, (maximumBodyPercent - bodyPct) / maximumBodyPercent * 24.0)) : 24.0
+    float rangeScore = minimumCandleRangeATR > 0 ? math.max(0.0, math.min(18.0, rangeATR / minimumCandleRangeATR * 18.0)) : 18.0
+    float emaScore = emaPass ? 10.0 : 0.0
+    float reclaimScore = reclaimPass ? 10.0 : 0.0
+    float midScore = midPass ? 6.0 : 0.0
+    math.max(0.0, math.min(100.0, wickScore + bodyScore + rangeScore + emaScore + reclaimScore + midScore))
+
+
+//=============================================================================
+// 11. ENVIRONMENT AND SESSION STATE
+//=============================================================================
+
+bool chartIs5m = timeframe.isminutes and timeframe.multiplier == 5
+bool symbolIsMNQ = str.contains(str.upper(syminfo.root), "MNQ") or str.contains(str.upper(syminfo.ticker), "MNQ")
+bool environmentValid = (not require5mChart or chartIs5m) and (not requireMNQ or symbolIsMNQ)
+
+bool inTradingSession = not na(time(timeframe.period, tradingSession, sessionTimezone))
+bool inEntrySession = not na(time(timeframe.period, entrySession, sessionTimezone))
+// FIX: entrySessionPass was previously bypassed with `sourceParityMode or ...`,
+// which meant the entry-window restriction silently did nothing whenever
+// Sequence-Safe Base Mode was ON (the default). Restricting WHEN a valid
+// signal is allowed to execute does not change the sweep/confirmation
+// signal logic itself, so this is a risk control, not a parity setting --
+// it must not be bypassed by sourceParityMode.
+bool entrySessionPass = not useEntrySession or inEntrySession
+
+int sessionEndMOD = f_sessionEndMOD(tradingSession)
+int barCloseMOD = hour(time_close, sessionTimezone) * 60 + minute(time_close, sessionTimezone)
+bool finalSessionBar = inTradingSession and barCloseMOD == sessionEndMOD
+
+int dayId = year(time, sessionTimezone) * 10000 + month(time, sessionTimezone) * 100 + dayofmonth(time, sessionTimezone)
+bool newSessionDay = barstate.isfirst or dayId != dayId[1]
+
+var label environmentWarning = na
+
+if barstate.isfirst and not environmentValid
+    string warningText = require5mChart and not chartIs5m ? "Use a 5-minute chart or disable Require 5-Minute Chart." : "Use MNQ or disable Require MNQ Symbol."
+    environmentWarning := label.new(bar_index, high, warningText, style=label.style_label_down, color=C_STOP, textcolor=color.white)
+
+
+//=============================================================================
+// 12. LOCAL AND CONFIRMED HTF TREND
+//=============================================================================
+
+float localFastEMA = ta.ema(close, localFastLength)
+float localSlowEMA = ta.ema(close, localSlowLength)
+float localFastSlope = localFastEMA - localFastEMA[localSlopeLookback]
+
+bool localBullTrend = (sourceParityMode or localTrendMode == "Source EMA-50") ? close > localSlowEMA : close > localFastEMA and localFastEMA > localSlowEMA and localFastSlope > 0
+bool localBearTrend = (sourceParityMode or localTrendMode == "Source EMA-50") ? close < localSlowEMA : close < localFastEMA and localFastEMA < localSlowEMA and localFastSlope < 0
+
+f_confirmedHTFTrend() =>
+    float fast = ta.ema(close, htfFastLength)
+    float slow = ta.ema(close, htfSlowLength)
+    [close[1], fast[1], slow[1], (fast - fast[htfSlopeLookback])[1]]
+
+[confirmedHTFClose, confirmedHTFFast, confirmedHTFSlow, confirmedHTFSlope] = request.security(
+     syminfo.tickerid,
+     trendTimeframe,
+     f_confirmedHTFTrend(),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on
+)
+
+bool htfBullTrend = not na(confirmedHTFFast) and confirmedHTFClose > confirmedHTFFast and confirmedHTFFast > confirmedHTFSlow and confirmedHTFSlope > 0
+bool htfBearTrend = not na(confirmedHTFFast) and confirmedHTFClose < confirmedHTFFast and confirmedHTFFast < confirmedHTFSlow and confirmedHTFSlope < 0
+
+bool longTrendPass = sourceParityMode ? close > localSlowEMA : (not useLocalTrend or localBullTrend) and (not useHTFTrend or htfBullTrend)
+bool shortTrendPass = sourceParityMode ? close < localSlowEMA : (not useLocalTrend or localBearTrend) and (not useHTFTrend or htfBearTrend)
+
+
+//=============================================================================
+// 13. PERSISTENT EXECUTION TERRITORY
+//=============================================================================
+// This layer controls execution permission only. It does not participate in
+// pivot storage, sweep detection, reclaim validation, confirmation timing,
+// quality scoring, stop calculation, or target calculation.
+//
+// Territory changes only after the opposite EMA-stack condition is confirmed
+// for N consecutive completed bars. Mixed/pullback bars retain the last
+// established territory, preventing a single retracement from authorizing a
+// countertrend trade.
+//
+// FIX: territory bar-counting now freezes during confirmed chop (see the
+// CHOP FILTER section below for chopFilterPass). A whipsawing EMA-50 slope
+// during a genuinely choppy stretch was able to flip the persistent
+// territory back and forth, which is exactly the counter-trend blocker
+// failing at the moment it matters most. Freezing the counter during chop
+// keeps the last established territory intact instead of degrading it.
+
+bool bullTerritoryCandidate = not na(localSlowEMA[territorySlopeLookback]) and localFastEMA > localSlowEMA and localSlowEMA > localSlowEMA[territorySlopeLookback]
+bool bearTerritoryCandidate = not na(localSlowEMA[territorySlopeLookback]) and localFastEMA < localSlowEMA and localSlowEMA < localSlowEMA[territorySlopeLookback]
+
+var int bullTerritoryBars = 0
+var int bearTerritoryBars = 0
+var int executionTerritory = 0
+
+
+//=============================================================================
+// 14. BULL / BEAR VOLUME PRESSURE
+//=============================================================================
+// This estimates where volume was exerted from the candle's close location.
+// It is useful on ordinary TradingView OHLCV feeds but is not true order-flow
+// delta because historical bid/ask aggressor volume is not available here.
+
+float pressureRange = math.max(high - low, syminfo.mintick)
+float bullVolumeEstimate = volume * f_safeDiv(close - low, pressureRange, 0.5)
+float bearVolumeEstimate = volume * f_safeDiv(high - close, pressureRange, 0.5)
+
+float bullVolumeSum = math.sum(bullVolumeEstimate, pressureLength)
+float bearVolumeSum = math.sum(bearVolumeEstimate, pressureLength)
+float totalPressureVolume = bullVolumeSum + bearVolumeSum
+
+float bullPressurePercent = totalPressureVolume > 0 ? bullVolumeSum / totalPressureVolume * 100.0 : na
+float bearPressurePercent = totalPressureVolume > 0 ? bearVolumeSum / totalPressureVolume * 100.0 : na
+float volumePressureScore = totalPressureVolume > 0 ? (bullVolumeSum - bearVolumeSum) / totalPressureVolume * 100.0 : na
+
+bool longPressurePass = sourceParityMode or not useVolumePressure or (not na(volumePressureScore) and volumePressureScore >= minimumPressureScore)
+bool shortPressurePass = sourceParityMode or not useVolumePressure or (not na(volumePressureScore) and volumePressureScore <= -minimumPressureScore)
+
+
+//=============================================================================
+// 15. DIRECTIONAL-INDEX SCORE
+//=============================================================================
+// Signed score is normalized to -100..+100:
+//   +100 = maximum +DI dominance; -100 = maximum -DI dominance.
+
+[plusDI, minusDI, adx] = ta.dmi(diLength, adxSmoothing)
+float diDenominator = plusDI + minusDI
+float diScore = diDenominator > 0 ? (plusDI - minusDI) / diDenominator * 100.0 : na
+
+bool longDIPass = sourceParityMode or not useDIFilter or (not na(diScore) and not na(adx) and plusDI > minusDI and diScore >= minimumDIScore and adx >= minimumADX)
+bool shortDIPass = sourceParityMode or not useDIFilter or (not na(diScore) and not na(adx) and minusDI > plusDI and diScore <= -minimumDIScore and adx >= minimumADX)
+
+
+//=============================================================================
+// 15B. CHOP FILTER
+//=============================================================================
+// Two independent chop lenses that apply to BOTH directions equally (chop is
+// a market-state condition, not a directional one): ADX (reused from
+// section 15, own threshold) measures trend strength, the Choppiness Index
+// measures how range-bound the last chopLength bars have been. Either one
+// failing blocks new confirmations. This is deliberately NOT bypassed by
+// sourceParityMode -- it is a risk control layered on top of the source
+// signal, same as the daily trade limit and entry window.
+
+float chopTrueRange = ta.tr(true)
+float chopRangeSum = math.sum(chopTrueRange, chopLength)
+float chopHighest = ta.highest(high, chopLength)
+float chopLowest = ta.lowest(low, chopLength)
+float chopRange = chopHighest - chopLowest
+float chopValue = chopRange > 0 and chopLength > 1 ? 100.0 * math.log10(chopRangeSum / chopRange) / math.log10(chopLength) : na
+
+bool chopFilterPass = not useChopFilter or (not na(adx) and adx >= chopMinimumADX and (na(chopValue) or chopValue <= chopMaximum))
+
+if barstate.isconfirmed
+    bool territoryUpdateAllowed = not useChopFilter or chopFilterPass
+
+    if territoryUpdateAllowed
+        bullTerritoryBars := bullTerritoryCandidate ? bullTerritoryBars + 1 : 0
+        bearTerritoryBars := bearTerritoryCandidate ? bearTerritoryBars + 1 : 0
+
+        if bullTerritoryBars >= territoryConfirmationBars
+            executionTerritory := 1
+        else if bearTerritoryBars >= territoryConfirmationBars
+            executionTerritory := -1
+
+bool longTerritoryPass = not useTerritoryBlocker or executionTerritory != -1
+bool shortTerritoryPass = not useTerritoryBlocker or executionTerritory != 1
+
+
+//=============================================================================
+// 16. ATR AND SWEEP-CANDLE QUALITY
+//=============================================================================
+
+float atr = ta.atr(atrLength)
+float candleRange = math.max(high - low, syminfo.mintick)
+float candleBody = math.abs(close - open)
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+
+float bodyPercent = candleBody / candleRange
+float upperWickPercent = upperWick / candleRange
+float lowerWickPercent = lowerWick / candleRange
+float candleRangeATR = not na(atr) and atr > 0 ? candleRange / atr : na
+float minimumSweepDistance = not na(atr) ? atr * minimumSweepATR : na
+
+bool commonSweepQuality = barstate.isconfirmed and environmentValid and entrySessionPass and not na(candleRangeATR) and bodyPercent <= maximumBodyPercent and candleRangeATR >= minimumCandleRangeATR
+
+
+//=============================================================================
+// 17. CONFIRMED PIVOTS AND LIQUIDITY STORAGE
+//=============================================================================
+
+float pivotHigh = ta.pivothigh(high, pivotLength, pivotLength)
+float pivotLow = ta.pivotlow(low, pivotLength, pivotLength)
+
+var array<float> highLevels = array.new_float()
+var array<int> highBars = array.new_int()
+var array<float> lowLevels = array.new_float()
+var array<int> lowBars = array.new_int()
+
+if not na(pivotHigh)
+    array.push(highLevels, pivotHigh)
+    array.push(highBars, bar_index - pivotLength)
+    if array.size(highLevels) > storedLevels
+        array.shift(highLevels)
+        array.shift(highBars)
+
+if not na(pivotLow)
+    array.push(lowLevels, pivotLow)
+    array.push(lowBars, bar_index - pivotLength)
+    if array.size(lowLevels) > storedLevels
+        array.shift(lowLevels)
+        array.shift(lowBars)
+
+float latestHighLiquidity = array.size(highLevels) > 0 ? array.get(highLevels, array.size(highLevels) - 1) : na
+float latestLowLiquidity = array.size(lowLevels) > 0 ? array.get(lowLevels, array.size(lowLevels) - 1) : na
+
+
+//=============================================================================
+// 18. FIND THE MOST RECENT SWEPT LEVEL
+//=============================================================================
+
+float sweptHighLevel = na
+float sweptLowLevel = na
+int sweptHighIndex = na
+int sweptLowIndex = na
+
+int highCount = array.size(highLevels)
+if highCount > 0
+    for i = highCount - 1 to 0
+        float level = array.get(highLevels, i)
+        int levelBar = array.get(highBars, i)
+        if levelBar < bar_index and high > level and not na(minimumSweepDistance) and high - level >= minimumSweepDistance
+            sweptHighLevel := level
+            sweptHighIndex := i
+            break
+
+int lowCount = array.size(lowLevels)
+if lowCount > 0
+    for i = lowCount - 1 to 0
+        float level = array.get(lowLevels, i)
+        int levelBar = array.get(lowBars, i)
+        if levelBar < bar_index and low < level and not na(minimumSweepDistance) and level - low >= minimumSweepDistance
+            sweptLowLevel := level
+            sweptLowIndex := i
+            break
+
+bool bearishReclaim = not na(sweptHighLevel) and close < sweptHighLevel and (reclaimRule == "Close Back Inside" or close < (high + low) / 2.0)
+bool bullishReclaim = not na(sweptLowLevel) and close > sweptLowLevel and (reclaimRule == "Close Back Inside" or close > (high + low) / 2.0)
+
+bool validSellSweep = commonSweepQuality and bearishReclaim and upperWickPercent >= minimumWickPercent
+bool validBuySweep = commonSweepQuality and bullishReclaim and lowerWickPercent >= minimumWickPercent
+
+bool bullEmaOkForScore = close > localSlowEMA
+bool bearEmaOkForScore = close < localSlowEMA
+bool bullMidOkForScore = close > (high + low) / 2.0
+bool bearMidOkForScore = close < (high + low) / 2.0
+
+float buySweepQualityScore = f_qualityScore(lowerWickPercent, bodyPercent, candleRangeATR, bullEmaOkForScore, bullishReclaim, bullMidOkForScore)
+float sellSweepQualityScore = f_qualityScore(upperWickPercent, bodyPercent, candleRangeATR, bearEmaOkForScore, bearishReclaim, bearMidOkForScore)
+
+
+//=============================================================================
+// 19. PENDING SWEEP MEMORY
+//=============================================================================
+
+var int pendingBullSweepBar = na
+var float pendingBullHigh = na
+var float pendingBullLow = na
+var float pendingBullMid = na
+var float pendingBullLevel = na
+var float pendingBullScore = na
+
+var int pendingBearSweepBar = na
+var float pendingBearHigh = na
+var float pendingBearLow = na
+var float pendingBearMid = na
+var float pendingBearLevel = na
+var float pendingBearScore = na
+
+if not sourceParityMode and newSessionDay and barstate.isnew
+    pendingBullSweepBar := na
+    pendingBullHigh := na
+    pendingBullLow := na
+    pendingBullMid := na
+    pendingBullLevel := na
+    pendingBullScore := na
+    pendingBearSweepBar := na
+    pendingBearHigh := na
+    pendingBearLow := na
+    pendingBearMid := na
+    pendingBearLevel := na
+    pendingBearScore := na
+
+// In sequence-safe mode the first qualifying sweep is frozen until it either
+// confirms or expires. A second sweep cannot reset age back to zero.
+if validBuySweep and (not sourceParityMode or (na(pendingBullSweepBar) and strategy.position_size == 0))
+    pendingBullSweepBar := bar_index
+    pendingBullHigh := high
+    pendingBullLow := low
+    pendingBullMid := (high + low) / 2.0
+    pendingBullLevel := sweptLowLevel
+    pendingBullScore := buySweepQualityScore
+
+    if not sourceParityMode and consumeSweptLevels and not na(sweptLowIndex)
+        array.remove(lowLevels, sweptLowIndex)
+        array.remove(lowBars, sweptLowIndex)
+
+if validSellSweep and (not sourceParityMode or (na(pendingBearSweepBar) and strategy.position_size == 0))
+    pendingBearSweepBar := bar_index
+    pendingBearHigh := high
+    pendingBearLow := low
+    pendingBearMid := (high + low) / 2.0
+    pendingBearLevel := sweptHighLevel
+    pendingBearScore := sellSweepQualityScore
+
+    if not sourceParityMode and consumeSweptLevels and not na(sweptHighIndex)
+        array.remove(highLevels, sweptHighIndex)
+        array.remove(highBars, sweptHighIndex)
+
+int minimumConfirmationAge = sourceParityMode ? 1 : allowSweepBarConfirmation ? 0 : 1
+int effectiveConfirmationWindow = sourceParityMode ? math.max(1, confirmationWindow) : confirmationWindow
+
+bool bullPending = not na(pendingBullSweepBar)
+bool bearPending = not na(pendingBearSweepBar)
+int bullPendingAge = bullPending ? bar_index - pendingBullSweepBar : -1
+int bearPendingAge = bearPending ? bar_index - pendingBearSweepBar : -1
+
+bool bullWindowOpen = bullPending and bullPendingAge >= minimumConfirmationAge and bullPendingAge <= effectiveConfirmationWindow
+bool bearWindowOpen = bearPending and bearPendingAge >= minimumConfirmationAge and bearPendingAge <= effectiveConfirmationWindow
+bool bullPendingExpired = bullPending and bullPendingAge > effectiveConfirmationWindow
+bool bearPendingExpired = bearPending and bearPendingAge > effectiveConfirmationWindow
+bool bullPendingInvalidated = not sourceParityMode and bullPending and close < pendingBullLow
+bool bearPendingInvalidated = not sourceParityMode and bearPending and close > pendingBearHigh
+
+float longConfirmationLevel = confirmationReference == "Sweep Extreme" ? pendingBullHigh : pendingBullMid
+float shortConfirmationLevel = confirmationReference == "Sweep Extreme" ? pendingBearLow : pendingBearMid
+
+bool longConfirmationPricePass = bullWindowOpen and close > longConfirmationLevel
+bool shortConfirmationPricePass = bearWindowOpen and close < shortConfirmationLevel
+bool longBodyPass = not requireDirectionalBody or close > open
+bool shortBodyPass = not requireDirectionalBody or close < open
+
+// Dashboard compatibility values. Entry logic remains independently stateful.
+int pendingDirection = bullWindowOpen ? 1 : bearWindowOpen ? -1 : bullPending ? 1 : bearPending ? -1 : 0
+bool pendingSweep = bullPending or bearPending
+int pendingAge = pendingDirection == 1 ? bullPendingAge : pendingDirection == -1 ? bearPendingAge : -1
+bool confirmationWindowOpen = bullWindowOpen or bearWindowOpen
+bool pendingExpired = pendingDirection == 1 ? bullPendingExpired : pendingDirection == -1 ? bearPendingExpired : false
+bool pendingInvalidated = pendingDirection == 1 ? bullPendingInvalidated : pendingDirection == -1 ? bearPendingInvalidated : false
+float pendingLiquidityLevel = pendingDirection == 1 ? pendingBullLevel : pendingDirection == -1 ? pendingBearLevel : na
+float pendingSweepScore = pendingDirection == 1 ? pendingBullScore : pendingDirection == -1 ? pendingBearScore : na
+
+
+//=============================================================================
+// 20. DAILY LIMITS AND COOLDOWN
+//=============================================================================
+
+var int tradesToday = 0
+var int rawConfirmationsToday = 0
+var int blockedConfirmationsToday = 0
+var int lastExitBar = na
+var int lastSignalBar = na
+var int lastOrderBar = na
+
+if newSessionDay and barstate.isnew
+    tradesToday := 0
+    rawConfirmationsToday := 0
+    blockedConfirmationsToday := 0
+
+// FIX: tradeLimitPass was previously `sourceParityMode or tradesToday <
+// maximumTradesPerDay`, which made the daily trade limit a complete no-op
+// whenever Sequence-Safe Base Mode was ON (the default) -- no matter what
+// value the user set. Capping how many of the naturally-occurring source
+// signals get executed does not change the signal logic itself, so this
+// must not be bypassed by sourceParityMode either.
+bool tradeLimitPass = tradesToday < maximumTradesPerDay
+
+// FIX: cooldownPass previously measured bars only since the last RAW
+// confirmation (lastSignalBar). lastExitBar was already being recorded in
+// section 26 but was never read anywhere -- dead code. Since a held trade
+// routinely lasts longer than signalCooldownBars, cooldownPass was already
+// satisfied the instant a trade closed, so the cooldown provided no real
+// protection against re-entering immediately after a stop-out. It now also
+// requires bars since the last CLOSED trade to exceed the cooldown.
+bool cooldownPass = (na(lastSignalBar) or bar_index - lastSignalBar > signalCooldownBars) and (na(lastExitBar) or bar_index - lastExitBar > signalCooldownBars)
+bool noDuplicateOrderThisBar = na(lastOrderBar) or bar_index != lastOrderBar
+bool flat = strategy.position_size == 0
+
+
+//=============================================================================
+// 21. CANDIDATE RISK
+//=============================================================================
+
+float minimumRiskDistance = minimumStopTicks * syminfo.mintick
+float effectiveStopATRMultiplier = sourceParityMode ? 1.50 : stopLossATRMultiplier
+float effectiveTargetR = sourceParityMode ? 3.0 : targetR
+float sourceLongATRStop = not na(atr) ? close - atr * effectiveStopATRMultiplier : na
+float sourceShortATRStop = not na(atr) ? close + atr * effectiveStopATRMultiplier : na
+float structuralLongStop = not na(pendingBullLow) ? pendingBullLow - atr * sweepStopBufferATR : na
+float structuralShortStop = not na(pendingBearHigh) ? pendingBearHigh + atr * sweepStopBufferATR : na
+
+float candidateLongStop = sourceParityMode or stopMode == "Source ATR" ? sourceLongATRStop : stopMode == "Sweep Structure" ? structuralLongStop : math.min(sourceLongATRStop, structuralLongStop)
+float candidateShortStop = sourceParityMode or stopMode == "Source ATR" ? sourceShortATRStop : stopMode == "Sweep Structure" ? structuralShortStop : math.max(sourceShortATRStop, structuralShortStop)
+float candidateLongRisk = not na(candidateLongStop) ? close - candidateLongStop : na
+float candidateShortRisk = not na(candidateShortStop) ? candidateShortStop - close : na
+
+bool longRiskPass = sourceParityMode ? not na(candidateLongRisk) and candidateLongRisk > 0 : not na(candidateLongRisk) and candidateLongRisk >= minimumRiskDistance and not na(atr) and atr > 0 and candidateLongRisk <= atr * maximumStopATR
+bool shortRiskPass = sourceParityMode ? not na(candidateShortRisk) and candidateShortRisk > 0 : not na(candidateShortRisk) and candidateShortRisk >= minimumRiskDistance and not na(atr) and atr > 0 and candidateShortRisk <= atr * maximumStopATR
+
+
+//=============================================================================
+// 22. FINAL ENTRY CONDITIONS AND EXECUTION PERMISSION
+//=============================================================================
+
+bool commonEntryPass = barstate.isconfirmed and environmentValid and entrySessionPass and flat and tradeLimitPass and cooldownPass and noDuplicateOrderThisBar and chopFilterPass
+
+// Raw confirmation preserves the complete v1.2 sequence. The territory layer
+// is intentionally applied only after this raw decision has already formed.
+bool rawLongConfirmation = commonEntryPass and bullWindowOpen and not bullPendingInvalidated and longConfirmationPricePass and longBodyPass and longTrendPass and longPressurePass and longDIPass and longRiskPass
+bool rawShortConfirmation = commonEntryPass and bearWindowOpen and not bearPendingInvalidated and shortConfirmationPricePass and shortBodyPass and shortTrendPass and shortPressurePass and shortDIPass and shortRiskPass and not rawLongConfirmation
+
+bool blockedLongConfirmation = rawLongConfirmation and not longTerritoryPass
+bool blockedShortConfirmation = rawShortConfirmation and not shortTerritoryPass
+
+bool longEntry = rawLongConfirmation and longTerritoryPass
+bool shortEntry = rawShortConfirmation and shortTerritoryPass and not longEntry
+
+var string lastExecutionDecision = "NONE YET"
+var int lastExecutionDecisionBar = na
+
+if newSessionDay and barstate.isnew
+    lastExecutionDecision := "NONE YET"
+    lastExecutionDecisionBar := na
+
+if rawLongConfirmation or rawShortConfirmation
+    // A blocked confirmation consumes the same source cooldown as an executed
+    // confirmation. This prevents repeated labels and repeated decisions from
+    // one market event while preserving the source signal cadence.
+    lastSignalBar := bar_index
+    rawConfirmationsToday += 1
+
+if blockedLongConfirmation
+    blockedConfirmationsToday += 1
+    lastExecutionDecision := "BEAR TERRITORY - LONG DENIED"
+    lastExecutionDecisionBar := bar_index
+
+if blockedShortConfirmation
+    blockedConfirmationsToday += 1
+    lastExecutionDecision := "BULL TERRITORY - SHORT DENIED"
+    lastExecutionDecisionBar := bar_index
+
+
+//=============================================================================
+// 23. TRADE STATE AND ORDER SUBMISSION
+//=============================================================================
+
+var float pendingStop = na
+var float pendingATR = na
+var float activeEntry = na
+var float initialRisk = na
+var float activeStop = na
+var float activeTarget = na
+var float highestSinceEntry = na
+var float lowestSinceEntry = na
+var int entryBarIndex = na
+var bool tradeInitialized = false
+var bool breakEvenMoved = false
+var bool trailActivated = false
+var string lastExitReason = "NONE"
+
+var box activeTargetBox = na
+var box activeStopBox = na
+var label activeEntryTag = na
+var label activeTargetTag = na
+var label activeStopTag = na
+
+// Exact plot titles are kept stable for webhook bridge templates.
+var float pmtStopValue = na
+var float pmtTargetValue = na
+
+// Consume a blocked confirmation immediately. The sequence has completed, but
+// execution permission was denied; retaining the setup would create a stale
+// entry after the market has already moved.
+if blockedLongConfirmation
+    pendingBullSweepBar := na
+    pendingBullHigh := na
+    pendingBullLow := na
+    pendingBullMid := na
+    pendingBullLevel := na
+    pendingBullScore := na
+
+if blockedShortConfirmation
+    pendingBearSweepBar := na
+    pendingBearHigh := na
+    pendingBearLow := na
+    pendingBearMid := na
+    pendingBearLevel := na
+    pendingBearScore := na
+
+if longEntry
+    pendingStop := candidateLongStop
+    pendingATR := atr
+    pmtStopValue := candidateLongStop
+    pmtTargetValue := close + candidateLongRisk * effectiveTargetR
+    lastOrderBar := bar_index
+    tradesToday += 1
+    pendingBullSweepBar := na
+    pendingBullHigh := na
+    pendingBullLow := na
+    pendingBullMid := na
+    pendingBullLevel := na
+    pendingBullScore := na
+    lastExitReason := "NONE"
+    lastExecutionDecision := "LONG EXECUTED"
+    lastExecutionDecisionBar := bar_index
+
+    strategy.entry("Long", strategy.long, qty=contracts, comment="LIQUIDITY TREND LONG", alert_message="LSTF LONG ENTRY")
+
+if shortEntry
+    pendingStop := candidateShortStop
+    pendingATR := atr
+    pmtStopValue := candidateShortStop
+    pmtTargetValue := close - candidateShortRisk * effectiveTargetR
+    lastOrderBar := bar_index
+    tradesToday += 1
+    pendingBearSweepBar := na
+    pendingBearHigh := na
+    pendingBearLow := na
+    pendingBearMid := na
+    pendingBearLevel := na
+    pendingBearScore := na
+    lastExitReason := "NONE"
+    lastExecutionDecision := "SHORT EXECUTED"
+    lastExecutionDecisionBar := bar_index
+
+    strategy.entry("Short", strategy.short, qty=contracts, comment="LIQUIDITY TREND SHORT", alert_message="LSTF SHORT ENTRY")
+
+
+//=============================================================================
+// 24. EXPIRE OR INVALIDATE UNUSED SETUPS
+//=============================================================================
+
+if barstate.isconfirmed and not longEntry and (bullPendingExpired or bullPendingInvalidated)
+    pendingBullSweepBar := na
+    pendingBullHigh := na
+    pendingBullLow := na
+    pendingBullMid := na
+    pendingBullLevel := na
+    pendingBullScore := na
+
+if barstate.isconfirmed and not shortEntry and (bearPendingExpired or bearPendingInvalidated)
+    pendingBearSweepBar := na
+    pendingBearHigh := na
+    pendingBearLow := na
+    pendingBearMid := na
+    pendingBearLevel := na
+    pendingBearScore := na
+
+if not sourceParityMode and (useEntrySession or closeAtSessionEnd) and finalSessionBar and strategy.position_size == 0
+    pendingBullSweepBar := na
+    pendingBullHigh := na
+    pendingBullLow := na
+    pendingBullMid := na
+    pendingBullLevel := na
+    pendingBullScore := na
+    pendingBearSweepBar := na
+    pendingBearHigh := na
+    pendingBearLow := na
+    pendingBearMid := na
+    pendingBearLevel := na
+    pendingBearScore := na
+
+
+//=============================================================================
+// 25. FILL INITIALIZATION
+//=============================================================================
+
+bool longFill = strategy.position_size > 0 and strategy.position_size[1] <= 0
+bool shortFill = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if longFill and not tradeInitialized
+    activeEntry := strategy.position_avg_price
+    activeStop := pendingStop
+    initialRisk := activeEntry - activeStop
+
+    bool fillRiskValid = sourceParityMode ? not na(initialRisk) and initialRisk > 0 : not na(initialRisk) and initialRisk >= minimumRiskDistance and not na(pendingATR) and pendingATR > 0 and initialRisk <= pendingATR * maximumStopATR
+
+    if not fillRiskValid
+        lastExitReason := "INVALID FILL RISK"
+        strategy.close("Long", immediately=true, comment="Invalid Fill Risk", alert_message="LSTF CLOSE LONG - INVALID RISK")
+    else
+        activeTarget := activeEntry + initialRisk * effectiveTargetR
+        highestSinceEntry := activeEntry
+        lowestSinceEntry := activeEntry
+        entryBarIndex := bar_index
+        tradeInitialized := true
+        breakEvenMoved := false
+        trailActivated := false
+        pmtStopValue := activeStop
+        pmtTargetValue := activeTarget
+
+if shortFill and not tradeInitialized
+    activeEntry := strategy.position_avg_price
+    activeStop := pendingStop
+    initialRisk := activeStop - activeEntry
+
+    bool fillRiskValid = sourceParityMode ? not na(initialRisk) and initialRisk > 0 : not na(initialRisk) and initialRisk >= minimumRiskDistance and not na(pendingATR) and pendingATR > 0 and initialRisk <= pendingATR * maximumStopATR
+
+    if not fillRiskValid
+        lastExitReason := "INVALID FILL RISK"
+        strategy.close("Short", immediately=true, comment="Invalid Fill Risk", alert_message="LSTF CLOSE SHORT - INVALID RISK")
+    else
+        activeTarget := activeEntry - initialRisk * effectiveTargetR
+        highestSinceEntry := activeEntry
+        lowestSinceEntry := activeEntry
+        entryBarIndex := bar_index
+        tradeInitialized := true
+        breakEvenMoved := false
+        trailActivated := false
+        pmtStopValue := activeStop
+        pmtTargetValue := activeTarget
+
+
+//-----------------------------------------------------------------------------
+// SOURCE-STYLE TRADE PROJECTION
+//-----------------------------------------------------------------------------
+
+if (longFill or shortFill) and tradeInitialized and showTradeProjection
+    bool projectionLong = strategy.position_size > 0
+    float targetTop = projectionLong ? activeTarget : activeEntry
+    float targetBottom = projectionLong ? activeEntry : activeTarget
+    float stopTop = projectionLong ? activeEntry : activeStop
+    float stopBottom = projectionLong ? activeStop : activeEntry
+
+    activeTargetBox := box.new(left=bar_index, top=targetTop, right=bar_index, bottom=targetBottom, xloc=xloc.bar_index, border_color=C_CYAN, bgcolor=color.new(C_CYAN, 86), border_width=1)
+    activeStopBox := box.new(left=bar_index, top=stopTop, right=bar_index, bottom=stopBottom, xloc=xloc.bar_index, border_color=C_STOP, bgcolor=color.new(C_STOP, 86), border_width=1)
+    activeEntryTag := label.new(bar_index, activeEntry, "ENTRY", xloc=xloc.bar_index, style=label.style_label_left, color=color.rgb(8, 145, 178), textcolor=color.white, size=size.tiny)
+    activeTargetTag := label.new(bar_index, activeTarget, "TARGET " + str.tostring(effectiveTargetR, "#.##") + "R", xloc=xloc.bar_index, style=label.style_label_left, color=C_READY, textcolor=color.white, size=size.tiny)
+    activeStopTag := label.new(bar_index, activeStop, "INVALIDATION", xloc=xloc.bar_index, style=label.style_label_left, color=C_STOP, textcolor=color.white, size=size.tiny)
+
+
+//=============================================================================
+// 26. POSITION MANAGEMENT
+//=============================================================================
+
+bool managementEligible = strategy.position_size != 0 and tradeInitialized and not na(entryBarIndex) and bar_index > entryBarIndex
+
+if strategy.position_size != 0 and tradeInitialized and showTradeProjection
+    if not na(activeTargetBox)
+        box.set_right(activeTargetBox, bar_index)
+    if not na(activeStopBox)
+        box.set_right(activeStopBox, bar_index)
+    if not na(activeEntryTag)
+        label.set_x(activeEntryTag, bar_index)
+        label.set_y(activeEntryTag, activeEntry)
+    if not na(activeTargetTag)
+        label.set_x(activeTargetTag, bar_index)
+        label.set_y(activeTargetTag, activeTarget)
+    if not na(activeStopTag)
+        label.set_x(activeStopTag, bar_index)
+        label.set_y(activeStopTag, activeStop)
+
+if managementEligible
+    highestSinceEntry := math.max(nz(highestSinceEntry, high), high)
+    lowestSinceEntry := math.min(nz(lowestSinceEntry, low), low)
+
+float breakEvenOffset = breakEvenOffsetTicks * syminfo.mintick
+
+if strategy.position_size > 0 and managementEligible and not sourceParityMode and useBreakEven and not breakEvenMoved and high >= activeEntry + initialRisk * breakEvenAtR
+    activeStop := math.max(activeStop, activeEntry + breakEvenOffset)
+    breakEvenMoved := true
+
+if strategy.position_size < 0 and managementEligible and not sourceParityMode and useBreakEven and not breakEvenMoved and low <= activeEntry - initialRisk * breakEvenAtR
+    activeStop := math.min(activeStop, activeEntry - breakEvenOffset)
+    breakEvenMoved := true
+
+if strategy.position_size > 0 and managementEligible and not sourceParityMode and useATRTrendTrail and highestSinceEntry >= activeEntry + initialRisk * trailActivationR
+    trailActivated := true
+
+if strategy.position_size < 0 and managementEligible and not sourceParityMode and useATRTrendTrail and lowestSinceEntry <= activeEntry - initialRisk * trailActivationR
+    trailActivated := true
+
+if strategy.position_size > 0 and trailActivated
+    float proposedLongTrail = math.min(highestSinceEntry - atr * trailATRMultiple, close - syminfo.mintick)
+    activeStop := math.max(activeStop, proposedLongTrail)
+
+if strategy.position_size < 0 and trailActivated
+    float proposedShortTrail = math.max(lowestSinceEntry + atr * trailATRMultiple, close + syminfo.mintick)
+    activeStop := math.min(activeStop, proposedShortTrail)
+
+pmtStopValue := strategy.position_size != 0 ? activeStop : pmtStopValue
+pmtTargetValue := strategy.position_size != 0 ? activeTarget : pmtTargetValue
+
+if strategy.position_size > 0 and tradeInitialized
+    strategy.exit("Long Exit", from_entry="Long", stop=activeStop, limit=activeTarget, alert_message="LSTF CLOSE LONG - BRACKET")
+
+if strategy.position_size < 0 and tradeInitialized
+    strategy.exit("Short Exit", from_entry="Short", stop=activeStop, limit=activeTarget, alert_message="LSTF CLOSE SHORT - BRACKET")
+
+int barsHeld = strategy.position_size != 0 and not na(entryBarIndex) ? bar_index - entryBarIndex : 0
+
+if not sourceParityMode and useTimeExit and strategy.position_size != 0 and managementEligible and barsHeld >= maximumHoldingBars
+    lastExitReason := "TIME"
+    strategy.close_all(immediately=true, comment="Time Exit", alert_message="LSTF CLOSE - TIME")
+
+if not sourceParityMode and closeAtSessionEnd and finalSessionBar and strategy.position_size != 0
+    lastExitReason := "SESSION"
+    strategy.close_all(immediately=true, comment="Session Exit", alert_message="LSTF CLOSE - SESSION")
+
+
+//=============================================================================
+// 27. CLOSED-POSITION CLEANUP
+//=============================================================================
+
+bool positionJustClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if positionJustClosed
+    if lastExitReason == "NONE"
+        lastExitReason := "STOP OR TARGET"
+
+    lastExitBar := bar_index
+    pendingStop := na
+    pendingATR := na
+    activeEntry := na
+    initialRisk := na
+    activeStop := na
+    activeTarget := na
+    highestSinceEntry := na
+    lowestSinceEntry := na
+    entryBarIndex := na
+    tradeInitialized := false
+    breakEvenMoved := false
+    trailActivated := false
+    activeTargetBox := na
+    activeStopBox := na
+    activeEntryTag := na
+    activeTargetTag := na
+    activeStopTag := na
+
+if strategy.position_size == 0 and not longEntry and not shortEntry
+    pmtStopValue := na
+    pmtTargetValue := na
+
+
+//=============================================================================
+// 28. DASHBOARD BLOCKER
+//=============================================================================
+
+string blockerText = "CLEAR"
+
+if blockedLongConfirmation
+    blockerText := "BEAR TERRITORY - LONG DENIED"
+else if blockedShortConfirmation
+    blockerText := "BULL TERRITORY - SHORT DENIED"
+else if not environmentValid
+    blockerText := not chartIs5m and require5mChart ? "NEED 5M CHART" : "NOT MNQ"
+else if not entrySessionPass
+    blockerText := "ENTRY WINDOW CLOSED"
+else if strategy.position_size != 0
+    blockerText := "POSITION OPEN"
+else if not tradeLimitPass
+    blockerText := "DAILY LIMIT"
+else if not cooldownPass
+    blockerText := "COOLDOWN"
+else if not chopFilterPass
+    blockerText := "CHOP FILTER"
+else if not pendingSweep
+    blockerText := "WAIT LIQUIDITY SWEEP"
+else if pendingExpired
+    blockerText := "SETUP EXPIRED"
+else if pendingInvalidated
+    blockerText := "SETUP INVALIDATED"
+else if not confirmationWindowOpen
+    blockerText := allowSweepBarConfirmation ? "WAIT CONFIRMATION" : "WAIT NEXT BAR"
+else if pendingDirection == 1 and not longTrendPass
+    blockerText := "LONG TREND BLOCK"
+else if pendingDirection == -1 and not shortTrendPass
+    blockerText := "SHORT TREND BLOCK"
+else if pendingDirection == 1 and not longPressurePass
+    blockerText := "BULL PRESSURE BLOCK"
+else if pendingDirection == -1 and not shortPressurePass
+    blockerText := "BEAR PRESSURE BLOCK"
+else if pendingDirection == 1 and not longDIPass
+    blockerText := "LONG DI/ADX BLOCK"
+else if pendingDirection == -1 and not shortDIPass
+    blockerText := "SHORT DI/ADX BLOCK"
+else if pendingDirection == 1 and not longConfirmationPricePass
+    blockerText := "WAIT LONG CONFIRM"
+else if pendingDirection == -1 and not shortConfirmationPricePass
+    blockerText := "WAIT SHORT CONFIRM"
+else if pendingDirection == 1 and not longBodyPass
+    blockerText := "LONG BODY BLOCK"
+else if pendingDirection == -1 and not shortBodyPass
+    blockerText := "SHORT BODY BLOCK"
+else if pendingDirection == 1 and not longRiskPass
+    blockerText := "LONG RISK BLOCK"
+else if pendingDirection == -1 and not shortRiskPass
+    blockerText := "SHORT RISK BLOCK"
+
+
+//=============================================================================
+// 29. VISUALS
+//=============================================================================
+
+plot(showEMAs ? localFastEMA : na, "Local Fast EMA", color=color.new(C_BULL, 20), linewidth=1)
+plot(showEMAs ? localSlowEMA : na, "Local Slow EMA", color=color.new(C_WAIT, 20), linewidth=1)
+plot(showLiquidityLevels ? latestHighLiquidity : na, "Latest High Liquidity", color=color.new(C_BEAR, 45), style=plot.style_stepline)
+plot(showLiquidityLevels ? latestLowLiquidity : na, "Latest Low Liquidity", color=color.new(C_BULL, 45), style=plot.style_stepline)
+plot(pendingSweep ? pendingLiquidityLevel : na, "Swept Liquidity Level", color=C_WAIT, linewidth=2, style=plot.style_linebr)
+plot(pendingSweep ? (pendingDirection == 1 ? longConfirmationLevel : shortConfirmationLevel) : na, "Confirmation Level", color=pendingDirection == 1 ? C_BULL : C_BEAR, linewidth=2, style=plot.style_linebr)
+
+plot(strategy.position_size != 0 ? activeEntry : na, "Active Entry", color=color.white, linewidth=1, style=plot.style_linebr)
+plot(pmtStopValue, "PMT Stop", color=C_STOP, linewidth=2, style=plot.style_linebr)
+plot(pmtTargetValue, "PMT Target", color=C_READY, linewidth=2, style=plot.style_linebr)
+
+plotshape(validBuySweep, title="Valid Bullish Liquidity Sweep", style=shape.circle, location=location.belowbar, color=C_CYAN, size=size.tiny, text="SW")
+plotshape(validSellSweep, title="Valid Bearish Liquidity Sweep", style=shape.circle, location=location.abovebar, color=C_CYAN, size=size.tiny, text="SW")
+plotshape(longEntry, title="Long Entry", style=shape.labelup, location=location.belowbar, color=C_READY, textcolor=color.white, text="BUY", size=size.small)
+plotshape(shortEntry, title="Short Entry", style=shape.labeldown, location=location.abovebar, color=C_STOP, textcolor=color.white, text="SELL", size=size.small)
+plotshape(showBlockedMarkers and blockedLongConfirmation, title="Blocked Long Confirmation", style=shape.labelup, location=location.belowbar, color=C_WAIT, textcolor=color.white, text="BL", size=size.tiny)
+plotshape(showBlockedMarkers and blockedShortConfirmation, title="Blocked Short Confirmation", style=shape.labeldown, location=location.abovebar, color=C_WAIT, textcolor=color.white, text="BS", size=size.tiny)
+plotshape(showDebugMarkers and pendingExpired, title="Pending Sweep Expired", style=shape.xcross, location=location.abovebar, color=C_WAIT, size=size.tiny)
+plotshape(showDebugMarkers and pendingInvalidated, title="Pending Sweep Invalidated", style=shape.xcross, location=location.abovebar, color=C_STOP, size=size.tiny)
+
+
+//=============================================================================
+// 30. DASHBOARD
+//=============================================================================
+
+var table dashboard = table.new(position.bottom_right, 2, 15, border_width=1, border_color=C_BORDER)
+
+f_dashCell(int row, string labelText, string valueText, color valueColor) =>
+    table.cell(dashboard, 0, row, labelText, text_color=color.white, bgcolor=row == 0 ? C_PANEL_ALT : C_PANEL, text_halign=text.align_left)
+    table.cell(dashboard, 1, row, valueText, text_color=valueColor, bgcolor=row == 0 ? C_PANEL_ALT : C_PANEL, text_halign=text.align_right)
+
+if barstate.islast
+    table.clear(dashboard, 0, 0, 1, 14)
+
+    if showDashboard
+        string rawStateText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : pendingSweep ? "SETUP PENDING" : "SCANNING"
+        string stateText = rawStateText
+        color stateColor = strategy.position_size > 0 ? C_READY : strategy.position_size < 0 ? C_STOP : pendingSweep ? C_WAIT : C_NEUTRAL
+        string localTrendText = f_trendName(localBullTrend, localBearTrend)
+        string htfTrendText = f_trendName(htfBullTrend, htfBearTrend)
+        string trendText = localTrendText + " / " + htfTrendText
+        color trendColor = localBullTrend ? C_BULL : localBearTrend ? C_BEAR : C_NEUTRAL
+        string pressureText = na(bullPressurePercent) ? "-" : "B " + str.tostring(bullPressurePercent, "#.0") + " / S " + str.tostring(bearPressurePercent, "#.0") + " (" + f_signed(volumePressureScore) + ")"
+        color pressureColor = na(volumePressureScore) ? C_NEUTRAL : volumePressureScore >= minimumPressureScore ? C_READY : volumePressureScore <= -minimumPressureScore ? C_STOP : C_WAIT
+        string diText = f_signed(diScore) + " / ADX " + (na(adx) ? "-" : str.tostring(adx, "#.0"))
+        color diColor = na(diScore) ? C_NEUTRAL : diScore >= minimumDIScore and adx >= minimumADX ? C_READY : diScore <= -minimumDIScore and adx >= minimumADX ? C_STOP : C_WAIT
+        string pendingText = pendingDirection == 1 ? "LONG / " + str.tostring(pendingAge) + "/" + str.tostring(effectiveConfirmationWindow) : pendingDirection == -1 ? "SHORT / " + str.tostring(pendingAge) + "/" + str.tostring(effectiveConfirmationWindow) : "NONE"
+        color pendingColor = pendingDirection == 1 ? C_BULL : pendingDirection == -1 ? C_BEAR : C_NEUTRAL
+        string positionText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+        color positionColor = strategy.position_size > 0 ? C_READY : strategy.position_size < 0 ? C_STOP : C_NEUTRAL
+        string qualityLevelText = (na(pendingSweepScore) ? "-" : str.tostring(pendingSweepScore, "#.0")) + " / " + (pendingDirection == 1 ? f_price(longConfirmationLevel) : pendingDirection == -1 ? f_price(shortConfirmationLevel) : "-")
+        string riskModelText = "SL " + str.tostring(effectiveStopATRMultiplier, "#.##") + " ATR / TP " + str.tostring(effectiveTargetR, "#.##") + "R"
+        string territoryText = not useTerritoryBlocker ? "OFF" : executionTerritory == 1 ? "BULL - SHORTS DENIED" : executionTerritory == -1 ? "BEAR - LONGS DENIED" : "NEUTRAL - BOTH ALLOWED"
+        color territoryColor = not useTerritoryBlocker ? C_NEUTRAL : executionTerritory == 1 ? C_BULL : executionTerritory == -1 ? C_BEAR : C_WAIT
+        string decisionCountText = str.tostring(rawConfirmationsToday) + " / " + str.tostring(blockedConfirmationsToday) + " / " + str.tostring(tradesToday)
+        color decisionColor = blockedConfirmationsToday > 0 ? C_WAIT : tradesToday > 0 ? C_READY : C_NEUTRAL
+        color lastDecisionColor = str.contains(lastExecutionDecision, "DENIED") ? C_WAIT : str.contains(lastExecutionDecision, "EXECUTED") ? C_READY : C_NEUTRAL
+        string chopText = not useChopFilter ? "OFF" : chopFilterPass ? "TRENDING (ADX " + str.tostring(adx, "#.0") + ")" : "CHOPPY (ADX " + str.tostring(adx, "#.0") + ")"
+        color chopColor = not useChopFilter ? C_NEUTRAL : chopFilterPass ? C_READY : C_WAIT
+
+        f_dashCell(0, "LSTF v1.3", stateText, stateColor)
+        f_dashCell(1, "MODE", sourceParityMode ? "SEQUENCE SAFE" : "FILTERED TREND", sourceParityMode ? C_READY : C_WAIT)
+        f_dashCell(2, "EXECUTION TERRITORY", territoryText, territoryColor)
+        f_dashCell(3, "LOCAL / " + trendTimeframe, trendText, trendColor)
+        f_dashCell(4, "VOLUME PRESSURE", pressureText, pressureColor)
+        f_dashCell(5, "DI SCORE / ADX", diText, diColor)
+        f_dashCell(6, "SWEEP / AGE", pendingText, pendingColor)
+        f_dashCell(7, "QUALITY / LEVEL", qualityLevelText, pendingColor)
+        f_dashCell(8, "RISK MODEL", riskModelText, C_WAIT)
+        f_dashCell(9, "BLOCKER", blockerText, blockerText == "CLEAR" ? C_READY : C_WAIT)
+        f_dashCell(10, "RAW / BLOCK / TRADE", decisionCountText, decisionColor)
+        f_dashCell(11, "POSITION", positionText, positionColor)
+        f_dashCell(12, "LAST DECISION", lastExecutionDecision, lastDecisionColor)
+        f_dashCell(13, "AUTOMATION", automationArmed ? "ARMED / SIM TESTED" : "OFF / SIM FIRST", automationArmed ? C_READY : C_NEUTRAL)
+        f_dashCell(14, "CHOP FILTER", chopText, chopColor)
+
+
+//=============================================================================
+// 31. ALERTS
+//=============================================================================
+
+alertcondition(validBuySweep, title="Bullish Liquidity Sweep", message="Bullish liquidity sweep and reclaim detected | {{ticker}} | {{interval}}")
+alertcondition(validSellSweep, title="Bearish Liquidity Sweep", message="Bearish liquidity sweep and reclaim detected | {{ticker}} | {{interval}}")
+alertcondition(longEntry, title="Liquidity Trend Long Entry", message="Liquidity-sweep trend LONG confirmed | {{ticker}} | {{interval}}")
+alertcondition(shortEntry, title="Liquidity Trend Short Entry", message="Liquidity-sweep trend SHORT confirmed | {{ticker}} | {{interval}}")
+alertcondition(blockedLongConfirmation, title="Blocked Countertrend Long", message="Liquidity LONG confirmation denied by persistent bear territory | {{ticker}} | {{interval}}")
+alertcondition(blockedShortConfirmation, title="Blocked Countertrend Short", message="Liquidity SHORT confirmation denied by persistent bull territory | {{ticker}} | {{interval}}")
+alertcondition(positionJustClosed, title="Liquidity Trend Position Closed", message="Liquidity-sweep trend position closed | {{ticker}} | {{interval}}")
+
+
+//=============================================================================
+// 32. DATA-WINDOW DIAGNOSTICS
+//=============================================================================
+
+plot(volumePressureScore, "Signed Volume Pressure Score", display=display.data_window)
+plot(bullPressurePercent, "Bull Volume Pressure %", display=display.data_window)
+plot(bearPressurePercent, "Bear Volume Pressure %", display=display.data_window)
+plot(diScore, "Signed DI Score", display=display.data_window)
+plot(plusDI, "+DI", display=display.data_window)
+plot(minusDI, "-DI", display=display.data_window)
+plot(adx, "ADX", display=display.data_window)
+plot(chopValue, "Choppiness Index", display=display.data_window)
+plot(pendingSweepScore, "Pending Sweep Quality", display=display.data_window)
+plot(float(pendingDirection), "Pending Direction", display=display.data_window)
+plot(float(pendingAge), "Pending Age", display=display.data_window)
+plot(longTrendPass ? 1.0 : 0.0, "Long Trend Pass", display=display.data_window)
+plot(shortTrendPass ? 1.0 : 0.0, "Short Trend Pass", display=display.data_window)
+plot(longPressurePass ? 1.0 : 0.0, "Long Pressure Pass", display=display.data_window)
+plot(shortPressurePass ? 1.0 : 0.0, "Short Pressure Pass", display=display.data_window)
+plot(longDIPass ? 1.0 : 0.0, "Long DI Pass", display=display.data_window)
+plot(shortDIPass ? 1.0 : 0.0, "Short DI Pass", display=display.data_window)
+plot(longRiskPass ? 1.0 : 0.0, "Long Risk Pass", display=display.data_window)
+plot(shortRiskPass ? 1.0 : 0.0, "Short Risk Pass", display=display.data_window)
+plot(float(executionTerritory), "Execution Territory", display=display.data_window)
+plot(bullTerritoryCandidate ? 1.0 : 0.0, "Bull Territory Candidate", display=display.data_window)
+plot(bearTerritoryCandidate ? 1.0 : 0.0, "Bear Territory Candidate", display=display.data_window)
+plot(rawLongConfirmation ? 1.0 : 0.0, "Raw Long Confirmation", display=display.data_window)
+plot(rawShortConfirmation ? 1.0 : 0.0, "Raw Short Confirmation", display=display.data_window)
+plot(blockedLongConfirmation ? 1.0 : 0.0, "Blocked Long Confirmation", display=display.data_window)
+plot(blockedShortConfirmation ? 1.0 : 0.0, "Blocked Short Confirmation", display=display.data_window)
