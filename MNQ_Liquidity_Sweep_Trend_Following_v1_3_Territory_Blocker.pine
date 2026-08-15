@@ -201,6 +201,8 @@ int maximumHoldingBars = input.int(24, "Maximum Holding Bars", minval=1, maxval=
 
 bool automationArmed = input.bool(false, "Webhook Automation Armed", tooltip="Dashboard reminder only. Keep OFF until the strategy has been tested in simulation and your broker bridge alert is configured.", group=G_AUTOMATION)
 bool showDashboard = input.bool(true, "Show Dashboard", group=G_DISPLAY)
+string dashboardFont = input.string("Compact", "Dashboard Font Size", options=["Compact", "Phone", "Large"], tooltip="Compact is smallest and recommended for mobile. The dashboard is also trimmed to its most decision-relevant rows.", group=G_DISPLAY)
+string dashboardPosition = input.string("Bottom Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=G_DISPLAY)
 bool showEMAs = input.bool(false, "Show Local EMAs", tooltip="OFF matches the supplied source display.", group=G_DISPLAY)
 bool showLiquidityLevels = input.bool(false, "Show Latest Pivot Liquidity", group=G_DISPLAY)
 bool showTradeProjection = input.bool(true, "Show Entry / Target / Invalidation Projection", group=G_DISPLAY)
@@ -1071,56 +1073,64 @@ plotshape(showDebugMarkers and pendingInvalidated, title="Pending Sweep Invalida
 // 30. DASHBOARD
 //=============================================================================
 
-var table dashboard = table.new(position.bottom_right, 2, 15, border_width=1, border_color=C_BORDER)
+// Compact-by-default: 12 rows instead of 15 (POSITION folds into the top
+// state row, RAW/BLOCK/TRADE folds into MODE, DI SCORE and CHOP FILTER
+// merge into one row since both are ADX-based), plus a tunable font size.
+// Together these are what actually shrink the panel on a phone screen --
+// font size alone does not help much if the row count still overflows.
+resolvedDashboardPosition =
+     dashboardPosition == "Top Left" ? position.top_left :
+     dashboardPosition == "Bottom Right" ? position.bottom_right :
+     dashboardPosition == "Bottom Left" ? position.bottom_left :
+     position.top_right
+
+dashboardTextSize =
+     dashboardFont == "Large" ? size.normal :
+     dashboardFont == "Phone" ? size.small :
+     size.tiny
+
+var table dashboard = table.new(resolvedDashboardPosition, 2, 12, border_width=1, border_color=C_BORDER)
 
 f_dashCell(int row, string labelText, string valueText, color valueColor) =>
-    table.cell(dashboard, 0, row, labelText, text_color=color.white, bgcolor=row == 0 ? C_PANEL_ALT : C_PANEL, text_halign=text.align_left)
-    table.cell(dashboard, 1, row, valueText, text_color=valueColor, bgcolor=row == 0 ? C_PANEL_ALT : C_PANEL, text_halign=text.align_right)
+    table.cell(dashboard, 0, row, labelText, text_color=color.white, bgcolor=row == 0 ? C_PANEL_ALT : C_PANEL, text_halign=text.align_left, text_size=dashboardTextSize)
+    table.cell(dashboard, 1, row, valueText, text_color=valueColor, bgcolor=row == 0 ? C_PANEL_ALT : C_PANEL, text_halign=text.align_right, text_size=dashboardTextSize)
 
 if barstate.islast
-    table.clear(dashboard, 0, 0, 1, 14)
+    table.clear(dashboard, 0, 0, 1, 11)
 
     if showDashboard
-        string rawStateText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : pendingSweep ? "SETUP PENDING" : "SCANNING"
+        string rawStateText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : pendingSweep ? "PENDING" : "SCAN"
         string stateText = rawStateText
         color stateColor = strategy.position_size > 0 ? C_READY : strategy.position_size < 0 ? C_STOP : pendingSweep ? C_WAIT : C_NEUTRAL
         string localTrendText = f_trendName(localBullTrend, localBearTrend)
         string htfTrendText = f_trendName(htfBullTrend, htfBearTrend)
         string trendText = localTrendText + " / " + htfTrendText
         color trendColor = localBullTrend ? C_BULL : localBearTrend ? C_BEAR : C_NEUTRAL
-        string pressureText = na(bullPressurePercent) ? "-" : "B " + str.tostring(bullPressurePercent, "#.0") + " / S " + str.tostring(bearPressurePercent, "#.0") + " (" + f_signed(volumePressureScore) + ")"
+        string pressureText = na(bullPressurePercent) ? "-" : "B" + str.tostring(bullPressurePercent, "#") + "/S" + str.tostring(bearPressurePercent, "#") + " (" + f_signed(volumePressureScore) + ")"
         color pressureColor = na(volumePressureScore) ? C_NEUTRAL : volumePressureScore >= minimumPressureScore ? C_READY : volumePressureScore <= -minimumPressureScore ? C_STOP : C_WAIT
-        string diText = f_signed(diScore) + " / ADX " + (na(adx) ? "-" : str.tostring(adx, "#.0"))
-        color diColor = na(diScore) ? C_NEUTRAL : diScore >= minimumDIScore and adx >= minimumADX ? C_READY : diScore <= -minimumDIScore and adx >= minimumADX ? C_STOP : C_WAIT
-        string pendingText = pendingDirection == 1 ? "LONG / " + str.tostring(pendingAge) + "/" + str.tostring(effectiveConfirmationWindow) : pendingDirection == -1 ? "SHORT / " + str.tostring(pendingAge) + "/" + str.tostring(effectiveConfirmationWindow) : "NONE"
+        string diChopText = f_signed(diScore) + " ADX" + (na(adx) ? "-" : str.tostring(adx, "#")) + (useChopFilter ? (chopFilterPass ? " OK" : " CHOP") : "")
+        color diChopColor = useChopFilter and not chopFilterPass ? C_STOP : na(diScore) ? C_NEUTRAL : diScore >= minimumDIScore and adx >= minimumADX ? C_READY : diScore <= -minimumDIScore and adx >= minimumADX ? C_STOP : C_WAIT
+        string pendingText = pendingDirection == 1 ? "LONG " + str.tostring(pendingAge) + "/" + str.tostring(effectiveConfirmationWindow) : pendingDirection == -1 ? "SHORT " + str.tostring(pendingAge) + "/" + str.tostring(effectiveConfirmationWindow) : "NONE"
         color pendingColor = pendingDirection == 1 ? C_BULL : pendingDirection == -1 ? C_BEAR : C_NEUTRAL
-        string positionText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
-        color positionColor = strategy.position_size > 0 ? C_READY : strategy.position_size < 0 ? C_STOP : C_NEUTRAL
-        string qualityLevelText = (na(pendingSweepScore) ? "-" : str.tostring(pendingSweepScore, "#.0")) + " / " + (pendingDirection == 1 ? f_price(longConfirmationLevel) : pendingDirection == -1 ? f_price(shortConfirmationLevel) : "-")
-        string riskModelText = "SL " + str.tostring(effectiveStopATRMultiplier, "#.##") + " ATR / TP " + str.tostring(effectiveTargetR, "#.##") + "R"
-        string territoryText = not useTerritoryBlocker ? "OFF" : executionTerritory == 1 ? "BULL - SHORTS DENIED" : executionTerritory == -1 ? "BEAR - LONGS DENIED" : "NEUTRAL - BOTH ALLOWED"
+        string qualityLevelText = (na(pendingSweepScore) ? "-" : str.tostring(pendingSweepScore, "#")) + " / " + (pendingDirection == 1 ? f_price(longConfirmationLevel) : pendingDirection == -1 ? f_price(shortConfirmationLevel) : "-")
+        string riskModelText = "SL" + str.tostring(effectiveStopATRMultiplier, "#.##") + " TP" + str.tostring(effectiveTargetR, "#.##") + "R"
+        string territoryText = not useTerritoryBlocker ? "OFF" : executionTerritory == 1 ? "BULL (NO SHORT)" : executionTerritory == -1 ? "BEAR (NO LONG)" : "NEUTRAL"
         color territoryColor = not useTerritoryBlocker ? C_NEUTRAL : executionTerritory == 1 ? C_BULL : executionTerritory == -1 ? C_BEAR : C_WAIT
-        string decisionCountText = str.tostring(rawConfirmationsToday) + " / " + str.tostring(blockedConfirmationsToday) + " / " + str.tostring(tradesToday)
-        color decisionColor = blockedConfirmationsToday > 0 ? C_WAIT : tradesToday > 0 ? C_READY : C_NEUTRAL
+        string modeText = (sourceParityMode ? "SAFE " : "FILTER ") + str.tostring(tradesToday) + "/" + str.tostring(maximumTradesPerDay)
         color lastDecisionColor = str.contains(lastExecutionDecision, "DENIED") ? C_WAIT : str.contains(lastExecutionDecision, "EXECUTED") ? C_READY : C_NEUTRAL
-        string chopText = not useChopFilter ? "OFF" : chopFilterPass ? "TRENDING (ADX " + str.tostring(adx, "#.0") + ")" : "CHOPPY (ADX " + str.tostring(adx, "#.0") + ")"
-        color chopColor = not useChopFilter ? C_NEUTRAL : chopFilterPass ? C_READY : C_WAIT
 
         f_dashCell(0, "LSTF v1.3", stateText, stateColor)
-        f_dashCell(1, "MODE", sourceParityMode ? "SEQUENCE SAFE" : "FILTERED TREND", sourceParityMode ? C_READY : C_WAIT)
-        f_dashCell(2, "EXECUTION TERRITORY", territoryText, territoryColor)
-        f_dashCell(3, "LOCAL / " + trendTimeframe, trendText, trendColor)
-        f_dashCell(4, "VOLUME PRESSURE", pressureText, pressureColor)
-        f_dashCell(5, "DI SCORE / ADX", diText, diColor)
-        f_dashCell(6, "SWEEP / AGE", pendingText, pendingColor)
-        f_dashCell(7, "QUALITY / LEVEL", qualityLevelText, pendingColor)
-        f_dashCell(8, "RISK MODEL", riskModelText, C_WAIT)
+        f_dashCell(1, "MODE", modeText, sourceParityMode ? C_READY : C_WAIT)
+        f_dashCell(2, "TERRITORY", territoryText, territoryColor)
+        f_dashCell(3, "TREND", trendText, trendColor)
+        f_dashCell(4, "PRESSURE", pressureText, pressureColor)
+        f_dashCell(5, "DI / CHOP", diChopText, diChopColor)
+        f_dashCell(6, "SWEEP", pendingText, pendingColor)
+        f_dashCell(7, "QUALITY", qualityLevelText, pendingColor)
+        f_dashCell(8, "RISK", riskModelText, C_WAIT)
         f_dashCell(9, "BLOCKER", blockerText, blockerText == "CLEAR" ? C_READY : C_WAIT)
-        f_dashCell(10, "RAW / BLOCK / TRADE", decisionCountText, decisionColor)
-        f_dashCell(11, "POSITION", positionText, positionColor)
-        f_dashCell(12, "LAST DECISION", lastExecutionDecision, lastDecisionColor)
-        f_dashCell(13, "AUTOMATION", automationArmed ? "ARMED / SIM TESTED" : "OFF / SIM FIRST", automationArmed ? C_READY : C_NEUTRAL)
-        f_dashCell(14, "CHOP FILTER", chopText, chopColor)
+        f_dashCell(10, "DECISION", lastExecutionDecision, lastDecisionColor)
+        f_dashCell(11, "AUTO", automationArmed ? "ARMED" : "SIM ONLY", automationArmed ? C_READY : C_NEUTRAL)
 
 
 //=============================================================================
