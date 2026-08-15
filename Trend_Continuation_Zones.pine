@@ -60,6 +60,7 @@ int BOX_TRANSPARENCY = 86
 // INPUT GROUPS
 // ============================================================================
 groupTrend    = "📈 Trend Filter"
+groupChop     = "🌪️ Chop Filter"
 groupBreak    = "🚀 Breakout Detection"
 groupQuality  = "🧪 Candle Quality Filters"
 groupConfirm  = "✅ Entry Confirmation"
@@ -101,6 +102,53 @@ htfSlowLength = input.int(
      minval=2,
      group=groupTrend,
      tooltip="Slow EMA on the higher timeframe used to confirm trend direction.",
+     display=display.none
+)
+
+useChopFilter = input.bool(
+     true,
+     "🌪️ Enable Chop Filter",
+     group=groupChop,
+     tooltip="When enabled, breakouts are blocked while the market lacks trend strength (ADX) or is showing high choppiness (Choppiness Index) -- the two most common causes of failed breakouts. Unlike the Trend Filter, this can be turned off, since doing so only removes an extra quality gate -- it can never enable a counter-trend signal.",
+     display=display.none
+)
+
+adxLen = input.int(
+     14,
+     "📐 ADX Length",
+     minval=1,
+     group=groupChop,
+     tooltip="Period used to calculate ADX, the trend-strength component of the chop filter.",
+     display=display.none
+)
+
+adxMinimum = input.float(
+     20.0,
+     "📈 Minimum ADX",
+     minval=1.0,
+     step=0.5,
+     group=groupChop,
+     tooltip="Breakouts are blocked while ADX is below this level -- a low ADX means the market is not trending strongly enough for a breakout to be reliable.",
+     display=display.none
+)
+
+chopLen = input.int(
+     14,
+     "📐 Choppiness Index Length",
+     minval=2,
+     group=groupChop,
+     tooltip="Period used to calculate the Choppiness Index, the range/consolidation component of the chop filter.",
+     display=display.none
+)
+
+chopMaximum = input.float(
+     61.8,
+     "📉 Maximum Choppiness Index",
+     minval=0.0,
+     maxval=100.0,
+     step=0.1,
+     group=groupChop,
+     tooltip="Breakouts are blocked while the Choppiness Index is above this level -- high readings indicate range-bound, non-directional price action. 61.8 is the traditional threshold.",
      display=display.none
 )
 
@@ -224,6 +272,15 @@ signalCooldownBars = input.int(
      minval=0,
      group=groupConfirm,
      tooltip="Minimum number of bars required between two confirmed signals.",
+     display=display.none
+)
+
+postLossCooldownBars = input.int(
+     20,
+     "🧊 Extra Cooldown After Stop-Out",
+     minval=0,
+     group=groupConfirm,
+     tooltip="Additional bars of cooldown layered on top of the standard signal cooldown, applied only after a stopped-out simulated trade. Helps prevent repeated whipsaw entries during choppy stretches.",
      display=display.none
 )
 
@@ -399,7 +456,7 @@ f_push_box_prune(_arr, _box, _max) =>
 
 f_panel_clear(_t) =>
     for col = 0 to 1
-        for row = 0 to 9
+        for row = 0 to 10
             table.cell(_t, col, row, "", bgcolor=CLR_BG, text_color=CLR_BG)
 
 f_quality_score(_bodyPct, _wickPct, _rangeAtr, _minBody, _maxWick, _minRangeAtr, _emaDistanceAtr, _htfOk) =>
@@ -523,6 +580,29 @@ bool longTrendOk  = localBullish and htfBullish
 bool shortTrendOk = localBearish and htfBearish
 
 // ============================================================================
+// CHOP FILTER
+// ============================================================================
+// Two independent chop lenses: ADX measures trend strength, the
+// Choppiness Index measures how range-bound the last chopLen bars have
+// been. Either one failing is enough to block a breakout -- chop kills
+// breakout systems through false breaks, so this is deliberately strict.
+[plusDI, minusDI, adxValue] = ta.dmi(adxLen, adxLen)
+
+float chopTrueRange = ta.tr(true)
+float chopRangeSum  = math.sum(chopTrueRange, chopLen)
+float chopHighest    = ta.highest(high, chopLen)
+float chopLowest     = ta.lowest(low, chopLen)
+float chopRange       = chopHighest - chopLowest
+float chopValue = chopRange > 0 and chopLen > 1 ? 100.0 * math.log10(chopRangeSum / chopRange) / math.log10(chopLen) : na
+
+bool chopFilterOk =
+     not useChopFilter or
+     (
+         not na(adxValue) and adxValue >= adxMinimum and
+         (na(chopValue) or chopValue <= chopMaximum)
+     )
+
+// ============================================================================
 // PIVOTS AND BREAKOUT LEVEL STORAGE
 // ============================================================================
 pivotHigh = ta.pivothigh(high, pivotLength, pivotLength)
@@ -601,7 +681,8 @@ validBuyBreakout =
      bodyPercent >= minBodyPercent and
      not na(minRangeDistancePx) and
      candleRange >= minRangeDistancePx and
-     longTrendOk
+     longTrendOk and
+     chopFilterOk
 
 validSellBreakout =
      not na(brokenLowLevel) and
@@ -610,7 +691,8 @@ validSellBreakout =
      bodyPercent >= minBodyPercent and
      not na(minRangeDistancePx) and
      candleRange >= minRangeDistancePx and
-     shortTrendOk
+     shortTrendOk and
+     chopFilterOk
 
 // ============================================================================
 // BREAKOUT TRACE / REFERENCE MEMORY
@@ -725,7 +807,12 @@ sellConfirmed =
 // SIGNAL COOLDOWN
 // ============================================================================
 var int lastSignalBar = na
-cooldownPassed = na(lastSignalBar) or (bar_index - lastSignalBar > signalCooldownBars)
+var int lastLossBar   = na
+
+bool standardCooldownPassed = na(lastSignalBar) or (bar_index - lastSignalBar > signalCooldownBars)
+bool lossCooldownPassed     = na(lastLossBar) or (bar_index - lastLossBar > postLossCooldownBars)
+
+cooldownPassed = standardCooldownPassed and lossCooldownPassed
 
 rawBuySignal  = buyConfirmed
 rawSellSignal = sellConfirmed
@@ -974,6 +1061,8 @@ if exitWin
     activeInvalidationTag  := na
 
 if exitLoss
+    lastLossBar := bar_index
+
     if showStoppedTrades
         label.new(bar_index, exitDirection == 1 ? low : high, "ATR SL HIT", xloc=xloc.bar_index, style=exitDirection == 1 ? label.style_label_up : label.style_label_down, color=CLR_RED, textcolor=CLR_TEXT, size=f_label_size(signalLabelSize))
     else
@@ -1080,6 +1169,15 @@ color riskStateColor =
      atrPct >= 0.35 ? CLR_CYAN :
      CLR_GREEN
 
+string chopStateText =
+     not useChopFilter ? "OFF" :
+     chopFilterOk ? "TRENDING " + f_fmt(adxValue) : "CHOPPY " + f_fmt(adxValue)
+
+color chopStateColor =
+     not useChopFilter ? CLR_MUTED :
+     chopFilterOk ? CLR_GREEN :
+     CLR_RED
+
 // ============================================================================
 // SIGNAL VISUALS
 // ============================================================================
@@ -1109,7 +1207,7 @@ barcolor(
 // ============================================================================
 // STATUS PANEL
 // ============================================================================
-var table panel = table.new(f_table_position(panelPosition), 2, 10, border_width=1, border_color=CLR_BORDER)
+var table panel = table.new(f_table_position(panelPosition), 2, 11, border_width=1, border_color=CLR_BORDER)
 
 if barstate.islast
     if showStatusPanel
@@ -1142,6 +1240,9 @@ if barstate.islast
 
         table.cell(panel, 0, 9, "Risk State", bgcolor=CLR_BG, text_color=CLR_TEXT)
         table.cell(panel, 1, 9, riskStateText, bgcolor=CLR_BG, text_color=riskStateColor)
+
+        table.cell(panel, 0, 10, "Chop Filter", bgcolor=CLR_BG, text_color=CLR_TEXT)
+        table.cell(panel, 1, 10, chopStateText, bgcolor=CLR_BG, text_color=chopStateColor)
     else
         f_panel_clear(panel)
 
@@ -1150,3 +1251,9 @@ if barstate.islast
 // ============================================================================
 alertcondition(plotLongSignal,  title="Bullish Trend Continuation", message="Bullish trend continuation breakout confirmed")
 alertcondition(plotShortSignal, title="Bearish Trend Continuation", message="Bearish trend continuation breakout confirmed")
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+plot(adxValue, "ADX", display=display.data_window)
+plot(chopValue, "Choppiness Index", display=display.data_window)
