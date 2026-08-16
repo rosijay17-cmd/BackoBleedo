@@ -1,0 +1,565 @@
+//@version=6
+indicator(
+     title = "15-Minute ORB Box — Master",
+     shorttitle = "15M ORB Box",
+     overlay = true,
+     max_boxes_count = 250,
+     max_lines_count = 500,
+     max_labels_count = 500
+)
+
+//══════════════════════════════════════════════════════════════════════
+// 1. ORB SETTINGS
+//══════════════════════════════════════════════════════════════════════
+
+groupORB = "1. ORB Settings"
+
+orbSession = input.session(
+     defval = "0830-0845",
+     title = "ORB Session",
+     group = groupORB
+)
+
+orbTimezone = input.string(
+     defval = "America/Chicago",
+     title = "ORB Time Zone",
+     options = [
+         "America/Chicago",
+         "America/New_York",
+         "America/Denver",
+         "America/Los_Angeles",
+         "Etc/UTC"
+     ],
+     group = groupORB
+)
+
+weekdaysOnly = input.bool(
+     defval = true,
+     title = "Weekdays Only",
+     group = groupORB
+)
+
+showHistoricalObjects = input.bool(
+     defval = true,
+     title = "Show Historical ORBs",
+     group = groupORB
+)
+
+//══════════════════════════════════════════════════════════════════════
+// 2. BOX APPEARANCE
+//══════════════════════════════════════════════════════════════════════
+
+groupBox = "2. Box Appearance"
+
+showORBBox = input.bool(
+     defval = true,
+     title = "Show ORB Box",
+     group = groupBox
+)
+
+boxBorderColor = input.color(
+     defval = color.orange,
+     title = "Box Border Color",
+     group = groupBox
+)
+
+boxFillColor = input.color(
+     defval = color.orange,
+     title = "Box Fill Color",
+     group = groupBox
+)
+
+boxTransparency = input.int(
+     defval = 88,
+     title = "Box Fill Transparency",
+     minval = 0,
+     maxval = 100,
+     group = groupBox
+)
+
+boxBorderWidth = input.int(
+     defval = 2,
+     title = "Box Border Width",
+     minval = 1,
+     maxval = 5,
+     group = groupBox
+)
+
+boxBorderStyleInput = input.string(
+     defval = "Solid",
+     title = "Box Border Style",
+     options = ["Solid", "Dashed", "Dotted"],
+     group = groupBox
+)
+
+//══════════════════════════════════════════════════════════════════════
+// 3. PRICE-LEVEL LINE SETTINGS
+//══════════════════════════════════════════════════════════════════════
+
+groupLevels = "3. Price Level Lines"
+
+showHighLine = input.bool(
+     defval = true,
+     title = "Show ORB High Line",
+     group = groupLevels
+)
+
+showMidLine = input.bool(
+     defval = true,
+     title = "Show ORB Midpoint Line",
+     group = groupLevels
+)
+
+showLowLine = input.bool(
+     defval = true,
+     title = "Show ORB Low Line",
+     group = groupLevels
+)
+
+lineStartOffset = input.int(
+     defval = 0,
+     title = "Line Start Offset",
+     tooltip = "Moves the beginning of the lines from the 8:45 AM completion bar. Zero begins at the right edge of the ORB.",
+     minval = -50,
+     maxval = 100,
+     group = groupLevels
+)
+
+highColor = input.color(
+     defval = color.red,
+     title = "ORB High Color",
+     group = groupLevels
+)
+
+midColor = input.color(
+     defval = color.yellow,
+     title = "ORB Midpoint Color",
+     group = groupLevels
+)
+
+lowColor = input.color(
+     defval = color.lime,
+     title = "ORB Low Color",
+     group = groupLevels
+)
+
+levelWidth = input.int(
+     defval = 2,
+     title = "High and Low Width",
+     minval = 1,
+     maxval = 5,
+     group = groupLevels
+)
+
+midpointWidth = input.int(
+     defval = 1,
+     title = "Midpoint Width",
+     minval = 1,
+     maxval = 5,
+     group = groupLevels
+)
+
+levelStyleInput = input.string(
+     defval = "Solid",
+     title = "High and Low Style",
+     options = ["Solid", "Dashed", "Dotted"],
+     group = groupLevels
+)
+
+midpointStyleInput = input.string(
+     defval = "Dashed",
+     title = "Midpoint Style",
+     options = ["Solid", "Dashed", "Dotted"],
+     group = groupLevels
+)
+
+//══════════════════════════════════════════════════════════════════════
+// 4. PRICE-LABEL CONTROLS
+//══════════════════════════════════════════════════════════════════════
+
+groupLabels = "4. Price Label Controls"
+
+showLabels = input.bool(
+     defval = true,
+     title = "Show Price Labels",
+     group = groupLabels
+)
+
+showHighLabel = input.bool(
+     defval = true,
+     title = "Show High Label",
+     group = groupLabels
+)
+
+showMidLabel = input.bool(
+     defval = true,
+     title = "Show Midpoint Label",
+     group = groupLabels
+)
+
+showLowLabel = input.bool(
+     defval = true,
+     title = "Show Low Label",
+     group = groupLabels
+)
+
+showPriceInLabel = input.bool(
+     defval = true,
+     title = "Include Price in Labels",
+     group = groupLabels
+)
+
+labelHorizontalOffset = input.int(
+     defval = 10,
+     title = "Label and Line Endpoint Offset",
+     tooltip = "Moves the labels left or right. The price lines automatically terminate at this position.",
+     minval = -100,
+     maxval = 500,
+     group = groupLabels
+)
+
+labelSizeInput = input.string(
+     defval = "Small",
+     title = "Label Size",
+     options = ["Tiny", "Small", "Normal", "Large", "Huge"],
+     group = groupLabels
+)
+
+labelStyleInput = input.string(
+     defval = "Left",
+     title = "Label Direction",
+     options = ["Left", "Right", "Up", "Down"],
+     group = groupLabels
+)
+
+highLabelBackground = input.color(
+     defval = color.red,
+     title = "High Label Background",
+     group = groupLabels
+)
+
+highLabelTextColor = input.color(
+     defval = color.white,
+     title = "High Label Text",
+     group = groupLabels
+)
+
+midLabelBackground = input.color(
+     defval = color.yellow,
+     title = "Midpoint Label Background",
+     group = groupLabels
+)
+
+midLabelTextColor = input.color(
+     defval = color.black,
+     title = "Midpoint Label Text",
+     group = groupLabels
+)
+
+lowLabelBackground = input.color(
+     defval = color.lime,
+     title = "Low Label Background",
+     group = groupLabels
+)
+
+lowLabelTextColor = input.color(
+     defval = color.black,
+     title = "Low Label Text",
+     group = groupLabels
+)
+
+//══════════════════════════════════════════════════════════════════════
+// 5. STYLE CONVERSIONS
+//══════════════════════════════════════════════════════════════════════
+
+boxBorderStyle = switch boxBorderStyleInput
+    "Solid"  => line.style_solid
+    "Dashed" => line.style_dashed
+    "Dotted" => line.style_dotted
+    => line.style_solid
+
+levelLineStyle = switch levelStyleInput
+    "Solid"  => line.style_solid
+    "Dashed" => line.style_dashed
+    "Dotted" => line.style_dotted
+    => line.style_solid
+
+midpointLineStyle = switch midpointStyleInput
+    "Solid"  => line.style_solid
+    "Dashed" => line.style_dashed
+    "Dotted" => line.style_dotted
+    => line.style_dashed
+
+selectedLabelSize = switch labelSizeInput
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    "Large"  => size.large
+    "Huge"   => size.huge
+    => size.small
+
+selectedLabelStyle = switch labelStyleInput
+    "Left"  => label.style_label_left
+    "Right" => label.style_label_right
+    "Up"    => label.style_label_up
+    "Down"  => label.style_label_down
+    => label.style_label_left
+
+//══════════════════════════════════════════════════════════════════════
+// 6. SESSION DETECTION
+//══════════════════════════════════════════════════════════════════════
+
+sessionDays = weekdaysOnly ? ":23456" : ":1234567"
+completeSession = orbSession + sessionDays
+
+inORB = not na(
+     time(
+         timeframe.period,
+         completeSession,
+         orbTimezone
+     )
+)
+
+orbBegins = inORB and not inORB[1]
+orbEnds = not inORB and inORB[1]
+
+//══════════════════════════════════════════════════════════════════════
+// 7. PERSISTENT VARIABLES
+//══════════════════════════════════════════════════════════════════════
+
+var float orbHigh = na
+var float orbLow = na
+var float orbMid = na
+
+var int orbStartTime = na
+var int orbEndTime = na
+
+var box currentORBBox = na
+
+var line currentHighLine = na
+var line currentMidLine = na
+var line currentLowLine = na
+
+var label currentHighLabel = na
+var label currentMidLabel = na
+var label currentLowLabel = na
+
+//══════════════════════════════════════════════════════════════════════
+// 8. DELETE PREVIOUS ORB OBJECTS
+//══════════════════════════════════════════════════════════════════════
+
+if orbBegins and not showHistoricalObjects
+    if not na(currentORBBox)
+        box.delete(currentORBBox)
+
+    if not na(currentHighLine)
+        line.delete(currentHighLine)
+
+    if not na(currentMidLine)
+        line.delete(currentMidLine)
+
+    if not na(currentLowLine)
+        line.delete(currentLowLine)
+
+    if not na(currentHighLabel)
+        label.delete(currentHighLabel)
+
+    if not na(currentMidLabel)
+        label.delete(currentMidLabel)
+
+    if not na(currentLowLabel)
+        label.delete(currentLowLabel)
+
+//══════════════════════════════════════════════════════════════════════
+// 9. START NEW ORB
+//══════════════════════════════════════════════════════════════════════
+
+if orbBegins
+    orbHigh := high
+    orbLow := low
+    orbMid := (orbHigh + orbLow) / 2.0
+
+    orbStartTime := time
+    orbEndTime := time_close
+
+    if showORBBox
+        currentORBBox := box.new(
+             left = orbStartTime,
+             top = orbHigh,
+             right = orbEndTime,
+             bottom = orbLow,
+             xloc = xloc.bar_time,
+             border_color = boxBorderColor,
+             border_width = boxBorderWidth,
+             border_style = boxBorderStyle,
+             bgcolor = color.new(boxFillColor, boxTransparency)
+         )
+
+//══════════════════════════════════════════════════════════════════════
+// 10. UPDATE ORB WHILE FORMING
+//══════════════════════════════════════════════════════════════════════
+
+if inORB
+    orbHigh := math.max(nz(orbHigh, high), high)
+    orbLow := math.min(nz(orbLow, low), low)
+    orbMid := (orbHigh + orbLow) / 2.0
+    orbEndTime := time_close
+
+    if showORBBox and not na(currentORBBox)
+        box.set_top(currentORBBox, orbHigh)
+        box.set_bottom(currentORBBox, orbLow)
+        box.set_right(currentORBBox, orbEndTime)
+        box.set_border_color(currentORBBox, boxBorderColor)
+        box.set_border_width(currentORBBox, boxBorderWidth)
+        box.set_border_style(currentORBBox, boxBorderStyle)
+        box.set_bgcolor(
+             currentORBBox,
+             color.new(boxFillColor, boxTransparency)
+         )
+
+//══════════════════════════════════════════════════════════════════════
+// 11. FINALIZE ORB
+// Lines terminate at the same X-coordinate as the labels.
+// Moving the labels automatically changes each line's length.
+//══════════════════════════════════════════════════════════════════════
+
+if orbEnds and not na(orbHigh) and not na(orbLow)
+    orbMid := (orbHigh + orbLow) / 2.0
+
+    int lineStartBar = bar_index + lineStartOffset
+    int labelXPosition = bar_index + labelHorizontalOffset
+
+    // Prevent line endpoints from being placed before line starts.
+    int lineEndBar = math.max(
+         lineStartBar + 1,
+         labelXPosition
+     )
+
+    if showORBBox and not na(currentORBBox)
+        box.set_top(currentORBBox, orbHigh)
+        box.set_bottom(currentORBBox, orbLow)
+        box.set_right(currentORBBox, orbEndTime)
+
+    if showHighLine
+        currentHighLine := line.new(
+             x1 = lineStartBar,
+             y1 = orbHigh,
+             x2 = lineEndBar,
+             y2 = orbHigh,
+             xloc = xloc.bar_index,
+             extend = extend.none,
+             color = highColor,
+             style = levelLineStyle,
+             width = levelWidth
+         )
+
+    if showMidLine
+        currentMidLine := line.new(
+             x1 = lineStartBar,
+             y1 = orbMid,
+             x2 = lineEndBar,
+             y2 = orbMid,
+             xloc = xloc.bar_index,
+             extend = extend.none,
+             color = midColor,
+             style = midpointLineStyle,
+             width = midpointWidth
+         )
+
+    if showLowLine
+        currentLowLine := line.new(
+             x1 = lineStartBar,
+             y1 = orbLow,
+             x2 = lineEndBar,
+             y2 = orbLow,
+             xloc = xloc.bar_index,
+             extend = extend.none,
+             color = lowColor,
+             style = levelLineStyle,
+             width = levelWidth
+         )
+
+    string highText = showPriceInLabel
+         ? "ORB High  " + str.tostring(orbHigh, format.mintick)
+         : "ORB High"
+
+    string midText = showPriceInLabel
+         ? "ORB Mid  " + str.tostring(orbMid, format.mintick)
+         : "ORB Mid"
+
+    string lowText = showPriceInLabel
+         ? "ORB Low  " + str.tostring(orbLow, format.mintick)
+         : "ORB Low"
+
+    if showLabels and showHighLabel
+        currentHighLabel := label.new(
+             x = labelXPosition,
+             y = orbHigh,
+             text = highText,
+             xloc = xloc.bar_index,
+             yloc = yloc.price,
+             style = selectedLabelStyle,
+             color = highLabelBackground,
+             textcolor = highLabelTextColor,
+             size = selectedLabelSize
+         )
+
+    if showLabels and showMidLabel
+        currentMidLabel := label.new(
+             x = labelXPosition,
+             y = orbMid,
+             text = midText,
+             xloc = xloc.bar_index,
+             yloc = yloc.price,
+             style = selectedLabelStyle,
+             color = midLabelBackground,
+             textcolor = midLabelTextColor,
+             size = selectedLabelSize
+         )
+
+    if showLabels and showLowLabel
+        currentLowLabel := label.new(
+             x = labelXPosition,
+             y = orbLow,
+             text = lowText,
+             xloc = xloc.bar_index,
+             yloc = yloc.price,
+             style = selectedLabelStyle,
+             color = lowLabelBackground,
+             textcolor = lowLabelTextColor,
+             size = selectedLabelSize
+         )
+
+//══════════════════════════════════════════════════════════════════════
+// 12. ALERTS
+//══════════════════════════════════════════════════════════════════════
+
+alertcondition(
+     condition = orbEnds,
+     title = "15-Minute ORB Complete",
+     message = "The 8:30–8:45 AM Central Time opening range is complete."
+)
+
+alertcondition(
+     condition = not inORB and not na(orbHigh) and ta.crossover(close, orbHigh),
+     title = "ORB High Break",
+     message = "Price crossed above the 15-minute ORB high."
+)
+
+alertcondition(
+     condition = not inORB and not na(orbLow) and ta.crossunder(close, orbLow),
+     title = "ORB Low Break",
+     message = "Price crossed below the 15-minute ORB low."
+)
+
+alertcondition(
+     condition = not inORB and not na(orbMid) and ta.crossover(close, orbMid),
+     title = "ORB Midpoint Cross Up",
+     message = "Price crossed above the 15-minute ORB midpoint."
+)
+
+alertcondition(
+     condition = not inORB and not na(orbMid) and ta.crossunder(close, orbMid),
+     title = "ORB Midpoint Cross Down",
+     message = "Price crossed below the 15-minute ORB midpoint."
+)
