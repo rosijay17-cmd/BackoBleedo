@@ -638,6 +638,7 @@ string tradingSession = input.session("0830-1500", "Trading Session", group = G_
 string lastentryTime = input.string("11:15", "Last Entry Time HH:mm", group = G_SESSION)
 
 int maxTrades = input.int(2, "Max Retest Trades Per Session", minval = 1, group = G_ENTRY)
+int cooldownBars = input.int(10, "Cooldown Bars After Trade Closes", minval = 0, tooltip = "Minimum number of bars required after a position closes before a new break-return-cross entry is allowed. Independent of Max Retest Trades Per Session -- this throttles how soon after an exit re-entry can happen, that caps how many entries total.", group = G_ENTRY)
 bool allowLongs = input.bool(true, "Allow Longs", group = G_ENTRY)
 bool allowShorts = input.bool(true, "Allow Shorts", group = G_ENTRY)
 
@@ -736,6 +737,13 @@ if orbBegins
 if orbEnds
     orbRangeReady := not na(orbHigh) and not na(orbLow) and orbHigh > orbLow
 
+// Cooldown: minimum bars since the last CLOSED trade before a new entry is
+// allowed. lastExitBar is set in section 06 when positionJustClosed fires.
+var int lastExitBar = na
+
+bool cooldownPass = na(lastExitBar) or (bar_index - lastExitBar > cooldownBars)
+int cooldownRemaining = na(lastExitBar) ? 0 : math.max(cooldownBars - (bar_index - lastExitBar), 0)
+
 float bufferedOrbHigh = not na(orbHigh) ? orbHigh * (1.0 + bfrRange) : na
 float bufferedOrbLow = not na(orbLow) ? orbLow * (1.0 - bfrRange) : na
 
@@ -774,7 +782,8 @@ bool canEnter =
      canTrackBRC and
      isWithinEntryTime and
      flat and
-     tradeCount < maxTrades
+     tradeCount < maxTrades and
+     cooldownPass
 
 if canTrackBRC
     if not hasBrokenOutUpper and high > bufferedOrbHigh
@@ -938,6 +947,8 @@ if closeAtSessionEnd and finalSessionBar
 bool positionJustClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
 
 if positionJustClosed
+    lastExitBar := bar_index
+
     activeSL := na
     activeTP := na
     activeEntryReference := na
@@ -999,6 +1010,7 @@ string brcState =
      strategy.position_size > 0 ? "LONG" :
      strategy.position_size < 0 ? "SHORT" :
      tradeCount >= maxTrades ? "MAX TRADES" :
+     not cooldownPass ? "COOLDOWN" :
      not isWithinEntryTime ? "ENTRY TIME CLOSED" :
      hasReturnedToUpper ? "LONG CROSS READY" :
      hasReturnedToLower ? "SHORT CROSS READY" :
@@ -1012,10 +1024,11 @@ color stateColor =
      brcState == "LONG CROSS READY" ? C_LONG :
      brcState == "SHORT CROSS READY" ? C_SHORT :
      brcState == "MAX TRADES" ? C_WARNING :
+     brcState == "COOLDOWN" ? C_WARNING :
      brcState == "ENTRY TIME CLOSED" ? C_WARNING :
      C_NEUTRAL
 
-var table dashboard = table.new(position.top_right, 2, 13, border_width = 1)
+var table dashboard = table.new(position.top_right, 2, 14, border_width = 1)
 
 f_dashboardCell(int row, string leftText, string rightText, color rightColor) =>
     table.cell(
@@ -1041,7 +1054,7 @@ f_dashboardCell(int row, string leftText, string rightText, color rightColor) =>
     )
 
 if barstate.islast
-    table.clear(dashboard, 0, 0, 1, 12)
+    table.clear(dashboard, 0, 0, 1, 13)
 
     if showDashboard
         f_dashboardCell(0, "ORB BRC", brcState, stateColor)
@@ -1052,11 +1065,12 @@ if barstate.islast
         f_dashboardCell(5, "ORB LOW", f_price(orbLow), C_SHORT)
         f_dashboardCell(6, "LAST ENTRY", lastentryTime, isWithinEntryTime ? C_READY : C_WARNING)
         f_dashboardCell(7, "TRADES", str.tostring(tradeCount) + " / " + str.tostring(maxTrades), tradeCount < maxTrades ? C_READY : C_WARNING)
-        f_dashboardCell(8, "UPPER SEQ", str.tostring(hasBrokenOutUpper) + " / " + str.tostring(hasReturnedToUpper), hasReturnedToUpper ? C_LONG : C_NEUTRAL)
-        f_dashboardCell(9, "LOWER SEQ", str.tostring(hasBrokenOutLower) + " / " + str.tostring(hasReturnedToLower), hasReturnedToLower ? C_SHORT : C_NEUTRAL)
-        f_dashboardCell(10, "SL / TP", f_price(activeSL) + " / " + f_price(activeTP), strategy.position_size != 0 ? C_READY : C_NEUTRAL)
-        f_dashboardCell(11, "TRIGGER", crossTriggerMode, C_NEUTRAL)
-        f_dashboardCell(12, "ALERTS", enableInformationalAlerts ? "ON" : "OFF", enableInformationalAlerts ? C_READY : C_NEUTRAL)
+        f_dashboardCell(8, "COOLDOWN", cooldownPass ? "READY" : str.tostring(cooldownRemaining) + " BARS", cooldownPass ? C_READY : C_WARNING)
+        f_dashboardCell(9, "UPPER SEQ", str.tostring(hasBrokenOutUpper) + " / " + str.tostring(hasReturnedToUpper), hasReturnedToUpper ? C_LONG : C_NEUTRAL)
+        f_dashboardCell(10, "LOWER SEQ", str.tostring(hasBrokenOutLower) + " / " + str.tostring(hasReturnedToLower), hasReturnedToLower ? C_SHORT : C_NEUTRAL)
+        f_dashboardCell(11, "SL / TP", f_price(activeSL) + " / " + f_price(activeTP), strategy.position_size != 0 ? C_READY : C_NEUTRAL)
+        f_dashboardCell(12, "TRIGGER", crossTriggerMode, C_NEUTRAL)
+        f_dashboardCell(13, "ALERTS", enableInformationalAlerts ? "ON" : "OFF", enableInformationalAlerts ? C_READY : C_NEUTRAL)
 
 
 //=============================================================================
