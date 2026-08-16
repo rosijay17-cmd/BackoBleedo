@@ -17,6 +17,11 @@ strategy("MTF Second-Flip Continuation v1.2 - Signal Volatility", shorttitle="MT
 // 5. Rejects excessive genuine transitions before entry.
 // 6. Optionally filters high signal churn and low trend quality.
 // 7. Uses compact visuals and alert() calls to reduce plot consumption.
+// 8. Adds an independent engulfing + third-candle continuation entry: an
+//    engulfing candle in the direction of the confirmed HTF bias, followed
+//    by a third candle whose open is rejected back into the trend. Fires
+//    alongside the second-flip engine, sharing its HTF bias filter and
+//    daily/session/risk controls (see section 19B).
 //
 // IMPORTANT
 // request.security_lower_tf() reconstructs chronology only at the selected
@@ -38,6 +43,7 @@ string G_FILTER  = "06 - Optional Filters"
 string G_RISK    = "07 - Risk Management"
 string G_DAILY   = "08 - Daily Controls"
 string G_VIS     = "09 - Visuals"
+string G_ENGULF  = "10 - Engulfing Continuation"
 
 
 //=============================================================================
@@ -306,6 +312,30 @@ float dailyLossLimit = input.float(
      step=50.0,
      group=G_DAILY
 )
+
+
+//=============================================================================
+// 09B. ENGULFING CONTINUATION INPUTS
+//=============================================================================
+
+bool useEngulfingSignal = input.bool(
+     true,
+     "Enable engulfing + 3rd-candle entry",
+     group=G_ENGULF,
+     tooltip="Independent entry: an engulfing candle in the direction of the confirmed HTF bias, followed by a third candle whose open is rejected back into the trend."
+)
+
+float minEngulfBodyATR = input.float(
+     0.0,
+     "Minimum engulfing body, x ATR (0 = off)",
+     minval=0.0,
+     maxval=3.0,
+     step=0.05,
+     group=G_ENGULF,
+     tooltip="Requires the engulfing candle's body to be at least this fraction of the confirmed 15m ATR. Zero disables the filter."
+)
+
+bool showEngulfMarkers = input.bool(true, "Show engulfing setup markers", group=G_ENGULF)
 
 
 //=============================================================================
@@ -869,6 +899,46 @@ if intrabarCount > 0
 
 
 //=============================================================================
+// 19B. ENGULFING + THIRD-CANDLE CONTINUATION SIGNAL
+//=============================================================================
+// Independent entry trigger for 15m trend continuation, separate from the
+// second-flip breakout engine above:
+//   1. Candle[1] is an engulfing candle in the direction of the confirmed
+//      HTF bias -- its body fully engulfs the prior, counter-trend
+//      candle[2] body.
+//   2. The current ("third") candle opens back inside candle[1]'s range, is
+//      rejected away from that open against the trend, and closes back in
+//      the trend direction -- confirming continuation.
+// Fires on bar close. Shares the confirmed HTF bias filter and the same
+// daily/session/risk controls as the flip engine, plus the same optional
+// EMA / ATR-regime / Efficiency filters, so both entry paths obey one
+// rulebook. VWAP filtering is intrabar-only and does not apply here.
+
+float engulfBodyATR  = na(confirmedATR) or confirmedATR <= 0 ? na : math.abs(close[1] - open[1]) / confirmedATR
+bool  engulfBodyPass = minEngulfBodyATR <= 0.0 or (not na(engulfBodyATR) and engulfBodyATR >= minEngulfBodyATR)
+
+bool bullEngulfPrior = close[1] > open[1] and open[2] > close[2] and close[1] >= open[2] and open[1] <= close[2] and engulfBodyPass
+bool bearEngulfPrior = close[1] < open[1] and close[2] > open[2] and close[1] <= open[2] and open[1] >= close[2] and engulfBodyPass
+
+bool thirdCandleRejectLong  = open <= high[1] and open >= low[1] and low  < open and close > open
+bool thirdCandleRejectShort = open <= high[1] and open >= low[1] and high > open and close < open
+
+bool openingDelayPassClose = chartMOD >= sessionStartMOD + openingDelayMinutes
+bool commonEntryPassClose  = inExecutionSession and openingDelayPassClose and not (flattenAtSessionEnd and isFinalSessionBar) and not dayHalted and tradeCountPass and cooldownPass and positionPass and signalBarPass
+
+bool engulfEMAPassLong   = not useEMAFilter or (not na(confirmedEMA) and close > confirmedEMA and confirmedEMARising)
+bool engulfEMAPassShort  = not useEMAFilter or (not na(confirmedEMA) and close < confirmedEMA and confirmedEMAFalling)
+bool engulfATRPass        = not useATRRegimeFilter or (not na(confirmedATRRatio) and confirmedATRRatio >= minATRRatio and confirmedATRRatio <= maxATRRatio)
+bool engulfEfficiencyPass = not useEfficiencyFilter or (not na(confirmedEfficiency) and confirmedEfficiency >= minimumEfficiency)
+
+bool engulfContinuationLong  = finalBias == 1  and bullEngulfPrior and thirdCandleRejectLong  and engulfEMAPassLong  and engulfATRPass and engulfEfficiencyPass
+bool engulfContinuationShort = finalBias == -1 and bearEngulfPrior and thirdCandleRejectShort and engulfEMAPassShort and engulfATRPass and engulfEfficiencyPass
+
+bool engulfLongSignal  = useEngulfingSignal and engulfContinuationLong  and commonEntryPassClose and not longEntrySignal and not shortEntrySignal
+bool engulfShortSignal = useEngulfingSignal and engulfContinuationShort and commonEntryPassClose and not longEntrySignal and not shortEntrySignal
+
+
+//=============================================================================
 // 20. MUTUALLY EXCLUSIVE ENTRY SIGNAL
 //=============================================================================
 
@@ -892,6 +962,20 @@ if validLongSignal
          alert_message="MTF2FLIP v1.2 LONG entry"
     )
 
+if engulfLongSignal
+    pendingStop := f_longStopCandidate(close, confirmedATR, low[1])
+    pendingDirection := 1
+    lastSignalBar := bar_index
+    tradesToday += 1
+
+    strategy.entry(
+         "Long",
+         strategy.long,
+         qty=contracts,
+         comment="Engulf Continuation Long",
+         alert_message="MTF2FLIP v1.2 ENGULF LONG entry"
+    )
+
 if validShortSignal
     pendingStop := f_shortStopCandidate(shortSignalReferencePrice, confirmedATR, shortSignalStructureHigh)
     pendingDirection := -1
@@ -904,6 +988,20 @@ if validShortSignal
          qty=contracts,
          comment="Second Flip Short",
          alert_message="MTF2FLIP v1.2 SHORT entry"
+    )
+
+if engulfShortSignal
+    pendingStop := f_shortStopCandidate(close, confirmedATR, high[1])
+    pendingDirection := -1
+    lastSignalBar := bar_index
+    tradesToday += 1
+
+    strategy.entry(
+         "Short",
+         strategy.short,
+         qty=contracts,
+         comment="Engulf Continuation Short",
+         alert_message="MTF2FLIP v1.2 ENGULF SHORT entry"
     )
 
 
@@ -1040,6 +1138,9 @@ plot(strategy.position_size != 0 ? activeTarget : na, "Active Target", color=col
 plotshape(validLongSignal, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="L")
 plotshape(validShortSignal, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="S")
 
+plotshape(showEngulfMarkers and engulfLongSignal, title="Engulf Continuation Long", style=shape.triangleup, location=location.belowbar, color=color.teal, size=size.small, text="EL")
+plotshape(showEngulfMarkers and engulfShortSignal, title="Engulf Continuation Short", style=shape.triangledown, location=location.abovebar, color=color.purple, size=size.small, text="ES")
+
 plotshape(showDebugMarkers and bullFlip2Event, title="Bull Flip 2", style=shape.diamond, location=location.belowbar, color=color.lime, size=size.tiny, text="B2")
 plotshape(showDebugMarkers and bearFlip2Event, title="Bear Flip 2", style=shape.diamond, location=location.abovebar, color=color.red, size=size.tiny, text="S2")
 plotshape(showDebugMarkers and longInvalidationEvent, title="Long Setup Invalidated", style=shape.xcross, location=location.belowbar, color=color.orange, size=size.tiny, text="X")
@@ -1093,6 +1194,12 @@ if validLongSignal
 else if validShortSignal
     setupStatus := "SHORT SIGNAL"
     setupColor := color.red
+else if engulfLongSignal
+    setupStatus := "ENGULF LONG"
+    setupColor := color.teal
+else if engulfShortSignal
+    setupStatus := "ENGULF SHORT"
+    setupColor := color.purple
 else if longBreakArmed
     setupStatus := "LONG ARMED"
     setupColor := color.green
@@ -1163,6 +1270,12 @@ if validLongSignal
 if validShortSignal
     alert("MTF2FLIP: Short entry signal.", alert.freq_all)
 
+if engulfLongSignal
+    alert("MTF2FLIP: Engulfing continuation long entry.", alert.freq_all)
+
+if engulfShortSignal
+    alert("MTF2FLIP: Engulfing continuation short entry.", alert.freq_all)
+
 if positionClosed
     alert("MTF2FLIP: Position closed.", alert.freq_all)
 
@@ -1182,3 +1295,8 @@ plot(marketVolatilityRatio, "Market Volatility Ratio", display=display.data_wind
 plot(trendQuality, "Trend Quality", display=display.data_window)
 plot(float(finalBias), "Final HTF Bias", display=display.data_window)
 plot(float(invalidationCode), "Invalidation Code", display=display.data_window)
+plot(engulfBodyATR, "Engulf Body, x ATR", display=display.data_window)
+plot(bullEngulfPrior ? 1.0 : 0.0, "Bull Engulf Prior Bar", display=display.data_window)
+plot(bearEngulfPrior ? 1.0 : 0.0, "Bear Engulf Prior Bar", display=display.data_window)
+plot(engulfLongSignal ? 1.0 : 0.0, "Engulf Continuation Long Signal", display=display.data_window)
+plot(engulfShortSignal ? 1.0 : 0.0, "Engulf Continuation Short Signal", display=display.data_window)
