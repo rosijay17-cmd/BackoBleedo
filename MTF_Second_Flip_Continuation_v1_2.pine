@@ -335,6 +335,15 @@ float minEngulfBodyATR = input.float(
      tooltip="Requires the engulfing candle's body to be at least this fraction of the confirmed 15m ATR. Zero disables the filter."
 )
 
+int engulfExpiryBars = input.int(
+     6,
+     "Setup expiry after engulfing candle, bars",
+     minval=1,
+     maxval=50,
+     group=G_ENGULF,
+     tooltip="If price has not both retested and broken back through the engulfing candle's level within this many bars, the setup is discarded."
+)
+
 bool showEngulfMarkers = input.bool(true, "Show engulfing setup markers", group=G_ENGULF)
 
 
@@ -899,20 +908,26 @@ if intrabarCount > 0
 
 
 //=============================================================================
-// 19B. ENGULFING + THIRD-CANDLE CONTINUATION SIGNAL
+// 19B. ENGULFING + THIRD-CANDLE RETEST-AND-BREAK CONTINUATION SIGNAL
 //=============================================================================
 // Independent entry trigger for 15m trend continuation, separate from the
-// second-flip breakout engine above:
-//   1. Candle[1] is an engulfing candle in the direction of the confirmed
-//      HTF bias -- its body fully engulfs the prior, counter-trend
-//      candle[2] body.
-//   2. The current ("third") candle opens back inside candle[1]'s range, is
-//      rejected away from that open against the trend, and closes back in
-//      the trend direction -- confirming continuation.
-// Fires on bar close. Shares the confirmed HTF bias filter and the same
-// daily/session/risk controls as the flip engine, plus the same optional
-// EMA / ATR-regime / Efficiency filters, so both entry paths obey one
-// rulebook. VWAP filtering is intrabar-only and does not apply here.
+// second-flip breakout engine above. A break-return-cross state machine,
+// structurally identical to the ORB break-return-cross pattern used
+// elsewhere in this repo, rooted at an engulfing candle's range instead of
+// an opening-range box:
+//   1. ARM  -- candle[1] is an engulfing candle in the direction of the
+//      confirmed HTF bias: its body fully engulfs the prior, counter-trend
+//      candle[2] body. Its high/low freeze as the armed level and stop
+//      reference.
+//   2. RETURN -- a later candle retests back into the engulfing candle's
+//      range (trades through its midpoint) and closes back in the trend
+//      direction ("the third candle retests and flips toward the trade").
+//   3. CROSS -- entry fires on the first subsequent bar that freshly breaks
+//      back out beyond the engulfing candle's high (long) / low (short).
+// Shares the confirmed HTF bias filter and the same daily/session/risk
+// controls as the flip engine, plus the same optional EMA / ATR-regime /
+// Efficiency filters, so both entry paths obey one rulebook. VWAP filtering
+// is intrabar-only and does not apply here.
 
 float engulfBodyATR  = na(confirmedATR) or confirmedATR <= 0 ? na : math.abs(close[1] - open[1]) / confirmedATR
 bool  engulfBodyPass = minEngulfBodyATR <= 0.0 or (not na(engulfBodyATR) and engulfBodyATR >= minEngulfBodyATR)
@@ -920,22 +935,85 @@ bool  engulfBodyPass = minEngulfBodyATR <= 0.0 or (not na(engulfBodyATR) and eng
 bool bullEngulfPrior = close[1] > open[1] and open[2] > close[2] and close[1] >= open[2] and open[1] <= close[2] and engulfBodyPass
 bool bearEngulfPrior = close[1] < open[1] and close[2] > open[2] and close[1] <= open[2] and open[1] >= close[2] and engulfBodyPass
 
-bool thirdCandleRejectLong  = open <= high[1] and open >= low[1] and low  < open and close > open
-bool thirdCandleRejectShort = open <= high[1] and open >= low[1] and high > open and close < open
+var float engulfLongLevel               = na
+var float engulfLongStopRef             = na
+var float engulfLongMid                 = na
+var bool  engulfLongArmed               = false
+var bool  engulfLongReturned            = false
+var int   engulfLongArmBar              = na
+var bool  engulfPrevLongBreakConfirmed  = false
+
+var float engulfShortLevel              = na
+var float engulfShortStopRef            = na
+var float engulfShortMid                = na
+var bool  engulfShortArmed              = false
+var bool  engulfShortReturned           = false
+var int   engulfShortArmBar             = na
+var bool  engulfPrevShortBreakConfirmed = false
+
+// --- ARM: a fresh engulfing candle freezes the level, stop, and midpoint ---
+if finalBias == 1 and bullEngulfPrior
+    engulfLongArmed := true
+    engulfLongLevel := high[1]
+    engulfLongStopRef := low[1]
+    engulfLongMid := (high[1] + low[1]) / 2.0
+    engulfLongArmBar := bar_index
+    engulfLongReturned := false
+    engulfPrevLongBreakConfirmed := false
+
+if finalBias == -1 and bearEngulfPrior
+    engulfShortArmed := true
+    engulfShortLevel := low[1]
+    engulfShortStopRef := high[1]
+    engulfShortMid := (high[1] + low[1]) / 2.0
+    engulfShortArmBar := bar_index
+    engulfShortReturned := false
+    engulfPrevShortBreakConfirmed := false
+
+// --- expire a stale, unresolved arm ---
+if engulfLongArmed and not na(engulfLongArmBar) and bar_index - engulfLongArmBar > engulfExpiryBars
+    engulfLongArmed := false
+
+if engulfShortArmed and not na(engulfShortArmBar) and bar_index - engulfShortArmBar > engulfExpiryBars
+    engulfShortArmed := false
+
+// --- RETURN: the third candle (or later) retests into the engulfing range
+//     and closes back in the trend direction ---
+if engulfLongArmed and not engulfLongReturned and bar_index > engulfLongArmBar
+    if low <= engulfLongMid and close > open
+        engulfLongReturned := true
+
+if engulfShortArmed and not engulfShortReturned and bar_index > engulfShortArmBar
+    if high >= engulfShortMid and close < open
+        engulfShortReturned := true
+
+// --- CROSS: a fresh break of the engulfing candle's high/low confirms entry ---
+bool longBreakConfirmedNow  = engulfLongArmed  and (breakConfirmationMode == "Intrabar Close" ? close > engulfLongLevel  : high > engulfLongLevel)
+bool shortBreakConfirmedNow = engulfShortArmed and (breakConfirmationMode == "Intrabar Close" ? close < engulfShortLevel : low  < engulfShortLevel)
+
+bool engulfEMAPassLong    = not useEMAFilter or (not na(confirmedEMA) and close > confirmedEMA and confirmedEMARising)
+bool engulfEMAPassShort   = not useEMAFilter or (not na(confirmedEMA) and close < confirmedEMA and confirmedEMAFalling)
+bool engulfATRPass        = not useATRRegimeFilter or (not na(confirmedATRRatio) and confirmedATRRatio >= minATRRatio and confirmedATRRatio <= maxATRRatio)
+bool engulfEfficiencyPass = not useEfficiencyFilter or (not na(confirmedEfficiency) and confirmedEfficiency >= minimumEfficiency)
 
 bool openingDelayPassClose = chartMOD >= sessionStartMOD + openingDelayMinutes
 bool commonEntryPassClose  = inExecutionSession and openingDelayPassClose and not (flattenAtSessionEnd and isFinalSessionBar) and not dayHalted and tradeCountPass and cooldownPass and positionPass and signalBarPass
 
-bool engulfEMAPassLong   = not useEMAFilter or (not na(confirmedEMA) and close > confirmedEMA and confirmedEMARising)
-bool engulfEMAPassShort  = not useEMAFilter or (not na(confirmedEMA) and close < confirmedEMA and confirmedEMAFalling)
-bool engulfATRPass        = not useATRRegimeFilter or (not na(confirmedATRRatio) and confirmedATRRatio >= minATRRatio and confirmedATRRatio <= maxATRRatio)
-bool engulfEfficiencyPass = not useEfficiencyFilter or (not na(confirmedEfficiency) and confirmedEfficiency >= minimumEfficiency)
-
-bool engulfContinuationLong  = finalBias == 1  and bullEngulfPrior and thirdCandleRejectLong  and engulfEMAPassLong  and engulfATRPass and engulfEfficiencyPass
-bool engulfContinuationShort = finalBias == -1 and bearEngulfPrior and thirdCandleRejectShort and engulfEMAPassShort and engulfATRPass and engulfEfficiencyPass
+bool engulfContinuationLong  = engulfLongArmed  and engulfLongReturned  and longBreakConfirmedNow  and not engulfPrevLongBreakConfirmed  and bar_index > engulfLongArmBar  and engulfEMAPassLong  and engulfATRPass and engulfEfficiencyPass
+bool engulfContinuationShort = engulfShortArmed and engulfShortReturned and shortBreakConfirmedNow and not engulfPrevShortBreakConfirmed and bar_index > engulfShortArmBar and engulfEMAPassShort and engulfATRPass and engulfEfficiencyPass
 
 bool engulfLongSignal  = useEngulfingSignal and engulfContinuationLong  and commonEntryPassClose and not longEntrySignal and not shortEntrySignal
 bool engulfShortSignal = useEngulfingSignal and engulfContinuationShort and commonEntryPassClose and not longEntrySignal and not shortEntrySignal
+
+// disarm once fired, and roll the break-confirmation trackers forward
+if engulfLongSignal
+    engulfLongArmed := false
+
+if engulfShortSignal
+    engulfShortArmed := false
+
+engulfPrevLongBreakConfirmed := longBreakConfirmedNow
+engulfPrevShortBreakConfirmed := shortBreakConfirmedNow
 
 
 //=============================================================================
@@ -963,7 +1041,7 @@ if validLongSignal
     )
 
 if engulfLongSignal
-    pendingStop := f_longStopCandidate(close, confirmedATR, low[1])
+    pendingStop := f_longStopCandidate(close, confirmedATR, engulfLongStopRef)
     pendingDirection := 1
     lastSignalBar := bar_index
     tradesToday += 1
@@ -991,7 +1069,7 @@ if validShortSignal
     )
 
 if engulfShortSignal
-    pendingStop := f_shortStopCandidate(close, confirmedATR, high[1])
+    pendingStop := f_shortStopCandidate(close, confirmedATR, engulfShortStopRef)
     pendingDirection := -1
     lastSignalBar := bar_index
     tradesToday += 1
@@ -1138,6 +1216,9 @@ plot(strategy.position_size != 0 ? activeTarget : na, "Active Target", color=col
 plotshape(validLongSignal, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="L")
 plotshape(validShortSignal, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="S")
 
+plotshape(showEngulfMarkers and (finalBias == 1 and bullEngulfPrior), title="Bullish Engulfing Candle", style=shape.circle, location=location.belowbar, color=color.new(color.teal, 40), size=size.tiny, text="E", offset=-1)
+plotshape(showEngulfMarkers and (finalBias == -1 and bearEngulfPrior), title="Bearish Engulfing Candle", style=shape.circle, location=location.abovebar, color=color.new(color.purple, 40), size=size.tiny, text="E", offset=-1)
+
 plotshape(showEngulfMarkers and engulfLongSignal, title="Engulf Continuation Long", style=shape.triangleup, location=location.belowbar, color=color.teal, size=size.small, text="EL")
 plotshape(showEngulfMarkers and engulfShortSignal, title="Engulf Continuation Short", style=shape.triangledown, location=location.abovebar, color=color.purple, size=size.small, text="ES")
 
@@ -1200,6 +1281,18 @@ else if engulfLongSignal
 else if engulfShortSignal
     setupStatus := "ENGULF SHORT"
     setupColor := color.purple
+else if engulfLongArmed and engulfLongReturned
+    setupStatus := "ENGULF LONG RETEST"
+    setupColor := color.new(color.teal, 15)
+else if engulfShortArmed and engulfShortReturned
+    setupStatus := "ENGULF SHORT RETEST"
+    setupColor := color.new(color.purple, 15)
+else if engulfLongArmed
+    setupStatus := "ENGULF LONG ARMED"
+    setupColor := color.new(color.teal, 40)
+else if engulfShortArmed
+    setupStatus := "ENGULF SHORT ARMED"
+    setupColor := color.new(color.purple, 40)
 else if longBreakArmed
     setupStatus := "LONG ARMED"
     setupColor := color.green
@@ -1300,3 +1393,7 @@ plot(bullEngulfPrior ? 1.0 : 0.0, "Bull Engulf Prior Bar", display=display.data_
 plot(bearEngulfPrior ? 1.0 : 0.0, "Bear Engulf Prior Bar", display=display.data_window)
 plot(engulfLongSignal ? 1.0 : 0.0, "Engulf Continuation Long Signal", display=display.data_window)
 plot(engulfShortSignal ? 1.0 : 0.0, "Engulf Continuation Short Signal", display=display.data_window)
+plot(engulfLongArmed ? 1.0 : 0.0, "Engulf Long Armed", display=display.data_window)
+plot(engulfShortArmed ? 1.0 : 0.0, "Engulf Short Armed", display=display.data_window)
+plot(engulfLongReturned ? 1.0 : 0.0, "Engulf Long Retested", display=display.data_window)
+plot(engulfShortReturned ? 1.0 : 0.0, "Engulf Short Retested", display=display.data_window)
