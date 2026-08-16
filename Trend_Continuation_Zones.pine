@@ -917,6 +917,31 @@ if plotShortSignal
     f_push_label_prune(scoreLabels, scoreTag, 50)
 
 // ============================================================================
+// R:R VISUAL GATE (diagnostic -- extracted, not a new filter)
+// ============================================================================
+// This is the exact condition the TRADE CREATION block below runs on,
+// pulled out so it can be inspected directly instead of inferred from
+// whether a box happened to render. It is identical in root cause to the
+// BUY/SELL label's own condition (showSignalLabels and plotLongSignal /
+// plotShortSignal) except for swapping showSignalLabels for
+// enableSimulation -- there is no Quality Score, Trend State, ADX/chop, or
+// session condition anywhere in this gate. Both toggles default true, so in
+// practice this is true on every bar plotLongSignal/plotShortSignal is true,
+// same bar as the BUY/SELL label. If a BUY label shows with no R:R diagram,
+// this gate was still true on that bar -- the box/line/label objects were
+// drawn and then silently recycled later by TradingView's global
+// max_boxes_count/max_lines_count/max_labels_count caps, because (unlike
+// every other object type in this script) activeTpBox/activeSlBox/
+// activeEntryZone/activeEntryLine1/activeEntryLine2/activeInvalidationLine/
+// activeEntryTag/activeTpTag/activeSlTag/activeInvalidationTag are never
+// pushed into a size-capped prune array and are never explicitly deleted on
+// a winning trade (only a losing trade with Show Stopped Trades off cleans
+// up immediately) -- they just get overwritten to na while the drawn
+// objects themselves stay on the chart until the platform recycles them.
+bool rrBoxConditionLong  = enableSimulation and plotLongSignal
+bool rrBoxConditionShort = enableSimulation and plotShortSignal
+
+// ============================================================================
 // TRADE CREATION
 // ============================================================================
 if enableSimulation and plotLongSignal
@@ -1257,3 +1282,11 @@ alertcondition(plotShortSignal, title="Bearish Trend Continuation", message="Bea
 // ============================================================================
 plot(adxValue, "ADX", display=display.data_window)
 plot(chopValue, "Choppiness Index", display=display.data_window)
+
+// Overlay these two pairs on any bar to confirm the R:R box gate and the
+// BUY/SELL label gate always move together -- proves the label-without-box
+// bars you see on the chart are an object-pruning artifact, not a logic gate.
+plot(rrBoxConditionLong ? 1.0 : 0.0, "RR Box Condition Long", display=display.data_window)
+plot(plotLongSignal ? 1.0 : 0.0, "BUY Label Condition (plotLongSignal)", display=display.data_window)
+plot(rrBoxConditionShort ? 1.0 : 0.0, "RR Box Condition Short", display=display.data_window)
+plot(plotShortSignal ? 1.0 : 0.0, "SELL Label Condition (plotShortSignal)", display=display.data_window)
