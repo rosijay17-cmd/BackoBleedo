@@ -537,9 +537,31 @@ if not sourceParityMode and newSessionDay and barstate.isnew
     pendingBearLevel := na
     pendingBearScore := na
 
+// Confirmation window sizing is computed here, BEFORE the registration
+// checks below, specifically so the staleness check those checks now use
+// (see FIX note) has effectiveConfirmationWindow available. Moving these two
+// lines earlier does not change their own values -- they only depend on
+// inputs, not on anything else computed in this section.
+int minimumConfirmationAge = sourceParityMode ? 1 : allowSweepBarConfirmation ? 0 : 1
+int effectiveConfirmationWindow = sourceParityMode ? math.max(1, confirmationWindow) : confirmationWindow
+
+// FIX: a pending sweep that has already aged past effectiveConfirmationWindow
+// as of the CURRENT bar is stale. The registration checks below previously
+// tested only `na(pendingBullSweepBar)` / `na(pendingBearSweepBar)`, which
+// stays false until section 24 clears it -- but section 24 runs later in the
+// script, after these checks, on the very same bar. Any fresh, valid sweep
+// landing on the exact bar an old pending expires was therefore silently
+// discarded instead of being registered, forcing the setup to wait for a
+// completely separate later sweep before tracking could resume. Treating an
+// already-stale pending as equivalent to "none pending" here closes that gap
+// without weakening the "first sweep freezes until confirm/expire" rule for
+// any pending that is still genuinely alive within its window.
+bool pendingBullStale = not na(pendingBullSweepBar) and (bar_index - pendingBullSweepBar) > effectiveConfirmationWindow
+bool pendingBearStale = not na(pendingBearSweepBar) and (bar_index - pendingBearSweepBar) > effectiveConfirmationWindow
+
 // In sequence-safe mode the first qualifying sweep is frozen until it either
 // confirms or expires. A second sweep cannot reset age back to zero.
-if validBuySweep and (not sourceParityMode or (na(pendingBullSweepBar) and strategy.position_size == 0))
+if validBuySweep and (not sourceParityMode or ((na(pendingBullSweepBar) or pendingBullStale) and strategy.position_size == 0))
     pendingBullSweepBar := bar_index
     pendingBullHigh := high
     pendingBullLow := low
@@ -551,7 +573,7 @@ if validBuySweep and (not sourceParityMode or (na(pendingBullSweepBar) and strat
         array.remove(lowLevels, sweptLowIndex)
         array.remove(lowBars, sweptLowIndex)
 
-if validSellSweep and (not sourceParityMode or (na(pendingBearSweepBar) and strategy.position_size == 0))
+if validSellSweep and (not sourceParityMode or ((na(pendingBearSweepBar) or pendingBearStale) and strategy.position_size == 0))
     pendingBearSweepBar := bar_index
     pendingBearHigh := high
     pendingBearLow := low
@@ -562,9 +584,6 @@ if validSellSweep and (not sourceParityMode or (na(pendingBearSweepBar) and stra
     if not sourceParityMode and consumeSweptLevels and not na(sweptHighIndex)
         array.remove(highLevels, sweptHighIndex)
         array.remove(highBars, sweptHighIndex)
-
-int minimumConfirmationAge = sourceParityMode ? 1 : allowSweepBarConfirmation ? 0 : 1
-int effectiveConfirmationWindow = sourceParityMode ? math.max(1, confirmationWindow) : confirmationWindow
 
 bool bullPending = not na(pendingBullSweepBar)
 bool bearPending = not na(pendingBearSweepBar)
