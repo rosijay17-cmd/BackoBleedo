@@ -841,6 +841,21 @@ varip float activeSL = na
 varip float activeTP = na
 varip float activeEntryReference = na
 
+// FIX: longEntrySignal / shortEntrySignal go true only transiently. The
+// entry block below resets hasBrokenOutUpper/hasReturnedToUpper (etc.) the
+// instant it fires -- and since this script runs calc_on_every_tick=true,
+// those varip flags flip back to false on the very next recalculation of
+// the SAME bar, well before that bar's final render. strategy.entry() still
+// fires correctly (it already executed procedurally), but plotshape() only
+// draws a bar's FINAL calculated value, so the entry arrow silently never
+// appears -- most visible during Bar Replay, which plays out each bar's
+// intrabar path tick by tick, making the flip-back easy to actually catch.
+// These bar_index-keyed markers persist "an entry fired on this bar" for
+// the rest of that bar's recalculations, independent of the state-machine
+// reset, so section 07's arrows plot correctly.
+var int longEntryFiredBar = na
+var int shortEntryFiredBar = na
+
 if longEntrySignal
     float longRisk = orbHigh - orbMid
 
@@ -867,6 +882,7 @@ if longEntrySignal
     )
 
     tradeCount += 1
+    longEntryFiredBar := bar_index
 
     hasBrokenOutUpper := false
     hasReturnedToUpper := false
@@ -902,6 +918,7 @@ if shortEntrySignal
     )
 
     tradeCount += 1
+    shortEntryFiredBar := bar_index
 
     hasBrokenOutUpper := false
     hasReturnedToUpper := false
@@ -977,7 +994,7 @@ plot(
 )
 
 plotshape(
-     showEntryArrows and longEntrySignal,
+     showEntryArrows and longEntryFiredBar == bar_index,
      title = "LONG ENTRY",
      style = shape.triangleup,
      location = location.belowbar,
@@ -988,7 +1005,7 @@ plotshape(
 )
 
 plotshape(
-     showEntryArrows and shortEntrySignal,
+     showEntryArrows and shortEntryFiredBar == bar_index,
      title = "SHORT ENTRY",
      style = shape.triangledown,
      location = location.abovebar,
