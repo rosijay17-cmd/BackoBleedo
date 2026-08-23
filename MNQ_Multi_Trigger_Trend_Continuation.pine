@@ -627,14 +627,14 @@ if longEntry
     lastSignalBar := bar_index
     tradesToday += 1
     lastTriggerTag := longTriggerTag
-    strategy.entry("Long", strategy.long, qty=contracts, comment="LONG " + longTriggerTag, alert_message="MNQ MTTC LONG (" + longTriggerTag + ")")
+    strategy.entry("Long", strategy.long, qty=contracts, comment="LONG " + longTriggerTag, alert_message="MNQ MTTC Bullish Signal (" + longTriggerTag + ")")
 
 if shortEntry
     pendingStop := candidateShortStop
     lastSignalBar := bar_index
     tradesToday += 1
     lastTriggerTag := shortTriggerTag
-    strategy.entry("Short", strategy.short, qty=contracts, comment="SHORT " + shortTriggerTag, alert_message="MNQ MTTC SHORT (" + shortTriggerTag + ")")
+    strategy.entry("Short", strategy.short, qty=contracts, comment="SHORT " + shortTriggerTag, alert_message="MNQ MTTC Bearish Signal (" + shortTriggerTag + ")")
 
 
 //=============================================================================
@@ -776,15 +776,15 @@ bgcolor(finalBiasRaw == 1 ? color.new(C_BULL, 95) : finalBiasRaw == -1 ? color.n
 // 31. ALERTS
 //=============================================================================
 
-alertcondition(longEntry, title="MNQ MTTC Long Entry", message="MNQ MTTC LONG entry | {{ticker}} | {{interval}}")
-alertcondition(shortEntry, title="MNQ MTTC Short Entry", message="MNQ MTTC SHORT entry | {{ticker}} | {{interval}}")
+alertcondition(longEntry, title="MNQ MTTC Bullish Signal", message="MNQ MTTC Bullish Signal | {{ticker}} | {{interval}}")
+alertcondition(shortEntry, title="MNQ MTTC Bearish Signal", message="MNQ MTTC Bearish Signal | {{ticker}} | {{interval}}")
 alertcondition(positionJustClosed, title="MNQ MTTC Position Closed", message="MNQ MTTC position closed | {{ticker}} | {{interval}}")
 
 if longEntry
-    alert("MNQ MTTC LONG | " + longTriggerTag + " | " + syminfo.ticker + " @ " + f_price(close) + " | SL " + f_price(candidateLongStop), alert.freq_once_per_bar_close)
+    alert("MNQ MTTC Bullish Signal | " + longTriggerTag + " | " + syminfo.ticker + " @ " + f_price(close) + " | SL " + f_price(candidateLongStop), alert.freq_once_per_bar_close)
 
 if shortEntry
-    alert("MNQ MTTC SHORT | " + shortTriggerTag + " | " + syminfo.ticker + " @ " + f_price(close) + " | SL " + f_price(candidateShortStop), alert.freq_once_per_bar_close)
+    alert("MNQ MTTC Bearish Signal | " + shortTriggerTag + " | " + syminfo.ticker + " @ " + f_price(close) + " | SL " + f_price(candidateShortStop), alert.freq_once_per_bar_close)
 
 
 //=============================================================================
