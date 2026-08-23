@@ -35,6 +35,7 @@ are shared:
 | 3 | Weighted multi-indicator signal combination | `references/multi-indicator-combination.md` | Sukma & Namahoot (2024/25), *Computational Economics* |
 | 4 | RL + fuzzy-logic hierarchical multi-strategy capital allocation | `references/rl-fuzzy-strategy-allocation.md` | Huang, Chen, Chang & Huang (2025), *Applied Soft Computing* |
 | 5 | Implied vs. historical volatility as a realized-vol predictor | `references/implied-vs-historical-volatility.md` | Szakmary, Ors, Kim & Davidson (2003), *J. of Banking & Finance* |
+| 6 | Optimal trend-following as a two-threshold hysteresis rule on regime probability | `references/optimal-trend-following-boundaries.md` | Dai, Yang, Zhang & Zhu (2016), *Mathematics of Operations Research* |
 
 ## Portability Matrix
 
@@ -52,6 +53,9 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
 | RL training (CNN + deterministic policy gradient) | ❌ Not feasible | ✅ Required | Needs a deep-learning framework; also needs cross-script equity-curve visibility Pine doesn't have |
 | Fuzzy-logic feature smoothing | ⚠️ Approximable with a smoothed/clamped scoring function | ✅ Full version | A Pine "soft gate" (e.g. `math.min(math.max(...), ...)` ramp instead of a hard boolean) captures the spirit cheaply |
 | GARCH(1,1) volatility forecasting | ❌ Not feasible | ✅ Required (e.g. `arch` package) | Recursive MLE fit; ATR/realized-range is the Pine-native substitute, with the bias noted in paper #5 |
+| HJB free-boundary solve for the exact optimal thresholds | ❌ Not feasible | ⚠️ Possible but heavy | System of variational inequalities — theory-grounding for a design choice, not a library to import |
+| Two-threshold hysteresis band (strict entry, loose exit) on a regime signal | ✅ Direct — the *structure*, not the exact optimal levels | ✅ | Doesn't need a real Wonham filter; apply to any 0-1 regime proxy Pine already computes |
+| Wonham filter for a literal regime-probability `p_t` | ⚠️ Not really — needs a filtering recursion each bar | ✅ Feasible, lighter than paper #2's TVTP pipeline | A genuinely tractable middle-ground project if a literal implementation is ever wanted |
 
 ## Cross-Paper Synthesis
 
@@ -86,6 +90,24 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
   combined signal's out-of-sample validity is untested. Treat every formula in this
   skill as a *building block*, not a proven strategy — always re-validate on this
   repo's own instruments (NQ/MNQ/ES) and timeframes in `quantor` before trusting it.
+- **Asymmetric entry/exit thresholds on a regime signal aren't a whipsaw hack — they're
+  what the provably optimal rule looks like.** Paper #6 derives, from first principles,
+  that the optimal trend-following policy is a strict-entry/loose-exit two-threshold
+  band on regime probability, with a no-trade zone between them that widens as
+  transaction costs rise. This is independent, theoretical confirmation of a pattern
+  this repo already uses empirically (`MTF_Second_Flip`'s "second flip" requirement,
+  `BBL_MTF`'s/`Academia_PO3`'s separate enter-vs-hold thresholds on the same score) —
+  and it converges with paper #2 rather than contradicting it: even though paper #6's
+  stated objective is return-maximizing, the optimal policy it derives still conditions
+  on nothing but the regime signal itself, the same "predict the regime, not the
+  return" prescription paper #2 reaches empirically.
+- **A single backtest run is a single sample path, and paper #6 proves how wide that
+  variance can be even under a correctly-specified model** (identical parameters,
+  identical thresholds, single-path total returns spanning roughly 0.08x to ~1,888x
+  across ten simulated paths in the paper's own Table 3). Every TradingView Strategy
+  Tester run on one instrument over one historical window in this repo is exactly that
+  kind of single path — walk-forward validation across multiple periods in `quantor`,
+  not one in-sample run, is the only way to see whether an edge is really there.
 
 ## Mapping to This Repo's Architecture
 
@@ -129,6 +151,17 @@ can be corrected against the real implementation rather than inference.
   fixed threshold. The `quantor` pipeline is the right place to prototype a TVTP-style
   regime classifier (see reference file for the exact model spec) and use it either to
   segment walk-forward validation windows, or to derive a simplified on-chart proxy.
+- **Every regime/bias gate in this repo ↔ paper #6's two-threshold hysteresis result**:
+  wherever a strategy currently re-checks one shared cutoff every bar to decide both
+  "may I enter" and "am I still in trend," paper #6 argues for deliberately splitting
+  that into two thresholds — stricter to arm/enter, distinctly looser to remain
+  armed/hold — with the gap between them widening for higher-cost instruments and
+  narrowing for cheap ones (directly relevant to MNQ specifically, a low-commission
+  micro contract, where the theoretically-justified no-trade band is narrower than a
+  higher-cost strategy's defaults would suggest). This is the concrete architecture
+  note for the MNQ trend-following design discussed this session: build the regime gate
+  as a real two-threshold band from the start, not one cutoff reused for both entry and
+  hold-through.
 
 ## Changelog
 
@@ -139,3 +172,14 @@ can be corrected against the real implementation rather than inference.
   papers at this stage — the five cover largely non-overlapping mechanisms (signal
   churn, regime prediction, indicator combination, capital allocation, volatility
   forecasting) with the synthesis notes above covering their few points of overlap.
+- **2026-08-23** — Ingested paper #6: Dai, Yang, Zhang & Zhu (2016), "Optimal Trend
+  Following Trading Rules" (*Mathematics of Operations Research*) — a stochastic
+  optimal-control proof (not an empirical study, unlike papers #1-5) that the optimal
+  trend-following rule under a hidden bull/bear Markov-switching model is a
+  two-threshold hysteresis band on regime probability, with only finitely many trades
+  almost surely and a no-trade zone that widens with transaction costs. No
+  contradiction with paper #2 — see the "Contradicts / qualifies" note in the new
+  reference file; the two converge on "trade the regime signal alone" from an
+  empirical and a theoretical direction respectively. Directly informs the MNQ
+  trend-following strategy design discussed the same session (see the Mapping section
+  above): the regime/bias gate should be a genuine two-threshold band from the start.
