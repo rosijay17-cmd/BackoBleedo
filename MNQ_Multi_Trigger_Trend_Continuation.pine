@@ -1,0 +1,805 @@
+//@version=6
+strategy(
+     title="MNQ Multi-Trigger Trend Continuation",
+     shorttitle="MNQ MTTC",
+     overlay=true,
+     pyramiding=0,
+     initial_capital=50000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.47,
+     slippage=1,
+     process_orders_on_close=true,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false,
+     max_bars_back=5000,
+     max_labels_count=300,
+     max_lines_count=100,
+     max_boxes_count=100
+)
+
+//=============================================================================
+// OVERVIEW
+//=============================================================================
+// Ground-up trend-continuation strategy for MNQ, built from a synthesis of
+// patterns already proven across this repo plus the research in the
+// quant-research-notes skill. Three independent, individually-toggleable
+// entry triggers share one regime gate, one risk model, and one dashboard,
+// so their relative performance can be compared and tuned separately in
+// Strategy Tester (each trade's comment/alert tags which trigger fired):
+//
+//   1. PULLBACK RECLAIM   -- retrace to the trend EMA, reclaim with a
+//      quality candle. Simplest, most frequent signals.
+//   2. SECOND-FLIP RE-ENTRY -- requires a genuine counter-trend excursion
+//      AND a second flip back into bias before arming, then a break of the
+//      prior bar's extreme to confirm. A confirmed-bar-level approximation
+//      of MTF_Second_Flip_Continuation_v1_2.pine's fuller intrabar
+//      reconstruction -- deliberately simplified for this combined script.
+//   3. LIQUIDITY SWEEP + RECLAIM -- needs a real stop-run beyond a stored
+//      swing pivot before reclaiming it. Most selective; wants real volume.
+//
+// REGIME GATE -- built as a genuine two-threshold hysteresis band, not one
+// shared cutoff, per Dai, Yang, Zhang & Zhu (2016) "Optimal Trend Following
+// Trading Rules" (quant-research-notes reference #6): the provably optimal
+// trend-following rule arms on a STRICT threshold and only exits the regime
+// on a distinctly LOOSER one, with a no-trade zone between them. Here that
+// becomes regimeEnterMin (strict, arms new entries) vs. regimeHoldMin
+// (loose, merely keeps the regime alive) applied to a continuous 0-100
+// trend-quality score -- not a literal Wonham-filter probability, but the
+// same structural idea using tools Pine already has.
+//
+// Per the same skill's synthesis notes: the regime gate stays a pure gate
+// and never touches stop/target sizing (paper #2's finding); no trigger's
+// weights were grid-search-optimized against this repo's own data (paper
+// #3's flagged pitfall) -- they are principled, interpretable starting
+// points, meant to be walk-forward tuned in the Python quantor pipeline,
+// not trusted as-is. Session window is a fully open input, not hardcoded
+// RTH or 24h, per request.
+//=============================================================================
+
+
+//=============================================================================
+// 01. INPUT GROUPS
+//=============================================================================
+
+const string G_SESSION  = "01 - Session"
+const string G_BIAS     = "02 - HTF Bias"
+const string G_REGIME   = "03 - Trend Quality / Regime Gate"
+const string G_TRIGGERS = "04 - Entry Triggers"
+const string G_PULLBACK = "05 - Pullback Reclaim Trigger"
+const string G_FLIP     = "06 - Second-Flip Trigger"
+const string G_SWEEP    = "07 - Liquidity Sweep Trigger"
+const string G_RISK     = "08 - Risk Management"
+const string G_DAILY    = "09 - Daily Controls"
+const string G_DISPLAY  = "10 - Dashboard and Display"
+
+
+//=============================================================================
+// 02. SESSION INPUTS
+//=============================================================================
+
+string tradingSession   = input.session("0930-1600", "Trading Session", tooltip="Type any window -- e.g. 0000-2359 for effectively 24h, or 1800-1600 for the Globex overnight-through-RTH session. Not hardcoded to RTH.", group=G_SESSION)
+string sessionTimezone  = input.string("America/New_York", "Session Timezone", group=G_SESSION)
+bool   restrictToSession = input.bool(true, "Restrict Entries To Session Window", group=G_SESSION)
+bool   closeAtSessionEnd = input.bool(false, "Close Position At Session End", group=G_SESSION)
+
+
+//=============================================================================
+// 03. HTF BIAS INPUTS
+//=============================================================================
+
+string biasTF1   = input.timeframe("60", "Bias TF 1", group=G_BIAS)
+string biasTF2    = input.timeframe("240", "Bias TF 2", group=G_BIAS)
+int    biasEmaLen = input.int(50, "Bias EMA Length", minval=5, group=G_BIAS)
+
+
+//=============================================================================
+// 04. TREND QUALITY / REGIME GATE INPUTS
+//=============================================================================
+
+int   adxLen        = input.int(14, "ADX Length", minval=2, group=G_REGIME)
+float adxNormLo      = input.float(15.0, "ADX Norm Low (0 pts)", minval=0, group=G_REGIME)
+float adxNormHi      = input.float(35.0, "ADX Norm High (full pts)", minval=1, group=G_REGIME)
+int   chopLen        = input.int(14, "Choppiness Length", minval=2, group=G_REGIME)
+float chopBest        = input.float(38.2, "Choppiness Best (full pts)", minval=0, group=G_REGIME)
+float chopWorst       = input.float(61.8, "Choppiness Worst (0 pts)", minval=0, group=G_REGIME)
+int   efficiencyLen  = input.int(14, "Efficiency Ratio Length", minval=2, group=G_REGIME)
+float efficiencyLo    = input.float(0.15, "Efficiency Low (0 pts)", minval=0, maxval=1, step=0.01, group=G_REGIME)
+float efficiencyHi    = input.float(0.60, "Efficiency High (full pts)", minval=0, maxval=1, step=0.01, group=G_REGIME)
+int   persistenceLen = input.int(3, "Persistence Bars", minval=1, group=G_REGIME)
+
+float regimeEnterMin = input.float(70.0, "Regime Enter Threshold (strict)", minval=0, maxval=100, tooltip="Trend-quality score required to ARM a new regime -- the strict threshold. See the header note on paper #6's two-threshold hysteresis result.", group=G_REGIME)
+float regimeHoldMin  = input.float(45.0, "Regime Hold Threshold (loose)", minval=0, maxval=100, tooltip="Trend-quality score required merely to REMAIN in an already-armed regime. Deliberately looser than the enter threshold and deliberately not the same input -- the whole point of the hysteresis band.", group=G_REGIME)
+
+
+//=============================================================================
+// 05. ENTRY TRIGGER TOGGLES
+//=============================================================================
+
+bool useTriggerPullback = input.bool(true, "Enable: Pullback Reclaim", group=G_TRIGGERS)
+bool useTriggerFlip     = input.bool(true, "Enable: Second-Flip Re-Entry", group=G_TRIGGERS)
+bool useTriggerSweep    = input.bool(true, "Enable: Liquidity Sweep + Reclaim", group=G_TRIGGERS)
+
+
+//=============================================================================
+// 06. PULLBACK RECLAIM TRIGGER INPUTS
+//=============================================================================
+
+int   pullbackTrendEmaLen  = input.int(21, "Pullback Trend EMA", minval=2, group=G_PULLBACK)
+int   pullbackLookback      = input.int(8, "Pullback Lookback Bars", minval=1, group=G_PULLBACK)
+float pullbackMinBodyPct    = input.float(0.45, "Minimum Reclaim Body %", minval=0, maxval=1, step=0.05, group=G_PULLBACK)
+
+
+//=============================================================================
+// 07. SECOND-FLIP TRIGGER INPUTS
+//=============================================================================
+
+int flipEmaLen        = input.int(21, "Flip Reference EMA", minval=2, group=G_FLIP)
+int flipMemoryBars    = input.int(30, "Flip Memory, Bars", minval=5, maxval=200, tooltip="A flip count resets if no second flip completes within this many bars.", group=G_FLIP)
+int flipConfirmWindow = input.int(4, "Break Confirmation Window, Bars", minval=1, maxval=20, tooltip="After the second flip arms, price must break the prior bar's extreme within this many bars.", group=G_FLIP)
+
+
+//=============================================================================
+// 08. LIQUIDITY SWEEP TRIGGER INPUTS
+//=============================================================================
+
+int   sweepPivotLength      = input.int(5, "Swing Pivot Length", minval=1, maxval=20, group=G_SWEEP)
+int   sweepStoredLevels     = input.int(15, "Stored Liquidity Levels", minval=5, maxval=100, group=G_SWEEP)
+float sweepMinDistanceAtr   = input.float(0.10, "Minimum Sweep Distance / ATR", minval=0.01, maxval=2.0, step=0.01, group=G_SWEEP)
+float sweepMinWickPct       = input.float(0.35, "Minimum Rejection Wick %", minval=0, maxval=1, step=0.01, group=G_SWEEP)
+int   sweepConfirmWindow    = input.int(2, "Reclaim Confirmation Window, Bars", minval=0, maxval=10, group=G_SWEEP)
+
+
+//=============================================================================
+// 09. RISK MANAGEMENT INPUTS
+//=============================================================================
+
+int   contracts          = input.int(1, "MNQ Contracts", minval=1, maxval=50, group=G_RISK)
+int   atrLen              = input.int(14, "ATR Length", minval=2, group=G_RISK)
+float atrStopMultiplier   = input.float(1.5, "ATR Stop Multiplier", minval=0.1, step=0.1, group=G_RISK)
+float structuralStopBufferAtr = input.float(0.10, "Stop Buffer Beyond Structure / ATR", minval=0, maxval=2, step=0.05, group=G_RISK)
+float rrTarget            = input.float(2.0, "Risk-Reward Target", minval=0.25, step=0.25, group=G_RISK)
+bool  useBreakEven        = input.bool(true, "Use Break-Even", group=G_RISK)
+float breakEvenAtR        = input.float(1.0, "Break-Even Trigger, R", minval=0.25, step=0.25, group=G_RISK)
+
+
+//=============================================================================
+// 10. DAILY CONTROLS INPUTS
+//=============================================================================
+
+int maxTradesPerDay  = input.int(4, "Maximum Trades Per Day", minval=1, group=G_DAILY)
+int cooldownBars     = input.int(8, "Cooldown Bars", minval=0, tooltip="Measured from both the last signal bar and the last CLOSED-trade bar.", group=G_DAILY)
+
+
+//=============================================================================
+// 11. DASHBOARD AND DISPLAY INPUTS
+//=============================================================================
+
+bool   showDashboard   = input.bool(true, "Show Dashboard", group=G_DISPLAY)
+string dashboardPos    = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=G_DISPLAY)
+bool   showEmas         = input.bool(true, "Show EMAs", group=G_DISPLAY)
+bool   showEntryMarkers = input.bool(true, "Show Entry Markers", group=G_DISPLAY)
+
+
+//=============================================================================
+// 12. COLORS AND HELPERS
+//=============================================================================
+
+color C_BULL    = color.rgb(0, 145, 255)
+color C_BEAR    = color.rgb(165, 85, 235)
+color C_READY   = color.rgb(20, 185, 105)
+color C_WAIT    = color.rgb(245, 155, 25)
+color C_STOP    = color.rgb(240, 65, 80)
+color C_NEUTRAL = color.rgb(95, 110, 130)
+
+f_high(float v, float worst, float best) =>
+    na(v) ? 0.0 : v <= worst ? 0.0 : v >= best ? 1.0 : (v - worst) / math.max(best - worst, 0.000001)
+
+f_low(float v, float best, float worst) =>
+    na(v) ? 0.0 : v <= best ? 1.0 : v >= worst ? 0.0 : (worst - v) / math.max(worst - best, 0.000001)
+
+f_price(float v) =>
+    na(v) ? "-" : str.tostring(v, format.mintick)
+
+f_num(float v) =>
+    na(v) ? "-" : str.tostring(v, "#.0")
+
+
+//=============================================================================
+// 13. SESSION STATE
+//=============================================================================
+
+bool inTradingSession = not na(time(timeframe.period, tradingSession, sessionTimezone))
+bool entrySessionPass  = not restrictToSession or inTradingSession
+
+int sessionEndMOD  = int(str.tonumber(str.substring(tradingSession, 5, 7))) * 60 + int(str.tonumber(str.substring(tradingSession, 7, 9)))
+int barCloseMOD    = hour(time_close, sessionTimezone) * 60 + minute(time_close, sessionTimezone)
+bool finalSessionBar = inTradingSession and barCloseMOD == sessionEndMOD
+
+int  dayId       = year(time, sessionTimezone) * 10000 + month(time, sessionTimezone) * 100 + dayofmonth(time, sessionTimezone)
+bool newSessionDay = barstate.isfirst or dayId != dayId[1]
+
+
+//=============================================================================
+// 14. HTF BIAS
+//=============================================================================
+
+f_htfBiasSnapshot() =>
+    float c = close[1]
+    float e = ta.ema(close, biasEmaLen)[1]
+    [c, e]
+
+[htf1Close, htf1Ema] = request.security(syminfo.tickerid, biasTF1, f_htfBiasSnapshot(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+[htf2Close, htf2Ema] = request.security(syminfo.tickerid, biasTF2, f_htfBiasSnapshot(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+bool htf1Bull = not na(htf1Close) and not na(htf1Ema) and htf1Close > htf1Ema
+bool htf1Bear = not na(htf1Close) and not na(htf1Ema) and htf1Close < htf1Ema
+bool htf2Bull = not na(htf2Close) and not na(htf2Ema) and htf2Close > htf2Ema
+bool htf2Bear = not na(htf2Close) and not na(htf2Ema) and htf2Close < htf2Ema
+
+int finalBiasRaw = htf1Bull and htf2Bull ? 1 : htf1Bear and htf2Bear ? -1 : 0
+
+
+//=============================================================================
+// 15. TREND-QUALITY SCORE AND HYSTERESIS REGIME GATE
+//=============================================================================
+// Score components are principled, interpretable starting weights -- not
+// grid-search-optimized against this repo's own data (see the header note
+// on paper #3's flagged overfitting pitfall). Walk-forward tune in quantor
+// before trusting them.
+
+[plusDI, minusDI, adxExec] = ta.dmi(adxLen, adxLen)
+
+float chopTrueRangeSum = math.sum(ta.tr(true), chopLen)
+float chopHighest = ta.highest(high, chopLen)
+float chopLowest  = ta.lowest(low, chopLen)
+float chopRange   = chopHighest - chopLowest
+float chopValue   = chopRange > 0 and chopLen > 1 ? 100.0 * math.log10(chopTrueRangeSum / chopRange) / math.log10(chopLen) : na
+
+float avgAbsChange = ta.sma(math.abs(ta.change(close)), efficiencyLen)
+float efficiencyPath = not na(avgAbsChange) ? avgAbsChange * efficiencyLen : na
+float efficiencyRatio = not na(efficiencyPath) and efficiencyPath > 0 and bar_index >= efficiencyLen ? math.abs(close - close[efficiencyLen]) / efficiencyPath : 0.0
+
+bool risingPersist  = ta.rising(close, persistenceLen)
+bool fallingPersist = ta.falling(close, persistenceLen)
+bool persistenceAgrees = (finalBiasRaw == 1 and risingPersist) or (finalBiasRaw == -1 and fallingPersist)
+
+float regimeScore = 100.0 * (
+     f_high(adxExec, adxNormLo, adxNormHi) * 0.30 +
+     f_low(nz(chopValue, chopWorst), chopBest, chopWorst) * 0.25 +
+     f_high(efficiencyRatio, efficiencyLo, efficiencyHi) * 0.20 +
+     (finalBiasRaw != 0 ? 1.0 : 0.0) * 0.15 +
+     (persistenceAgrees ? 1.0 : 0.0) * 0.10)
+
+// FIX (built in from the start, not retrofitted): two-threshold hysteresis,
+// not one shared cutoff. Strict to arm a fresh regime, distinctly looser to
+// remain in it -- see the header note and quant-research-notes reference
+// #6. A regime that drops below regimeHoldMin (or whose HTF bias itself
+// flips to neutral) disarms and resets every trigger engine's pending state
+// below, so a stale setup from the old regime can never carry into the new
+// one.
+var bool regimeArmed = false
+
+if barstate.isconfirmed
+    if not regimeArmed and finalBiasRaw != 0 and regimeScore >= regimeEnterMin
+        regimeArmed := true
+    else if regimeArmed and (finalBiasRaw == 0 or regimeScore < regimeHoldMin)
+        regimeArmed := false
+
+int finalBias = regimeArmed ? finalBiasRaw : 0
+
+
+//=============================================================================
+// 16. BASE INDICATORS
+//=============================================================================
+
+float atr = ta.atr(atrLen)
+float emaFast = ta.ema(close, pullbackTrendEmaLen)
+float emaFlip = ta.ema(close, flipEmaLen)
+
+float bodySize    = math.abs(close - open)
+float candleRange = math.max(high - low, syminfo.mintick)
+float upperWick   = high - math.max(open, close)
+float lowerWick   = math.min(open, close) - low
+float bodyPct      = candleRange > 0 ? bodySize / candleRange : 0.0
+float upperWickPct = candleRange > 0 ? upperWick / candleRange : 0.0
+float lowerWickPct = candleRange > 0 ? lowerWick / candleRange : 0.0
+bool  bullCandle   = close > open
+bool  bearCandle   = close < open
+
+
+//=============================================================================
+// 17. TRIGGER 1 -- PULLBACK RECLAIM
+//=============================================================================
+
+bool bullPullback = finalBias == 1 and (low <= emaFast)
+bool bearPullback = finalBias == -1 and (high >= emaFast)
+
+bool bullPullbackRecent = ta.barssince(bullPullback) <= pullbackLookback
+bool bearPullbackRecent = ta.barssince(bearPullback) <= pullbackLookback
+
+bool pullbackLongSignal  = regimeArmed and finalBias == 1 and bullPullbackRecent and close > emaFast and bullCandle and bodyPct >= pullbackMinBodyPct
+bool pullbackShortSignal = regimeArmed and finalBias == -1 and bearPullbackRecent and close < emaFast and bearCandle and bodyPct >= pullbackMinBodyPct
+
+
+//=============================================================================
+// 18. TRIGGER 2 -- SECOND-FLIP RE-ENTRY
+//=============================================================================
+// Confirmed-bar-level approximation of MTF_Second_Flip_Continuation_v1_2.pine's
+// fuller intrabar LTF reconstruction -- deliberately simplified for this
+// combined script. A counter-trend bar (closes against finalBias, relative
+// to emaFlip) followed by a rebound bar (closes back with finalBias) counts
+// as one flip. A SECOND such flip arms the setup; price must then break the
+// prior bar's extreme within flipConfirmWindow bars to confirm.
+
+bool barIsBull = close > emaFlip
+bool barIsBear = close < emaFlip
+bool barCounterTrend  = (finalBias == 1 and barIsBear) or (finalBias == -1 and barIsBull)
+bool barAgreesWithBias = (finalBias == 1 and barIsBull) or (finalBias == -1 and barIsBear)
+
+var int  flipCount        = 0
+var bool flipWasCounter   = false
+var int  lastFlipEventBar = na
+var int  flipRegimeBiasAtCount = 0
+
+// Reset the flip count whenever the regime itself resets or flips direction
+// -- a flip counted under the old regime/direction must never carry into a
+// new one.
+if not regimeArmed or finalBias != flipRegimeBiasAtCount
+    flipCount := 0
+    flipWasCounter := false
+    lastFlipEventBar := na
+    flipRegimeBiasAtCount := finalBias
+
+if barstate.isconfirmed and regimeArmed
+    if barCounterTrend
+        flipWasCounter := true
+    else if barAgreesWithBias and flipWasCounter
+        flipCount += 1
+        flipWasCounter := false
+        lastFlipEventBar := bar_index
+
+bool flipMemoryOk = not na(lastFlipEventBar) and bar_index - lastFlipEventBar <= flipMemoryBars
+
+if not na(lastFlipEventBar) and bar_index - lastFlipEventBar > flipMemoryBars
+    flipCount := 0
+
+bool flipArmedLong  = regimeArmed and finalBias == 1 and flipCount >= 2 and flipMemoryOk
+bool flipArmedShort = regimeArmed and finalBias == -1 and flipCount >= 2 and flipMemoryOk
+
+// Pending break-confirmation memory, with the staleness-safe registration
+// fix applied from the start (see MNQ_Liquidity_Sweep_Trend_Following_v1_3's
+// section 19 fix earlier this session): a pending arm that has already
+// expired as of THIS bar must not block a fresh arm from registering.
+var int   pendingFlipLongBar  = na
+var float pendingFlipLongLevel = na
+var int   pendingFlipShortBar  = na
+var float pendingFlipShortLevel = na
+
+bool pendingFlipLongStale  = not na(pendingFlipLongBar) and (bar_index - pendingFlipLongBar) > flipConfirmWindow
+bool pendingFlipShortStale = not na(pendingFlipShortBar) and (bar_index - pendingFlipShortBar) > flipConfirmWindow
+
+if flipArmedLong and (na(pendingFlipLongBar) or pendingFlipLongStale)
+    pendingFlipLongBar := bar_index
+    pendingFlipLongLevel := high[1]
+
+if flipArmedShort and (na(pendingFlipShortBar) or pendingFlipShortStale)
+    pendingFlipShortBar := bar_index
+    pendingFlipShortLevel := low[1]
+
+bool flipLongWindowOpen  = not na(pendingFlipLongBar) and (bar_index - pendingFlipLongBar) >= 1 and (bar_index - pendingFlipLongBar) <= flipConfirmWindow
+bool flipShortWindowOpen = not na(pendingFlipShortBar) and (bar_index - pendingFlipShortBar) >= 1 and (bar_index - pendingFlipShortBar) <= flipConfirmWindow
+
+bool flipLongSignal  = regimeArmed and finalBias == 1 and flipLongWindowOpen and close > pendingFlipLongLevel
+bool flipShortSignal = regimeArmed and finalBias == -1 and flipShortWindowOpen and close < pendingFlipShortLevel
+
+if flipLongSignal
+    pendingFlipLongBar := na
+    pendingFlipLongLevel := na
+
+if flipShortSignal
+    pendingFlipShortBar := na
+    pendingFlipShortLevel := na
+
+
+//=============================================================================
+// 19. TRIGGER 3 -- LIQUIDITY SWEEP + RECLAIM
+//=============================================================================
+
+float pivotHigh = ta.pivothigh(high, sweepPivotLength, sweepPivotLength)
+float pivotLow  = ta.pivotlow(low, sweepPivotLength, sweepPivotLength)
+
+var array<float> sweepHighLevels = array.new_float()
+var array<int>   sweepHighBars   = array.new_int()
+var array<float> sweepLowLevels  = array.new_float()
+var array<int>   sweepLowBars    = array.new_int()
+
+if not na(pivotHigh)
+    array.push(sweepHighLevels, pivotHigh)
+    array.push(sweepHighBars, bar_index - sweepPivotLength)
+    if array.size(sweepHighLevels) > sweepStoredLevels
+        array.shift(sweepHighLevels)
+        array.shift(sweepHighBars)
+
+if not na(pivotLow)
+    array.push(sweepLowLevels, pivotLow)
+    array.push(sweepLowBars, bar_index - sweepPivotLength)
+    if array.size(sweepLowLevels) > sweepStoredLevels
+        array.shift(sweepLowLevels)
+        array.shift(sweepLowBars)
+
+float sweepMinDistance = not na(atr) ? atr * sweepMinDistanceAtr : na
+
+float sweptHighLevel = na
+int   sweptHighIdx   = na
+int   sweepHighCount = array.size(sweepHighLevels)
+if sweepHighCount > 0
+    for i = sweepHighCount - 1 to 0
+        float level = array.get(sweepHighLevels, i)
+        int   levelBar = array.get(sweepHighBars, i)
+        if levelBar < bar_index and high > level and not na(sweepMinDistance) and high - level >= sweepMinDistance
+            sweptHighLevel := level
+            sweptHighIdx := i
+            break
+
+float sweptLowLevel = na
+int   sweptLowIdx   = na
+int   sweepLowCount = array.size(sweepLowLevels)
+if sweepLowCount > 0
+    for i = sweepLowCount - 1 to 0
+        float level = array.get(sweepLowLevels, i)
+        int   levelBar = array.get(sweepLowBars, i)
+        if levelBar < bar_index and low < level and not na(sweepMinDistance) and level - low >= sweepMinDistance
+            sweptLowLevel := level
+            sweptLowIdx := i
+            break
+
+bool bearishReclaim = not na(sweptHighLevel) and close < sweptHighLevel
+bool bullishReclaim = not na(sweptLowLevel) and close > sweptLowLevel
+
+bool validSellSweep = finalBias == -1 and bearishReclaim and upperWickPct >= sweepMinWickPct
+bool validBuySweep  = finalBias == 1  and bullishReclaim and lowerWickPct >= sweepMinWickPct
+
+var int   pendingSweepLongBar  = na
+var float pendingSweepLongLevel = na
+var float pendingSweepLongStop  = na
+var int   pendingSweepShortBar  = na
+var float pendingSweepShortLevel = na
+var float pendingSweepShortStop  = na
+
+bool pendingSweepLongStale  = not na(pendingSweepLongBar) and (bar_index - pendingSweepLongBar) > sweepConfirmWindow
+bool pendingSweepShortStale = not na(pendingSweepShortBar) and (bar_index - pendingSweepShortBar) > sweepConfirmWindow
+
+if validBuySweep and regimeArmed and (na(pendingSweepLongBar) or pendingSweepLongStale)
+    pendingSweepLongBar := bar_index
+    pendingSweepLongLevel := sweptLowLevel
+    pendingSweepLongStop := low
+
+if validSellSweep and regimeArmed and (na(pendingSweepShortBar) or pendingSweepShortStale)
+    pendingSweepShortBar := bar_index
+    pendingSweepShortLevel := sweptHighLevel
+    pendingSweepShortStop := high
+
+bool sweepLongWindowOpen  = not na(pendingSweepLongBar) and (bar_index - pendingSweepLongBar) >= 1 and (bar_index - pendingSweepLongBar) <= sweepConfirmWindow
+bool sweepShortWindowOpen = not na(pendingSweepShortBar) and (bar_index - pendingSweepShortBar) >= 1 and (bar_index - pendingSweepShortBar) <= sweepConfirmWindow
+
+bool sweepLongSignal  = regimeArmed and finalBias == 1 and sweepLongWindowOpen and close > pendingSweepLongLevel and bullCandle
+bool sweepShortSignal = regimeArmed and finalBias == -1 and sweepShortWindowOpen and close < pendingSweepShortLevel and bearCandle
+
+float sweepLongStopRef  = pendingSweepLongStop
+float sweepShortStopRef = pendingSweepShortStop
+
+if sweepLongSignal
+    pendingSweepLongBar := na
+    pendingSweepLongLevel := na
+
+if sweepShortSignal
+    pendingSweepShortBar := na
+    pendingSweepShortLevel := na
+
+
+//=============================================================================
+// 20. TRIGGER COMBINATION AND TAGGING
+//=============================================================================
+// Any enabled trigger firing is a valid raw signal. Each strategy.entry's
+// comment (and the alert message) tags which trigger fired, so Strategy
+// Tester's List of Trades can be filtered/compared trigger by trigger --
+// the point of building all three rather than picking one.
+
+bool rawLongSignal  = (useTriggerPullback and pullbackLongSignal) or (useTriggerFlip and flipLongSignal) or (useTriggerSweep and sweepLongSignal)
+bool rawShortSignal = (useTriggerPullback and pullbackShortSignal) or (useTriggerFlip and flipShortSignal) or (useTriggerSweep and sweepShortSignal)
+
+string longTriggerTag =
+     useTriggerSweep and sweepLongSignal ? "SWEEP" :
+     useTriggerFlip and flipLongSignal ? "FLIP" :
+     useTriggerPullback and pullbackLongSignal ? "PULLBACK" :
+     "NONE"
+
+string shortTriggerTag =
+     useTriggerSweep and sweepShortSignal ? "SWEEP" :
+     useTriggerFlip and flipShortSignal ? "FLIP" :
+     useTriggerPullback and pullbackShortSignal ? "PULLBACK" :
+     "NONE"
+
+float longStructuralRef =
+     useTriggerSweep and sweepLongSignal ? sweepLongStopRef :
+     useTriggerFlip and flipLongSignal ? low[1] :
+     emaFast
+
+float shortStructuralRef =
+     useTriggerSweep and sweepShortSignal ? sweepShortStopRef :
+     useTriggerFlip and flipShortSignal ? high[1] :
+     emaFast
+
+
+//=============================================================================
+// 21. CANDIDATE RISK
+//=============================================================================
+
+float atrLongStop  = not na(atr) ? close - atr * atrStopMultiplier : na
+float atrShortStop = not na(atr) ? close + atr * atrStopMultiplier : na
+
+float structuralLongStop  = not na(longStructuralRef) ? longStructuralRef - atr * structuralStopBufferAtr : na
+float structuralShortStop = not na(shortStructuralRef) ? shortStructuralRef + atr * structuralStopBufferAtr : na
+
+float candidateLongStop  = not na(structuralLongStop) ? math.min(atrLongStop, structuralLongStop) : atrLongStop
+float candidateShortStop = not na(structuralShortStop) ? math.max(atrShortStop, structuralShortStop) : atrShortStop
+
+float candidateLongRisk  = not na(candidateLongStop) ? close - candidateLongStop : na
+float candidateShortRisk = not na(candidateShortStop) ? candidateShortStop - close : na
+
+bool longRiskPass  = not na(candidateLongRisk) and candidateLongRisk > 0
+bool shortRiskPass = not na(candidateShortRisk) and candidateShortRisk > 0
+
+
+//=============================================================================
+// 22. DAILY CONTROLS AND COOLDOWN
+//=============================================================================
+
+var int tradesToday = 0
+var int lastSignalBar = na
+var int lastExitBar   = na
+
+if newSessionDay and barstate.isnew
+    tradesToday := 0
+
+bool tradeLimitPass = tradesToday < maxTradesPerDay
+bool cooldownPass = (na(lastSignalBar) or bar_index - lastSignalBar > cooldownBars) and (na(lastExitBar) or bar_index - lastExitBar > cooldownBars)
+bool flat = strategy.position_size == 0
+
+
+//=============================================================================
+// 23. FINAL ENTRY CONDITIONS
+//=============================================================================
+
+bool commonEntryPass = barstate.isconfirmed and entrySessionPass and flat and tradeLimitPass and cooldownPass and regimeArmed
+
+bool longEntry  = commonEntryPass and rawLongSignal and longRiskPass
+bool shortEntry = commonEntryPass and rawShortSignal and shortRiskPass and not longEntry
+
+
+//=============================================================================
+// 24. SIGNAL-VOLATILITY DIAGNOSTIC (paper #1)
+//=============================================================================
+// b1/b2 track how often this strategy's own signal state flips, per
+// Zoicaș-Ienciu & Pochea (quant-research-notes reference #1) -- built in
+// from the start as a live diagnostic, not retrofitted after the fact.
+
+var int sigState  = 0
+var int sigNBS    = 0
+var int sigNBN    = 0
+var int sigNSN    = 0
+var int sigTotal  = 0
+
+int newSigState = longEntry ? 1 : shortEntry ? -1 : flat ? 0 : sigState
+
+if barstate.isconfirmed and newSigState != sigState
+    sigTotal += 1
+    if (newSigState == 1 and sigState == -1) or (newSigState == -1 and sigState == 1)
+        sigNBS += 1
+    else if (newSigState == 1 and sigState == 0) or (newSigState == 0 and sigState == 1)
+        sigNBN += 1
+    else if (newSigState == -1 and sigState == 0) or (newSigState == 0 and sigState == -1)
+        sigNSN += 1
+    sigState := newSigState
+
+float b1SignalVol = sigTotal > 0 ? (sigNBS + sigNBN) / sigTotal * 100.0 : na
+float b2SignalVol = sigTotal > 0 ? (sigNBS + sigNSN) / sigTotal * 100.0 : na
+
+
+//=============================================================================
+// 25. ORDERS
+//=============================================================================
+
+var float activeEntry = na
+var float initialRisk = na
+var float activeStop  = na
+var float activeTarget = na
+var int   entryBarIndex = na
+var bool  tradeInitialized = false
+var bool  breakEvenMoved = false
+var float pendingStop = na
+var string lastTriggerTag = "NONE"
+
+if longEntry
+    pendingStop := candidateLongStop
+    lastSignalBar := bar_index
+    tradesToday += 1
+    lastTriggerTag := longTriggerTag
+    strategy.entry("Long", strategy.long, qty=contracts, comment="LONG " + longTriggerTag, alert_message="MNQ MTTC LONG (" + longTriggerTag + ")")
+
+if shortEntry
+    pendingStop := candidateShortStop
+    lastSignalBar := bar_index
+    tradesToday += 1
+    lastTriggerTag := shortTriggerTag
+    strategy.entry("Short", strategy.short, qty=contracts, comment="SHORT " + shortTriggerTag, alert_message="MNQ MTTC SHORT (" + shortTriggerTag + ")")
+
+
+//=============================================================================
+// 26. FILL INITIALIZATION
+//=============================================================================
+
+bool longFill  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+bool shortFill = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if longFill and not tradeInitialized
+    activeEntry := strategy.position_avg_price
+    activeStop := pendingStop
+    initialRisk := activeEntry - activeStop
+    if not na(initialRisk) and initialRisk > 0
+        activeTarget := activeEntry + initialRisk * rrTarget
+        entryBarIndex := bar_index
+        tradeInitialized := true
+        breakEvenMoved := false
+    else
+        strategy.close("Long", comment="Invalid Risk", immediately=true)
+
+if shortFill and not tradeInitialized
+    activeEntry := strategy.position_avg_price
+    activeStop := pendingStop
+    initialRisk := activeStop - activeEntry
+    if not na(initialRisk) and initialRisk > 0
+        activeTarget := activeEntry - initialRisk * rrTarget
+        entryBarIndex := bar_index
+        tradeInitialized := true
+        breakEvenMoved := false
+    else
+        strategy.close("Short", comment="Invalid Risk", immediately=true)
+
+
+//=============================================================================
+// 27. POSITION MANAGEMENT
+//=============================================================================
+
+bool managementEligible = strategy.position_size != 0 and tradeInitialized and not na(entryBarIndex) and bar_index > entryBarIndex
+
+if strategy.position_size > 0 and managementEligible and useBreakEven and not breakEvenMoved and high >= activeEntry + initialRisk * breakEvenAtR
+    activeStop := math.max(activeStop, activeEntry)
+    breakEvenMoved := true
+
+if strategy.position_size < 0 and managementEligible and useBreakEven and not breakEvenMoved and low <= activeEntry - initialRisk * breakEvenAtR
+    activeStop := math.min(activeStop, activeEntry)
+    breakEvenMoved := true
+
+if strategy.position_size > 0 and tradeInitialized
+    strategy.exit("Long Exit", from_entry="Long", stop=activeStop, limit=activeTarget, alert_message="MNQ MTTC CLOSE LONG")
+
+if strategy.position_size < 0 and tradeInitialized
+    strategy.exit("Short Exit", from_entry="Short", stop=activeStop, limit=activeTarget, alert_message="MNQ MTTC CLOSE SHORT")
+
+if closeAtSessionEnd and finalSessionBar and strategy.position_size != 0
+    strategy.close_all(comment="Session Close", alert_message="MNQ MTTC CLOSE SESSION", immediately=true)
+
+
+//=============================================================================
+// 28. CLOSED-POSITION CLEANUP
+//=============================================================================
+
+bool positionJustClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if positionJustClosed
+    lastExitBar := bar_index
+    activeEntry := na
+    initialRisk := na
+    activeStop := na
+    activeTarget := na
+    entryBarIndex := na
+    tradeInitialized := false
+    breakEvenMoved := false
+    pendingStop := na
+
+
+//=============================================================================
+// 29. DASHBOARD
+//=============================================================================
+
+resolvedDashPos =
+     dashboardPos == "Top Left" ? position.top_left :
+     dashboardPos == "Bottom Right" ? position.bottom_right :
+     dashboardPos == "Bottom Left" ? position.bottom_left :
+     position.top_right
+
+var table dash = table.new(resolvedDashPos, 2, 15, border_width=1, border_color=color.rgb(44, 57, 76))
+
+f_row(int row, string leftText, string rightText, color valueColor) =>
+    table.cell(dash, 0, row, leftText, text_color=color.white, bgcolor=color.new(color.gray, 72), text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, row, rightText, text_color=color.white, bgcolor=color.new(valueColor, 55), text_size=size.small, text_halign=text.align_right)
+
+if barstate.islast
+    table.clear(dash, 0, 0, 1, 14)
+
+    if showDashboard
+        string biasText = finalBiasRaw == 1 ? "BULL" : finalBiasRaw == -1 ? "BEAR" : "NEUTRAL"
+        color  biasColor = finalBiasRaw == 1 ? C_BULL : finalBiasRaw == -1 ? C_BEAR : C_NEUTRAL
+        string regimeText = regimeArmed ? "ARMED" : "DISARMED"
+        color  regimeColor = regimeArmed ? C_READY : C_WAIT
+        string posText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+        color  posColor = strategy.position_size > 0 ? C_BULL : strategy.position_size < 0 ? C_BEAR : C_NEUTRAL
+        string triggersText = (useTriggerPullback ? "P" : "-") + (useTriggerFlip ? "F" : "-") + (useTriggerSweep ? "S" : "-")
+
+        f_row(0, "MNQ MTTC", posText, posColor)
+        f_row(1, "BIAS", biasText, biasColor)
+        f_row(2, "REGIME SCORE", f_num(regimeScore) + " (" + f_num(regimeEnterMin) + "/" + f_num(regimeHoldMin) + ")", regimeColor)
+        f_row(3, "REGIME", regimeText, regimeColor)
+        f_row(4, "TRIGGERS ON", triggersText, C_NEUTRAL)
+        f_row(5, "PULLBACK", useTriggerPullback ? (bullPullbackRecent ? "BULL PB" : bearPullbackRecent ? "BEAR PB" : "WAIT") : "OFF", C_NEUTRAL)
+        f_row(6, "FLIP COUNT", str.tostring(flipCount) + "/2", flipCount >= 2 ? C_READY : C_NEUTRAL)
+        f_row(7, "SWEEP LONG/SHORT", (not na(pendingSweepLongBar) ? "L" : "-") + " / " + (not na(pendingSweepShortBar) ? "S" : "-"), C_NEUTRAL)
+        f_row(8, "ADX / CHOP", f_num(adxExec) + " / " + f_num(nz(chopValue)), C_NEUTRAL)
+        f_row(9, "EFFICIENCY", f_num(efficiencyRatio * 100), C_NEUTRAL)
+        f_row(10, "TRADES TODAY", str.tostring(tradesToday) + "/" + str.tostring(maxTradesPerDay), tradesToday < maxTradesPerDay ? C_READY : C_WAIT)
+        f_row(11, "COOLDOWN", cooldownPass ? "READY" : "WAIT", cooldownPass ? C_READY : C_WAIT)
+        f_row(12, "LAST TRIGGER", lastTriggerTag, C_NEUTRAL)
+        f_row(13, "SIGNAL VOL b1/b2", f_num(b1SignalVol) + "% / " + f_num(b2SignalVol) + "%", C_NEUTRAL)
+        f_row(14, "SL / TP", f_price(activeStop) + " / " + f_price(activeTarget), strategy.position_size != 0 ? C_READY : C_NEUTRAL)
+
+
+//=============================================================================
+// 30. VISUALS
+//=============================================================================
+
+plot(showEmas ? emaFast : na, "Pullback EMA", color=color.new(color.orange, 20))
+plot(showEmas ? emaFlip : na, "Flip EMA", color=color.new(color.purple, 40))
+
+plotshape(showEntryMarkers and longEntry, title="Long Entry", style=shape.triangleup, location=location.belowbar, color=C_BULL, size=size.small, text="L")
+plotshape(showEntryMarkers and shortEntry, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=C_BEAR, size=size.small, text="S")
+
+plot(strategy.position_size != 0 ? activeStop : na, "Active Stop", color=C_STOP, linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? activeTarget : na, "Active Target", color=C_READY, linewidth=2, style=plot.style_linebr)
+
+bgcolor(finalBiasRaw == 1 ? color.new(C_BULL, 95) : finalBiasRaw == -1 ? color.new(C_BEAR, 95) : na, title="HTF Bias")
+
+
+//=============================================================================
+// 31. ALERTS
+//=============================================================================
+
+alertcondition(longEntry, title="MNQ MTTC Long Entry", message="MNQ MTTC LONG entry | {{ticker}} | {{interval}}")
+alertcondition(shortEntry, title="MNQ MTTC Short Entry", message="MNQ MTTC SHORT entry | {{ticker}} | {{interval}}")
+alertcondition(positionJustClosed, title="MNQ MTTC Position Closed", message="MNQ MTTC position closed | {{ticker}} | {{interval}}")
+
+if longEntry
+    alert("MNQ MTTC LONG | " + longTriggerTag + " | " + syminfo.ticker + " @ " + f_price(close) + " | SL " + f_price(candidateLongStop), alert.freq_once_per_bar_close)
+
+if shortEntry
+    alert("MNQ MTTC SHORT | " + shortTriggerTag + " | " + syminfo.ticker + " @ " + f_price(close) + " | SL " + f_price(candidateShortStop), alert.freq_once_per_bar_close)
+
+
+//=============================================================================
+// 32. DATA WINDOW
+//=============================================================================
+
+plot(regimeScore, "Regime Score", display=display.data_window)
+plot(float(finalBiasRaw), "Raw HTF Bias", display=display.data_window)
+plot(regimeArmed ? 1.0 : 0.0, "Regime Armed", display=display.data_window)
+plot(float(flipCount), "Flip Count", display=display.data_window)
+plot(adxExec, "ADX", display=display.data_window)
+plot(chopValue, "Choppiness", display=display.data_window)
+plot(efficiencyRatio, "Efficiency Ratio", display=display.data_window)
+plot(b1SignalVol, "Signal Volatility b1", display=display.data_window)
+plot(b2SignalVol, "Signal Volatility b2", display=display.data_window)
+plot(pullbackLongSignal ? 1.0 : 0.0, "Pullback Long Raw", display=display.data_window)
+plot(flipLongSignal ? 1.0 : 0.0, "Flip Long Raw", display=display.data_window)
+plot(sweepLongSignal ? 1.0 : 0.0, "Sweep Long Raw", display=display.data_window)
