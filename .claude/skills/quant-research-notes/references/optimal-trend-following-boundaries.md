@@ -186,6 +186,12 @@ synthesis notes.
 
 ## Applied in This Repo
 
-*(none yet — update this section if the MNQ trend-following design (or any existing
-strategy) is revised to use a genuine two-threshold hysteresis band on its regime gate,
-noting the file and which two thresholds were split apart)*
+- **`MNQ_Multi_Trigger_Trend_Continuation.pine`** (2026-08-23) — the regime gate
+  (section 15) is built as a genuine two-threshold hysteresis band from the start:
+  `regimeEnterMin` (strict, default 70) arms a fresh regime, `regimeHoldMin` (loose,
+  default 45) is the distinctly lower bar required merely to remain in it, applied to
+  a continuous 0–100 trend-quality score (ADX-normalized + Choppiness-normalized +
+  Efficiency-normalized + bias/persistence agreement) rather than a literal Wonham-
+  filter probability. A regime disarming resets every entry-trigger engine's pending
+  state, so nothing carries across regimes — the same "no stale state across a regime
+  change" discipline this paper's model implies.
