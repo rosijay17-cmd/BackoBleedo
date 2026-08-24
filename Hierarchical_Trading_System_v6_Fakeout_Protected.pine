@@ -1,0 +1,201 @@
+//@version=6
+strategy("Hierarchical Trading System v6 (Fakeout Protected)", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// ==========================================
+// --- INPUTS ---
+// ==========================================
+// 1. Regime Classifier Inputs (Layer 1)
+adxLength      = input.int(14, title="ADX Length", group="Layer 1: Regime Classifier")
+adxThreshold   = input.int(25, title="ADX Threshold", group="Layer 1: Regime Classifier")
+cooldownBars   = input.int(5, title="Cooldown Bars", minval=0, group="Execution Settings")
+
+// 2. Mean Reversion Inputs (Layer 2 - Sub-Strategy A)
+bbLength       = input.int(20, title="BB Length", group="Sub-Strategy A: Mean Reversion")
+baseMult       = input.float(2.5, title="Base BB Multiplier", group="Sub-Strategy A: Mean Reversion")
+asymOffset     = input.float(0.5, title="Asymmetric Offset", group="Sub-Strategy A: Mean Reversion")
+emaLength      = input.int(200, title="Trend Filter EMA", group="Sub-Strategy A: Mean Reversion")
+
+// 3. Trend Following Inputs (Layer 2 - Sub-Strategy B)
+dcLength       = input.int(20, title="Donchian Breakout Length", group="Sub-Strategy B: Trend Following")
+dcExitLength   = input.int(10, title="Donchian Exit Length", group="Sub-Strategy B: Trend Following")
+
+// 4. Fakeout Filters (Sub-Strategy B Additions)
+useVolumeFilter = input.bool(true, title="Enable Volume Confirmation?", group="Sub-Strategy B: Breakout Filters", tooltip="Breakout volume must exceed average volume")
+volLength       = input.int(20, title="Volume Average Length", group="Sub-Strategy B: Breakout Filters")
+volMultiplier   = input.float(1.5, title="Volume Multiplier (x SMA)", group="Sub-Strategy B: Breakout Filters")
+
+useAtrFilter    = input.bool(true, title="Enable Range (ATR) Confirmation?", group="Sub-Strategy B: Breakout Filters", tooltip="Breakout candle range must exceed ATR")
+atrLength       = input.int(14, title="ATR Length", group="Sub-Strategy B: Breakout Filters")
+atrMultiplier   = input.float(1.0, title="Range Multiplier (x ATR)", group="Sub-Strategy B: Breakout Filters")
+
+// --- NEW DEFENSIVE BREAKOUT FILTERS ---
+useWickFilter   = input.bool(true, title="Enable Rejection Wick Filter?", group="Sub-Strategy B: Breakout Filters", tooltip="Breakout candle rejection wick cannot exceed threshold")
+maxWickPct      = input.float(35.0, title="Max Rejection Wick %", group="Sub-Strategy B: Breakout Filters", tooltip="Max rejection wick size as a percentage of total candle range")
+
+useAtrPenetration  = input.bool(true, title="Enable ATR Penetration Filter?", group="Sub-Strategy B: Breakout Filters", tooltip="Close must exceed breakout level by a minimum distance")
+atrPenetrationMult = input.float(0.5, title="Min ATR Penetration Multiplier", group="Sub-Strategy B: Breakout Filters", tooltip="Multiplier of ATR to determine clearance over breakout level")
+
+// ==========================================
+// --- CALCULATIONS & REGIME CLASS ---
+// ==========================================
+// Layer 1: ADX Regime Calculation
+[diPlus, diMinus, adxValue] = ta.dmi(adxLength, adxLength)
+bool isTrending = adxValue >= adxThreshold
+bool isRanging  = not isTrending
+
+// Color background based on active regime: Teal for Trending, Orange for Ranging
+bgcolor(isTrending ? color.new(color.teal, 98) : color.new(color.orange, 98), title="Regime Background Color")
+
+// Sub-Strategy A: Asymmetric Bollinger Bands
+basis     = ta.sma(close, bbLength)
+stdDevVal = ta.stdev(close, bbLength)
+trendEma  = ta.ema(close, emaLength)
+bool isUptrend = close > trendEma
+
+float longMult  = isUptrend ? (baseMult - asymOffset) : (baseMult + asymOffset)
+float shortMult = isUptrend ? (baseMult + asymOffset) : (baseMult - asymOffset)
+
+upperBB = basis + (shortMult * stdDevVal)
+lowerBB = basis - (longMult * stdDevVal)
+
+// Sub-Strategy B: Donchian Channels
+dcUpper = ta.highest(high, dcLength)[1]
+dcLower = ta.lowest(low, dcLength)[1]
+dcExitUpper = ta.highest(high, dcExitLength)[1]
+dcExitLower = ta.lowest(low, dcExitLength)[1]
+
+// ==========================================
+// --- FAKEOUT FILTER LOGIC ---
+// ==========================================
+// 1. Volume Confirmation
+volMa = ta.sma(volume, volLength)
+bool isVolumeConfirmed = not useVolumeFilter or (volume > (volMa * volMultiplier))
+
+// 2. Range Expansion Confirmation
+atrVal = ta.atr(atrLength)
+candleRange = high - low
+bool isRangeConfirmed = not useAtrFilter or (candleRange > (atrVal * atrMultiplier))
+
+// 3. NEW: Rejection Wick Ratio Filter (Prevents entering on immediate rejections)
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+
+bool longWickOK  = not useWickFilter or (candleRange > 0 ? (upperWick / candleRange) * 100 <= maxWickPct : true)
+bool shortWickOK = not useWickFilter or (candleRange > 0 ? (lowerWick / candleRange) * 100 <= maxWickPct : true)
+
+// 4. NEW: ATR Penetration Filter (Ensures the close cleanly clears the channel boundary)
+bool longAtrPenetration  = not useAtrPenetration or ((close - dcUpper) >= (atrVal * atrPenetrationMult))
+bool shortAtrPenetration = not useAtrPenetration or ((dcLower - close) >= (atrVal * atrPenetrationMult))
+
+// Combined Directional Breakout Validation Pipelines
+bool isLongBreakoutValid  = isVolumeConfirmed and isRangeConfirmed and longWickOK and longAtrPenetration
+bool isShortBreakoutValid = isVolumeConfirmed and isRangeConfirmed and shortWickOK and shortAtrPenetration
+
+// ==========================================
+// --- SIGNALS & COOLDOWN ---
+// ==========================================
+var int lastSignalBar = -99999
+bool isCooldownOver   = (bar_index - lastSignalBar) >= cooldownBars
+
+// Raw signals
+bool rawMrLong  = ta.crossover(close, lowerBB)
+bool rawMrShort = ta.crossunder(close, upperBB)
+
+bool rawTfLong  = ta.crossover(close, dcUpper)
+bool rawTfShort = ta.crossunder(close, dcLower)
+
+// Filtered signals based on current Regime State
+bool mrLongCondition  = isRanging and rawMrLong and isCooldownOver
+bool mrShortCondition = isRanging and rawMrShort and isCooldownOver
+
+// Trend-Following Signals must pass the direction-specific Breakout Validation Filters
+bool tfLongCondition  = isTrending and rawTfLong and isCooldownOver and isLongBreakoutValid
+bool tfShortCondition = isTrending and rawTfShort and isCooldownOver and isShortBreakoutValid
+
+// Update Cooldown Tracker on any executed signal
+if mrLongCondition or mrShortCondition or tfLongCondition or tfShortCondition
+    lastSignalBar := bar_index
+
+// ==========================================
+// --- ALERT MESSAGE BUILDERS ---
+// ==========================================
+// FIX: the original script had zero alertcondition()/alert()/alert_message
+// calls anywhere -- that is why entries plotted on the chart but no alert
+// ever fired. There was nothing wired to trigger one. Every message below
+// identifies which of the four entry types (or which exit) fired, plus
+// ticker/timeframe/price, so a single "Any alert() function call" alert
+// created on this script tells you exactly what happened without opening
+// the chart.
+f_alertMsg(string label, float px) =>
+    label + " | " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(px, format.mintick)
+
+// ==========================================
+// --- EXECUTION ENGINE ---
+// ==========================================
+// 1. Mean Reversion Execution (MR)
+if mrLongCondition
+    string msg = f_alertMsg("MR LONG entry (mean reversion)", close)
+    strategy.entry("MR Long", strategy.long, comment="MR Buy", alert_message=msg)
+    alert(msg, alert.freq_once_per_bar_close)
+
+if mrShortCondition
+    string msg = f_alertMsg("MR SHORT entry (mean reversion)", close)
+    strategy.entry("MR Short", strategy.short, comment="MR Short", alert_message=msg)
+    alert(msg, alert.freq_once_per_bar_close)
+
+// 2. Trend Following Execution (TF)
+if tfLongCondition
+    string msg = f_alertMsg("TF LONG entry (breakout)", close)
+    strategy.entry("TF Long", strategy.long, comment="TF Breakout Buy", alert_message=msg)
+    alert(msg, alert.freq_once_per_bar_close)
+
+if tfShortCondition
+    string msg = f_alertMsg("TF SHORT entry (breakout)", close)
+    strategy.entry("TF Short", strategy.short, comment="TF Breakout Short", alert_message=msg)
+    alert(msg, alert.freq_once_per_bar_close)
+
+// ==========================================
+// --- EXIT ENGINE ---
+// ==========================================
+// MR Exits (Reversion to Mean)
+if isRanging
+    if ta.crossover(close, basis) and (strategy.position_size < 0)
+        string msg = f_alertMsg("MR SHORT exit (cover, reverted to mean)", close)
+        strategy.close("MR Short", comment="MR Short Cover", alert_message=msg)
+        alert(msg, alert.freq_once_per_bar_close)
+    if ta.crossunder(close, basis) and (strategy.position_size > 0)
+        string msg = f_alertMsg("MR LONG exit (sell, reverted to mean)", close)
+        strategy.close("MR Long", comment="MR Long Sell", alert_message=msg)
+        alert(msg, alert.freq_once_per_bar_close)
+
+// TF Exits (Trailing Highs/Lows)
+if isTrending
+    if ta.crossunder(close, dcExitLower) and (strategy.position_size > 0)
+        string msg = f_alertMsg("TF LONG exit (trailing stop)", close)
+        strategy.close("TF Long", comment="TF Trail Exit", alert_message=msg)
+        alert(msg, alert.freq_once_per_bar_close)
+    if ta.crossover(close, dcExitUpper) and (strategy.position_size < 0)
+        string msg = f_alertMsg("TF SHORT exit (trailing stop)", close)
+        strategy.close("TF Short", comment="TF Trail Exit", alert_message=msg)
+        alert(msg, alert.freq_once_per_bar_close)
+
+// ==========================================
+// --- VISUALIZATIONS & ALERTS ---
+// ==========================================
+plot(basis, color=color.new(color.blue, 50), title="BB Basis (Mean)")
+plot(trendEma, color=color.orange, linewidth=2, title="Trend Filter EMA")
+
+plotshape(mrLongCondition, title="MR Long Signal", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="MR")
+plotshape(mrShortCondition, title="MR Short Signal", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="MR")
+
+plotshape(tfLongCondition, title="TF Long Signal", style=shape.triangleup, location=location.belowbar, color=color.teal, size=size.small, text="TF Breakout")
+plotshape(tfShortCondition, title="TF Short Signal", style=shape.triangledown, location=location.abovebar, color=color.maroon, size=size.small, text="TF Breakout")
+
+// alertcondition() gives a second, independent way to pick an alert on
+// this script from the "Condition" dropdown (rather than "Any alert()
+// function call") -- pick whichever workflow you prefer in the Create
+// Alert dialog; both are wired to fire on the same bars.
+alertcondition(mrLongCondition, title="MR Long Entry", message="Hierarchical System: MR LONG entry (mean reversion) | {{ticker}} | {{interval}}")
+alertcondition(mrShortCondition, title="MR Short Entry", message="Hierarchical System: MR SHORT entry (mean reversion) | {{ticker}} | {{interval}}")
+alertcondition(tfLongCondition, title="TF Long Entry", message="Hierarchical System: TF LONG entry (breakout) | {{ticker}} | {{interval}}")
+alertcondition(tfShortCondition, title="TF Short Entry", message="Hierarchical System: TF SHORT entry (breakout) | {{ticker}} | {{interval}}")
