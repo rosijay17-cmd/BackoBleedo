@@ -41,9 +41,14 @@ strategy(
 //   4. ADAPTIVE TREND FLOW -- an adaptive fast/slow-EMA basis with
 //      stdev-scaled bands and a SuperTrend-style flip, entry logic adapted
 //      from "Adaptive Trend Flow [QuantAlgo]" (c) QuantAlgo, MPL 2.0. The
-//      source's flip signal has no bias/confirmation filter of its own;
-//      here it is gated by finalBias/regimeArmed (no counter-trend fires)
-//      and evaluated on confirmed bars only, matching every other trigger.
+//      state machine is an exact structural port that recomputes every
+//      bar like the source (no internal confirmation gate -- that would
+//      only fight the source's own real-time behavior for no backtest
+//      benefit, since section 23's commonEntryPass is the one checkpoint
+//      that already keeps every trigger's actual order submission
+//      confirmed-bar-only); the only real adaptation is gating by
+//      finalBias/regimeArmed so a flow flip fires as an entry only when
+//      it agrees with the already-armed regime direction.
 //
 // REGIME GATE -- built as a genuine two-threshold hysteresis band, not one
 // shared cutoff, per Dai, Yang, Zhang & Zhu (2016) "Optimal Trend Following
@@ -523,16 +528,29 @@ if sweepShortSignal
 // Entry mechanism adapted from "Adaptive Trend Flow [QuantAlgo]" (c) QuantAlgo,
 // MPL 2.0 -- an adaptive fast/slow-EMA basis with stdev-scaled bands, and a
 // SuperTrend-style flip state machine. The source indicator's flip signal
-// alone has no bias or confirmation filter; two deliberate adaptations were
+// alone has no bias or confirmation filter; one deliberate adaptation was
 // made rather than importing it verbatim:
-//   1. Gated by finalBias/regimeArmed -- this strategy never takes a signal
-//      against its own regime gate (the "no counter-trend" rule every other
-//      trigger already follows), so a flow flip only fires as an entry when
-//      it agrees with the already-armed regime direction.
-//   2. Evaluated on confirmed bars only (barstate.isconfirmed), consistent
-//      with every other trigger engine in this script -- the source
-//      indicator updates every intrabar tick, which this strategy's
-//      execution discipline deliberately avoids.
+//   Gated by finalBias/regimeArmed -- this strategy never takes a signal
+//   against its own regime gate (the "no counter-trend" rule every other
+//   trigger already follows), so a flow flip only fires as an entry when
+//   it agrees with the already-armed regime direction.
+// The state machine itself (atfTrend/atfLevel below) is otherwise a
+// deliberately EXACT structural port of the source's get_trend_state():
+// it recomputes every bar, unconditionally, exactly like the source, with
+// no internal barstate.isconfirmed gate. An earlier version of this
+// adaptation wrapped the whole block in "if barstate.isconfirmed", which
+// made zero difference to backtest results (historical bars are always
+// confirmed) but silently broke live/replay visual parity with the source
+// indicator -- during a still-forming bar, atfTrend/atfLevel would freeze
+// instead of updating tick-by-tick like the source, so the dashboard's ATF
+// TREND row and the "L"/"S" comparison against the source indicator on
+// screen would lag a full bar behind. Section 23's commonEntryPass already
+// requires barstate.isconfirmed before ANY strategy.entry() fires (the
+// same single choke point Triggers 1 and 3 rely on, rather than each
+// re-gating internally) -- so removing this trigger's own redundant gate
+// costs nothing on order-execution safety and restores true bar-by-bar
+// parity with the source, on the same checkpoint the other two ungated
+// triggers already use.
 // Variable names carry an atf/flow prefix throughout to avoid any collision
 // with Trigger 2's flip*-prefixed second-flip engine -- these are two
 // unrelated "flip" concepts that happen to share the word.
@@ -549,25 +567,36 @@ float atfLower      = atfBasis - (atfSmoothVol * atfSensitivity)
 var int   atfTrend = 0
 var float atfLevel = na
 
-if barstate.isconfirmed
-    if na(atfLevel)
-        atfTrend := close > atfBasis ? 1 : -1
-        atfLevel := atfTrend == 1 ? atfLower : atfUpper
-    else if atfTrend == 1
-        if close < atfLower
-            atfTrend := -1
-            atfLevel := atfUpper
-        else
-            atfLevel := atfLower
+// Two independent "if" statements, NOT "if/else if" -- this exactly
+// mirrors the source's own structure, where the initialization check and
+// the trend-continuation check are separate statements that both run on
+// the same bar when priming for the first time. Confirmed harmless (the
+// second check can never actually flip trend back on the priming bar,
+// since lower < basis < upper by construction), but kept structurally
+// identical to the source rather than collapsed into "else if", per the
+// same-condition parity this trigger is meant to hold.
+if na(atfLevel)
+    atfTrend := close > atfBasis ? 1 : -1
+    atfLevel := atfTrend == 1 ? atfLower : atfUpper
+if atfTrend == 1
+    if close < atfLower
+        atfTrend := -1
+        atfLevel := atfUpper
     else
-        if close > atfUpper
-            atfTrend := 1
-            atfLevel := atfLower
-        else
-            atfLevel := atfUpper
+        atfLevel := atfLower
+else
+    if close > atfUpper
+        atfTrend := 1
+        atfLevel := atfLower
+    else
+        atfLevel := atfUpper
 
-bool atfFlipLong  = barstate.isconfirmed and atfTrend == 1 and atfTrend[1] == -1
-bool atfFlipShort = barstate.isconfirmed and atfTrend == -1 and atfTrend[1] == 1
+// No inline isconfirmed gate here either, matching Triggers 1 and 3's
+// convention -- the flip is a plain per-bar boolean; commonEntryPass
+// (section 23) is the sole checkpoint that decides whether a bar's flip
+// is eligible to actually submit an order.
+bool atfFlipLong  = atfTrend == 1 and atfTrend[1] == -1
+bool atfFlipShort = atfTrend == -1 and atfTrend[1] == 1
 
 bool flowLongSignal  = regimeArmed and finalBias == 1 and atfFlipLong
 bool flowShortSignal = regimeArmed and finalBias == -1 and atfFlipShort
