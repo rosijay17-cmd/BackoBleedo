@@ -24,7 +24,7 @@ strategy(
 //=============================================================================
 // Ground-up trend-continuation strategy for MNQ, built from a synthesis of
 // patterns already proven across this repo plus the research in the
-// quant-research-notes skill. Three independent, individually-toggleable
+// quant-research-notes skill. Four independent, individually-toggleable
 // entry triggers share one regime gate, one risk model, and one dashboard,
 // so their relative performance can be compared and tuned separately in
 // Strategy Tester (each trade's comment/alert tags which trigger fired):
@@ -38,6 +38,12 @@ strategy(
 //      reconstruction -- deliberately simplified for this combined script.
 //   3. LIQUIDITY SWEEP + RECLAIM -- needs a real stop-run beyond a stored
 //      swing pivot before reclaiming it. Most selective; wants real volume.
+//   4. ADAPTIVE TREND FLOW -- an adaptive fast/slow-EMA basis with
+//      stdev-scaled bands and a SuperTrend-style flip, entry logic adapted
+//      from "Adaptive Trend Flow [QuantAlgo]" (c) QuantAlgo, MPL 2.0. The
+//      source's flip signal has no bias/confirmation filter of its own;
+//      here it is gated by finalBias/regimeArmed (no counter-trend fires)
+//      and evaluated on confirmed bars only, matching every other trigger.
 //
 // REGIME GATE -- built as a genuine two-threshold hysteresis band, not one
 // shared cutoff, per Dai, Yang, Zhang & Zhu (2016) "Optimal Trend Following
@@ -70,6 +76,7 @@ const string G_TRIGGERS = "04 - Entry Triggers"
 const string G_PULLBACK = "05 - Pullback Reclaim Trigger"
 const string G_FLIP     = "06 - Second-Flip Trigger"
 const string G_SWEEP    = "07 - Liquidity Sweep Trigger"
+const string G_FLOW     = "07B - Adaptive Trend Flow Trigger"
 const string G_RISK     = "08 - Risk Management"
 const string G_DAILY    = "09 - Daily Controls"
 const string G_DISPLAY  = "10 - Dashboard and Display"
@@ -120,6 +127,7 @@ float regimeHoldMin  = input.float(45.0, "Regime Hold Threshold (loose)", minval
 bool useTriggerPullback = input.bool(true, "Enable: Pullback Reclaim", group=G_TRIGGERS)
 bool useTriggerFlip     = input.bool(true, "Enable: Second-Flip Re-Entry", group=G_TRIGGERS)
 bool useTriggerSweep    = input.bool(true, "Enable: Liquidity Sweep + Reclaim", group=G_TRIGGERS)
+bool useTriggerFlow     = input.bool(true, "Enable: Adaptive Trend Flow", group=G_TRIGGERS)
 
 
 //=============================================================================
@@ -149,6 +157,16 @@ int   sweepStoredLevels     = input.int(15, "Stored Liquidity Levels", minval=5,
 float sweepMinDistanceAtr   = input.float(0.10, "Minimum Sweep Distance / ATR", minval=0.01, maxval=2.0, step=0.01, group=G_SWEEP)
 float sweepMinWickPct       = input.float(0.35, "Minimum Rejection Wick %", minval=0, maxval=1, step=0.01, group=G_SWEEP)
 int   sweepConfirmWindow    = input.int(2, "Reclaim Confirmation Window, Bars", minval=0, maxval=10, group=G_SWEEP)
+
+
+//=============================================================================
+// 08B. ADAPTIVE TREND FLOW TRIGGER INPUTS
+//=============================================================================
+// Adapted from "Adaptive Trend Flow [QuantAlgo]" (c) QuantAlgo, MPL 2.0.
+
+int   atfLength      = input.int(10, "Main Length", minval=2, group=G_FLOW)
+int   atfSmoothLen   = input.int(14, "Smoothing Length", minval=2, group=G_FLOW)
+float atfSensitivity = input.float(2.0, "Sensitivity", minval=0.1, step=0.1, group=G_FLOW)
 
 
 //=============================================================================
@@ -500,35 +518,95 @@ if sweepShortSignal
 
 
 //=============================================================================
+// 19B. TRIGGER 4 -- ADAPTIVE TREND FLOW (adapted from QuantAlgo)
+//=============================================================================
+// Entry mechanism adapted from "Adaptive Trend Flow [QuantAlgo]" (c) QuantAlgo,
+// MPL 2.0 -- an adaptive fast/slow-EMA basis with stdev-scaled bands, and a
+// SuperTrend-style flip state machine. The source indicator's flip signal
+// alone has no bias or confirmation filter; two deliberate adaptations were
+// made rather than importing it verbatim:
+//   1. Gated by finalBias/regimeArmed -- this strategy never takes a signal
+//      against its own regime gate (the "no counter-trend" rule every other
+//      trigger already follows), so a flow flip only fires as an entry when
+//      it agrees with the already-armed regime direction.
+//   2. Evaluated on confirmed bars only (barstate.isconfirmed), consistent
+//      with every other trigger engine in this script -- the source
+//      indicator updates every intrabar tick, which this strategy's
+//      execution discipline deliberately avoids.
+// Variable names carry an atf/flow prefix throughout to avoid any collision
+// with Trigger 2's flip*-prefixed second-flip engine -- these are two
+// unrelated "flip" concepts that happen to share the word.
+
+float atfTypical    = hlc3
+float atfFastEma    = ta.ema(atfTypical, atfLength)
+float atfSlowEma    = ta.ema(atfTypical, atfLength * 2)
+float atfBasis      = (atfFastEma + atfSlowEma) / 2
+float atfVol        = ta.stdev(atfTypical, atfLength)
+float atfSmoothVol  = ta.ema(atfVol, atfSmoothLen)
+float atfUpper      = atfBasis + (atfSmoothVol * atfSensitivity)
+float atfLower      = atfBasis - (atfSmoothVol * atfSensitivity)
+
+var int   atfTrend = 0
+var float atfLevel = na
+
+if barstate.isconfirmed
+    if na(atfLevel)
+        atfTrend := close > atfBasis ? 1 : -1
+        atfLevel := atfTrend == 1 ? atfLower : atfUpper
+    else if atfTrend == 1
+        if close < atfLower
+            atfTrend := -1
+            atfLevel := atfUpper
+        else
+            atfLevel := atfLower
+    else
+        if close > atfUpper
+            atfTrend := 1
+            atfLevel := atfLower
+        else
+            atfLevel := atfUpper
+
+bool atfFlipLong  = barstate.isconfirmed and atfTrend == 1 and atfTrend[1] == -1
+bool atfFlipShort = barstate.isconfirmed and atfTrend == -1 and atfTrend[1] == 1
+
+bool flowLongSignal  = regimeArmed and finalBias == 1 and atfFlipLong
+bool flowShortSignal = regimeArmed and finalBias == -1 and atfFlipShort
+
+
+//=============================================================================
 // 20. TRIGGER COMBINATION AND TAGGING
 //=============================================================================
 // Any enabled trigger firing is a valid raw signal. Each strategy.entry's
 // comment (and the alert message) tags which trigger fired, so Strategy
 // Tester's List of Trades can be filtered/compared trigger by trigger --
-// the point of building all three rather than picking one.
+// the point of building all four rather than picking one.
 
-bool rawLongSignal  = (useTriggerPullback and pullbackLongSignal) or (useTriggerFlip and flipLongSignal) or (useTriggerSweep and sweepLongSignal)
-bool rawShortSignal = (useTriggerPullback and pullbackShortSignal) or (useTriggerFlip and flipShortSignal) or (useTriggerSweep and sweepShortSignal)
+bool rawLongSignal  = (useTriggerPullback and pullbackLongSignal) or (useTriggerFlip and flipLongSignal) or (useTriggerSweep and sweepLongSignal) or (useTriggerFlow and flowLongSignal)
+bool rawShortSignal = (useTriggerPullback and pullbackShortSignal) or (useTriggerFlip and flipShortSignal) or (useTriggerSweep and sweepShortSignal) or (useTriggerFlow and flowShortSignal)
 
 string longTriggerTag =
      useTriggerSweep and sweepLongSignal ? "SWEEP" :
+     useTriggerFlow and flowLongSignal ? "FLOW" :
      useTriggerFlip and flipLongSignal ? "FLIP" :
      useTriggerPullback and pullbackLongSignal ? "PULLBACK" :
      "NONE"
 
 string shortTriggerTag =
      useTriggerSweep and sweepShortSignal ? "SWEEP" :
+     useTriggerFlow and flowShortSignal ? "FLOW" :
      useTriggerFlip and flipShortSignal ? "FLIP" :
      useTriggerPullback and pullbackShortSignal ? "PULLBACK" :
      "NONE"
 
 float longStructuralRef =
      useTriggerSweep and sweepLongSignal ? sweepLongStopRef :
+     useTriggerFlow and flowLongSignal ? atfLevel :
      useTriggerFlip and flipLongSignal ? low[1] :
      emaFast
 
 float shortStructuralRef =
      useTriggerSweep and sweepShortSignal ? sweepShortStopRef :
+     useTriggerFlow and flowShortSignal ? atfLevel :
      useTriggerFlip and flipShortSignal ? high[1] :
      emaFast
 
@@ -721,14 +799,14 @@ resolvedDashPos =
      dashboardPos == "Bottom Left" ? position.bottom_left :
      position.top_right
 
-var table dash = table.new(resolvedDashPos, 2, 15, border_width=1, border_color=color.rgb(44, 57, 76))
+var table dash = table.new(resolvedDashPos, 2, 16, border_width=1, border_color=color.rgb(44, 57, 76))
 
 f_row(int row, string leftText, string rightText, color valueColor) =>
     table.cell(dash, 0, row, leftText, text_color=color.white, bgcolor=color.new(color.gray, 72), text_size=size.small, text_halign=text.align_left)
     table.cell(dash, 1, row, rightText, text_color=color.white, bgcolor=color.new(valueColor, 55), text_size=size.small, text_halign=text.align_right)
 
 if barstate.islast
-    table.clear(dash, 0, 0, 1, 14)
+    table.clear(dash, 0, 0, 1, 15)
 
     if showDashboard
         string biasText = finalBiasRaw == 1 ? "BULL" : finalBiasRaw == -1 ? "BEAR" : "NEUTRAL"
@@ -737,7 +815,7 @@ if barstate.islast
         color  regimeColor = regimeArmed ? C_READY : C_WAIT
         string posText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
         color  posColor = strategy.position_size > 0 ? C_BULL : strategy.position_size < 0 ? C_BEAR : C_NEUTRAL
-        string triggersText = (useTriggerPullback ? "P" : "-") + (useTriggerFlip ? "F" : "-") + (useTriggerSweep ? "S" : "-")
+        string triggersText = (useTriggerPullback ? "P" : "-") + (useTriggerFlip ? "F" : "-") + (useTriggerSweep ? "S" : "-") + (useTriggerFlow ? "A" : "-")
 
         f_row(0, "MNQ MTTC", posText, posColor)
         f_row(1, "BIAS", biasText, biasColor)
@@ -754,6 +832,7 @@ if barstate.islast
         f_row(12, "LAST TRIGGER", lastTriggerTag, C_NEUTRAL)
         f_row(13, "SIGNAL VOL b1/b2", f_num(b1SignalVol) + "% / " + f_num(b2SignalVol) + "%", C_NEUTRAL)
         f_row(14, "SL / TP", f_price(activeStop) + " / " + f_price(activeTarget), strategy.position_size != 0 ? C_READY : C_NEUTRAL)
+        f_row(15, "ATF TREND", useTriggerFlow ? (atfTrend == 1 ? "UP" : "DOWN") : "OFF", useTriggerFlow ? (atfTrend == 1 ? C_BULL : C_BEAR) : C_NEUTRAL)
 
 
 //=============================================================================
@@ -803,3 +882,6 @@ plot(b2SignalVol, "Signal Volatility b2", display=display.data_window)
 plot(pullbackLongSignal ? 1.0 : 0.0, "Pullback Long Raw", display=display.data_window)
 plot(flipLongSignal ? 1.0 : 0.0, "Flip Long Raw", display=display.data_window)
 plot(sweepLongSignal ? 1.0 : 0.0, "Sweep Long Raw", display=display.data_window)
+plot(flowLongSignal ? 1.0 : 0.0, "Flow Long Raw", display=display.data_window)
+plot(flowShortSignal ? 1.0 : 0.0, "Flow Short Raw", display=display.data_window)
+plot(float(atfTrend), "ATF Trend State", display=display.data_window)
