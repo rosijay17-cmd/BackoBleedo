@@ -35,32 +35,43 @@ maxWickPct      = input.float(35.0, title="Max Rejection Wick %", group="Breakou
 useAtrPenetration  = input.bool(true, title="Enable ATR Penetration Filter?", group="Breakout Filters")
 atrPenetrationMult = input.float(0.5, title="Min ATR Penetration Multiplier", group="Breakout Filters")
 
-// 5. ORB Range Display (NEW -- the requested enhancement)
-showOrbLabels    = input.bool(true, title="Show OR High/Low Labels", group="ORB Range Display")
-showOrbRangeSize = input.bool(true, title="Show Range Size In Label", group="ORB Range Display")
-showOrbMidline   = input.bool(true, title="Show OR Midpoint Line", group="ORB Range Display")
-color orbBoxColor   = input.color(color.blue, title="OR Box Color", group="ORB Range Display")
-color orbLabelColor = input.color(color.new(color.blue, 0), title="OR Label Text Color", group="ORB Range Display")
-color orbMidColor   = input.color(color.new(color.gray, 40), title="OR Midpoint Line Color", group="ORB Range Display")
+// 5. ORB Range Display -- rebuilt to match the "ORB Range Breakout
+// [NSE/BSE]" reference the user pasted: flat plotted levels + a bgcolor
+// session highlight instead of a box, with labels anchored near the
+// CURRENT bar (redrawn every last-bar update via labelOffset) instead of
+// fixed at the range's start bar -- the fixed-position version scrolled
+// off the left edge of the screen on a long trading day, which is what
+// the user didn't like about the prior version.
+showMidline        = input.bool(true, title="Show Midline", tooltip="The midline often acts as intraday support/resistance after breakout.", group="ORB Range Display")
+color orbHighColor = input.color(color.new(#26a69a, 0), title="ORB High Color", group="ORB Range Display")
+color orbLowColor  = input.color(color.new(#ef5350, 0), title="ORB Low Color", group="ORB Range Display")
+color midlineColor = input.color(color.new(#ff9800, 50), title="Midline Color", group="ORB Range Display")
+color orbBgColor   = input.color(color.new(color.blue, 92), title="ORB Session Background", group="ORB Range Display")
+showOrbLabels      = input.bool(true, title="Show Price Labels", group="ORB Range Display")
+string labelSizeInput = input.string("Small", "Label Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group="ORB Range Display")
+labelOffset        = input.int(1, title="Label Offset (bars)", minval=0, maxval=50, tooltip="Horizontal distance of labels from the latest candle, in bars.", group="ORB Range Display")
 
-// 6. ORB Range Context (NEW -- ATR-normalized quality tag + target
-// projections, re-implemented in spirit from the documented methodology
-// of the public "ORB with Range Context" indicator by VishalSubandh:
-// https://in.tradingview.com/script/kST1aBES-ORB-with-Range-Context/
-rangeAtrLength         = input.int(14, title="Range Quality ATR Length", group="ORB Range Context")
-narrowThreshold        = input.float(0.5, title="Narrow Threshold (x ATR)", minval=0.01, step=0.05, group="ORB Range Context", tooltip="Range below this multiple of ATR is classified NARROW.")
-wideThreshold          = input.float(1.2, title="Wide Threshold (x ATR)", minval=0.01, step=0.05, group="ORB Range Context", tooltip="Range above this multiple of ATR is classified WIDE.")
-showRangeQuality       = input.bool(true, title="Show Range Quality Tag", group="ORB Range Context")
-showTargetProjections  = input.bool(true, title="Show Target Projections", group="ORB Range Context")
-target1Mult            = input.float(1.0, title="Target 1 Multiple (x Range)", minval=0.1, step=0.1, group="ORB Range Context")
-target2Mult            = input.float(1.5, title="Target 2 Multiple (x Range)", minval=0.1, step=0.1, group="ORB Range Context")
-target3Mult            = input.float(2.0, title="Target 3 Multiple (x Range)", minval=0.1, step=0.1, group="ORB Range Context")
-color qualityNarrowColor = input.color(color.orange, title="Narrow Tag Color", group="ORB Range Context")
-color qualityNormalColor = input.color(color.blue,   title="Normal Tag Color", group="ORB Range Context")
-color qualityWideColor   = input.color(color.purple, title="Wide Tag Color", group="ORB Range Context")
-color target1Color = input.color(color.teal,   title="Target 1 Line Color", group="ORB Range Context")
-color target2Color = input.color(color.orange, title="Target 2 Line Color", group="ORB Range Context")
-color target3Color = input.color(color.red,    title="Target 3 Line Color", group="ORB Range Context")
+// 6. ORB Range Context -- target projections + ATR-normalized range
+// quality (Narrow / Normal / Wide), same methodology as before, redrawn
+// using the reference's technique: a fixed 30-bar trailing segment near
+// current price, refreshed every last-bar update, rather than one line
+// extended live from the actual breakout bar.
+showTargetProjections = input.bool(true, title="Show Target Projections", group="ORB Range Context")
+target1Mult      = input.float(1.0, title="Target 1 (x Range)", minval=0.1, step=0.1, group="ORB Range Context")
+target2Mult      = input.float(1.5, title="Target 2 (x Range)", minval=0.1, step=0.1, group="ORB Range Context")
+target3Mult      = input.float(2.0, title="Target 3 (x Range)", minval=0.1, step=0.1, group="ORB Range Context")
+color targetColor = input.color(color.new(#00bcd4, 30), title="Target Lines Color", group="ORB Range Context")
+showRangeQuality = input.bool(true, title="Show Range Quality", tooltip="Compares the OR range to ATR to classify it as Narrow/Normal/Wide.", group="ORB Range Context")
+rangeAtrLength   = input.int(14, title="Range Quality ATR Length", minval=5, maxval=50, group="ORB Range Context")
+narrowThreshold  = input.float(0.5, title="Narrow Range (< x ATR)", minval=0.1, step=0.05, group="ORB Range Context")
+wideThreshold    = input.float(1.2, title="Wide Range (> x ATR)", minval=0.1, step=0.05, group="ORB Range Context")
+
+// 7. ORB Info Panel -- a small dedicated table for the ORB range's own
+// stats (Range / Quality / Range-vs-ATR / Breakout direction), separate
+// from the existing regime HUD below so neither gets crowded.
+showInfoPanel   = input.bool(true, title="Show ORB Info Panel", group="ORB Info Panel")
+string tableSizeInput = input.string("Small", "Info Table Size", options=["Auto", "Tiny", "Small", "Normal", "Large", "Huge"], group="ORB Info Panel")
+string themeSelect    = input.string("Dark", "Info Panel Theme", options=["Dark", "Light"], group="ORB Info Panel")
 
 // ==========================================
 // --- DYNAMIC SESSION CONCATENATION ---
@@ -98,182 +109,97 @@ else
 bool isRangingRegime = regimeState == 2
 
 // ==========================================
-// --- HELPERS (NEW) ---
+// --- HELPERS ---
 // ==========================================
 f_priceStr(float v) =>
     na(v) ? "-" : str.tostring(v, format.mintick)
 
+// Convert the label/table size dropdown strings into size.* constants,
+// same switch-based pattern as the reference indicator.
+f_labelSize(string sizeStr) =>
+    switch sizeStr
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        "Huge" => size.huge
+        => size.small
+
+f_tableSize(string sizeStr) =>
+    switch sizeStr
+        "Auto" => size.auto
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        "Huge" => size.huge
+        => size.small
+
+f_themeColors() =>
+    if themeSelect == "Light"
+        [color.new(color.white, 15), color.black, color.new(#e3e3e3, 30)]
+    else
+        [color.new(color.black, 85), color.white, color.new(color.blue, 70)]
+
 // ==========================================
-// --- RANGE TRACKING & VISUAL BOXES ---
+// --- RANGE TRACKING ---
 // ==========================================
+// Rebuilt to match the reference: no box, no live-growing visuals during
+// the OR window itself (just the bgcolor highlight below) -- the range
+// only gets drawn/labeled once it's finalized. orbHigh/orbLow simply
+// carry the last-known range through non-session hours until the next
+// isNewSession overwrites them fresh; no separate "reset to na on new
+// day" step is needed (and the prior version's version of that step had
+// a latent ordering hazard on RTH-only chart data, where isNewSession and
+// a new calendar day land on the exact same bar -- this sidesteps it
+// entirely rather than papering over it).
+bool validTF = timeframe.isintraday
+
 var float orbHigh = na
 var float orbLow  = na
-var bool rangeSet = false
-var box orbBox    = na
-
-// NEW: OR high/low price labels + midpoint reference line, anchored at
-// the range's start bar so they read as a fixed tag on the box (like the
-// reference image) instead of sliding across the chart every bar.
-var label orbHighLabel = na
-var label orbLowLabel  = na
-var line  orbMidLine   = na
-
-// NEW: target-projection lines/labels for the range-context enhancement
-// below -- only one breakout's worth is kept on screen at a time (this
-// strategy can, in principle, take a long breakout and later a short one
-// on the same day with pyramiding=0's default reversal behavior), so a
-// fresh breakout replaces the previous set rather than accumulating them.
-var line  target1Line = na
-var line  target2Line = na
-var line  target3Line = na
-var label target1Label = na
-var label target2Label = na
-var label target3Label = na
-
-// NEW: ATR-normalized range-quality classification (Narrow / Normal /
-// Wide), appended into the ORH label below. rangeAtr only depends on
-// price history, not on orbHigh/orbLow, so it's safe to compute once per
-// bar ahead of the session-tracking branches that use it.
-float rangeAtr = ta.atr(rangeAtrLength)
-
-f_qualityTag(float rangeWidth) =>
-    float ratio = not na(rangeAtr) and rangeAtr > 0 and not na(rangeWidth) ? rangeWidth / rangeAtr : na
-    string tag = na(ratio) ? "" : ratio < narrowThreshold ? "NARROW" : ratio > wideThreshold ? "WIDE" : "NORMAL"
-    showRangeQuality and tag != "" ? "  [" + tag + " " + str.tostring(ratio, "#.##") + "x ATR]" : ""
-
-// NEW: pure target-level calculator -- Pine functions cannot reassign a
-// global "var" (compiler error CE10088, "Cannot modify global variable"),
-// so this only computes the three target prices; the actual line/label
-// creation happens in one top-level block after the entries below, where
-// reassigning target1Line/target2Line/etc. is legal.
-f_targetLevels(bool isLong, float breakoutLevel, float rangeWidth) =>
-    float t1 = isLong ? breakoutLevel + rangeWidth * target1Mult : breakoutLevel - rangeWidth * target1Mult
-    float t2 = isLong ? breakoutLevel + rangeWidth * target2Mult : breakoutLevel - rangeWidth * target2Mult
-    float t3 = isLong ? breakoutLevel + rangeWidth * target3Mult : breakoutLevel - rangeWidth * target3Mult
-    [t1, t2, t3]
 
 bool inOrbSession = not na(time(timeframe.period, orbSession, timezone))
 bool isNewSession = inOrbSession and not inOrbSession[1]
 
-// Create and update the visual box dynamically
 if isNewSession
-    orbHigh  := high
-    orbLow   := low
-    rangeSet := false
-
-    // Create new box for the session
-    orbBox := box.new(left=bar_index, top=high, right=bar_index, bottom=low,
-                      bgcolor=color.new(orbBoxColor, 96),
-                      border_color=color.new(orbBoxColor, 60),
-                      border_width=2,
-                      border_style=line.style_dashed)
-
-    // NEW: (re)create the OR high/low labels and midpoint line for this
-    // fresh session, deleting anything left over from the prior one.
-    if not na(orbHighLabel)
-        label.delete(orbHighLabel)
-    if not na(orbLowLabel)
-        label.delete(orbLowLabel)
-    if not na(orbMidLine)
-        line.delete(orbMidLine)
-
-    // NEW: clear the prior day's target projections too.
-    if not na(target1Line)
-        line.delete(target1Line)
-        target1Line := na
-    if not na(target2Line)
-        line.delete(target2Line)
-        target2Line := na
-    if not na(target3Line)
-        line.delete(target3Line)
-        target3Line := na
-    if not na(target1Label)
-        label.delete(target1Label)
-        target1Label := na
-    if not na(target2Label)
-        label.delete(target2Label)
-        target2Label := na
-    if not na(target3Label)
-        label.delete(target3Label)
-        target3Label := na
-
-    if showOrbLabels
-        orbHighLabel := label.new(bar_index, high, "ORH " + f_priceStr(high),
-                                   style=label.style_label_down, color=color(na),
-                                   textcolor=orbLabelColor, size=size.small,
-                                   textalign=text.align_left)
-        orbLowLabel := label.new(bar_index, low, "ORL " + f_priceStr(low),
-                                  style=label.style_label_up, color=color(na),
-                                  textcolor=orbLabelColor, size=size.small,
-                                  textalign=text.align_left)
-
-    if showOrbMidline
-        orbMidLine := line.new(bar_index, (high + low) / 2, bar_index, (high + low) / 2,
-                                color=orbMidColor, width=1, style=line.style_dotted)
-
+    orbHigh := high
+    orbLow  := low
 else if inOrbSession
     orbHigh := math.max(orbHigh, high)
     orbLow  := math.min(orbLow, low)
 
-    // Dynamically expand the box edges in real-time
-    if not na(orbBox)
-        box.set_top(orbBox, orbHigh)
-        box.set_bottom(orbBox, orbLow)
-        box.set_right(orbBox, bar_index)
+bool  rangeSet       = validTF and not inOrbSession and not na(orbHigh)
+float orbMid         = (orbHigh + orbLow) / 2
+float orbRangeWidth  = orbHigh - orbLow
 
-    // NEW: keep the OR high/low labels tracking the live range as it
-    // forms, and keep the midpoint line's y centered between them.
-    if showOrbLabels and not na(orbHighLabel)
-        string highText = "ORH " + f_priceStr(orbHigh) + (showOrbRangeSize ? "  (" + f_priceStr(orbHigh - orbLow) + ")" : "") + f_qualityTag(orbHigh - orbLow)
-        label.set_y(orbHighLabel, orbHigh)
-        label.set_text(orbHighLabel, highText)
-    if showOrbLabels and not na(orbLowLabel)
-        label.set_y(orbLowLabel, orbLow)
-        label.set_text(orbLowLabel, "ORL " + f_priceStr(orbLow))
+// ATR-normalized range-quality classification (Narrow / Normal / Wide),
+// computed once the range is set and held (var) until the next one.
+float rangeAtr = ta.atr(rangeAtrLength)
+float rangeRatio = orbRangeWidth / rangeAtr
 
-    if showOrbMidline and not na(orbMidLine)
-        line.set_y1(orbMidLine, (orbHigh + orbLow) / 2)
-        line.set_y2(orbMidLine, (orbHigh + orbLow) / 2)
-        line.set_x2(orbMidLine, bar_index)
+var string rangeQuality      = "-"
+var color  rangeQualityColor = color.gray
 
-else if not inOrbSession and inOrbSession[1]
-    rangeSet := true
+if rangeSet and not na(rangeAtr) and rangeAtr > 0
+    if rangeRatio < narrowThreshold
+        rangeQuality := "NARROW"
+        rangeQualityColor := color.new(#4caf50, 0)
+    else if rangeRatio > wideThreshold
+        rangeQuality := "WIDE"
+        rangeQualityColor := color.new(#f44336, 0)
+    else
+        rangeQuality := "NORMAL"
+        rangeQualityColor := color.new(#2196f3, 0)
 
-    // Finalize the right boundary of the box when the session ends
-    if not na(orbBox)
-        box.set_right(orbBox, bar_index[1])
-
-    // NEW: lock the labels' final text once the range is set.
-    if showOrbLabels and not na(orbHighLabel)
-        string finalHighText = "ORH " + f_priceStr(orbHigh) + (showOrbRangeSize ? "  (" + f_priceStr(orbHigh - orbLow) + ")" : "") + f_qualityTag(orbHigh - orbLow)
-        label.set_text(orbHighLabel, finalHighText)
-    if showOrbLabels and not na(orbLowLabel)
-        label.set_text(orbLowLabel, "ORL " + f_priceStr(orbLow))
-
-// NEW: extend the midpoint line across the trading window after the
-// range is finalized, so it reads as a persistent reference level for
-// the rest of the day, matching the reference image.
-if showOrbMidline and rangeSet and not na(orbMidLine)
-    line.set_x2(orbMidLine, bar_index)
-
-// NEW: extend today's target-projection lines forward as the session
-// progresses, same idea as the midline above. inTradingWindow itself is
-// declared later (Execution Engine section) so it's recomputed locally
-// here rather than reordering the file -- it's a cheap time() check.
-bool inTradingWindowForTargets = not na(time(timeframe.period, tradingSession, timezone))
-if showTargetProjections and inTradingWindowForTargets
-    if not na(target1Line)
-        line.set_x2(target1Line, bar_index)
-    if not na(target2Line)
-        line.set_x2(target2Line, bar_index)
-    if not na(target3Line)
-        line.set_x2(target3Line, bar_index)
-
-// Reset range lines on a daily basis
-if ta.change(time("D")) != 0
-    rangeSet := false
-    orbHigh  := na
-    orbLow   := na
+// Target levels for both directions, computed unconditionally every bar
+// (cheap arithmetic) -- only the relevant set gets drawn below, gated by
+// which direction actually broke out.
+float t1Long  = orbHigh + orbRangeWidth * target1Mult
+float t2Long  = orbHigh + orbRangeWidth * target2Mult
+float t3Long  = orbHigh + orbRangeWidth * target3Mult
+float t1Short = orbLow - orbRangeWidth * target1Mult
+float t2Short = orbLow - orbRangeWidth * target2Mult
+float t3Short = orbLow - orbRangeWidth * target3Mult
 
 // ==========================================
 // --- FAKEOUT BREAKOUT FILTERS ---
@@ -306,10 +232,12 @@ bool inTradingWindow = not na(time(timeframe.period, tradingSession, timezone))
 
 var bool longTaken  = false
 var bool shortTaken = false
+var string firstBreakoutDir = "NONE"
 
 if ta.change(time("D")) != 0
     longTaken  := false
     shortTaken := false
+    firstBreakoutDir := "NONE"
 
 // Trigger breakouts on close confirmation outside the range boundaries
 bool rawLongTrigger  = rangeSet and inTradingWindow and not longTaken and ta.crossover(close, orbHigh)
@@ -330,6 +258,8 @@ if longTrigger
     activeSL  := close - slDistance
     activeTP  := close + (slDistance * rrMultiple)
     strategy.entry("Long", strategy.long, comment="ORB LONG")
+    if firstBreakoutDir == "NONE"
+        firstBreakoutDir := "LONG"
 
 // 2. Short Entry
 if shortTrigger
@@ -337,35 +267,8 @@ if shortTrigger
     activeSL   := close + slDistance
     activeTP   := close - (slDistance * rrMultiple)
     strategy.entry("Short", strategy.short, comment="ORB SHORT")
-
-// NEW: draw (replacing any prior set) the target-projection lines/labels
-// for whichever direction just broke out. longTrigger and shortTrigger
-// can never both be true on the same bar (close can't be simultaneously
-// above orbHigh and below orbLow), so this single block safely covers
-// both without duplicating the drawing code per direction.
-if showTargetProjections and (longTrigger or shortTrigger)
-    [t1, t2, t3] = f_targetLevels(longTrigger, longTrigger ? orbHigh : orbLow, orbHigh - orbLow)
-
-    if not na(target1Line)
-        line.delete(target1Line)
-    if not na(target2Line)
-        line.delete(target2Line)
-    if not na(target3Line)
-        line.delete(target3Line)
-    if not na(target1Label)
-        label.delete(target1Label)
-    if not na(target2Label)
-        label.delete(target2Label)
-    if not na(target3Label)
-        label.delete(target3Label)
-
-    string dirTag = longTrigger ? "LONG" : "SHORT"
-    target1Line := line.new(bar_index, t1, bar_index, t1, color=target1Color, width=1, style=line.style_dashed)
-    target2Line := line.new(bar_index, t2, bar_index, t2, color=target2Color, width=1, style=line.style_dashed)
-    target3Line := line.new(bar_index, t3, bar_index, t3, color=target3Color, width=1, style=line.style_dashed)
-    target1Label := label.new(bar_index, t1, "T1 " + dirTag + " (" + f_priceStr(t1) + ")", style=label.style_label_left, color=color(na), textcolor=target1Color, size=size.small)
-    target2Label := label.new(bar_index, t2, "T2 " + dirTag + " (" + f_priceStr(t2) + ")", style=label.style_label_left, color=color(na), textcolor=target2Color, size=size.small)
-    target3Label := label.new(bar_index, t3, "T3 " + dirTag + " (" + f_priceStr(t3) + ")", style=label.style_label_left, color=color(na), textcolor=target3Color, size=size.small)
+    if firstBreakoutDir == "NONE"
+        firstBreakoutDir := "SHORT"
 
 // ==========================================
 // --- EXIT ENGINE ---
@@ -384,11 +287,132 @@ if forceClose and sessionJustEnded and strategy.position_size != 0
 // ==========================================
 // --- VISUALIZATIONS & HUD ---
 // ==========================================
+// ORB High/Low/Mid as flat plotted levels (not a box) -- only visible
+// once the range is finalized, exactly like the reference. plot()/
+// bgcolor()/plotshape() must be called unconditionally at the top level
+// in Pine, so the on/off toggle lives in the value expression (na when
+// not applicable), not around the call itself.
+plot(validTF and rangeSet ? orbHigh : na, "ORB High", orbHighColor, 2, plot.style_linebr)
+plot(validTF and rangeSet ? orbLow : na, "ORB Low", orbLowColor, 2, plot.style_linebr)
+plot(validTF and rangeSet and showMidline ? orbMid : na, "ORB Mid", midlineColor, 1, plot.style_linebr)
+
+bgcolor(inOrbSession ? orbBgColor : na, title="ORB Session")
+
 // Shapes representing verified breakouts
 plotshape(longTrigger, title="ORB Buy Signal", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="ORB BUY")
 plotshape(shortTrigger, title="ORB Sell Signal", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="ORB SELL")
 
-// Real-Time HUD Dashboard
+// NEW: labels + target-projection lines, redrawn every last-bar update
+// and anchored near the CURRENT bar (bar_index + labelOffset) so they
+// stay visible near live price action all day, rather than fixed at the
+// range's start bar. Separate long/short line AND label variable sets --
+// the reference indicator this was modeled on shares one label-variable
+// set between its long and short target blocks, which silently orphans
+// the long labels if both a long and a short breakout happen on the same
+// day (nothing ever deletes them); kept the fix in since it costs nothing
+// and this strategy's longTaken/shortTaken already allow exactly that
+// same-day-both-directions case.
+var label orbHighLbl = na
+var label orbLowLbl  = na
+var label midLbl     = na
+
+var line  t1LongLine = na
+var line  t2LongLine = na
+var line  t3LongLine = na
+var line  t1ShortLine = na
+var line  t2ShortLine = na
+var line  t3ShortLine = na
+var label t1LongLbl = na
+var label t2LongLbl = na
+var label t3LongLbl = na
+var label t1ShortLbl = na
+var label t2ShortLbl = na
+var label t3ShortLbl = na
+
+if barstate.islast and validTF and rangeSet
+    label.delete(orbHighLbl)
+    label.delete(orbLowLbl)
+    label.delete(midLbl)
+    line.delete(t1LongLine)
+    line.delete(t2LongLine)
+    line.delete(t3LongLine)
+    line.delete(t1ShortLine)
+    line.delete(t2ShortLine)
+    line.delete(t3ShortLine)
+    label.delete(t1LongLbl)
+    label.delete(t2LongLbl)
+    label.delete(t3LongLbl)
+    label.delete(t1ShortLbl)
+    label.delete(t2ShortLbl)
+    label.delete(t3ShortLbl)
+
+    int startBar = bar_index - 30
+    string selectedLabelSize = f_labelSize(labelSizeInput)
+
+    if showOrbLabels
+        string highSuffix = showRangeQuality and rangeQuality != "-" ? "  [" + rangeQuality + " " + str.tostring(rangeRatio, "#.##") + "x ATR]" : ""
+        orbHighLbl := label.new(bar_index + labelOffset, orbHigh, "ORB H: " + f_priceStr(orbHigh) + highSuffix,
+             style=label.style_label_left, color=color.new(orbHighColor, 85), textcolor=orbHighColor, size=selectedLabelSize)
+        orbLowLbl := label.new(bar_index + labelOffset, orbLow, "ORB L: " + f_priceStr(orbLow),
+             style=label.style_label_left, color=color.new(orbLowColor, 85), textcolor=orbLowColor, size=selectedLabelSize)
+        if showMidline
+            midLbl := label.new(bar_index + labelOffset, orbMid, "Mid: " + f_priceStr(orbMid),
+                 style=label.style_label_left, color=color.new(midlineColor, 85), textcolor=midlineColor, size=selectedLabelSize)
+
+    // Target projections on a bullish breakout
+    if showTargetProjections and longTaken
+        t1LongLine := line.new(startBar, t1Long, bar_index, t1Long, color=targetColor, style=line.style_dashed)
+        t2LongLine := line.new(startBar, t2Long, bar_index, t2Long, color=targetColor, style=line.style_dashed)
+        t3LongLine := line.new(startBar, t3Long, bar_index, t3Long, color=targetColor, style=line.style_dashed)
+        if showOrbLabels
+            t1LongLbl := label.new(bar_index + labelOffset, t1Long, "T1: " + f_priceStr(t1Long),
+                 style=label.style_label_left, color=color.new(targetColor, 85), textcolor=targetColor, size=size.tiny)
+            t2LongLbl := label.new(bar_index + labelOffset, t2Long, "T2: " + f_priceStr(t2Long),
+                 style=label.style_label_left, color=color.new(targetColor, 85), textcolor=targetColor, size=size.tiny)
+            t3LongLbl := label.new(bar_index + labelOffset, t3Long, "T3: " + f_priceStr(t3Long),
+                 style=label.style_label_left, color=color.new(targetColor, 85), textcolor=targetColor, size=size.tiny)
+
+    // Target projections on a bearish breakout
+    if showTargetProjections and shortTaken
+        t1ShortLine := line.new(startBar, t1Short, bar_index, t1Short, color=targetColor, style=line.style_dashed)
+        t2ShortLine := line.new(startBar, t2Short, bar_index, t2Short, color=targetColor, style=line.style_dashed)
+        t3ShortLine := line.new(startBar, t3Short, bar_index, t3Short, color=targetColor, style=line.style_dashed)
+        if showOrbLabels
+            t1ShortLbl := label.new(bar_index + labelOffset, t1Short, "T1: " + f_priceStr(t1Short),
+                 style=label.style_label_left, color=color.new(targetColor, 85), textcolor=targetColor, size=size.tiny)
+            t2ShortLbl := label.new(bar_index + labelOffset, t2Short, "T2: " + f_priceStr(t2Short),
+                 style=label.style_label_left, color=color.new(targetColor, 85), textcolor=targetColor, size=size.tiny)
+            t3ShortLbl := label.new(bar_index + labelOffset, t3Short, "T3: " + f_priceStr(t3Short),
+                 style=label.style_label_left, color=color.new(targetColor, 85), textcolor=targetColor, size=size.tiny)
+
+// NEW: dedicated ORB info panel, separate from the regime HUD below.
+var table orbInfo = na
+
+if showInfoPanel and validTF and barstate.islast and rangeSet
+    table.delete(orbInfo)
+
+    color boColor = firstBreakoutDir == "LONG" ? orbHighColor : firstBreakoutDir == "SHORT" ? orbLowColor : color.gray
+    [bgColorTheme, textColorTheme, headerBgTheme] = f_themeColors()
+    string selectedTableSize = f_tableSize(tableSizeInput)
+
+    orbInfo := table.new(position.bottom_right, 2, 5, bgcolor=bgColorTheme, border_width=1, border_color=themeSelect == "Light" ? color.gray : color.new(color.gray, 50))
+
+    table.cell(orbInfo, 0, 0, "ORB LEVELS", text_color=themeSelect == "Light" ? color.black : color.white, text_size=selectedTableSize, bgcolor=headerBgTheme)
+    table.merge_cells(orbInfo, 0, 0, 1, 0)
+
+    table.cell(orbInfo, 0, 1, "Range", text_color=textColorTheme, text_size=selectedTableSize)
+    table.cell(orbInfo, 1, 1, f_priceStr(orbRangeWidth), text_color=textColorTheme, text_size=selectedTableSize)
+
+    table.cell(orbInfo, 0, 2, "Quality", text_color=textColorTheme, text_size=selectedTableSize)
+    table.cell(orbInfo, 1, 2, showRangeQuality ? rangeQuality : "-", text_color=rangeQualityColor, text_size=selectedTableSize)
+
+    table.cell(orbInfo, 0, 3, "Range/ATR", text_color=textColorTheme, text_size=selectedTableSize)
+    table.cell(orbInfo, 1, 3, str.tostring(rangeRatio, "#.##") + "x", text_color=textColorTheme, text_size=selectedTableSize)
+
+    table.cell(orbInfo, 0, 4, "Breakout", text_color=textColorTheme, text_size=selectedTableSize)
+    table.cell(orbInfo, 1, 4, firstBreakoutDir, text_color=boColor, text_size=selectedTableSize)
+
+// Real-Time Regime HUD Dashboard (unchanged, top-right)
 var table hud = table.new(position.top_right, 2, 3, bgcolor=color.new(color.black, 30), border_width=1)
 if barstate.islast
     table.clear(hud, 0, 0, 1, 2)
@@ -407,3 +431,15 @@ if barstate.islast
 
     table.cell(hud, 0, 2, "VOL COMPRESSION:", text_color=color.white, text_size=size.small)
     table.cell(hud, 1, 2, isSqueezed ? "COILING" : "EXPANDED", bgcolor=isSqueezed ? color.new(color.yellow, 20) : color.new(color.green, 20), text_color=color.white, text_size=size.small)
+
+// ==========================================
+// --- INFORMATIONAL ALERTS (NEW) ---
+// ==========================================
+// Target-hit alerts, purely informational -- do not affect strategy
+// execution (that's still governed by activeSL/activeTP + rrMultiple in
+// the Exit Engine above, unchanged).
+bool t1Hit = (longTaken and ta.crossover(high, t1Long)) or (shortTaken and ta.crossunder(low, t1Short))
+bool t2Hit = (longTaken and ta.crossover(high, t2Long)) or (shortTaken and ta.crossunder(low, t2Short))
+
+alertcondition(t1Hit, title="ORB Target 1 Hit", message="ORB Target 1 reached | {{ticker}} | {{interval}}")
+alertcondition(t2Hit, title="ORB Target 2 Hit", message="ORB Target 2 reached | {{ticker}} | {{interval}}")
