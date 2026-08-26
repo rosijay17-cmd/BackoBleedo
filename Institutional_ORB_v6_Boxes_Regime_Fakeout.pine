@@ -141,34 +141,16 @@ f_qualityTag(float rangeWidth) =>
     string tag = na(ratio) ? "" : ratio < narrowThreshold ? "NARROW" : ratio > wideThreshold ? "WIDE" : "NORMAL"
     showRangeQuality and tag != "" ? "  [" + tag + " " + str.tostring(ratio, "#.##") + "x ATR]" : ""
 
-// NEW: draws (replacing any prior set) the 1.0x/1.5x/2.0x target
-// projection lines and labels from a breakout level. Visual only -- this
-// strategy's actual take-profit below still uses rrMultiple, unchanged.
-f_drawTargets(bool isLong, float breakoutLevel, float rangeWidth) =>
+// NEW: pure target-level calculator -- Pine functions cannot reassign a
+// global "var" (compiler error CE10088, "Cannot modify global variable"),
+// so this only computes the three target prices; the actual line/label
+// creation happens in one top-level block after the entries below, where
+// reassigning target1Line/target2Line/etc. is legal.
+f_targetLevels(bool isLong, float breakoutLevel, float rangeWidth) =>
     float t1 = isLong ? breakoutLevel + rangeWidth * target1Mult : breakoutLevel - rangeWidth * target1Mult
     float t2 = isLong ? breakoutLevel + rangeWidth * target2Mult : breakoutLevel - rangeWidth * target2Mult
     float t3 = isLong ? breakoutLevel + rangeWidth * target3Mult : breakoutLevel - rangeWidth * target3Mult
-
-    if not na(target1Line)
-        line.delete(target1Line)
-    if not na(target2Line)
-        line.delete(target2Line)
-    if not na(target3Line)
-        line.delete(target3Line)
-    if not na(target1Label)
-        label.delete(target1Label)
-    if not na(target2Label)
-        label.delete(target2Label)
-    if not na(target3Label)
-        label.delete(target3Label)
-
-    string dirTag = isLong ? "LONG" : "SHORT"
-    target1Line := line.new(bar_index, t1, bar_index, t1, color=target1Color, width=1, style=line.style_dashed)
-    target2Line := line.new(bar_index, t2, bar_index, t2, color=target2Color, width=1, style=line.style_dashed)
-    target3Line := line.new(bar_index, t3, bar_index, t3, color=target3Color, width=1, style=line.style_dashed)
-    target1Label := label.new(bar_index, t1, "T1 " + dirTag + " (" + f_priceStr(t1) + ")", style=label.style_label_left, color=color(na), textcolor=target1Color, size=size.small)
-    target2Label := label.new(bar_index, t2, "T2 " + dirTag + " (" + f_priceStr(t2) + ")", style=label.style_label_left, color=color(na), textcolor=target2Color, size=size.small)
-    target3Label := label.new(bar_index, t3, "T3 " + dirTag + " (" + f_priceStr(t3) + ")", style=label.style_label_left, color=color(na), textcolor=target3Color, size=size.small)
+    [t1, t2, t3]
 
 bool inOrbSession = not na(time(timeframe.period, orbSession, timezone))
 bool isNewSession = inOrbSession and not inOrbSession[1]
@@ -348,8 +330,6 @@ if longTrigger
     activeSL  := close - slDistance
     activeTP  := close + (slDistance * rrMultiple)
     strategy.entry("Long", strategy.long, comment="ORB LONG")
-    if showTargetProjections
-        f_drawTargets(true, orbHigh, orbHigh - orbLow)
 
 // 2. Short Entry
 if shortTrigger
@@ -357,8 +337,35 @@ if shortTrigger
     activeSL   := close + slDistance
     activeTP   := close - (slDistance * rrMultiple)
     strategy.entry("Short", strategy.short, comment="ORB SHORT")
-    if showTargetProjections
-        f_drawTargets(false, orbLow, orbHigh - orbLow)
+
+// NEW: draw (replacing any prior set) the target-projection lines/labels
+// for whichever direction just broke out. longTrigger and shortTrigger
+// can never both be true on the same bar (close can't be simultaneously
+// above orbHigh and below orbLow), so this single block safely covers
+// both without duplicating the drawing code per direction.
+if showTargetProjections and (longTrigger or shortTrigger)
+    [t1, t2, t3] = f_targetLevels(longTrigger, longTrigger ? orbHigh : orbLow, orbHigh - orbLow)
+
+    if not na(target1Line)
+        line.delete(target1Line)
+    if not na(target2Line)
+        line.delete(target2Line)
+    if not na(target3Line)
+        line.delete(target3Line)
+    if not na(target1Label)
+        label.delete(target1Label)
+    if not na(target2Label)
+        label.delete(target2Label)
+    if not na(target3Label)
+        label.delete(target3Label)
+
+    string dirTag = longTrigger ? "LONG" : "SHORT"
+    target1Line := line.new(bar_index, t1, bar_index, t1, color=target1Color, width=1, style=line.style_dashed)
+    target2Line := line.new(bar_index, t2, bar_index, t2, color=target2Color, width=1, style=line.style_dashed)
+    target3Line := line.new(bar_index, t3, bar_index, t3, color=target3Color, width=1, style=line.style_dashed)
+    target1Label := label.new(bar_index, t1, "T1 " + dirTag + " (" + f_priceStr(t1) + ")", style=label.style_label_left, color=color(na), textcolor=target1Color, size=size.small)
+    target2Label := label.new(bar_index, t2, "T2 " + dirTag + " (" + f_priceStr(t2) + ")", style=label.style_label_left, color=color(na), textcolor=target2Color, size=size.small)
+    target3Label := label.new(bar_index, t3, "T3 " + dirTag + " (" + f_priceStr(t3) + ")", style=label.style_label_left, color=color(na), textcolor=target3Color, size=size.small)
 
 // ==========================================
 // --- EXIT ENGINE ---
