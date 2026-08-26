@@ -1,0 +1,294 @@
+//@version=6
+//@strategy_alert_message {{strategy.order.alert_message}} | {{ticker}} | {{interval}} | Fill: {{strategy.order.price}}
+
+strategy("Institutional ORB v6 (Boxes + Regime + Fakeout)", overlay=true, initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1)
+
+// ==========================================
+// --- INPUTS ---
+// ==========================================
+// 1. Dynamic Time Settings
+orbStart       = input.string("0930", title="ORB Start Time (HHMM)", group="Dynamic Time Settings")
+orbEnd         = input.string("1000", title="ORB End Time (HHMM)", group="Dynamic Time Settings")
+tradingEnd     = input.string("1600", title="Trading Session End (HHMM)", group="Dynamic Time Settings")
+timezone       = input.string("America/New_York", title="Session Timezone", group="Dynamic Time Settings")
+
+// 2. Risk Settings
+riskPct        = input.float(25.0, title="Stop Loss % of Range", minval=1.0, maxval=100.0, group="Risk Management", tooltip="Stop loss size as a percentage of the total range width")
+rrMultiple     = input.float(5.0, title="Risk Reward Multiple", group="Risk Management")
+forceClose     = input.bool(true, title="Force Close at Session End?", group="Risk Management")
+
+// 3. Layer 1: Markov-Proxy Regime Switcher Settings
+adxLength      = input.int(14, title="ADX Length", group="Layer 1: Regime Switcher")
+adxThreshold   = input.int(25, title="ADX Trend Threshold", group="Layer 1: Regime Switcher")
+bbSqueezeLen   = input.int(20, title="Squeeze BB Length", group="Layer 1: Regime Switcher")
+bbSqueezeMult  = input.float(2.0, title="Squeeze BB Multiplier", group="Layer 1: Regime Switcher")
+kcSqueezeMult  = input.float(1.5, title="Squeeze Keltner Multiplier", group="Layer 1: Regime Switcher")
+
+// 4. Sub-Strategy B: Fakeout Breakout Filters
+useVolumeFilter = input.bool(true, title="Enable Volume Confirmation?", group="Breakout Filters")
+volLength       = input.int(20, title="Volume Average Length", group="Breakout Filters")
+volMultiplier   = input.float(1.5, title="Volume Multiplier (x SMA)", group="Breakout Filters")
+
+useWickFilter   = input.bool(true, title="Enable Rejection Wick Filter?", group="Breakout Filters")
+maxWickPct      = input.float(35.0, title="Max Rejection Wick %", group="Breakout Filters")
+
+useAtrPenetration  = input.bool(true, title="Enable ATR Penetration Filter?", group="Breakout Filters")
+atrPenetrationMult = input.float(0.5, title="Min ATR Penetration Multiplier", group="Breakout Filters")
+
+// 5. ORB Range Display (NEW -- the requested enhancement)
+showOrbLabels    = input.bool(true, title="Show OR High/Low Labels", group="ORB Range Display")
+showOrbRangeSize = input.bool(true, title="Show Range Size In Label", group="ORB Range Display")
+showOrbMidline   = input.bool(true, title="Show OR Midpoint Line", group="ORB Range Display")
+color orbBoxColor   = input.color(color.blue, title="OR Box Color", group="ORB Range Display")
+color orbLabelColor = input.color(color.new(color.blue, 0), title="OR Label Text Color", group="ORB Range Display")
+color orbMidColor   = input.color(color.new(color.gray, 40), title="OR Midpoint Line Color", group="ORB Range Display")
+
+// ==========================================
+// --- DYNAMIC SESSION CONCATENATION ---
+// ==========================================
+string orbSession     = orbStart + "-" + orbEnd
+string tradingSession = orbEnd + "-" + tradingEnd
+
+// ==========================================
+// --- LAYER 1: REGIME SWITCHER ENGINE ---
+// ==========================================
+// Volatility Compression (Squeeze Detection)
+basisSqueeze = ta.sma(close, bbSqueezeLen)
+devSqueeze   = bbSqueezeMult * ta.stdev(close, bbSqueezeLen)
+upperBB      = basisSqueeze + devSqueeze
+lowerBB      = basisSqueeze - devSqueeze
+
+atrValSqueeze = ta.atr(bbSqueezeLen)
+upperKC       = basisSqueeze + (atrValSqueeze * kcSqueezeMult)
+lowerKC       = basisSqueeze - (atrValSqueeze * kcSqueezeMult)
+
+bool isSqueezed = (upperBB < upperKC) and (lowerBB > lowerKC)
+
+// Trend Momentum (ADX)
+[diPlus, diMinus, adxValue] = ta.dmi(adxLength, adxLength)
+
+// Regime Classification
+int regimeState = 2
+if isSqueezed
+    regimeState := 0
+else if adxValue >= adxThreshold
+    regimeState := 1
+else
+    regimeState := 2
+
+bool isRangingRegime = regimeState == 2
+
+// ==========================================
+// --- HELPERS (NEW) ---
+// ==========================================
+f_priceStr(float v) =>
+    na(v) ? "-" : str.tostring(v, format.mintick)
+
+// ==========================================
+// --- RANGE TRACKING & VISUAL BOXES ---
+// ==========================================
+var float orbHigh = na
+var float orbLow  = na
+var bool rangeSet = false
+var box orbBox    = na
+
+// NEW: OR high/low price labels + midpoint reference line, anchored at
+// the range's start bar so they read as a fixed tag on the box (like the
+// reference image) instead of sliding across the chart every bar.
+var label orbHighLabel = na
+var label orbLowLabel  = na
+var line  orbMidLine   = na
+
+bool inOrbSession = not na(time(timeframe.period, orbSession, timezone))
+bool isNewSession = inOrbSession and not inOrbSession[1]
+
+// Create and update the visual box dynamically
+if isNewSession
+    orbHigh  := high
+    orbLow   := low
+    rangeSet := false
+
+    // Create new box for the session
+    orbBox := box.new(left=bar_index, top=high, right=bar_index, bottom=low,
+                      bgcolor=color.new(orbBoxColor, 96),
+                      border_color=color.new(orbBoxColor, 60),
+                      border_width=2,
+                      border_style=line.style_dashed)
+
+    // NEW: (re)create the OR high/low labels and midpoint line for this
+    // fresh session, deleting anything left over from the prior one.
+    if not na(orbHighLabel)
+        label.delete(orbHighLabel)
+    if not na(orbLowLabel)
+        label.delete(orbLowLabel)
+    if not na(orbMidLine)
+        line.delete(orbMidLine)
+
+    if showOrbLabels
+        orbHighLabel := label.new(bar_index, high, "ORH " + f_priceStr(high),
+                                   style=label.style_label_down, color=color(na),
+                                   textcolor=orbLabelColor, size=size.small,
+                                   textalign=text.align_left)
+        orbLowLabel := label.new(bar_index, low, "ORL " + f_priceStr(low),
+                                  style=label.style_label_up, color=color(na),
+                                  textcolor=orbLabelColor, size=size.small,
+                                  textalign=text.align_left)
+
+    if showOrbMidline
+        orbMidLine := line.new(bar_index, (high + low) / 2, bar_index, (high + low) / 2,
+                                color=orbMidColor, width=1, style=line.style_dotted)
+
+else if inOrbSession
+    orbHigh := math.max(orbHigh, high)
+    orbLow  := math.min(orbLow, low)
+
+    // Dynamically expand the box edges in real-time
+    if not na(orbBox)
+        box.set_top(orbBox, orbHigh)
+        box.set_bottom(orbBox, orbLow)
+        box.set_right(orbBox, bar_index)
+
+    // NEW: keep the OR high/low labels tracking the live range as it
+    // forms, and keep the midpoint line's y centered between them.
+    if showOrbLabels and not na(orbHighLabel)
+        string highText = "ORH " + f_priceStr(orbHigh) + (showOrbRangeSize ? "  (" + f_priceStr(orbHigh - orbLow) + ")" : "")
+        label.set_y(orbHighLabel, orbHigh)
+        label.set_text(orbHighLabel, highText)
+    if showOrbLabels and not na(orbLowLabel)
+        label.set_y(orbLowLabel, orbLow)
+        label.set_text(orbLowLabel, "ORL " + f_priceStr(orbLow))
+
+    if showOrbMidline and not na(orbMidLine)
+        line.set_y1(orbMidLine, (orbHigh + orbLow) / 2)
+        line.set_y2(orbMidLine, (orbHigh + orbLow) / 2)
+        line.set_x2(orbMidLine, bar_index)
+
+else if not inOrbSession and inOrbSession[1]
+    rangeSet := true
+
+    // Finalize the right boundary of the box when the session ends
+    if not na(orbBox)
+        box.set_right(orbBox, bar_index[1])
+
+    // NEW: lock the labels' final text once the range is set.
+    if showOrbLabels and not na(orbHighLabel)
+        string finalHighText = "ORH " + f_priceStr(orbHigh) + (showOrbRangeSize ? "  (" + f_priceStr(orbHigh - orbLow) + ")" : "")
+        label.set_text(orbHighLabel, finalHighText)
+    if showOrbLabels and not na(orbLowLabel)
+        label.set_text(orbLowLabel, "ORL " + f_priceStr(orbLow))
+
+// NEW: extend the midpoint line across the trading window after the
+// range is finalized, so it reads as a persistent reference level for
+// the rest of the day, matching the reference image.
+if showOrbMidline and rangeSet and not na(orbMidLine)
+    line.set_x2(orbMidLine, bar_index)
+
+// Reset range lines on a daily basis
+if ta.change(time("D")) != 0
+    rangeSet := false
+    orbHigh  := na
+    orbLow   := na
+
+// ==========================================
+// --- FAKEOUT BREAKOUT FILTERS ---
+// ==========================================
+// 1. Volume Filter
+volMa = ta.sma(volume, volLength)
+bool isVolumeConfirmed = not useVolumeFilter or (volume > (volMa * volMultiplier))
+
+// 2. Rejection Wick Filter
+candleRange = high - low
+upperWick   = high - math.max(open, close)
+lowerWick   = math.min(open, close) - low
+
+bool longWickOK  = not useWickFilter or (candleRange > 0 ? (upperWick / candleRange) * 100 <= maxWickPct : true)
+bool shortWickOK = not useWickFilter or (candleRange > 0 ? (lowerWick / candleRange) * 100 <= maxWickPct : true)
+
+// 3. ATR Penetration (Clearance distance)
+atrVal = ta.atr(14)
+bool longAtrPenetration  = not useAtrPenetration or ((close - orbHigh) >= (atrVal * atrPenetrationMult))
+bool shortAtrPenetration = not useAtrPenetration or ((orbLow - close) >= (atrVal * atrPenetrationMult))
+
+// Combined validation checks
+bool isLongBreakoutValid  = isVolumeConfirmed and longWickOK and longAtrPenetration
+bool isShortBreakoutValid = isVolumeConfirmed and shortWickOK and shortAtrPenetration
+
+// ==========================================
+// --- EXECUTION ENGINE ---
+// ==========================================
+bool inTradingWindow = not na(time(timeframe.period, tradingSession, timezone))
+
+var bool longTaken  = false
+var bool shortTaken = false
+
+if ta.change(time("D")) != 0
+    longTaken  := false
+    shortTaken := false
+
+// Trigger breakouts on close confirmation outside the range boundaries
+bool rawLongTrigger  = rangeSet and inTradingWindow and not longTaken and ta.crossover(close, orbHigh)
+bool rawShortTrigger = rangeSet and inTradingWindow and not shortTaken and ta.crossunder(close, orbLow)
+
+// ORB Entries are strictly blocked during Ranging Regimes (isRangingRegime == false)
+bool longTrigger  = rawLongTrigger and not isRangingRegime and isLongBreakoutValid
+bool shortTrigger = rawShortTrigger and not isRangingRegime and isShortBreakoutValid
+
+var float activeSL = na
+var float activeTP = na
+
+float slDistance = (orbHigh - orbLow) * (riskPct / 100.0)
+
+// 1. Long Entry
+if longTrigger
+    longTaken := true
+    activeSL  := close - slDistance
+    activeTP  := close + (slDistance * rrMultiple)
+    strategy.entry("Long", strategy.long, comment="ORB LONG")
+
+// 2. Short Entry
+if shortTrigger
+    shortTaken := true
+    activeSL   := close + slDistance
+    activeTP   := close - (slDistance * rrMultiple)
+    strategy.entry("Short", strategy.short, comment="ORB SHORT")
+
+// ==========================================
+// --- EXIT ENGINE ---
+// ==========================================
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop=activeSL, limit=activeTP, comment="SL/TP Exit")
+
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop=activeSL, limit=activeTP, comment="SL/TP Exit")
+
+// End of trading window force-close
+bool sessionJustEnded = not inTradingWindow and inTradingWindow[1]
+if forceClose and sessionJustEnded and strategy.position_size != 0
+    strategy.close_all(comment="Session Ended - Force Close")
+
+// ==========================================
+// --- VISUALIZATIONS & HUD ---
+// ==========================================
+// Shapes representing verified breakouts
+plotshape(longTrigger, title="ORB Buy Signal", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="ORB BUY")
+plotshape(shortTrigger, title="ORB Sell Signal", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="ORB SELL")
+
+// Real-Time HUD Dashboard
+var table hud = table.new(position.top_right, 2, 3, bgcolor=color.new(color.black, 30), border_width=1)
+if barstate.islast
+    table.clear(hud, 0, 0, 1, 2)
+    string activeStateText = regimeState == 0 ? "SQUEEZE (HIGH ORB EXPECTATION)" :
+                             regimeState == 1 ? "TRENDING (ORB ENABLED)"          :
+                             "RANGING (ORB DISABLED)"
+    color activeStateColor = regimeState == 0 ? color.yellow :
+                             regimeState == 1 ? color.teal   :
+                             color.orange
+
+    table.cell(hud, 0, 0, "MARKET REGIME:", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 0, activeStateText, bgcolor=activeStateColor, text_color=color.white, text_size=size.small)
+
+    table.cell(hud, 0, 1, "ADX POWER:", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 1, str.tostring(adxValue, "#.#"), text_color=color.white, text_size=size.small)
+
+    table.cell(hud, 0, 2, "VOL COMPRESSION:", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 2, isSqueezed ? "COILING" : "EXPANDED", bgcolor=isSqueezed ? color.new(color.yellow, 20) : color.new(color.green, 20), text_color=color.white, text_size=size.small)
