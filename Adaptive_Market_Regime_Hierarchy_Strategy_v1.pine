@@ -538,9 +538,9 @@ bool showVwapInput = input.bool(
     group = GROUP_VISUALS
 )
 
-bool showEntryLabelsInput = input.bool(
+bool showEntryArrowsInput = input.bool(
     true,
-    "Show BUY / SELL Fill Labels",
+    "Show BUY / SELL Entry Arrows",
     group = GROUP_VISUALS
 )
 
@@ -1051,23 +1051,6 @@ if newLongFill
     initialRisk := activeEntryPrice - activeStop
     activeTarget := activeEntryPrice + initialRisk * rewardRisk
 
-    if showEntryLabelsInput
-        label.new(
-            bar_index,
-            activeEntryPrice,
-            "BUY\n" +
-            activeSetupName +
-            "\n" +
-            activeRegimeName +
-            "\n" +
-            str.tostring(activeEntryPrice, format.mintick),
-            yloc = yloc.price,
-            style = label.style_label_up,
-            color = color.lime,
-            textcolor = color.black,
-            size = size.small
-        )
-
 //=============================================================================
 // SHORT FILL — BUILD ADAPTIVE RISK
 //=============================================================================
@@ -1107,23 +1090,6 @@ if newShortFill
     activeStop := selectedStop
     initialRisk := activeStop - activeEntryPrice
     activeTarget := activeEntryPrice - initialRisk * rewardRisk
-
-    if showEntryLabelsInput
-        label.new(
-            bar_index,
-            activeEntryPrice,
-            "SELL\n" +
-            activeSetupName +
-            "\n" +
-            activeRegimeName +
-            "\n" +
-            str.tostring(activeEntryPrice, format.mintick),
-            yloc = yloc.price,
-            style = label.style_label_down,
-            color = color.red,
-            textcolor = color.white,
-            size = size.small
-        )
 
 //=============================================================================
 // LONG TRADE MANAGEMENT
@@ -1236,6 +1202,28 @@ bgcolor(
 //=============================================================================
 // CORE VISUALS
 //=============================================================================
+
+// Entry arrows, replacing the old BUY/SELL text labels. plotshape() has to
+// be called unconditionally at the top level (unlike label.new(), it
+// can't live inside the "if newLongFill" block above), so the toggle and
+// the fill condition both live in the series argument instead.
+plotshape(
+    showEntryArrowsInput and newLongFill,
+    title = "Buy Signal",
+    style = shape.triangleup,
+    location = location.belowbar,
+    color = color.lime,
+    size = size.small
+)
+
+plotshape(
+    showEntryArrowsInput and newShortFill,
+    title = "Sell Signal",
+    style = shape.triangledown,
+    location = location.abovebar,
+    color = color.red,
+    size = size.small
+)
 
 plot(
     showEmaInput ? fastEMA : na,
