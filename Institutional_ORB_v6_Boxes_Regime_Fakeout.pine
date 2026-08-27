@@ -18,6 +18,20 @@ rrMultiple     = input.float(5.0, title="Risk Reward Multiple", group="Risk Mana
 forceClose     = input.bool(true, title="Force Close at Session End?", group="Risk Management")
 
 // 3. Layer 1: Markov-Proxy Regime Switcher Settings
+// NOTE: adxLength/bbSqueezeLen are fixed BAR-COUNT lookbacks, not fixed
+// TIME windows -- 14-20 bars is ~3.5-5 hours of real time on a 15m chart
+// but only 14-20 MINUTES on a 1m chart. Dropping to a lower timeframe
+// without retuning these means the regime classifier sees a much shorter,
+// noisier slice of the day and calls it "ranging" far more often, and
+// entries are strictly blocked whenever isRangingRegime is true -- this is
+// almost certainly why entries look fine at 15m and vanish below it.
+// useRegimeFilter (default on, so 15m behavior is unchanged) lets you
+// bypass that block entirely to confirm the diagnosis before retuning:
+// watch the HUD's "MARKET REGIME" cell on your target lower timeframe --
+// if it reads RANGING almost constantly, that confirms it, and the real
+// fix is shortening adxLength/bbSqueezeLen (and probably adxThreshold) to
+// match that timeframe's own rhythm, not leaving the filter off for good.
+useRegimeFilter = input.bool(true, title="Enable Ranging-Regime Entry Block", group="Layer 1: Regime Switcher")
 adxLength      = input.int(14, title="ADX Length", group="Layer 1: Regime Switcher")
 adxThreshold   = input.int(25, title="ADX Trend Threshold", group="Layer 1: Regime Switcher")
 bbSqueezeLen   = input.int(20, title="Squeeze BB Length", group="Layer 1: Regime Switcher")
@@ -243,9 +257,10 @@ if ta.change(time("D")) != 0
 bool rawLongTrigger  = rangeSet and inTradingWindow and not longTaken and ta.crossover(close, orbHigh)
 bool rawShortTrigger = rangeSet and inTradingWindow and not shortTaken and ta.crossunder(close, orbLow)
 
-// ORB Entries are strictly blocked during Ranging Regimes (isRangingRegime == false)
-bool longTrigger  = rawLongTrigger and not isRangingRegime and isLongBreakoutValid
-bool shortTrigger = rawShortTrigger and not isRangingRegime and isShortBreakoutValid
+// ORB Entries are strictly blocked during Ranging Regimes (isRangingRegime
+// == true), unless useRegimeFilter is turned off.
+bool longTrigger  = rawLongTrigger and (not useRegimeFilter or not isRangingRegime) and isLongBreakoutValid
+bool shortTrigger = rawShortTrigger and (not useRegimeFilter or not isRangingRegime) and isShortBreakoutValid
 
 var float activeSL = na
 var float activeTP = na
@@ -416,10 +431,12 @@ if showInfoPanel and validTF and barstate.islast and rangeSet
 var table hud = table.new(position.top_right, 2, 3, bgcolor=color.new(color.black, 30), border_width=1)
 if barstate.islast
     table.clear(hud, 0, 0, 1, 2)
-    string activeStateText = regimeState == 0 ? "SQUEEZE (HIGH ORB EXPECTATION)" :
+    string activeStateText = not useRegimeFilter ? (regimeState == 0 ? "SQUEEZE (filter OFF)" : regimeState == 1 ? "TRENDING (filter OFF)" : "RANGING (filter OFF)") :
+                             regimeState == 0 ? "SQUEEZE (HIGH ORB EXPECTATION)" :
                              regimeState == 1 ? "TRENDING (ORB ENABLED)"          :
                              "RANGING (ORB DISABLED)"
-    color activeStateColor = regimeState == 0 ? color.yellow :
+    color activeStateColor = not useRegimeFilter ? color.gray :
+                             regimeState == 0 ? color.yellow :
                              regimeState == 1 ? color.teal   :
                              color.orange
 
