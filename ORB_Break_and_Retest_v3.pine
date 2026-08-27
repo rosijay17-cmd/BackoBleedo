@@ -234,12 +234,15 @@ if not timeframe.isintraday
 //=============================================================================
 // FIX (syntax error CE10156, "end of line without line continuation"):
 // a multi-line expression that isn't wrapped in brackets -- like a
-// function body after "=>" -- needs every continuation line indented
-// MORE than the line it continues, or Pine's parser reads each line as
-// its own (invalid) statement rather than a continuation of the "+"
-// chain above it. Both f_entryMessage and f_exitMessage had every line
-// of the concatenation at the same indentation as the first line; only
-// the indentation changed below, no logic/content changed.
+// function body after "=>" -- needs its continuation lines indented by
+// an amount that is NOT a multiple of 4 spaces. Pine reserves 4-space
+// multiples for if/for/function block nesting, so an 8-space (or any
+// other 4-multiple) continuation indent is still read as a new nested
+// block rather than a continuation of the "+" chain above it -- indent
+// alone being "deeper" isn't sufficient, it specifically can't land on
+// 4, 8, 12, etc. Both f_entryMessage and f_exitMessage now use a 6-space
+// continuation indent (first line of the body stays at the function's
+// normal 4-space indent). Only indentation changed, no logic/content.
 
 f_entryMessage(
     string direction,
@@ -250,21 +253,21 @@ f_entryMessage(
     float rangeLow
 ) =>
     "ORB ENTRY " +
-        direction +
-        " | Symbol=" +
-        syminfo.tickerid +
-        " | TF=" +
-        timeframe.period +
-        " | Mode=" +
-        mode +
-        " | Type=" +
-        orderType +
-        " | Level=" +
-        str.tostring(orderLevel, format.mintick) +
-        " | ORH=" +
-        str.tostring(rangeHigh, format.mintick) +
-        " | ORL=" +
-        str.tostring(rangeLow, format.mintick)
+      direction +
+      " | Symbol=" +
+      syminfo.tickerid +
+      " | TF=" +
+      timeframe.period +
+      " | Mode=" +
+      mode +
+      " | Type=" +
+      orderType +
+      " | Level=" +
+      str.tostring(orderLevel, format.mintick) +
+      " | ORH=" +
+      str.tostring(rangeHigh, format.mintick) +
+      " | ORL=" +
+      str.tostring(rangeLow, format.mintick)
 
 
 f_exitMessage(
@@ -273,15 +276,15 @@ f_exitMessage(
     float targetPrice
 ) =>
     "ORB EXIT " +
-        direction +
-        " | Symbol=" +
-        syminfo.tickerid +
-        " | TF=" +
-        timeframe.period +
-        " | Stop=" +
-        str.tostring(stopPrice, format.mintick) +
-        " | Target=" +
-        str.tostring(targetPrice, format.mintick)
+      direction +
+      " | Symbol=" +
+      syminfo.tickerid +
+      " | TF=" +
+      timeframe.period +
+      " | Stop=" +
+      str.tostring(stopPrice, format.mintick) +
+      " | Target=" +
+      str.tostring(targetPrice, format.mintick)
 
 //=============================================================================
 // SESSION DETECTION
