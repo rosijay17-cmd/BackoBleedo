@@ -133,8 +133,13 @@ bool useHTFInput = input.bool(
     group = GROUP_TREND
 )
 
+// FIX: default was "60" (1H), which errors out (RE10142, "Higher
+// timeframe must be greater than the chart timeframe") on any chart
+// timeframe of 1H or above -- exactly what happened on a 4H chart. "D"
+// works as a default regardless of which intraday timeframe this gets
+// applied to; still fully overridable per-chart.
 string htfInput = input.timeframe(
-    "60",
+    "D",
     "Higher Timeframe",
     group = GROUP_TREND
 )
