@@ -238,9 +238,21 @@ bool shadeORInput = input.bool(
     group = GROUP_VISUALS
 )
 
-bool showEntryLabelsInput = input.bool(
+bool showEntryTrianglesInput = input.bool(
     true,
-    "Show BUY / SELL Entry Labels",
+    "Show BUY / SELL Entry Triangles",
+    group = GROUP_VISUALS
+)
+
+color longTriangleColorInput = input.color(
+    color.blue,
+    "Long Triangle Color",
+    group = GROUP_VISUALS
+)
+
+color shortTriangleColorInput = input.color(
+    color.purple,
+    "Short Triangle Color",
     group = GROUP_VISUALS
 )
 
@@ -706,29 +718,6 @@ if newLong
 
     activeTarget := entryPrice + risk * rewardRiskInput
 
-    //---------------------------------------------------------------------
-    // CUSTOM BUY LABEL AT ACTUAL FILL PRICE
-    //---------------------------------------------------------------------
-
-    if showEntryLabelsInput
-
-        label.new(
-            bar_index,
-            entryPrice,
-            "BUY\n" +
-            entryModeInput +
-            "\n" +
-            str.tostring(
-                entryPrice,
-                format.mintick
-            ),
-            yloc = yloc.price,
-            style = label.style_label_up,
-            color = color.lime,
-            textcolor = color.black,
-            size = size.small
-        )
-
 //=============================================================================
 // ACTUAL SHORT FILL
 //=============================================================================
@@ -756,29 +745,6 @@ if newShort
     float risk = activeStop - entryPrice
 
     activeTarget := entryPrice - risk * rewardRiskInput
-
-    //---------------------------------------------------------------------
-    // CUSTOM SELL LABEL AT ACTUAL FILL PRICE
-    //---------------------------------------------------------------------
-
-    if showEntryLabelsInput
-
-        label.new(
-            bar_index,
-            entryPrice,
-            "SELL\n" +
-            entryModeInput +
-            "\n" +
-            str.tostring(
-                entryPrice,
-                format.mintick
-            ),
-            yloc = yloc.price,
-            style = label.style_label_down,
-            color = color.red,
-            textcolor = color.white,
-            size = size.small
-        )
 
 //=============================================================================
 // LONG EXIT
@@ -869,6 +835,29 @@ if forceFlatInput and inFlatWindow
 //=============================================================================
 // VISUALS
 //=============================================================================
+
+// NEW: entry triangles at the actual fill price, replacing the old BUY/
+// SELL text labels. plotshape() has to be called unconditionally at the
+// top level (unlike label.new(), it can't live inside the "if newLong"
+// block above), so the toggle and the fill condition both live in the
+// series argument instead.
+plotshape(
+    showEntryTrianglesInput and newLong,
+    title = "Long Entry Triangle",
+    style = shape.triangleup,
+    location = location.belowbar,
+    color = longTriangleColorInput,
+    size = size.small
+)
+
+plotshape(
+    showEntryTrianglesInput and newShort,
+    title = "Short Entry Triangle",
+    style = shape.triangledown,
+    location = location.abovebar,
+    color = shortTriangleColorInput,
+    size = size.small
+)
 
 bool displayOR = showORInput and (inOR or inTradeWindow or strategy.position_size != 0)
 
