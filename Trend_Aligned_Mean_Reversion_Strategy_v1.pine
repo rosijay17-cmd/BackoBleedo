@@ -1173,7 +1173,7 @@ plot(
 var table dashboard = table.new(
     position.top_right,
     2,
-    6,
+    8,
     frame_width = 1,
     border_width = 1
 )
@@ -1185,6 +1185,15 @@ if barstate.islast
     string htfText = not useHTFInput ? "DISABLED" : htfBull ? "BULLISH" : htfBear ? "BEARISH" : "NEUTRAL"
 
     string setupText = longArmed ? "LONG ARMED" : shortArmed ? "SHORT ARMED" : "WAITING"
+
+    // NEW: diagnostic rows for "no entry signals" -- lets you see which
+    // stage of arm -> confirm the pipeline is stuck at, instead of only
+    // the end result. STRETCH fires the instant a pullback qualifies
+    // (even before it's latched into longArmed/shortArmed); CONFIRM only
+    // means anything once a setup is actually armed.
+    string stretchText = longStretch ? "LONG STRETCH" : shortStretch ? "SHORT STRETCH" : "NONE"
+
+    string confirmText = not (longArmed or shortArmed) ? "N/A (NOT ARMED)" : longArmed ? (longConfirmation ? "LONG READY" : "LONG WAITING") : (shortConfirmation ? "SHORT READY" : "SHORT WAITING")
 
     if showDashboardInput
 
@@ -1303,6 +1312,40 @@ if barstate.islast
             text_color = color.white
         )
 
+        table.cell(
+            dashboard,
+            0,
+            6,
+            "STRETCH",
+            bgcolor = color.black,
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            1,
+            6,
+            stretchText,
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            0,
+            7,
+            "CONFIRM",
+            bgcolor = color.black,
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            1,
+            7,
+            confirmText,
+            text_color = color.white
+        )
+
     else
 
         table.clear(
@@ -1310,5 +1353,5 @@ if barstate.islast
             0,
             0,
             1,
-            5
+            7
         )
