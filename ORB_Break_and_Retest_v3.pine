@@ -93,6 +93,34 @@ int breakoutBufferTicksInput = input.int(
     group = GROUP_ENTRY
 )
 
+// NEW: a fixed tick buffer stays negligible on an instrument like NQ
+// regardless of volatility -- "cleared the OR" doesn't mean the same
+// thing on a calm day vs. a violent one. ATR mode scales the required
+// clearance to current volatility instead.
+string breakoutBufferModeInput = input.string(
+    "ATR",
+    "Breakout Buffer Mode",
+    options = ["Ticks", "ATR"],
+    tooltip = "Ticks uses Breakout Buffer -- Ticks above. ATR requires the break to clear the OR boundary by this multiple of ATR, which stays proportional to volatility instead of a fixed distance.",
+    group = GROUP_ENTRY
+)
+
+int breakoutAtrLengthInput = input.int(
+    14,
+    "Breakout Buffer ATR Length",
+    minval = 1,
+    group = GROUP_ENTRY
+)
+
+float breakoutBufferAtrMultInput = input.float(
+    0.10,
+    "Breakout Buffer — ATR Multiple",
+    minval = 0.0,
+    step = 0.01,
+    tooltip = "0.10 = price must clear the OR boundary by 10% of ATR before triggering.",
+    group = GROUP_ENTRY
+)
+
 int maxTradesInput = input.int(
     1,
     "Maximum Trades Per OR",
@@ -376,7 +404,10 @@ float orWidth = not na(orHigh) and not na(orLow) ? orHigh - orLow : na
 
 float orMid = not na(orHigh) and not na(orLow) ? (orHigh + orLow) / 2.0 : na
 
-float breakoutBuffer = breakoutBufferTicksInput * syminfo.mintick
+// NEW: ATR-scaled breakout buffer option.
+float breakoutAtr = ta.atr(breakoutAtrLengthInput)
+
+float breakoutBuffer = breakoutBufferModeInput == "ATR" ? breakoutAtr * breakoutBufferAtrMultInput : breakoutBufferTicksInput * syminfo.mintick
 
 float longBreakPrice = not na(orHigh) ? orHigh + breakoutBuffer : na
 
