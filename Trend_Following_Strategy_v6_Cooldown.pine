@@ -175,6 +175,13 @@ bool colorBarsInput = input.bool(
      group = visualGroup
      )
 
+bool showDashboardInput = input.bool(
+     defval = true,
+     title = "Show Cooldown Dashboard",
+     tooltip = "Small table showing live cooldown state -- useful for confirming the cooldown is actually gating entries the way you expect.",
+     group = visualGroup
+     )
+
 // =============================================================================
 // TREND CALCULATIONS
 // =============================================================================
@@ -364,15 +371,26 @@ bool cooldownActive =
 var bool longCooldownArmed = true
 var bool shortCooldownArmed = true
 
-if bar_index == lastExitBar
-    longCooldownArmed := false
-    shortCooldownArmed := false
-
+// FIX (still not stopping signals): the disarm and the rearm checks were
+// running in the WRONG order. Disarm happened first, then the rearm check
+// ("if not longBeyondChannel") ran immediately after and used the SAME
+// exit bar's channel state -- and on a great many real stop-outs, price is
+// already back at/under entryHigh right on the bar it exits, so the rearm
+// check fired the instant the disarm did, undoing it on the very same bar.
+// Net effect: the arm/disarm flag basically never stayed disarmed, so it
+// added no protection and cooldown behaved as if the flag didn't exist.
+// Reordered so the disarm check runs LAST -- it now always has final say
+// on the exit bar itself, and the flag can only be rearmed on a LATER bar
+// once price genuinely closes back inside the channel.
 if not longBeyondChannel
     longCooldownArmed := true
 
 if not shortBeyondChannel
     shortCooldownArmed := true
+
+if bar_index == lastExitBar
+    longCooldownArmed := false
+    shortCooldownArmed := false
 
 // =============================================================================
 // FINAL ENTRY CONDITIONS
@@ -686,6 +704,32 @@ plotshape(
      size = size.small,
      text = "S"
      )
+
+// =============================================================================
+// DASHBOARD
+// =============================================================================
+
+var table cooldownTable = table.new(position.top_right, 2, 5, border_width = 1)
+
+f_dashboardCell(_col, _row, _text, _bg) =>
+    table.cell(cooldownTable, _col, _row, _text, bgcolor = _bg, text_color = color.white, text_size = size.small)
+
+if showDashboardInput and barstate.islast
+    f_dashboardCell(0, 0, "COOLDOWN", color.new(color.gray, 0))
+    f_dashboardCell(1, 0, useCooldownInput ? "ON" : "OFF", color.new(color.gray, 0))
+
+    string barsLeftText = na(lastExitBar) ? "n/a" : str.tostring(math.max(0, lastExitBar + cooldownBarsInput - bar_index))
+    f_dashboardCell(0, 1, "BARS LEFT", color.new(color.gray, 0))
+    f_dashboardCell(1, 1, barsLeftText, cooldownActive ? color.new(color.orange, 30) : color.new(color.gray, 0))
+
+    f_dashboardCell(0, 2, "COOLDOWN COMPLETE", color.new(color.gray, 0))
+    f_dashboardCell(1, 2, cooldownComplete ? "YES" : "NO", cooldownComplete ? color.new(color.green, 30) : color.new(color.red, 30))
+
+    f_dashboardCell(0, 3, "LONG ARMED", color.new(color.gray, 0))
+    f_dashboardCell(1, 3, longCooldownArmed ? "YES" : "NO", longCooldownArmed ? color.new(color.green, 30) : color.new(color.red, 30))
+
+    f_dashboardCell(0, 4, "SHORT ARMED", color.new(color.gray, 0))
+    f_dashboardCell(1, 4, shortCooldownArmed ? "YES" : "NO", shortCooldownArmed ? color.new(color.green, 30) : color.new(color.red, 30))
 
 // =============================================================================
 // ALERTS
