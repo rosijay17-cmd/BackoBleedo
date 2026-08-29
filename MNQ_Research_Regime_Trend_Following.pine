@@ -1,4 +1,19 @@
 //@version=6
+// FIX ("Trades" counter climbs but Closed/Open always shows 0/0): this
+// strategy() declaration never set margin_long/margin_short. MNQ's
+// notional value per contract (price * $2/point) runs roughly $55,000-
+// $60,000+ at the levels seen in testing -- comfortably more than the
+// $50,000 initial_capital below. Without an explicit margin requirement,
+// Pine v6's default margin handling can effectively require close to
+// full notional value as margin, so every strategy.entry() call was being
+// silently rejected by the broker emulator: no error, no callback, the
+// script has no way to know the order never filled. That's why
+// tradesToday/plotshape counted "entries" that strategy.closedtrades and
+// strategy.opentrades never saw -- they were never real trades at all.
+// margin_long/margin_short are expressed as a percentage of position
+// value; 5% is comfortably inside real micro-futures day-trading margin
+// ratios and leaves plenty of headroom under $50,000 capital for 1
+// contract.
 strategy(
      title                   = "MNQ Research Regime Trend Following",
      shorttitle              = "MNQ Regime TF",
@@ -10,6 +25,8 @@ strategy(
      commission_type         = strategy.commission.cash_per_contract,
      commission_value        = 0.62,
      slippage                = 1,
+     margin_long             = 5,
+     margin_short            = 5,
      process_orders_on_close = true,
      calc_on_order_fills     = true,
      calc_on_every_tick      = false,
