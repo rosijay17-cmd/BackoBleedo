@@ -107,8 +107,15 @@ float atrMultiplierInput = input.float(
 
 string sessionLimitGroup = "04 — Session Trade Limit"
 
+// FIX ("zero signals"): "0000-2359" is not a valid Pine all-day session
+// string -- valid hours only run 00-23, so there's no in-format way to
+// spell "through the end of the day" as ...2359. An invalid session string
+// makes time() return na on every bar, which makes inSession permanently
+// false, which makes sessionLimitOK permanently false -- gating shut every
+// single entry regardless of trend/breakout. The correct all-day format is
+// "0000-0000" (a full 24 hours starting at midnight).
 string sessionInput = input.session(
-     defval = "0000-2359",
+     defval = "0000-0000",
      title = "Trading Session",
      tooltip = "Defines one \"session\" for the trade-count limit below, and resets the counter at its start. Defaults to the full day (acts as a per-day limit); narrow it (e.g. 0930-1600) to also confine entries to that window.",
      group = sessionLimitGroup
@@ -319,7 +326,15 @@ bool shortBreakout =
 // ":1234567" means the session applies every day of the week.
 int sessionTime = time(timeframe.period, sessionInput + ":1234567")
 bool inSession = not na(sessionTime)
-bool newSession = inSession and not inSession[1]
+
+// FIX: with the all-day default "0000-0000" there is no gap for inSession
+// to ever drop to false, so "inSession and not inSession[1]" alone would
+// never detect a new day and the counter would never reset. Falling back
+// to an explicit calendar-day change (ta.change) catches that case, while
+// "not inSession[1]" still catches a narrower session (e.g. 0930-1600)
+// that opens after having genuinely been closed the bar before.
+bool newDay = ta.change(time("D")) != 0
+bool newSession = inSession and (newDay or not inSession[1])
 
 // Counts trades OPENED since the current session began -- reset the instant
 // a new session starts, regardless of what the prior session's count was.
