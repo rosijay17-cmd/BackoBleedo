@@ -208,14 +208,27 @@ float bodyPct = candleRange > 0 ? bodySize / candleRange : 0.0
 bool bullCandle = close > open
 bool bearCandle = close < open
 
-bool bullPullbackTouch = bullishTrend and low <= level + pullbackTolerance
-bool bearPullbackTouch = bearishTrend and high >= level - pullbackTolerance
+// FIX ("no entry signals"): the pullback target was "level", which is the
+// TRAILING TREND LEVEL -- prev_level in get_trend_state, set to the outer
+// volatility band (lower/upper) while a trend holds. Requiring price to
+// retrace all the way back to the opposite-side outer band during an
+// ESTABLISHED trend is asking for a retracement so deep it's nearly
+// mutually exclusive with "the trend hasn't already flipped" -- that
+// band is genuinely rarely touched except right at a flip, unlike the
+// EMA this same role uses elsewhere in this repo (MNQ_Multi_Trigger_
+// Trend_Continuation.pine's Trigger 1 pulls back to a 21-EMA, a close,
+// frequently-tested reference). Switched the pullback target to "basis"
+// -- the adaptive centerline, which tracks price much more closely --
+// while "level" stays exactly where it already was useful: the wide,
+// protective Trend Level stop reference further down.
+bool bullPullbackTouch = bullishTrend and low <= basis + pullbackTolerance
+bool bearPullbackTouch = bearishTrend and high >= basis - pullbackTolerance
 
 bool bullPullbackRecent = ta.barssince(bullPullbackTouch) <= pullbackLookbackInput
 bool bearPullbackRecent = ta.barssince(bearPullbackTouch) <= pullbackLookbackInput
 
-bool longReclaim = regimeEstablished and bullishTrend and bullPullbackRecent and close > level and bullCandle and bodyPct >= minReclaimBodyPctInput
-bool shortReclaim = regimeEstablished and bearishTrend and bearPullbackRecent and close < level and bearCandle and bodyPct >= minReclaimBodyPctInput
+bool longReclaim = regimeEstablished and bullishTrend and bullPullbackRecent and close > basis and bullCandle and bodyPct >= minReclaimBodyPctInput
+bool shortReclaim = regimeEstablished and bearishTrend and bearPullbackRecent and close < basis and bearCandle and bodyPct >= minReclaimBodyPctInput
 
 bool signalConfirmed = not confirmEntriesOnClose or barstate.isconfirmed
 
