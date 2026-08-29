@@ -1471,7 +1471,7 @@ var table dashboard =
      table.new(
           position.top_right,
           2,
-          12,
+          13,
           border_width = 1)
 
 if showDashboard and barstate.islast
@@ -1672,6 +1672,25 @@ if showDashboard and barstate.islast
          1,
          11,
          na(lastExitBar) ? "n/a" : str.tostring(lastExitBar) + " (now " + str.tostring(bar_index) + ")")
+
+    // Directly compares the strategy's OWN authoritative trade accounting
+    // (strategy.closedtrades / strategy.opentrades) against tradesToday and
+    // lastExitBar above. If closedtrades stays 0 while tradesToday climbs,
+    // the entries aren't actually completing round trips the way the
+    // dashboard's own trade counter assumes. If closedtrades DOES climb but
+    // lastExitBar still shows "no exit yet", the bug is specifically in the
+    // positionJustClosed tracking, not in the underlying order execution.
+    table.cell(
+         dashboard,
+         0,
+         12,
+         "Closed / Open")
+
+    table.cell(
+         dashboard,
+         1,
+         12,
+         str.tostring(strategy.closedtrades) + " / " + str.tostring(strategy.opentrades))
 
 // ============================================================================
 // ALERTS
