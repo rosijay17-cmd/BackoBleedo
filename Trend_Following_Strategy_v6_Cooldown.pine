@@ -1,6 +1,6 @@
 //@version=6
 strategy(
-     title = "Trend Following Strategy v6 - Cooldown",
+     title = "Trend Following Strategy v6 - Session Limit",
      shorttitle = "TF Strategy v6",
      overlay = true,
      pyramiding = 0,
@@ -102,24 +102,24 @@ float atrMultiplierInput = input.float(
      )
 
 // =============================================================================
-// 04 — COOLDOWN
+// 04 — SESSION TRADE LIMIT
 // =============================================================================
 
-string cooldownGroup = "04 — Cooldown"
+string sessionLimitGroup = "04 — Session Trade Limit"
 
-bool useCooldownInput = input.bool(
-     defval = true,
-     title = "Use Cooldown",
-     group = cooldownGroup
+string sessionInput = input.session(
+     defval = "0000-2359",
+     title = "Trading Session",
+     tooltip = "Defines one \"session\" for the trade-count limit below, and resets the counter at its start. Defaults to the full day (acts as a per-day limit); narrow it (e.g. 0930-1600) to also confine entries to that window.",
+     group = sessionLimitGroup
      )
 
-int cooldownBarsInput = input.int(
-     defval = 5,
-     title = "Cooldown Bars After Exit",
-     minval = 0,
-     maxval = 500,
-     tooltip = "Number of complete bars that must pass after a closed trade before another entry is allowed.",
-     group = cooldownGroup
+int maxTradesPerSessionInput = input.int(
+     defval = 3,
+     title = "Max Trades Per Session",
+     minval = 1,
+     tooltip = "Once this many trades have opened within the current session, no further entries are allowed until the next session begins.",
+     group = sessionLimitGroup
      )
 
 // =============================================================================
@@ -157,9 +157,9 @@ bool showStopsInput = input.bool(
      group = visualGroup
      )
 
-bool showCooldownInput = input.bool(
+bool showSessionLimitInput = input.bool(
      defval = true,
-     title = "Highlight Cooldown Bars",
+     title = "Highlight Session-Limit Bars",
      group = visualGroup
      )
 
@@ -177,8 +177,8 @@ bool colorBarsInput = input.bool(
 
 bool showDashboardInput = input.bool(
      defval = true,
-     title = "Show Cooldown Dashboard",
-     tooltip = "Small table showing live cooldown state -- useful for confirming the cooldown is actually gating entries the way you expect.",
+     title = "Show Session Dashboard",
+     tooltip = "Small table showing live session trade-count state -- useful for confirming the limit is actually gating entries the way you expect.",
      group = visualGroup
      )
 
@@ -311,86 +311,32 @@ bool shortBreakout =
          : shortBeyondChannel
 
 // =============================================================================
-// COOLDOWN LOGIC
+// SESSION TRADE LIMIT LOGIC
 // =============================================================================
 
-// Get the actual bar index of the most recently CLOSED trade.
-int lastExitBar =
-     strategy.closedtrades > 0
-         ? strategy.closedtrades.exit_bar_index(
-             strategy.closedtrades - 1
-             )
-         : na
+// Standard Pine session-detection idiom: time() returns na on any bar
+// outside the defined window, and a real timestamp on every bar inside it.
+// ":1234567" means the session applies every day of the week.
+int sessionTime = time(timeframe.period, sessionInput + ":1234567")
+bool inSession = not na(sessionTime)
+bool newSession = inSession and not inSession[1]
 
-// Number of bars since the most recent actual exit.
-int barsSinceExit =
-     na(lastExitBar)
-         ? na
-         : bar_index - lastExitBar
+// Counts trades OPENED since the current session began -- reset the instant
+// a new session starts, regardless of what the prior session's count was.
+var int tradesThisSession = 0
 
-// Example:
-//
-// Trade exits on bar 100
-// Cooldown = 5
-//
-// Bar 101 = BLOCKED
-// Bar 102 = BLOCKED
-// Bar 103 = BLOCKED
-// Bar 104 = BLOCKED
-// Bar 105 = BLOCKED
-// Bar 106 = ALLOWED
-//
-bool cooldownComplete =
-     not useCooldownInput or
-     na(lastExitBar) or
-     bar_index > lastExitBar + cooldownBarsInput
+if newSession
+    tradesThisSession := 0
 
-bool cooldownActive =
-     useCooldownInput and
-     not cooldownComplete and
-     strategy.position_size == 0
+bool sessionLimitReached = tradesThisSession >= maxTradesPerSessionInput
 
-// FIX ("cooldown doesn't block re-entries"): cooldownComplete on its own only
-// counts BARS -- it says nothing about whether the breakout condition that
-// triggered the trade is still sitting there, unchanged, the whole time.
-// If price never actually falls back inside the channel while the cooldown
-// bars tick by (a stop-out during a still-running trend, or "Require Fresh
-// Breakout" turned off), longBeyondChannel/shortBeyondChannel stays true for
-// the entire cooldown window. The instant bar_index crosses the cooldown
-// threshold, that SAME stale condition immediately re-fires -- so from the
-// user's perspective the cooldown "did nothing," even though the bar count
-// itself was being enforced correctly the whole time.
-//
-// Fix: arm/disarm a per-direction flag independent of the "Require Fresh
-// Breakout" toggle. The flag is disarmed the exact bar a trade closes, and
-// only re-arms once price actually closes back inside the channel (a real
-// reset, not just a tick count). A new entry needs the flag armed, so a
-// breakout that was already active going into the stop-out can't immediately
-// re-trigger the moment the cooldown bar count runs out -- it first has to
-// prove the move actually paused.
-var bool longCooldownArmed = true
-var bool shortCooldownArmed = true
-
-// FIX (still not stopping signals): the disarm and the rearm checks were
-// running in the WRONG order. Disarm happened first, then the rearm check
-// ("if not longBeyondChannel") ran immediately after and used the SAME
-// exit bar's channel state -- and on a great many real stop-outs, price is
-// already back at/under entryHigh right on the bar it exits, so the rearm
-// check fired the instant the disarm did, undoing it on the very same bar.
-// Net effect: the arm/disarm flag basically never stayed disarmed, so it
-// added no protection and cooldown behaved as if the flag didn't exist.
-// Reordered so the disarm check runs LAST -- it now always has final say
-// on the exit bar itself, and the flag can only be rearmed on a LATER bar
-// once price genuinely closes back inside the channel.
-if not longBeyondChannel
-    longCooldownArmed := true
-
-if not shortBeyondChannel
-    shortCooldownArmed := true
-
-if bar_index == lastExitBar
-    longCooldownArmed := false
-    shortCooldownArmed := false
+// Replaces the old bar-count cooldown entirely: instead of trying to
+// enforce a minimum GAP between trades (which kept letting a still-active
+// breakout re-fire the moment the gap elapsed), this caps the total COUNT
+// of trades allowed within a session. Simpler to reason about and to
+// verify on the dashboard below -- a plain counter against a plain limit,
+// no bar-math or arm/disarm state machine involved.
+bool sessionLimitOK = inSession and not sessionLimitReached
 
 // =============================================================================
 // FINAL ENTRY CONDITIONS
@@ -399,8 +345,7 @@ if bar_index == lastExitBar
 bool longSignal =
      allowLong and
      strategy.position_size == 0 and
-     cooldownComplete and
-     longCooldownArmed and
+     sessionLimitOK and
      bullishRegime and
      longStrengthOk and
      longBreakout
@@ -408,8 +353,7 @@ bool longSignal =
 bool shortSignal =
      allowShort and
      strategy.position_size == 0 and
-     cooldownComplete and
-     shortCooldownArmed and
+     sessionLimitOK and
      bearishRegime and
      shortStrengthOk and
      shortBreakout
@@ -432,6 +376,8 @@ if longSignal
          atrValue * atrMultiplierInput
 
     shortStop := na
+
+    tradesThisSession := tradesThisSession + 1
 
     strategy.entry(
          id = "Long",
@@ -457,6 +403,8 @@ if shortSignal
          atrValue * atrMultiplierInput
 
     longStop := na
+
+    tradesThisSession := tradesThisSession + 1
 
     strategy.entry(
          id = "Short",
@@ -645,17 +593,17 @@ plot(
      )
 
 // =============================================================================
-// VISUALS — COOLDOWN BACKGROUND
+// VISUALS — SESSION LIMIT BACKGROUND
 // =============================================================================
 
 bgcolor(
-     showCooldownInput and cooldownActive
+     showSessionLimitInput and strategy.position_size == 0 and not sessionLimitOK
          ? color.new(
              color.orange,
              85
              )
          : na,
-     title = "Cooldown Active"
+     title = "Session Trade Limit / Outside Session"
      )
 
 // =============================================================================
@@ -709,27 +657,23 @@ plotshape(
 // DASHBOARD
 // =============================================================================
 
-var table cooldownTable = table.new(position.top_right, 2, 5, border_width = 1)
+var table sessionTable = table.new(position.top_right, 2, 4, border_width = 1)
 
 f_dashboardCell(_col, _row, _text, _bg) =>
-    table.cell(cooldownTable, _col, _row, _text, bgcolor = _bg, text_color = color.white, text_size = size.small)
+    table.cell(sessionTable, _col, _row, _text, bgcolor = _bg, text_color = color.white, text_size = size.small)
 
 if showDashboardInput and barstate.islast
-    f_dashboardCell(0, 0, "COOLDOWN", color.new(color.gray, 0))
-    f_dashboardCell(1, 0, useCooldownInput ? "ON" : "OFF", color.new(color.gray, 0))
+    f_dashboardCell(0, 0, "IN SESSION", color.new(color.gray, 0))
+    f_dashboardCell(1, 0, inSession ? "YES" : "NO", inSession ? color.new(color.green, 30) : color.new(color.red, 30))
 
-    string barsLeftText = na(lastExitBar) ? "n/a" : str.tostring(math.max(0, lastExitBar + cooldownBarsInput - bar_index))
-    f_dashboardCell(0, 1, "BARS LEFT", color.new(color.gray, 0))
-    f_dashboardCell(1, 1, barsLeftText, cooldownActive ? color.new(color.orange, 30) : color.new(color.gray, 0))
+    f_dashboardCell(0, 1, "TRADES THIS SESSION", color.new(color.gray, 0))
+    f_dashboardCell(1, 1, str.tostring(tradesThisSession), color.new(color.gray, 0))
 
-    f_dashboardCell(0, 2, "COOLDOWN COMPLETE", color.new(color.gray, 0))
-    f_dashboardCell(1, 2, cooldownComplete ? "YES" : "NO", cooldownComplete ? color.new(color.green, 30) : color.new(color.red, 30))
+    f_dashboardCell(0, 2, "MAX PER SESSION", color.new(color.gray, 0))
+    f_dashboardCell(1, 2, str.tostring(maxTradesPerSessionInput), color.new(color.gray, 0))
 
-    f_dashboardCell(0, 3, "LONG ARMED", color.new(color.gray, 0))
-    f_dashboardCell(1, 3, longCooldownArmed ? "YES" : "NO", longCooldownArmed ? color.new(color.green, 30) : color.new(color.red, 30))
-
-    f_dashboardCell(0, 4, "SHORT ARMED", color.new(color.gray, 0))
-    f_dashboardCell(1, 4, shortCooldownArmed ? "YES" : "NO", shortCooldownArmed ? color.new(color.green, 30) : color.new(color.red, 30))
+    f_dashboardCell(0, 3, "LIMIT REACHED", color.new(color.gray, 0))
+    f_dashboardCell(1, 3, sessionLimitReached ? "YES" : "NO", sessionLimitReached ? color.new(color.red, 30) : color.new(color.green, 30))
 
 // =============================================================================
 // ALERTS
