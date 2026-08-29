@@ -1471,7 +1471,7 @@ var table dashboard =
      table.new(
           position.top_right,
           2,
-          10,
+          12,
           border_width = 1)
 
 if showDashboard and barstate.islast
@@ -1637,6 +1637,41 @@ if showDashboard and barstate.islast
          1,
          9,
          managementText)
+
+    // Raw cooldown state -- added because "cooldown not working" can't be
+    // diagnosed from cooldownPass alone (a true/false doesn't say whether
+    // it's genuinely not gating, or just gating a gap too short to notice
+    // on a zoomed-out chart). This shows the actual bar count against the
+    // actual setting.
+    string cooldownStatusText =
+         na(lastExitBar)
+              ? "no exit yet"
+              : str.tostring(barsSinceExit) + " / " + str.tostring(cooldownBars) + " bars"
+
+    table.cell(
+         dashboard,
+         0,
+         10,
+         "Cooldown")
+
+    table.cell(
+         dashboard,
+         1,
+         10,
+         cooldownStatusText,
+         bgcolor = cooldownPass ? color.new(color.green, 30) : color.new(color.red, 30))
+
+    table.cell(
+         dashboard,
+         0,
+         11,
+         "Last Exit Bar")
+
+    table.cell(
+         dashboard,
+         1,
+         11,
+         na(lastExitBar) ? "n/a" : str.tostring(lastExitBar) + " (now " + str.tostring(bar_index) + ")")
 
 // ============================================================================
 // ALERTS
