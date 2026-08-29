@@ -55,7 +55,7 @@ float sensitivity = input.float(2.0, "Sensitivity", step=0.1, group=trend_settin
 //=============================================================================
 // REGIME PERSISTENCE
 //=============================================================================
-int minTrendAgeInput = input.int(3, "Minimum Bars Since Flip", minval=0, group=regime_settings, tooltip="Requires the current trend direction to have held for at least this many bars before a pullback entry is allowed -- avoids trading a pullback into a flip that may itself still be unstable. 0 disables this filter.")
+int minTrendAgeInput = input.int(0, "Minimum Bars Since Flip", minval=0, group=regime_settings, tooltip="Requires the current trend direction to have held for at least this many bars before a pullback entry is allowed -- avoids trading a pullback into a flip that may itself still be unstable. 0 disables this filter (default -- this is a design safeguard, not something inherent to the pullback model itself; raise it if you specifically want fresh flips excluded).")
 
 //=============================================================================
 // PULLBACK ENTRY
