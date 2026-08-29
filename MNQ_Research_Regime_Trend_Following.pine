@@ -1463,6 +1463,33 @@ plot(
      "Trades Today",
      display = display.data_window)
 
+// The dashboard table (below) has grown to 13 rows and, on a phone-sized
+// chart pane, the bottom rows can end up taller than the pane itself --
+// table.new() isn't scrollable, so anything past that height is silently
+// clipped with no visible sign it's happening. The Data Window panel below
+// scrolls independently of chart height and can't be clipped this way, so
+// the same cooldown/trade-accounting numbers are duplicated here as the
+// reliable way to actually read them.
+plot(
+     float(strategy.closedtrades),
+     "Closed Trades (raw)",
+     display = display.data_window)
+
+plot(
+     float(strategy.opentrades),
+     "Open Trades (raw)",
+     display = display.data_window)
+
+plot(
+     na(lastExitBar) ? na : float(barsSinceExit),
+     "Bars Since Exit",
+     display = display.data_window)
+
+plot(
+     float(cooldownBars),
+     "Cooldown Bars Setting",
+     display = display.data_window)
+
 // ============================================================================
 // DASHBOARD
 // ============================================================================
