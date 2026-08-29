@@ -1,0 +1,704 @@
+//@version=6
+strategy(
+     title = "Trend Following Strategy v6 - Cooldown",
+     shorttitle = "TF Strategy v6",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 10,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.05,
+     slippage = 1
+     )
+
+// =============================================================================
+// 01 — TREND INPUTS
+// =============================================================================
+
+string trendGroup = "01 — Trend"
+
+int entryLengthInput = input.int(
+     defval = 55,
+     title = "Donchian Entry Length",
+     minval = 2,
+     group = trendGroup
+     )
+
+int exitLengthInput = input.int(
+     defval = 20,
+     title = "Donchian Exit Length",
+     minval = 2,
+     group = trendGroup
+     )
+
+int emaLengthInput = input.int(
+     defval = 200,
+     title = "Regime EMA Length",
+     minval = 1,
+     group = trendGroup
+     )
+
+bool requireFreshBreakoutInput = input.bool(
+     defval = true,
+     title = "Require Fresh Breakout",
+     tooltip = "When enabled, price must newly cross the Donchian breakout level. This helps prevent repeated entries while price remains beyond the breakout level.",
+     group = trendGroup
+     )
+
+// =============================================================================
+// 02 — TREND STRENGTH
+// =============================================================================
+
+string filterGroup = "02 — Trend Strength"
+
+bool useAdxInput = input.bool(
+     defval = true,
+     title = "Use ADX / DMI Filter",
+     group = filterGroup
+     )
+
+int diLengthInput = input.int(
+     defval = 14,
+     title = "DI Length",
+     minval = 1,
+     group = filterGroup
+     )
+
+int adxSmoothingInput = input.int(
+     defval = 14,
+     title = "ADX Smoothing",
+     minval = 1,
+     group = filterGroup
+     )
+
+float adxMinimumInput = input.float(
+     defval = 20.0,
+     title = "Minimum ADX",
+     minval = 0.0,
+     step = 0.5,
+     group = filterGroup
+     )
+
+// =============================================================================
+// 03 — RISK MANAGEMENT
+// =============================================================================
+
+string riskGroup = "03 — Risk Management"
+
+int atrLengthInput = input.int(
+     defval = 14,
+     title = "ATR Length",
+     minval = 1,
+     group = riskGroup
+     )
+
+float atrMultiplierInput = input.float(
+     defval = 3.0,
+     title = "ATR Stop Multiplier",
+     minval = 0.1,
+     step = 0.1,
+     group = riskGroup
+     )
+
+// =============================================================================
+// 04 — COOLDOWN
+// =============================================================================
+
+string cooldownGroup = "04 — Cooldown"
+
+bool useCooldownInput = input.bool(
+     defval = true,
+     title = "Use Cooldown",
+     group = cooldownGroup
+     )
+
+int cooldownBarsInput = input.int(
+     defval = 5,
+     title = "Cooldown Bars After Exit",
+     minval = 0,
+     maxval = 500,
+     tooltip = "Number of complete bars that must pass after a closed trade before another entry is allowed.",
+     group = cooldownGroup
+     )
+
+// =============================================================================
+// 05 — TRADE DIRECTION
+// =============================================================================
+
+string directionGroup = "05 — Direction"
+
+string tradeDirectionInput = input.string(
+     defval = "Both",
+     title = "Trade Direction",
+     options = [
+         "Both",
+         "Long only",
+         "Short only"
+         ],
+     group = directionGroup
+     )
+
+// =============================================================================
+// 06 — VISUALS
+// =============================================================================
+
+string visualGroup = "06 — Visuals"
+
+bool showChannelsInput = input.bool(
+     defval = true,
+     title = "Show Donchian Channels",
+     group = visualGroup
+     )
+
+bool showStopsInput = input.bool(
+     defval = true,
+     title = "Show ATR Trailing Stop",
+     group = visualGroup
+     )
+
+bool showCooldownInput = input.bool(
+     defval = true,
+     title = "Highlight Cooldown Bars",
+     group = visualGroup
+     )
+
+bool showSignalsInput = input.bool(
+     defval = true,
+     title = "Show Entry Signals",
+     group = visualGroup
+     )
+
+bool colorBarsInput = input.bool(
+     defval = false,
+     title = "Color Bars By Trend",
+     group = visualGroup
+     )
+
+// =============================================================================
+// TREND CALCULATIONS
+// =============================================================================
+
+float regimeEma = ta.ema(
+     close,
+     emaLengthInput
+     )
+
+// Previous completed Donchian levels.
+// [1] prevents the current candle from defining its own breakout.
+float entryHigh = ta.highest(
+     high,
+     entryLengthInput
+     )[1]
+
+float entryLow = ta.lowest(
+     low,
+     entryLengthInput
+     )[1]
+
+float exitHigh = ta.highest(
+     high,
+     exitLengthInput
+     )[1]
+
+float exitLow = ta.lowest(
+     low,
+     exitLengthInput
+     )[1]
+
+// =============================================================================
+// ATR
+// =============================================================================
+
+float atrValue = ta.atr(
+     atrLengthInput
+     )
+
+// =============================================================================
+// DMI / ADX
+// =============================================================================
+
+[plusDi, minusDi, adx] = ta.dmi(
+     diLengthInput,
+     adxSmoothingInput
+     )
+
+// =============================================================================
+// MARKET REGIME
+// =============================================================================
+
+bool bullishRegime =
+     close > regimeEma
+
+bool bearishRegime =
+     close < regimeEma
+
+// =============================================================================
+// DIRECTION PERMISSIONS
+// =============================================================================
+
+bool allowLong =
+     tradeDirectionInput != "Short only"
+
+bool allowShort =
+     tradeDirectionInput != "Long only"
+
+// =============================================================================
+// ADX / DMI FILTERS
+// =============================================================================
+
+bool longStrengthOk =
+     not useAdxInput or
+     (
+         adx >= adxMinimumInput and
+         plusDi > minusDi
+     )
+
+bool shortStrengthOk =
+     not useAdxInput or
+     (
+         adx >= adxMinimumInput and
+         minusDi > plusDi
+     )
+
+// =============================================================================
+// BREAKOUT CONDITIONS
+// =============================================================================
+
+// Basic Donchian conditions.
+bool longBeyondChannel =
+     not na(entryHigh) and
+     close > entryHigh
+
+bool shortBeyondChannel =
+     not na(entryLow) and
+     close < entryLow
+
+// Fresh breakout means price has JUST moved through the channel.
+//
+// This prevents:
+// short -> exit -> price still below channel -> immediate short again
+//
+// unless a genuine new breakout occurs.
+bool freshLongBreakout =
+     not na(entryHigh) and
+     not na(entryHigh[1]) and
+     close > entryHigh and
+     close[1] <= entryHigh[1]
+
+bool freshShortBreakout =
+     not na(entryLow) and
+     not na(entryLow[1]) and
+     close < entryLow and
+     close[1] >= entryLow[1]
+
+// User-selected breakout behavior.
+bool longBreakout =
+     requireFreshBreakoutInput
+         ? freshLongBreakout
+         : longBeyondChannel
+
+bool shortBreakout =
+     requireFreshBreakoutInput
+         ? freshShortBreakout
+         : shortBeyondChannel
+
+// =============================================================================
+// COOLDOWN LOGIC
+// =============================================================================
+
+// Get the actual bar index of the most recently CLOSED trade.
+int lastExitBar =
+     strategy.closedtrades > 0
+         ? strategy.closedtrades.exit_bar_index(
+             strategy.closedtrades - 1
+             )
+         : na
+
+// Number of bars since the most recent actual exit.
+int barsSinceExit =
+     na(lastExitBar)
+         ? na
+         : bar_index - lastExitBar
+
+// Example:
+//
+// Trade exits on bar 100
+// Cooldown = 5
+//
+// Bar 101 = BLOCKED
+// Bar 102 = BLOCKED
+// Bar 103 = BLOCKED
+// Bar 104 = BLOCKED
+// Bar 105 = BLOCKED
+// Bar 106 = ALLOWED
+//
+bool cooldownComplete =
+     not useCooldownInput or
+     na(lastExitBar) or
+     bar_index > lastExitBar + cooldownBarsInput
+
+bool cooldownActive =
+     useCooldownInput and
+     not cooldownComplete and
+     strategy.position_size == 0
+
+// FIX ("cooldown doesn't block re-entries"): cooldownComplete on its own only
+// counts BARS -- it says nothing about whether the breakout condition that
+// triggered the trade is still sitting there, unchanged, the whole time.
+// If price never actually falls back inside the channel while the cooldown
+// bars tick by (a stop-out during a still-running trend, or "Require Fresh
+// Breakout" turned off), longBeyondChannel/shortBeyondChannel stays true for
+// the entire cooldown window. The instant bar_index crosses the cooldown
+// threshold, that SAME stale condition immediately re-fires -- so from the
+// user's perspective the cooldown "did nothing," even though the bar count
+// itself was being enforced correctly the whole time.
+//
+// Fix: arm/disarm a per-direction flag independent of the "Require Fresh
+// Breakout" toggle. The flag is disarmed the exact bar a trade closes, and
+// only re-arms once price actually closes back inside the channel (a real
+// reset, not just a tick count). A new entry needs the flag armed, so a
+// breakout that was already active going into the stop-out can't immediately
+// re-trigger the moment the cooldown bar count runs out -- it first has to
+// prove the move actually paused.
+var bool longCooldownArmed = true
+var bool shortCooldownArmed = true
+
+if bar_index == lastExitBar
+    longCooldownArmed := false
+    shortCooldownArmed := false
+
+if not longBeyondChannel
+    longCooldownArmed := true
+
+if not shortBeyondChannel
+    shortCooldownArmed := true
+
+// =============================================================================
+// FINAL ENTRY CONDITIONS
+// =============================================================================
+
+bool longSignal =
+     allowLong and
+     strategy.position_size == 0 and
+     cooldownComplete and
+     longCooldownArmed and
+     bullishRegime and
+     longStrengthOk and
+     longBreakout
+
+bool shortSignal =
+     allowShort and
+     strategy.position_size == 0 and
+     cooldownComplete and
+     shortCooldownArmed and
+     bearishRegime and
+     shortStrengthOk and
+     shortBreakout
+
+// =============================================================================
+// STOP VARIABLES
+// =============================================================================
+
+var float longStop = na
+var float shortStop = na
+
+// =============================================================================
+// LONG ENTRY
+// =============================================================================
+
+if longSignal
+
+    longStop :=
+         close -
+         atrValue * atrMultiplierInput
+
+    shortStop := na
+
+    strategy.entry(
+         id = "Long",
+         direction = strategy.long,
+         comment = "Long Breakout"
+         )
+
+    strategy.exit(
+         id = "Long ATR Exit",
+         from_entry = "Long",
+         stop = longStop,
+         comment = "Long ATR Stop"
+         )
+
+// =============================================================================
+// SHORT ENTRY
+// =============================================================================
+
+if shortSignal
+
+    shortStop :=
+         close +
+         atrValue * atrMultiplierInput
+
+    longStop := na
+
+    strategy.entry(
+         id = "Short",
+         direction = strategy.short,
+         comment = "Short Breakout"
+         )
+
+    strategy.exit(
+         id = "Short ATR Exit",
+         from_entry = "Short",
+         stop = shortStop,
+         comment = "Short ATR Stop"
+         )
+
+// =============================================================================
+// LONG TRADE MANAGEMENT
+// =============================================================================
+
+if strategy.position_size > 0
+
+    float longCandidateStop =
+         close -
+         atrValue * atrMultiplierInput
+
+    // Stop can move UP, but never down.
+    longStop :=
+         math.max(
+             nz(
+                 longStop,
+                 strategy.position_avg_price -
+                 atrValue * atrMultiplierInput
+                 ),
+             longCandidateStop
+             )
+
+    strategy.exit(
+         id = "Long ATR Exit",
+         from_entry = "Long",
+         stop = longStop,
+         comment = "Long ATR Stop"
+         )
+
+    // Donchian trend exit.
+    if not na(exitLow) and close < exitLow
+
+        strategy.close(
+             id = "Long",
+             comment = "Long Channel Exit"
+             )
+
+// =============================================================================
+// SHORT TRADE MANAGEMENT
+// =============================================================================
+
+if strategy.position_size < 0
+
+    float shortCandidateStop =
+         close +
+         atrValue * atrMultiplierInput
+
+    // Stop can move DOWN, but never up.
+    shortStop :=
+         math.min(
+             nz(
+                 shortStop,
+                 strategy.position_avg_price +
+                 atrValue * atrMultiplierInput
+                 ),
+             shortCandidateStop
+             )
+
+    strategy.exit(
+         id = "Short ATR Exit",
+         from_entry = "Short",
+         stop = shortStop,
+         comment = "Short ATR Stop"
+         )
+
+    // Donchian trend exit.
+    if not na(exitHigh) and close > exitHigh
+
+        strategy.close(
+             id = "Short",
+             comment = "Short Channel Exit"
+             )
+
+// =============================================================================
+// RESET STOP VALUES AFTER POSITION CLOSES
+// =============================================================================
+
+if strategy.position_size == 0
+
+    if not longSignal
+        longStop := na
+
+    if not shortSignal
+        shortStop := na
+
+// =============================================================================
+// VISUALS — EMA
+// =============================================================================
+
+plot(
+     regimeEma,
+     title = "Regime EMA",
+     color = color.orange,
+     linewidth = 2
+     )
+
+// =============================================================================
+// VISUALS — DONCHIAN ENTRY CHANNEL
+// =============================================================================
+
+plot(
+     showChannelsInput
+         ? entryHigh
+         : na,
+     title = "Long Entry Channel",
+     color = color.new(
+         color.green,
+         45
+         )
+     )
+
+plot(
+     showChannelsInput
+         ? entryLow
+         : na,
+     title = "Short Entry Channel",
+     color = color.new(
+         color.red,
+         45
+         )
+     )
+
+// =============================================================================
+// VISUALS — DONCHIAN EXIT CHANNEL
+// =============================================================================
+
+plot(
+     showChannelsInput
+         ? exitHigh
+         : na,
+     title = "Short Exit Channel",
+     color = color.new(
+         color.green,
+         70
+         )
+     )
+
+plot(
+     showChannelsInput
+         ? exitLow
+         : na,
+     title = "Long Exit Channel",
+     color = color.new(
+         color.red,
+         70
+         )
+     )
+
+// =============================================================================
+// VISUALS — ATR STOPS
+// =============================================================================
+
+plot(
+     showStopsInput and
+     strategy.position_size > 0
+         ? longStop
+         : na,
+     title = "Long ATR Stop",
+     color = color.red,
+     linewidth = 2,
+     style = plot.style_linebr
+     )
+
+plot(
+     showStopsInput and
+     strategy.position_size < 0
+         ? shortStop
+         : na,
+     title = "Short ATR Stop",
+     color = color.red,
+     linewidth = 2,
+     style = plot.style_linebr
+     )
+
+// =============================================================================
+// VISUALS — COOLDOWN BACKGROUND
+// =============================================================================
+
+bgcolor(
+     showCooldownInput and cooldownActive
+         ? color.new(
+             color.orange,
+             85
+             )
+         : na,
+     title = "Cooldown Active"
+     )
+
+// =============================================================================
+// VISUALS — BAR COLORS
+// =============================================================================
+
+color regimeColor =
+     bullishRegime
+         ? color.new(
+             color.green,
+             65
+             )
+         : bearishRegime
+             ? color.new(
+                 color.red,
+                 65
+                 )
+             : na
+
+barcolor(
+     colorBarsInput
+         ? regimeColor
+         : na
+     )
+
+// =============================================================================
+// VISUALS — ENTRY SIGNALS
+// =============================================================================
+
+plotshape(
+     showSignalsInput and longSignal,
+     title = "Long Entry Signal",
+     style = shape.triangleup,
+     location = location.belowbar,
+     color = color.lime,
+     size = size.small,
+     text = "L"
+     )
+
+plotshape(
+     showSignalsInput and shortSignal,
+     title = "Short Entry Signal",
+     style = shape.triangledown,
+     location = location.abovebar,
+     color = color.red,
+     size = size.small,
+     text = "S"
+     )
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+
+alertcondition(
+     longSignal,
+     title = "Long Trend Entry",
+     message = "Trend Following Strategy: LONG breakout"
+     )
+
+alertcondition(
+     shortSignal,
+     title = "Short Trend Entry",
+     message = "Trend Following Strategy: SHORT breakout"
+     )
