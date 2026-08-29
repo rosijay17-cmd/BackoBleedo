@@ -1551,23 +1551,24 @@ if showDashboard and barstate.islast
               bullProbability,
               "#.000"))
 
+    // MOVED here from row 12: the table has consistently rendered rows
+    // 0-10 fine and clipped everything from row 11 down on the user's
+    // phone (table.new() isn't scrollable and doesn't fit the pane at
+    // 13 rows). This is the number actually needed right now, so it goes
+    // where it's guaranteed visible; the static Buy/Sell thresholds
+    // (rarely need to be re-checked mid-session) take its old spot at
+    // row 12 instead.
     table.cell(
          dashboard,
          0,
          2,
-         "Buy / Sell")
+         "Closed / Open")
 
     table.cell(
          dashboard,
          1,
          2,
-         str.tostring(
-              buyProbability,
-              "#.00") +
-         " / " +
-         str.tostring(
-              sellProbability,
-              "#.00"))
+         str.tostring(strategy.closedtrades) + " / " + str.tostring(strategy.opentrades))
 
     table.cell(
          dashboard,
@@ -1700,24 +1701,23 @@ if showDashboard and barstate.islast
          11,
          na(lastExitBar) ? "n/a" : str.tostring(lastExitBar) + " (now " + str.tostring(bar_index) + ")")
 
-    // Directly compares the strategy's OWN authoritative trade accounting
-    // (strategy.closedtrades / strategy.opentrades) against tradesToday and
-    // lastExitBar above. If closedtrades stays 0 while tradesToday climbs,
-    // the entries aren't actually completing round trips the way the
-    // dashboard's own trade counter assumes. If closedtrades DOES climb but
-    // lastExitBar still shows "no exit yet", the bug is specifically in the
-    // positionJustClosed tracking, not in the underlying order execution.
     table.cell(
          dashboard,
          0,
          12,
-         "Closed / Open")
+         "Buy / Sell")
 
     table.cell(
          dashboard,
          1,
          12,
-         str.tostring(strategy.closedtrades) + " / " + str.tostring(strategy.opentrades))
+         str.tostring(
+              buyProbability,
+              "#.00") +
+         " / " +
+         str.tostring(
+              sellProbability,
+              "#.00"))
 
 // ============================================================================
 // ALERTS
