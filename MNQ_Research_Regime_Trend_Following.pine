@@ -1490,14 +1490,13 @@ if showDashboard and barstate.islast
                    ? "SHORT"
                    : "FLAT"
 
-    string managementText =
-         strategy.position_size == 0
-              ? "OFF"
-              : trailActive
-                   ? "TRAIL"
-                   : breakEvenActive
-                        ? "BREAK EVEN"
-                        : "INITIAL"
+    // FIX (CE10156/CE10013 -- same class of error hit before): this one has
+    // one more ternary level than regimeText/positionText right above it,
+    // and that extra level lands the "? \"BREAK EVEN\"" continuation at
+    // indent 24 -- a multiple of 4. I checked the two shorter ternaries
+    // above and wrongly assumed this one was the same depth; it wasn't.
+    // Collapsed to remove the indentation dependency entirely.
+    string managementText = strategy.position_size == 0 ? "OFF" : trailActive ? "TRAIL" : breakEvenActive ? "BREAK EVEN" : "INITIAL"
 
     table.cell(
          dashboard,
