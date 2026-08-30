@@ -261,6 +261,70 @@ int swingLen = input.int(
 )
 
 // =====================================================
+// 2B. ORDER FLOW (CVD) INPUTS
+//
+// Real order flow -- bid/ask depth, trade-by-trade aggressor side,
+// footprint charts -- is a native TradingView platform feature (Premium+),
+// built on the exchange's real tick/quote feed. Pine Script has no access
+// to that data at all, scriptable or not.
+//
+// This is the closest legitimate approximation available in Pine: pull the
+// actual lower-timeframe bars inside each chart bar via
+// request.security_lower_tf(), classify each one up/down by its own
+// close-vs-open, and accumulate the volume on each side into a running
+// Cumulative Volume Delta (CVD). It is NOT true bid/ask delta -- a large
+// passive limit order sitting at the ask still gets counted as "buy volume"
+// if price ticks up through it -- but it is a materially better proxy than
+// the single-bar close-position heuristic (Chaikin-style), since it is
+// built from many smaller directional prints instead of one bar's shape.
+//
+// Pick a CVD Sub-Timeframe meaningfully lower than the chart timeframe but
+// not absurdly so -- TradingView caps how much intrabar history
+// request.security_lower_tf() can return, and an extreme mismatch (e.g. 1
+// second sub-bars under a Daily chart) will silently return less history
+// than the full period, degrading the delta calculation quietly rather
+// than erroring.
+// =====================================================
+string groupCVD = "Order Flow (CVD)"
+
+bool useCVDInput = input.bool(
+     defval=true,
+     title="Use CVD (Order Flow Proxy)",
+     group=groupCVD,
+     tooltip="Master toggle. When off, CVD is not computed and the divergence gate on TREND LONG/SHORT never blocks a signal."
+)
+
+string cvdSourceTfInput = input.timeframe(
+     defval="1",
+     title="CVD Sub-Timeframe",
+     group=groupCVD,
+     tooltip="Lower timeframe sampled for up/down volume classification. Must be lower than the chart timeframe. See note above on picking a reasonable gap, not an extreme one."
+)
+
+bool resetCvdDailyInput = input.bool(
+     defval=true,
+     title="Reset CVD Daily",
+     group=groupCVD,
+     tooltip="Zeroes the running CVD total at the start of each new day, the standard convention -- CVD is meant to read as \"today's net order flow,\" not an unbounded running total since the symbol's inception."
+)
+
+int cvdLookbackInput = input.int(
+     defval=20,
+     title="CVD Divergence Lookback (Bars)",
+     minval=5,
+     maxval=200,
+     group=groupCVD,
+     tooltip="Window used both for the CVD trend readout (rising/falling) and for divergence detection: compares this window's price/CVD extremes against the PRECEDING equal window, rather than matching literal swing pivots -- simpler and more robust against pivot-detection lag, at the cost of being a coarser read than a true swing-to-swing divergence."
+)
+
+bool showCvdDivergenceMarkersInput = input.bool(
+     defval=true,
+     title="Show CVD Divergence Markers",
+     group=groupCVD,
+     tooltip="Marks the bar where a fresh price/CVD divergence is first detected (edge-triggered -- one marker per divergence, not one every bar it persists)."
+)
+
+// =====================================================
 // 3. THEME COLORS
 // =====================================================
 color colorThemeBorder = color.rgb(35, 125, 255)
@@ -314,6 +378,128 @@ float atrRatio = 1.0
 
 if not na(atrAvg) and atrAvg > 0.0
     atrRatio := atr / atrAvg
+
+// =====================================================
+// ORDER FLOW (CVD) -- see the "2B" input group above for the full
+// explanation of why this is an approximation, not real order flow.
+// =====================================================
+[cvdLtfClose, cvdLtfOpen, cvdLtfVolume] = request.security_lower_tf(
+     syminfo.tickerid,
+     cvdSourceTfInput,
+     [close, open, volume]
+)
+
+float cvdBarBuyVol = 0.0
+float cvdBarSellVol = 0.0
+int cvdLtfCount = array.size(cvdLtfClose)
+
+if cvdLtfCount > 0
+    for cvdI = 0 to cvdLtfCount - 1
+        float cvdC = array.get(cvdLtfClose, cvdI)
+        float cvdO = array.get(cvdLtfOpen, cvdI)
+        float cvdV = array.get(cvdLtfVolume, cvdI)
+        if cvdC > cvdO
+            cvdBarBuyVol += cvdV
+        else if cvdC < cvdO
+            cvdBarSellVol += cvdV
+        else
+            // Sub-bar closed flat -- can't classify direction, so split the
+            // volume evenly rather than assigning it to either side.
+            cvdBarBuyVol += cvdV * 0.5
+            cvdBarSellVol += cvdV * 0.5
+
+float cvdBarDelta = cvdBarBuyVol - cvdBarSellVol
+
+bool cvdNewDay = ta.change(time("D")) != 0
+
+var float cvd = 0.0
+
+if resetCvdDailyInput and cvdNewDay
+    cvd := 0.0
+
+cvd := cvd + cvdBarDelta
+
+float cvdSlope = cvd - cvd[cvdLookbackInput]
+
+string cvdState = "FLAT"
+
+if cvdSlope > 0
+    cvdState := "RISING"
+else if cvdSlope < 0
+    cvdState := "FALLING"
+
+color cvdColor = colorGray
+
+if cvdState == "RISING"
+    cvdColor := colorBlue
+else if cvdState == "FALLING"
+    cvdColor := colorRed
+
+// ── Divergence: this window's price/CVD extreme vs the PRECEDING equal
+//    window's extreme (not literal swing-pivot matching -- see tooltip). ──
+float cvdPriceHighest     = ta.highest(high, cvdLookbackInput)
+float cvdPriceHighestPrev = ta.highest(high, cvdLookbackInput)[cvdLookbackInput]
+float cvdHighest          = ta.highest(cvd, cvdLookbackInput)
+float cvdHighestPrev      = ta.highest(cvd, cvdLookbackInput)[cvdLookbackInput]
+
+float cvdPriceLowest     = ta.lowest(low, cvdLookbackInput)
+float cvdPriceLowestPrev = ta.lowest(low, cvdLookbackInput)[cvdLookbackInput]
+float cvdLowest          = ta.lowest(cvd, cvdLookbackInput)
+float cvdLowestPrev      = ta.lowest(cvd, cvdLookbackInput)[cvdLookbackInput]
+
+// Bearish: price pressed to a fresh high over the window but CVD failed to
+// confirm it -- the rally isn't backed by net buying, a classic absorption
+// tell right where a false breakout would show up.
+bool bearishCvdDivergence =
+     useCVDInput and
+     cvdPriceHighest > cvdPriceHighestPrev and
+     cvdHighest <= cvdHighestPrev
+
+// Bullish: mirror image at the lows.
+bool bullishCvdDivergence =
+     useCVDInput and
+     cvdPriceLowest < cvdPriceLowestPrev and
+     cvdLowest >= cvdLowestPrev
+
+bool cvdConfirmsLong  = not useCVDInput or not bearishCvdDivergence
+bool cvdConfirmsShort = not useCVDInput or not bullishCvdDivergence
+
+string cvdDivergenceLabel = "NONE"
+color  cvdDivergenceColor = colorGray
+
+if bearishCvdDivergence
+    cvdDivergenceLabel := "BEARISH"
+    cvdDivergenceColor := colorRed
+else if bullishCvdDivergence
+    cvdDivergenceLabel := "BULLISH"
+    cvdDivergenceColor := colorGreen
+
+// Edge-triggered: fire the marker once, on the bar the divergence first
+// appears, not on every bar it continues to read true.
+bool freshBearishCvdDivergence = bearishCvdDivergence and not bearishCvdDivergence[1]
+bool freshBullishCvdDivergence = bullishCvdDivergence and not bullishCvdDivergence[1]
+
+if showCvdDivergenceMarkersInput and freshBearishCvdDivergence
+    label.new(
+         x=bar_index,
+         y=high + atr * 0.50,
+         text="CVD DIV",
+         style=label.style_label_down,
+         color=colorRed,
+         textcolor=color.white,
+         size=size.small
+    )
+
+if showCvdDivergenceMarkersInput and freshBullishCvdDivergence
+    label.new(
+         x=bar_index,
+         y=low - atr * 0.50,
+         text="CVD DIV",
+         style=label.style_label_up,
+         color=colorGreen,
+         textcolor=color.white,
+         size=size.small
+    )
 
 // =====================================================
 // Relative Accepted Price
@@ -479,13 +665,22 @@ bool cheapWeak =
      rapZ <= -misRich and
      acceptScore < mrWeakAcceptMax
 
+// cvdConfirmsLong/cvdConfirmsShort: a pure ADDITIONAL gate, not folded into
+// acceptScore -- keeps "is this regime tradeable" (the score) separate from
+// "does order flow confirm this specific direction" (CVD), matching the
+// architecture's existing when/where split rather than merging every signal
+// into one number. A bearish CVD divergence (rally not backed by net
+// buying) blocks TREND LONG; the mirror case blocks TREND SHORT. With
+// useCVDInput off, both gates pass unconditionally -- zero behavior change
+// from before this module existed.
 bool trendLongContext =
      (regime == "TREND" or regime == "EXPANSION") and
      bias == "BULL" and
      close > rap and
      plusDI > minusDI and
      vwapSlopeNorm > trendSlopeMin and
-     acceptScore >= trendAcceptMinRouter
+     acceptScore >= trendAcceptMinRouter and
+     cvdConfirmsLong
 
 bool trendShortContext =
      (regime == "TREND" or regime == "EXPANSION") and
@@ -493,7 +688,8 @@ bool trendShortContext =
      close < rap and
      minusDI > plusDI and
      vwapSlopeNorm < -trendSlopeMin and
-     acceptScore >= trendAcceptMinRouter
+     acceptScore >= trendAcceptMinRouter and
+     cvdConfirmsShort
 
 bool mrLongContext =
      regime == "RANGE" and
@@ -611,7 +807,7 @@ else if dashboardPos == "Bottom Left"
 var table dash = table.new(
      position.top_right,
      2,
-     14,
+     16,
      bgcolor=colorThemeLabel,
      frame_color=colorThemeBorder,
      frame_width=2,
@@ -829,13 +1025,29 @@ if barstate.islast
              riskMode,
              riskColor
         )
+
+        f_dashboardRow(
+             dash,
+             14,
+             "CVD",
+             useCVDInput ? cvdState : "OFF",
+             useCVDInput ? cvdColor : colorGray
+        )
+
+        f_dashboardRow(
+             dash,
+             15,
+             "CVD DIVERGENCE",
+             useCVDInput ? cvdDivergenceLabel : "OFF",
+             useCVDInput ? cvdDivergenceColor : colorGray
+        )
     else
         table.clear(
              table_id=dash,
              start_column=0,
              start_row=0,
              end_column=1,
-             end_row=13
+             end_row=15
         )
 
 // =====================================================
@@ -1106,6 +1318,14 @@ if engine == "BLOCK"
     psychologyColor := colorRed
 else if engine == "WAIT BREAKOUT"
     psychologyMessage := "WAIT\nSQUEEZE COMPRESSION"
+    psychologyColor := colorOrange
+else if engine == "TREND WATCH" and (bearishCvdDivergence or bullishCvdDivergence)
+    // TREND WATCH is exactly the state a divergence-blocked trend context
+    // falls through to (cvdConfirmsLong/Short already vetoed
+    // trendLongContext/trendShortContext upstream) -- so a divergence
+    // showing up here specifically means "this expansion isn't backed by
+    // order flow," worth a distinct message from generic "no commitment."
+    psychologyMessage := "CAUTION\nCVD DIVERGENCE -- POSSIBLE EXHAUSTION"
     psychologyColor := colorOrange
 else if engine == "WAIT" or engine == "TREND WATCH"
     psychologyMessage := "WAIT\nNO COMMITMENT"
