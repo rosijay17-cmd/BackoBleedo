@@ -1,0 +1,1151 @@
+//@version=6
+indicator(
+     title="Regime Engine + TCO Gatekeeper",
+     overlay=true,
+     max_labels_count=500,
+     max_lines_count=50,
+     max_boxes_count=50
+)
+
+// =====================================================
+// 1. ENGINE INPUTS
+// =====================================================
+string groupCore = "Core Settings"
+
+int atrLen = input.int(
+     defval=14,
+     title="ATR Length",
+     minval=1,
+     group=groupCore
+)
+
+int adxLen = input.int(
+     defval=14,
+     title="ADX Length",
+     minval=1,
+     group=groupCore
+)
+
+int rvolLen = input.int(
+     defval=50,
+     title="RVOL Length",
+     minval=1,
+     group=groupCore
+)
+
+int effLen = input.int(
+     defval=20,
+     title="Range Efficiency Length",
+     minval=2,
+     group=groupCore
+)
+
+int slopeLen = input.int(
+     defval=10,
+     title="VWAP Slope Length",
+     minval=1,
+     group=groupCore
+)
+
+// =====================================================
+// Regime thresholds
+// =====================================================
+string groupThresholds = "Regime Thresholds"
+
+float adxTrendMin = input.float(
+     defval=25.0,
+     title="ADX Trend Minimum",
+     minval=0.0,
+     group=groupThresholds
+)
+
+float adxChopMax = input.float(
+     defval=18.0,
+     title="ADX Chop Maximum",
+     minval=0.0,
+     group=groupThresholds
+)
+
+float effTrendMin = input.float(
+     defval=0.55,
+     title="Trend Efficiency Minimum",
+     minval=0.0,
+     maxval=1.0,
+     step=0.05,
+     group=groupThresholds
+)
+
+float effChopMax = input.float(
+     defval=0.30,
+     title="Chop Efficiency Maximum",
+     minval=0.0,
+     maxval=1.0,
+     step=0.05,
+     group=groupThresholds
+)
+
+float rvolExpansion = input.float(
+     defval=1.25,
+     title="RVOL Expansion Minimum",
+     minval=0.0,
+     step=0.05,
+     group=groupThresholds
+)
+
+float atrExpansion = input.float(
+     defval=1.25,
+     title="ATR Expansion Multiple",
+     minval=0.0,
+     step=0.05,
+     group=groupThresholds
+)
+
+float atrSqzMult = input.float(
+     defval=0.80,
+     title="ATR Squeeze Multiple",
+     minval=0.0,
+     step=0.05,
+     group=groupThresholds
+)
+
+// =====================================================
+// Relative accepted mispricing
+// =====================================================
+string groupMisprice = "Relative Accepted Mispricing"
+
+bool useVWAP = input.bool(
+     defval=true,
+     title="Use VWAP In RAP",
+     group=groupMisprice
+)
+
+bool useEMA = input.bool(
+     defval=true,
+     title="Use EMA In RAP",
+     group=groupMisprice
+)
+
+int emaLen = input.int(
+     defval=50,
+     title="EMA Length For RAP",
+     minval=1,
+     group=groupMisprice
+)
+
+float misRich = input.float(
+     defval=1.50,
+     title="Rich/Cheap Threshold",
+     minval=0.0,
+     step=0.10,
+     group=groupMisprice
+)
+
+float misExtreme = input.float(
+     defval=2.50,
+     title="Extreme Threshold",
+     minval=0.0,
+     step=0.10,
+     group=groupMisprice
+)
+
+// =====================================================
+// Engine router
+// =====================================================
+string groupRouter = "Engine Router"
+
+int mrWeakAcceptMax = input.int(
+     defval=55,
+     title="MR Max Acceptance Score",
+     minval=0,
+     maxval=100,
+     group=groupRouter
+)
+
+int trendAcceptMinRouter = input.int(
+     defval=55,
+     title="Trend Min Acceptance Score",
+     minval=0,
+     maxval=100,
+     group=groupRouter
+)
+
+float trendSlopeMin = input.float(
+     defval=0.10,
+     title="Trend VWAP Slope Minimum",
+     minval=0.0,
+     step=0.01,
+     group=groupRouter
+)
+
+bool blockChop = input.bool(
+     defval=true,
+     title="Block In CHOP",
+     group=groupRouter
+)
+
+bool waitSqueeze = input.bool(
+     defval=true,
+     title="Wait During SQZ",
+     group=groupRouter
+)
+
+// =====================================================
+// Display settings
+// =====================================================
+string groupDisplay = "Display"
+
+bool showTable = input.bool(
+     defval=true,
+     title="Show Engine Dashboard",
+     group=groupDisplay
+)
+
+string dashboardPos = input.string(
+     defval="Top Right",
+     title="Dashboard Position",
+     options=[
+          "Top Right",
+          "Top Left",
+          "Bottom Right",
+          "Bottom Left"
+     ],
+     group=groupDisplay
+)
+
+bool showBG = input.bool(
+     defval=true,
+     title="Color Background By Regime",
+     group=groupDisplay
+)
+
+bool showLabels = input.bool(
+     defval=false,
+     title="Show Regime Change Labels",
+     group=groupDisplay
+)
+
+// =====================================================
+// 2. TCO VISUAL GATEKEEPER INPUTS
+// =====================================================
+string groupTCO = "TCO Visual Gatekeeper"
+
+bool showUB = input.bool(
+     defval=true,
+     title="Show Unfinished Business (PDH/PDL)",
+     group=groupTCO
+)
+
+bool showMB = input.bool(
+     defval=true,
+     title="Show Must Break Levels",
+     group=groupTCO
+)
+
+bool showRT = input.bool(
+     defval=true,
+     title="Show Retracement Zones",
+     group=groupTCO
+)
+
+bool showPsy = input.bool(
+     defval=true,
+     title="Show Psychology Banner",
+     group=groupTCO
+)
+
+int swingLen = input.int(
+     defval=10,
+     title="Swing Length (Structure)",
+     minval=1,
+     group=groupTCO
+)
+
+// =====================================================
+// 3. THEME COLORS
+// =====================================================
+color colorThemeBorder = color.rgb(35, 125, 255)
+color colorThemeHeader = color.rgb(7, 24, 47)
+color colorThemeLabel = color.rgb(8, 20, 38)
+color colorThemeValue = color.rgb(86, 105, 132)
+color colorThemeGrid = color.rgb(55, 75, 100)
+color colorThemeText = color.white
+
+color colorBlue = color.rgb(50, 130, 245)
+color colorGreen = color.rgb(25, 195, 100)
+color colorRed = color.rgb(245, 55, 80)
+color colorOrange = color.rgb(245, 160, 20)
+color colorPurple = color.rgb(165, 45, 195)
+color colorGray = color.rgb(88, 105, 132)
+
+// =====================================================
+// 4. ENGINE CALCULATIONS
+// =====================================================
+float atr = ta.atr(atrLen)
+float atrAvg = ta.sma(atr, 50)
+
+float emaRAP = ta.ema(close, emaLen)
+float vwapVal = ta.vwap(hlc3)
+
+float volAvg = ta.sma(volume, rvolLen)
+float rvol = 0.0
+
+if not na(volAvg) and volAvg > 0.0
+    rvol := volume / volAvg
+
+[plusDI, minusDI, adx] = ta.dmi(adxLen, adxLen)
+
+float vwapSlope = vwapVal - vwapVal[slopeLen]
+float vwapSlopeNorm = 0.0
+
+if not na(atr) and atr > 0.0
+    vwapSlopeNorm := vwapSlope / atr
+
+float rangeHigh = ta.highest(high, effLen)
+float rangeLow = ta.lowest(low, effLen)
+float rangeSpan = rangeHigh - rangeLow
+
+float netMove = math.abs(close - close[effLen - 1])
+float rangeEff = 0.0
+
+if not na(rangeSpan) and rangeSpan > 0.0
+    rangeEff := math.min(netMove / rangeSpan, 1.0)
+
+float atrRatio = 1.0
+
+if not na(atrAvg) and atrAvg > 0.0
+    atrRatio := atr / atrAvg
+
+// =====================================================
+// Relative Accepted Price
+// =====================================================
+float rap = na
+
+if useVWAP and useEMA
+    rap := vwapVal * 0.60 + emaRAP * 0.40
+else if useVWAP
+    rap := vwapVal
+else if useEMA
+    rap := emaRAP
+else
+    rap := vwapVal
+
+float rapZ = 0.0
+
+if not na(atr) and atr > 0.0 and not na(rap)
+    rapZ := (close - rap) / atr
+
+string mispriceLabel = "FAIR"
+
+if rapZ >= misExtreme
+    mispriceLabel := "EXT RICH"
+else if rapZ >= misRich
+    mispriceLabel := "RICH"
+else if rapZ <= -misExtreme
+    mispriceLabel := "EXT CHEAP"
+else if rapZ <= -misRich
+    mispriceLabel := "CHEAP"
+
+color mispriceColor = colorGray
+
+if rapZ >= misExtreme
+    mispriceColor := colorRed
+else if rapZ >= misRich
+    mispriceColor := colorOrange
+else if rapZ <= -misExtreme
+    mispriceColor := color.rgb(0, 225, 130)
+else if rapZ <= -misRich
+    mispriceColor := color.teal
+
+// =====================================================
+// Directional bias
+// =====================================================
+bool bullBiasRaw = plusDI > minusDI and close > rap
+bool bearBiasRaw = minusDI > plusDI and close < rap
+
+string bias = "NEUTRAL"
+
+if bullBiasRaw
+    bias := "BULL"
+else if bearBiasRaw
+    bias := "BEAR"
+
+color biasColor = colorGray
+
+if bias == "BULL"
+    biasColor := colorBlue
+else if bias == "BEAR"
+    biasColor := colorRed
+
+// =====================================================
+// Acceptance score
+// =====================================================
+int closeAwayScore = math.abs(rapZ) > 0.75 ? 20 : 0
+int rvolScore = rvol > 1.0 ? 20 : 0
+int adxScore = adx > 20.0 ? 20 : 0
+int slopeScore = math.abs(vwapSlopeNorm) > 0.10 ? 20 : 0
+int diScore = math.abs(plusDI - minusDI) > 5.0 ? 20 : 0
+
+int acceptScore =
+     closeAwayScore +
+     rvolScore +
+     adxScore +
+     slopeScore +
+     diScore
+
+string acceptLabel = "WEAK"
+
+if acceptScore >= 70
+    acceptLabel := "STRONG"
+else if acceptScore >= 45
+    acceptLabel := "MIXED"
+
+color acceptColor = colorRed
+
+if acceptScore >= 70
+    acceptColor := colorBlue
+else if acceptScore >= 45
+    acceptColor := colorOrange
+
+// =====================================================
+// Volatility state
+// =====================================================
+string volState = "NORMAL"
+
+if atrRatio >= atrExpansion and rvol >= rvolExpansion
+    volState := "EXPANSION"
+else if atrRatio <= atrSqzMult
+    volState := "SQZ"
+
+color volColor = colorGray
+
+if volState == "EXPANSION"
+    volColor := colorRed
+else if volState == "SQZ"
+    volColor := colorOrange
+
+// =====================================================
+// Regime classification
+// =====================================================
+bool isTrend =
+     adx >= adxTrendMin and
+     rangeEff >= effTrendMin and
+     math.abs(vwapSlopeNorm) > 0.10 and
+     acceptScore >= 45
+
+bool isChop =
+     adx <= adxChopMax and
+     rangeEff <= effChopMax and
+     rvol < 1.0
+
+bool isExpansion =
+     atrRatio >= atrExpansion and
+     rvol >= rvolExpansion and
+     rangeEff >= 0.45
+
+bool isSqueeze =
+     atrRatio <= atrSqzMult and
+     rangeEff <= 0.45
+
+string regime = "RANGE"
+
+if isExpansion
+    regime := "EXPANSION"
+else if isTrend
+    regime := "TREND"
+else if isChop
+    regime := "CHOP"
+else if isSqueeze
+    regime := "SQZ"
+
+color regimeColor = colorOrange
+
+if regime == "TREND"
+    regimeColor := colorBlue
+else if regime == "CHOP"
+    regimeColor := colorRed
+else if regime == "EXPANSION"
+    regimeColor := colorPurple
+else if regime == "SQZ"
+    regimeColor := colorGray
+
+// =====================================================
+// 5. ENGINE ROUTER
+// =====================================================
+bool richWeak =
+     rapZ >= misRich and
+     acceptScore < mrWeakAcceptMax
+
+bool cheapWeak =
+     rapZ <= -misRich and
+     acceptScore < mrWeakAcceptMax
+
+bool trendLongContext =
+     (regime == "TREND" or regime == "EXPANSION") and
+     bias == "BULL" and
+     close > rap and
+     plusDI > minusDI and
+     vwapSlopeNorm > trendSlopeMin and
+     acceptScore >= trendAcceptMinRouter
+
+bool trendShortContext =
+     (regime == "TREND" or regime == "EXPANSION") and
+     bias == "BEAR" and
+     close < rap and
+     minusDI > plusDI and
+     vwapSlopeNorm < -trendSlopeMin and
+     acceptScore >= trendAcceptMinRouter
+
+bool mrLongContext =
+     regime == "RANGE" and
+     cheapWeak and
+     bias != "BEAR"
+
+bool mrShortContext =
+     regime == "RANGE" and
+     richWeak and
+     bias != "BULL"
+
+string engine = "WAIT"
+
+if blockChop and regime == "CHOP"
+    engine := "BLOCK"
+else if waitSqueeze and regime == "SQZ"
+    engine := "WAIT BREAKOUT"
+else if trendLongContext
+    engine := "TREND LONG"
+else if trendShortContext
+    engine := "TREND SHORT"
+else if mrLongContext
+    engine := "BB/MR LONG"
+else if mrShortContext
+    engine := "BB/MR SHORT"
+else if regime == "EXPANSION"
+    engine := "TREND WATCH"
+
+color engineColor = colorGray
+
+if engine == "BLOCK"
+    engineColor := colorRed
+else if str.contains(engine, "TREND")
+    engineColor := colorBlue
+else if str.contains(engine, "BB/MR")
+    engineColor := colorOrange
+else if engine == "WAIT BREAKOUT"
+    engineColor := colorPurple
+
+string riskMode = "NORMAL"
+
+if regime == "CHOP"
+    riskMode := "BLOCKED"
+else if regime == "SQZ"
+    riskMode := "REDUCED"
+else if rvol < 0.70
+    riskMode := "REDUCED"
+
+color riskColor = colorGreen
+
+if riskMode == "BLOCKED"
+    riskColor := colorRed
+else if riskMode == "REDUCED"
+    riskColor := colorOrange
+
+// =====================================================
+// 6. ENGINE PLOTS
+// =====================================================
+plot(
+     series=rap,
+     title="RAP",
+     color=color.white,
+     linewidth=2
+)
+
+plot(
+     series=vwapVal,
+     title="VWAP",
+     color=color.aqua,
+     linewidth=1
+)
+
+plot(
+     series=emaRAP,
+     title="EMA RAP",
+     color=color.fuchsia,
+     linewidth=1
+)
+
+color backgroundColor = na
+
+if showBG
+    backgroundColor := color.new(regimeColor, 88)
+
+bgcolor(backgroundColor)
+
+// =====================================================
+// Optional regime-change labels
+// =====================================================
+bool regimeChanged = not na(regime[1]) and regime != regime[1]
+
+if showLabels and regimeChanged
+    label.new(
+         x=bar_index,
+         y=high + atr * 0.30,
+         text=regime,
+         style=label.style_label_down,
+         color=regimeColor,
+         textcolor=color.white,
+         size=size.small
+    )
+
+// =====================================================
+// 7. ENGINE DASHBOARD
+// =====================================================
+string dashboardPosition = position.top_right
+
+if dashboardPos == "Top Left"
+    dashboardPosition := position.top_left
+else if dashboardPos == "Bottom Right"
+    dashboardPosition := position.bottom_right
+else if dashboardPos == "Bottom Left"
+    dashboardPosition := position.bottom_left
+
+var table dash = table.new(
+     position.top_right,
+     2,
+     14,
+     bgcolor=colorThemeLabel,
+     frame_color=colorThemeBorder,
+     frame_width=2,
+     border_color=colorThemeGrid,
+     border_width=1
+)
+
+f_dashboardRow(
+     table tableId,
+     int row,
+     string labelText,
+     string valueText,
+     color valueBackground
+) =>
+    table.cell(
+         table_id=tableId,
+         column=0,
+         row=row,
+         text=labelText,
+         text_color=colorThemeText,
+         bgcolor=colorThemeLabel,
+         text_size=size.small,
+         text_halign=text.align_left
+    )
+
+    table.cell(
+         table_id=tableId,
+         column=1,
+         row=row,
+         text=valueText,
+         text_color=colorThemeText,
+         bgcolor=valueBackground,
+         text_size=size.small,
+         text_halign=text.align_right
+    )
+
+if barstate.islast
+    table.set_position(dash, dashboardPosition)
+
+    if showTable
+        table.cell(
+             table_id=dash,
+             column=0,
+             row=0,
+             text="REGIME ENGINE",
+             text_color=colorThemeText,
+             bgcolor=colorThemeHeader,
+             text_size=size.small,
+             text_halign=text.align_left
+        )
+
+        string headerEngineText = engine
+
+        if engine == "BLOCK"
+            headerEngineText := "NO TRADE"
+
+        table.cell(
+             table_id=dash,
+             column=1,
+             row=0,
+             text=headerEngineText,
+             text_color=colorThemeText,
+             bgcolor=engineColor,
+             text_size=size.small,
+             text_halign=text.align_right
+        )
+
+        f_dashboardRow(
+             dash,
+             1,
+             "REGIME",
+             regime,
+             regimeColor
+        )
+
+        f_dashboardRow(
+             dash,
+             2,
+             "BIAS",
+             bias,
+             biasColor
+        )
+
+        f_dashboardRow(
+             dash,
+             3,
+             "ACCEPTANCE",
+             acceptLabel + "  " + str.tostring(acceptScore),
+             acceptColor
+        )
+
+        f_dashboardRow(
+             dash,
+             4,
+             "VOLATILITY",
+             volState,
+             volColor
+        )
+
+        f_dashboardRow(
+             dash,
+             5,
+             "MISPRICING",
+             mispriceLabel,
+             mispriceColor
+        )
+
+        f_dashboardRow(
+             dash,
+             6,
+             "RAP Z",
+             str.tostring(rapZ, "#.00"),
+             mispriceColor
+        )
+
+        color adxColor = colorGray
+
+        if adx >= adxTrendMin
+            adxColor := colorBlue
+        else if adx <= adxChopMax
+            adxColor := colorRed
+
+        f_dashboardRow(
+             dash,
+             7,
+             "ADX",
+             str.tostring(adx, "#.0"),
+             adxColor
+        )
+
+        color diColor = colorGray
+
+        if plusDI > minusDI
+            diColor := colorBlue
+        else if minusDI > plusDI
+            diColor := colorRed
+
+        string diText =
+             str.tostring(plusDI, "#.0") +
+             " / " +
+             str.tostring(minusDI, "#.0")
+
+        f_dashboardRow(
+             dash,
+             8,
+             "DI + / -",
+             diText,
+             diColor
+        )
+
+        color rvolColor = colorThemeValue
+
+        if rvol >= rvolExpansion
+            rvolColor := colorBlue
+        else if rvol < 0.70
+            rvolColor := colorOrange
+
+        f_dashboardRow(
+             dash,
+             9,
+             "RVOL",
+             str.tostring(rvol, "#.00"),
+             rvolColor
+        )
+
+        color atrRatioColor = colorThemeValue
+
+        if atrRatio >= atrExpansion
+            atrRatioColor := colorRed
+        else if atrRatio <= atrSqzMult
+            atrRatioColor := colorOrange
+
+        f_dashboardRow(
+             dash,
+             10,
+             "ATR RATIO",
+             str.tostring(atrRatio, "#.00"),
+             atrRatioColor
+        )
+
+        color efficiencyColor = colorThemeValue
+
+        if rangeEff >= effTrendMin
+            efficiencyColor := colorBlue
+        else if rangeEff <= effChopMax
+            efficiencyColor := colorRed
+
+        f_dashboardRow(
+             dash,
+             11,
+             "EFFICIENCY",
+             str.tostring(rangeEff, "#.00"),
+             efficiencyColor
+        )
+
+        color slopeColor = colorThemeValue
+
+        if vwapSlopeNorm > trendSlopeMin
+            slopeColor := colorBlue
+        else if vwapSlopeNorm < -trendSlopeMin
+            slopeColor := colorRed
+
+        f_dashboardRow(
+             dash,
+             12,
+             "VWAP SLOPE",
+             str.tostring(vwapSlopeNorm, "#.00"),
+             slopeColor
+        )
+
+        f_dashboardRow(
+             dash,
+             13,
+             "RISK",
+             riskMode,
+             riskColor
+        )
+    else
+        table.clear(
+             table_id=dash,
+             start_column=0,
+             start_row=0,
+             end_column=1,
+             end_row=13
+        )
+
+// =====================================================
+// 8. TCO VISUAL LAYER
+// =====================================================
+
+// Previous-day unfinished business
+float pdh = request.security(
+     symbol=syminfo.tickerid,
+     timeframe="D",
+     expression=high[1],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off
+)
+
+float pdl = request.security(
+     symbol=syminfo.tickerid,
+     timeframe="D",
+     expression=low[1],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off
+)
+
+// Persistent PDH/PDL objects
+var line linePDH = na
+var line linePDL = na
+var label labelPDH = na
+var label labelPDL = na
+
+if barstate.islast
+    if not na(linePDH)
+        line.delete(linePDH)
+        linePDH := na
+
+    if not na(linePDL)
+        line.delete(linePDL)
+        linePDL := na
+
+    if not na(labelPDH)
+        label.delete(labelPDH)
+        labelPDH := na
+
+    if not na(labelPDL)
+        label.delete(labelPDL)
+        labelPDL := na
+
+    if showUB and not na(pdh) and not na(pdl)
+        linePDH := line.new(
+             x1=bar_index - 10,
+             y1=pdh,
+             x2=bar_index + 10,
+             y2=pdh,
+             color=color.new(color.blue, 30),
+             style=line.style_dashed
+        )
+
+        linePDL := line.new(
+             x1=bar_index - 10,
+             y1=pdl,
+             x2=bar_index + 10,
+             y2=pdl,
+             color=color.new(color.blue, 30),
+             style=line.style_dashed
+        )
+
+        labelPDH := label.new(
+             x=bar_index + 10,
+             y=pdh,
+             text="PDH",
+             color=color.new(color.white, 100),
+             style=label.style_label_left,
+             textcolor=color.blue,
+             size=size.small
+        )
+
+        labelPDL := label.new(
+             x=bar_index + 10,
+             y=pdl,
+             text="PDL",
+             color=color.new(color.white, 100),
+             style=label.style_label_left,
+             textcolor=color.blue,
+             size=size.small
+        )
+
+// =====================================================
+// Market structure and must-break levels
+// =====================================================
+float pivotHigh = ta.pivothigh(
+     source=high,
+     leftbars=swingLen,
+     rightbars=swingLen
+)
+
+float pivotLow = ta.pivotlow(
+     source=low,
+     leftbars=swingLen,
+     rightbars=swingLen
+)
+
+var float lastPivotHigh = na
+var float lastPivotLow = na
+var int lastPivotHighIndex = na
+var int lastPivotLowIndex = na
+
+if not na(pivotHigh)
+    lastPivotHigh := pivotHigh
+    lastPivotHighIndex := bar_index - swingLen
+
+if not na(pivotLow)
+    lastPivotLow := pivotLow
+    lastPivotLowIndex := bar_index - swingLen
+
+var line mustBreakHighLine = na
+var line mustBreakLowLine = na
+var label mustBreakHighLabel = na
+var label mustBreakLowLabel = na
+
+if barstate.islast
+    if not na(mustBreakHighLine)
+        line.delete(mustBreakHighLine)
+        mustBreakHighLine := na
+
+    if not na(mustBreakLowLine)
+        line.delete(mustBreakLowLine)
+        mustBreakLowLine := na
+
+    if not na(mustBreakHighLabel)
+        label.delete(mustBreakHighLabel)
+        mustBreakHighLabel := na
+
+    if not na(mustBreakLowLabel)
+        label.delete(mustBreakLowLabel)
+        mustBreakLowLabel := na
+
+    bool validPivotHigh =
+         not na(lastPivotHigh) and
+         not na(lastPivotHighIndex)
+
+    bool validPivotLow =
+         not na(lastPivotLow) and
+         not na(lastPivotLowIndex)
+
+    bool drawMustBreakHigh =
+         showMB and
+         validPivotHigh and
+         (bias == "BEAR" or bias == "NEUTRAL")
+
+    bool drawMustBreakLow =
+         showMB and
+         validPivotLow and
+         (bias == "BULL" or bias == "NEUTRAL")
+
+    if drawMustBreakHigh
+        mustBreakHighLine := line.new(
+             x1=lastPivotHighIndex,
+             y1=lastPivotHigh,
+             x2=bar_index + 5,
+             y2=lastPivotHigh,
+             color=colorRed,
+             width=2
+        )
+
+        mustBreakHighLabel := label.new(
+             x=bar_index + 5,
+             y=lastPivotHigh,
+             text="MUST BREAK",
+             color=color.new(color.white, 100),
+             textcolor=colorRed,
+             style=label.style_label_left,
+             size=size.small
+        )
+
+    if drawMustBreakLow
+        mustBreakLowLine := line.new(
+             x1=lastPivotLowIndex,
+             y1=lastPivotLow,
+             x2=bar_index + 5,
+             y2=lastPivotLow,
+             color=colorGreen,
+             width=2
+        )
+
+        mustBreakLowLabel := label.new(
+             x=bar_index + 5,
+             y=lastPivotLow,
+             text="MUST BREAK",
+             color=color.new(color.white, 100),
+             textcolor=colorGreen,
+             style=label.style_label_left,
+             size=size.small
+        )
+
+// =====================================================
+// Retracement zones
+// =====================================================
+var box retracementBox = na
+bool inRetracement = false
+
+bool validSwing =
+     not na(lastPivotHigh) and
+     not na(lastPivotLow) and
+     not na(lastPivotHighIndex) and
+     not na(lastPivotLowIndex)
+
+if validSwing
+    float fib382 = na
+    float fib618 = na
+    color retracementColor = na
+
+    float swingRange = math.abs(lastPivotHigh - lastPivotLow)
+
+    if lastPivotHighIndex > lastPivotLowIndex
+        fib382 := lastPivotHigh - swingRange * 0.382
+        fib618 := lastPivotHigh - swingRange * 0.618
+        retracementColor := color.new(colorBlue, 85)
+
+        inRetracement :=
+             close <= fib382 and
+             close >= fib618
+    else
+        fib382 := lastPivotLow + swingRange * 0.382
+        fib618 := lastPivotLow + swingRange * 0.618
+        retracementColor := color.new(colorRed, 85)
+
+        inRetracement :=
+             close >= fib382 and
+             close <= fib618
+
+    if barstate.islast
+        if not na(retracementBox)
+            box.delete(retracementBox)
+            retracementBox := na
+
+        if showRT
+            float zoneTop = math.max(fib382, fib618)
+            float zoneBottom = math.min(fib382, fib618)
+            int zoneLeft = math.min(
+                 lastPivotHighIndex,
+                 lastPivotLowIndex
+            )
+
+            retracementBox := box.new(
+                 left=zoneLeft,
+                 top=zoneTop,
+                 right=bar_index + 5,
+                 bottom=zoneBottom,
+                 border_color=color.new(retracementColor, 100),
+                 bgcolor=retracementColor
+            )
+else
+    if barstate.islast and not na(retracementBox)
+        box.delete(retracementBox)
+        retracementBox := na
+
+// =====================================================
+// 9. PSYCHOLOGY GATEKEEPER
+// =====================================================
+string psychologyMessage = "EVALUATING..."
+color psychologyColor = colorGray
+
+bool isTrendEntry =
+     engine == "TREND LONG" or
+     engine == "TREND SHORT"
+
+if engine == "BLOCK"
+    psychologyMessage := "WAIT\nNO EDGE / CHOP"
+    psychologyColor := colorRed
+else if engine == "WAIT BREAKOUT"
+    psychologyMessage := "WAIT\nSQUEEZE COMPRESSION"
+    psychologyColor := colorOrange
+else if engine == "WAIT" or engine == "TREND WATCH"
+    psychologyMessage := "WAIT\nNO COMMITMENT"
+    psychologyColor := colorGray
+else if isTrendEntry and not inRetracement
+    psychologyMessage := "DON'T CHASE\nLET PRICE COME TO YOU"
+    psychologyColor := color.yellow
+else
+    psychologyMessage := "HIGH QUALITY SETUP\nREADY TO EVALUATE"
+    psychologyColor := colorGreen
+
+var table psychologyTable = table.new(
+     position.bottom_center,
+     1,
+     1,
+     bgcolor=color.new(color.black, 20),
+     frame_color=colorThemeBorder,
+     frame_width=1,
+     border_color=colorThemeGrid,
+     border_width=1
+)
+
+if barstate.islast
+    if showPsy
+        table.cell(
+             table_id=psychologyTable,
+             column=0,
+             row=0,
+             text=psychologyMessage,
+             text_color=psychologyColor,
+             bgcolor=colorThemeHeader,
+             text_size=size.large,
+             text_font_family=font.family_monospace,
+             text_halign=text.align_center
+        )
+    else
+        table.clear(
+             table_id=psychologyTable,
+             start_column=0,
+             start_row=0,
+             end_column=0,
+             end_row=0
+        )
