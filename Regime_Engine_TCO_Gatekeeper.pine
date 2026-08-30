@@ -325,6 +325,55 @@ bool showCvdDivergenceMarkersInput = input.bool(
 )
 
 // =====================================================
+// 2C. PULLBACK TARGET ZONE INPUTS
+//
+// Answers "where do I want price to come to" after an expansion, instead
+// of just "wait." Anchored to RAP mean-reversion rather than a Fibonacci
+// ratio of the swing -- VWAP-reversion has a real mechanism behind it
+// (a large share of institutional execution algorithms are literally
+// benchmarked to VWAP, which creates structural flow back toward it after
+// a stretch away), where a fixed 38.2%/61.8% retracement of a swing does
+// not have a comparable causal story. This does not replace the existing
+// Fibonacci retracement zone below -- both are shown, and either one being
+// in play is enough to clear the "don't chase" message.
+//
+// The zone is a target BAND, not a single price -- deliberately, since
+// treating any single level as an exact prediction overstates what this
+// (or any) retracement method can actually promise. It freezes at the
+// moment a fresh EXPANSION regime begins (using that bar's RAP/ATR/bias),
+// rather than recalculating every bar, so it reads as a stable level to
+// watch rather than a jittery number that moves with every tick.
+// =====================================================
+string groupPullback = "Pullback Target Zone"
+
+bool showPullbackZoneInput = input.bool(
+     defval=true,
+     title="Show Pullback Target Zone",
+     group=groupPullback,
+     tooltip="Master toggle. When off, the zone is not computed and only the Fibonacci retracement zone drives the psychology banner's \"ready\" state."
+)
+
+float pullbackTargetZInput = input.float(
+     defval=1.0,
+     title="Target Z (ATR From RAP)",
+     minval=0.0,
+     maxval=5.0,
+     step=0.05,
+     group=groupPullback,
+     tooltip="How far from RAP, in ATR, the zone is centered -- on the same side as the current stretch (e.g. above RAP for a bullish expansion), so this is a PARTIAL retracement toward fair value, not a full round-trip to it. 1.0 sits between the Rich/Cheap and Extreme thresholds by default."
+)
+
+float pullbackZoneWidthAtrInput = input.float(
+     defval=0.5,
+     title="Zone Width (ATR)",
+     minval=0.05,
+     maxval=3.0,
+     step=0.05,
+     group=groupPullback,
+     tooltip="Total width of the target band, in ATR, centered on Target Z. A band, not a single price -- this method estimates a reasonable zone to watch, not an exact tick."
+)
+
+// =====================================================
 // 3. THEME COLORS
 // =====================================================
 color colorThemeBorder = color.rgb(35, 125, 255)
@@ -655,6 +704,44 @@ else if regime == "SQZ"
     regimeColor := colorGray
 
 // =====================================================
+// PULLBACK TARGET ZONE
+// See the "2C" input group above for the full reasoning. Freezes on the
+// bar a fresh EXPANSION begins, using THAT bar's rap/atr/bias -- not
+// recalculated every bar afterward, so it reads as a stable level.
+// =====================================================
+bool freshExpansion = regime == "EXPANSION" and regime[1] != "EXPANSION"
+
+var float pullbackZoneTop = na
+var float pullbackZoneBottom = na
+var int pullbackZoneAnchorBar = na
+var string pullbackZoneBiasAtSet = ""
+
+if showPullbackZoneInput and freshExpansion and bias != "NEUTRAL" and not na(rap) and not na(atr)
+    float pullbackSign = bias == "BULL" ? 1.0 : -1.0
+    float pullbackTargetPrice = rap + atr * pullbackTargetZInput * pullbackSign
+    float pullbackHalfWidth = atr * pullbackZoneWidthAtrInput / 2.0
+    pullbackZoneTop := pullbackTargetPrice + pullbackHalfWidth
+    pullbackZoneBottom := pullbackTargetPrice - pullbackHalfWidth
+    pullbackZoneAnchorBar := bar_index
+    pullbackZoneBiasAtSet := bias
+
+// Invalidate the zone if the trend that produced it has since reversed --
+// a pullback target for a bull expansion means nothing once bias has
+// flipped bearish.
+if pullbackZoneBiasAtSet != "" and bias != "NEUTRAL" and bias != pullbackZoneBiasAtSet
+    pullbackZoneTop := na
+    pullbackZoneBottom := na
+    pullbackZoneAnchorBar := na
+    pullbackZoneBiasAtSet := ""
+
+bool inPullbackZone =
+     showPullbackZoneInput and
+     not na(pullbackZoneTop) and
+     not na(pullbackZoneBottom) and
+     close <= pullbackZoneTop and
+     close >= pullbackZoneBottom
+
+// =====================================================
 // 5. ENGINE ROUTER
 // =====================================================
 bool richWeak =
@@ -807,7 +894,7 @@ else if dashboardPos == "Bottom Left"
 var table dash = table.new(
      position.top_right,
      2,
-     16,
+     17,
      bgcolor=colorThemeLabel,
      frame_color=colorThemeBorder,
      frame_width=2,
@@ -1041,13 +1128,35 @@ if barstate.islast
              useCVDInput ? cvdDivergenceLabel : "OFF",
              useCVDInput ? cvdDivergenceColor : colorGray
         )
+
+        string pullbackZoneText =
+             not showPullbackZoneInput
+                  ? "OFF"
+                  : na(pullbackZoneTop) or na(pullbackZoneBottom)
+                       ? "N/A"
+                       : str.tostring(pullbackZoneBottom, format.mintick) + "-" + str.tostring(pullbackZoneTop, format.mintick)
+
+        color pullbackZoneRowColor =
+             not showPullbackZoneInput
+                  ? colorGray
+                  : inPullbackZone
+                       ? colorGreen
+                       : colorThemeValue
+
+        f_dashboardRow(
+             dash,
+             16,
+             "PULLBACK ZONE",
+             pullbackZoneText,
+             pullbackZoneRowColor
+        )
     else
         table.clear(
              table_id=dash,
              start_column=0,
              start_row=0,
              end_column=1,
-             end_row=15
+             end_row=16
         )
 
 // =====================================================
@@ -1304,6 +1413,47 @@ else
         retracementBox := na
 
 // =====================================================
+// Pullback target zone box
+// =====================================================
+var box pullbackZoneBoxDrawn = na
+var label pullbackZoneLabel = na
+
+if barstate.islast
+    if not na(pullbackZoneBoxDrawn)
+        box.delete(pullbackZoneBoxDrawn)
+        pullbackZoneBoxDrawn := na
+
+    if not na(pullbackZoneLabel)
+        label.delete(pullbackZoneLabel)
+        pullbackZoneLabel := na
+
+    if showPullbackZoneInput and not na(pullbackZoneTop) and not na(pullbackZoneBottom) and not na(pullbackZoneAnchorBar)
+        color pullbackBoxColor = pullbackZoneBiasAtSet == "BULL" ? color.new(colorBlue, 82) : color.new(colorRed, 82)
+
+        pullbackZoneBoxDrawn := box.new(
+             left=pullbackZoneAnchorBar,
+             top=pullbackZoneTop,
+             right=bar_index + 5,
+             bottom=pullbackZoneBottom,
+             border_color=color.new(pullbackBoxColor, 40),
+             bgcolor=pullbackBoxColor
+        )
+
+        pullbackZoneLabel := label.new(
+             x=bar_index + 5,
+             y=(pullbackZoneTop + pullbackZoneBottom) / 2,
+             text="PULLBACK ZONE",
+             color=color.new(color.white, 100),
+             textcolor=pullbackZoneBiasAtSet == "BULL" ? colorBlue : colorRed,
+             style=label.style_label_left,
+             size=size.small
+        )
+
+// Either method clearing counts as "price has come to you" -- Fibonacci
+// (swing-based) or the RAP pullback zone (mean-reversion-based).
+bool atGoodEntryZone = inRetracement or inPullbackZone
+
+// =====================================================
 // 9. PSYCHOLOGY GATEKEEPER
 // =====================================================
 string psychologyMessage = "EVALUATING..."
@@ -1330,8 +1480,17 @@ else if engine == "TREND WATCH" and (bearishCvdDivergence or bullishCvdDivergenc
 else if engine == "WAIT" or engine == "TREND WATCH"
     psychologyMessage := "WAIT\nNO COMMITMENT"
     psychologyColor := colorGray
-else if isTrendEntry and not inRetracement
-    psychologyMessage := "DON'T CHASE\nLET PRICE COME TO YOU"
+else if isTrendEntry and not atGoodEntryZone
+    // atGoodEntryZone = inRetracement (Fibonacci) OR inPullbackZone (RAP
+    // mean-reversion) -- either method clearing is enough to stop
+    // "chasing." When neither has, show the RAP-based zone's actual price
+    // range if one exists (the Fibonacci zone has no single frozen range to
+    // quote the same way, since it's recalculated from the live swing).
+    string pullbackRangeText =
+         not na(pullbackZoneTop) and not na(pullbackZoneBottom)
+              ? "\n~" + str.tostring(pullbackZoneBottom, format.mintick) + "-" + str.tostring(pullbackZoneTop, format.mintick)
+              : ""
+    psychologyMessage := "DON'T CHASE\nLET PRICE COME TO YOU" + pullbackRangeText
     psychologyColor := color.yellow
 else
     psychologyMessage := "HIGH QUALITY SETUP\nREADY TO EVALUATE"
