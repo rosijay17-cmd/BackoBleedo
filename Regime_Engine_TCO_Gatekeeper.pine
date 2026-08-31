@@ -1468,23 +1468,29 @@ if barstate.islast
              useVolumeTrendInput ? volumeTrendColor : colorGray
         )
 
-        string vpDashText =
-             not useVolumeProfileInput
-                  ? "OFF"
-                  : na(vpVAH) or na(vpVAL)
-                       ? "N/A"
-                       : close > vpVAH
-                            ? "ABOVE VAH " + str.tostring(vpVAH, format.mintick)
-                            : close < vpVAL
-                                 ? "BELOW VAL " + str.tostring(vpVAL, format.mintick)
-                                 : "IN VALUE AREA"
+        // NOTE (CE10013 fix): a single 4-level nested ternary here
+        // ("OFF" -> "N/A" -> above/below -> in value area) hit Pine's
+        // continuation-parsing limit on ternary depth -- confirmed by
+        // compiler error, not a false positive from the usual string-
+        // literal or "=>" scan classes. Rewritten as an if/else-if chain
+        // instead, matching how regime/bias/cvdState/mispriceLabel etc.
+        // are already built elsewhere in this file.
+        string vpDashText = "OFF"
+        color vpDashColor = colorGray
 
-        color vpDashColor =
-             not useVolumeProfileInput
-                  ? colorGray
-                  : inValueArea
-                       ? colorGreen
-                       : colorThemeValue
+        if useVolumeProfileInput
+            if na(vpVAH) or na(vpVAL)
+                vpDashText := "N/A"
+                vpDashColor := colorThemeValue
+            else if close > vpVAH
+                vpDashText := "ABOVE VAH " + str.tostring(vpVAH, format.mintick)
+                vpDashColor := colorThemeValue
+            else if close < vpVAL
+                vpDashText := "BELOW VAL " + str.tostring(vpVAL, format.mintick)
+                vpDashColor := colorThemeValue
+            else
+                vpDashText := "IN VALUE AREA"
+                vpDashColor := colorGreen
 
         f_dashboardRow(
              dash,
