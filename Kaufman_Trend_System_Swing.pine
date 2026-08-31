@@ -37,7 +37,7 @@ strategy(
      pyramiding=0,
      calc_on_every_tick=false,
      process_orders_on_close=false,
-     commission_type=commission.cash_per_contract,
+     commission_type=strategy.commission.cash_per_contract,
      commission_value=8,
      slippage=2,
      max_bars_back=500
