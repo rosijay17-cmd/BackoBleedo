@@ -374,6 +374,61 @@ float pullbackZoneWidthAtrInput = input.float(
 )
 
 // =====================================================
+// 2D. VOLUME TREND INPUTS
+//
+// A genuinely distinct axis from RVOL and CVD, not a third measurement of
+// either: RVOL reads whether THIS bar is unusually active relative to its
+// own average (a snapshot); CVD reads which SIDE is winning (direction).
+// Neither says whether participation itself has been rising or falling
+// over the recent past. This tracks that -- the percentage change in
+// average volume over a lookback window -- as a fading-breakout warning:
+// thinning participation as a move continues is a classic tell distinct
+// from any single quiet bar or from delta direction.
+//
+// Deliberately informational, not a hard gate on the router -- CVD
+// divergence already hard-blocks trendLongContext/trendShortContext, and
+// stacking a second hard volume-based block risked making trend signals
+// too rare to be useful. This surfaces as a dashboard row and a psychology
+// banner caution instead, on top of an otherwise-clean trend signal rather
+// than preventing one.
+// =====================================================
+string groupVolTrend = "Volume Trend"
+
+bool useVolumeTrendInput = input.bool(
+     defval=true,
+     title="Use Volume Trend",
+     group=groupVolTrend,
+     tooltip="Master toggle. When off, Volume Trend reads FLAT unconditionally and the psychology banner's thinning-volume caution never fires."
+)
+
+int volumeTrendLenInput = input.int(
+     defval=20,
+     title="Volume Trend Lookback (Bars)",
+     minval=5,
+     maxval=200,
+     group=groupVolTrend,
+     tooltip="Compares today's average volume (the same smoothed series RVOL is built from) against its value this many bars ago."
+)
+
+float volumeTrendRisingMinInput = input.float(
+     defval=0.15,
+     title="Rising Threshold (% Change)",
+     minval=0.0,
+     step=0.05,
+     group=groupVolTrend,
+     tooltip="Minimum increase in average volume over the lookback, as a fraction (0.15 = 15%), to classify as RISING."
+)
+
+float volumeTrendFallingMaxInput = input.float(
+     defval=-0.15,
+     title="Falling Threshold (% Change)",
+     maxval=0.0,
+     step=0.05,
+     group=groupVolTrend,
+     tooltip="Maximum decrease in average volume over the lookback, as a fraction (-0.15 = -15%), to classify as FALLING."
+)
+
+// =====================================================
 // 3. THEME COLORS
 // =====================================================
 color colorThemeBorder = color.rgb(35, 125, 255)
@@ -404,6 +459,29 @@ float rvol = 0.0
 
 if not na(volAvg) and volAvg > 0.0
     rvol := volume / volAvg
+
+// =====================================================
+// VOLUME TREND -- see the "2D" input group above for the full reasoning.
+// Built from volAvg (the same smoothed series RVOL uses), so this is a
+// genuinely different axis (is participation itself rising or falling
+// over time) rather than a second read of the same single-bar snapshot.
+// =====================================================
+float volAvgPrior = volAvg[volumeTrendLenInput]
+float volumeTrendChange = not na(volAvgPrior) and volAvgPrior > 0.0 ? (volAvg - volAvgPrior) / volAvgPrior : 0.0
+
+string volumeTrendState = "FLAT"
+
+if useVolumeTrendInput and volumeTrendChange >= volumeTrendRisingMinInput
+    volumeTrendState := "RISING"
+else if useVolumeTrendInput and volumeTrendChange <= volumeTrendFallingMaxInput
+    volumeTrendState := "FALLING"
+
+color volumeTrendColor = colorGray
+
+if volumeTrendState == "RISING"
+    volumeTrendColor := colorBlue
+else if volumeTrendState == "FALLING"
+    volumeTrendColor := colorRed
 
 [plusDI, minusDI, adx] = ta.dmi(adxLen, adxLen)
 
@@ -907,7 +985,7 @@ else if dashboardPos == "Bottom Left"
 var table dash = table.new(
      position.top_right,
      2,
-     17,
+     18,
      bgcolor=colorThemeLabel,
      frame_color=colorThemeBorder,
      frame_width=2,
@@ -1163,13 +1241,26 @@ if barstate.islast
              pullbackZoneText,
              pullbackZoneRowColor
         )
+
+        string volumeTrendText =
+             not useVolumeTrendInput
+                  ? "OFF"
+                  : volumeTrendState + "  " + (volumeTrendChange >= 0 ? "+" : "") + str.tostring(volumeTrendChange * 100, "#.0") + "%"
+
+        f_dashboardRow(
+             dash,
+             17,
+             "VOLUME TREND",
+             volumeTrendText,
+             useVolumeTrendInput ? volumeTrendColor : colorGray
+        )
     else
         table.clear(
              table_id=dash,
              start_column=0,
              start_row=0,
              end_column=1,
-             end_row=16
+             end_row=17
         )
 
 // =====================================================
@@ -1505,6 +1596,15 @@ else if isTrendEntry and not atGoodEntryZone
               : ""
     psychologyMessage := "DON'T CHASE\nLET PRICE COME TO YOU" + pullbackRangeText
     psychologyColor := color.yellow
+else if isTrendEntry and useVolumeTrendInput and volumeTrendState == "FALLING"
+    // Reached here only after clearing the entry-zone check above -- this
+    // is specifically "about to call it a clean setup, but participation
+    // has been thinning as the move continues," a fading-breakout warning
+    // distinct from RVOL (single-bar snapshot) or CVD (direction). Warns
+    // without blocking -- see the "2D" input group note on why this stays
+    // informational rather than a hard gate like CVD divergence.
+    psychologyMessage := "CAUTION\nTREND ON THINNING VOLUME"
+    psychologyColor := colorOrange
 else
     psychologyMessage := "HIGH QUALITY SETUP\nREADY TO EVALUATE"
     psychologyColor := colorGreen
