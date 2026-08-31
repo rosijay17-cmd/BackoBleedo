@@ -38,6 +38,7 @@ are shared:
 | 6 | Optimal trend-following as a two-threshold hysteresis rule on regime probability | `references/optimal-trend-following-boundaries.md` | Dai, Yang, Zhang & Zhu (2016), *Mathematics of Operations Research* |
 | 7 | Attention-autoencoder + correlation clustering for dynamic support/resistance levels | `references/deepsupp-attention-support-resistance.md` | Kriuk, Ng & Al Hossain (2025), arXiv:2507.01971 |
 | 8 | Cycle identification (peak/valley measurement, triangular-weighted MACD, trigonometric curve fitting) | `references/cycle-analysis-kaufman.md` | Kaufman (2019), *Trading Systems and Methods*, Ch. 11 |
+| 9 | Trend systems toolkit (bands/channels, single/multi-trend crossovers, ATR position sizing, MA-family confluence, projected crossovers) | `references/trend-systems-kaufman.md` | Kaufman (2019), *Trading Systems and Methods*, Ch. 8 |
 
 ## Portability Matrix
 
@@ -66,6 +67,14 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
 | Peak/valley cycle-length measurement (discover a candidate period) | ❌ Not for live Pine | ✅ Preferred (offline, once) | Find the period offline first, then hardcode it into a Pine oscillator — never search for it live bar-by-bar |
 | Trigonometric least-squares curve fit, searching over frequency `ω` | ❌ Not feasible as a live search | ✅ Required (Solver/`scipy.optimize` or equivalent) | A *fixed*-`ω` single-frequency fit reduces to closed-form OLS Pine could compute, but finding `ω` itself is the same class of iterative/nonlinear problem as the MLE and clustering steps already flagged elsewhere in this matrix |
 | Fourier/spectral analysis, MESA (Ehlers) | ⚠️ Unassessed | ⚠️ Unassessed | Not covered in the source excerpt ingested (paper #8) — flagged as a gap, not evaluated either way yet |
+| Bands/channels (Keltner, %, ATR/stdev-scaled, Bollinger, Modified Bollinger) | ✅ Direct | — | Pure arithmetic/recursive smoothing; Modified Bollinger formulas are copy-portable as given |
+| Single/multi-trend crossover systems (MA, EXP, BO, SWG, LRS, Donchian, Golden/Death Cross, ROC, Ichimoku) | ✅ Direct | — | `ta.sma`/`ta.ema`/`ta.highest`/`ta.lowest`/`ta.linreg` cover essentially all of it |
+| ATR-scaled position sizing (`investment / (ATR × BigPointValue)`) | ✅ Direct | — | Candidate proper fix for this session's earlier zero-qty/margin-rejection sizing bugs, not just the patches actually applied |
+| Moving-average-family confluence count (monotonic MA-fan agreement) | ✅ Direct | — | A `for` loop over N periods; genuinely new confirmation axis, not yet used anywhere in this repo |
+| Projected MA-crossover price (CP2), Market Directional Indicator (MDI) | ✅ Direct | — | Closed-form arithmetic on rolling price sums |
+| "Ahead of the crowd" positioning, portfolio replication | ⚠️ Codeable but unverified | — | No barrier to building, but paper #9 gives no backtest evidence either works |
+| Techno-fundamental discretionary exit | ❌ Not systematizable | — | Requires real-time discretionary judgment about *why* a trend is happening; source's own worked example (2010→2011 Fed case) shows it failing |
+| Ehlers' quotient transform (early trend ID) | ⚠️ Partial | ⚠️ Unassessed | Formula given; the roofing filter/AGC steps that complete the actual indicator aren't in the source excerpt — same shape as the Fourier/MESA gap above |
 
 ## Cross-Paper Synthesis
 
@@ -132,6 +141,34 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
   template for evaluating *any* future pattern-detection claim in this skill, cycle or
   otherwise: does a real mechanism exist, and does the claimed period hold up across
   multiple independent samples — not just "does the chart look periodic."
+- **Paper #9 independently confirms, from real multi-market backtests rather than
+  theory, several patterns this skill and this repo had already converged on from
+  other directions.** Its 2-consecutive-bar ROC confirmation rule is the same
+  debounce principle as paper #6's proven hysteresis band and this repo's
+  `MTF_Second_Flip` naming; its Bollinger-squeeze breakout filter is the same idea as
+  `Regime_Engine_TCO_Gatekeeper.pine`'s `isSqueeze`/`WAIT BREAKOUT` state, just built on
+  band width instead of ATR-ratio/range-efficiency; its MPTDI step-weighted system
+  (1972) is the same "let regime state change trading parameters" idea as this repo's
+  `riskMode`-by-`regime` pattern, just via discrete volatility steps instead of a
+  continuous classifier. Multiple independent sources landing on the same handful of
+  structural ideas is a stronger signal than any one of them alone.
+- **Multi-gate/multi-confirmation stacking (this repo's own recurring pattern — CVD +
+  Volume Trend + regime + bias, all hard-AND'd) has a real, quotable limit paper #9
+  demonstrates directly**: a 2-trend crossover *substantially improved* the strongly
+  trending Eurodollar market but barely moved the needle on the noisier e-mini S&P
+  ("a 2-trend system improves an already-trending market, but not a noisy one," the
+  source's own words). This doesn't contradict this repo's design (paper #6's
+  theoretical hysteresis result still supports strict-entry gating in general), but it's
+  a concrete reason to expect the TCO engine's stacked gates to help most on the
+  cleanest-trending instruments and to mainly just cut signal count — not necessarily
+  improve win rate — on noisier ones, and to verify that per-instrument in `quantor`
+  rather than assume it uniformly.
+- **A famous, historically-popular parameter set failing a direct modern retest (paper
+  #9's 4-9-18 crossover, "none of the results would have convinced you to trade this")
+  is the same lesson this skill's Changelog already drew from paper #8's 4-9-18-style
+  political cycles and the Swiss franc cycle**: reputation, age, or a colorful name is
+  never evidence. Treat any "classic"/"well-known" parameter combination proposed for
+  this repo's scripts with the same skepticism as a brand-new, untested one.
 - **A single backtest run is a single sample path, and paper #6 proves how wide that
   variance can be even under a correctly-specified model** (identical parameters,
   identical thresholds, single-path total returns spanning roughly 0.08x to ~1,888x
@@ -250,3 +287,22 @@ can be corrected against the real implementation rather than inference.
   before the chapter's own stated main methods (Fourier/spectral analysis, Ehlers'
   MESA) — flagged as an open gap if the rest of the chapter or a dedicated source is
   ever supplied.
+- **2026-08-31** — Ingested paper #9: Kaufman (2019), "Trend Systems" (Ch. 8 of
+  *Trading Systems and Methods*, uploaded as a 56-page excerpt). By far the most
+  directly applicable source in this skill so far — real multi-market backtest tables
+  (not single anecdotal charts) covering bands/channels, single- and multi-trend
+  crossover systems, ATR-based position sizing, and MA-family confluence, almost all of
+  it directly Pine-portable (a rarity here). Key empirical findings: ~35% win rate is
+  the normal trend-following profile (winners must average ≥2.85x losers); exponential
+  smoothing consistently underperforms simple MA/momentum; no single trend system wins
+  across all instruments; a 2-trend confirmation system helps a strongly trending
+  market (Eurodollar) far more than a noisy one (e-mini S&P) — see the new Cross-Paper
+  Synthesis notes for how this bears on this repo's own multi-gate architecture. Several
+  ideas in this chapter (Bollinger squeeze, MPTDI's regime-conditional parameters, ROC's
+  2-bar confirmation) turn out to be things this repo and this skill had already
+  independently converged on from other directions — logged as convergent validation.
+  Also surfaces two concrete, not-yet-built candidates for this repo: an ATR-scaled
+  position-sizing formula (a proper fix for the zero-qty/margin-rejection bug class
+  root-caused earlier this session in the Trend Following Strategy v6 files) and a
+  moving-average-family confluence count as a genuinely new confirmation axis for
+  `Regime_Engine_TCO_Gatekeeper.pine`. No contradiction with papers #1-8.
