@@ -835,11 +835,22 @@ else if riskMode == "REDUCED"
 // =====================================================
 // 6. ENGINE PLOTS
 // =====================================================
+// FIX (chart clutter): mobile's Style tab only exposes one combined
+// visibility toggle per plot (line + price-scale label together), so
+// there's no way to keep the line but drop the redundant label from
+// settings alone on mobile. display.all - display.price_scale removes
+// just the price-scale label in code instead -- confirmed against
+// TradingView's own docs, which give the identical pattern
+// (display.all - display.pane) as their own example. RAP and EMA RAP keep
+// their labels off since the dashboard's MISPRICING/RAP Z rows already
+// cover that value; VWAP keeps its label since it's the one level here
+// commonly referenced on its own.
 plot(
      series=rap,
      title="RAP",
      color=color.white,
-     linewidth=2
+     linewidth=2,
+     display=display.all - display.price_scale
 )
 
 plot(
@@ -853,7 +864,8 @@ plot(
      series=emaRAP,
      title="EMA RAP",
      color=color.fuchsia,
-     linewidth=1
+     linewidth=1,
+     display=display.all - display.price_scale
 )
 
 color backgroundColor = na
