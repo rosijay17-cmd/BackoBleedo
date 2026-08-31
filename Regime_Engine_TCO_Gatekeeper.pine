@@ -841,10 +841,10 @@ else if riskMode == "REDUCED"
 // settings alone on mobile. display.all - display.price_scale removes
 // just the price-scale label in code instead -- confirmed against
 // TradingView's own docs, which give the identical pattern
-// (display.all - display.pane) as their own example. RAP and EMA RAP keep
-// their labels off since the dashboard's MISPRICING/RAP Z rows already
-// cover that value; VWAP keeps its label since it's the one level here
-// commonly referenced on its own.
+// (display.all - display.pane) as their own example. All three plots
+// (RAP, VWAP, EMA RAP) have their price-scale labels off -- the
+// dashboard's MISPRICING/RAP Z rows already cover these values, so the
+// axis labels were pure duplication. The lines themselves are unaffected.
 plot(
      series=rap,
      title="RAP",
@@ -857,7 +857,8 @@ plot(
      series=vwapVal,
      title="VWAP",
      color=color.aqua,
-     linewidth=1
+     linewidth=1,
+     display=display.all - display.price_scale
 )
 
 plot(
