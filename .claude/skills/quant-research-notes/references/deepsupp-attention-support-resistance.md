@@ -137,6 +137,14 @@ the paper's own results actually support (see Critique above).
 
 ## Applied in This Repo
 
-*(none — evaluated and not recommended for implementation; see Portability and Critique
-above. If a future session decides to prototype Volume Profile inside
-`Regime_Engine_TCO_Gatekeeper.pine` as the practical alternative, note it here.)*
+**2026-08-31** — Ported the Volume Profile (POC/VAH/VAL) concept into
+`Regime_Engine_TCO_Gatekeeper.pine`, as recommended above, rather than any part of
+DeepSupp's own pipeline. Lean port of the visual Volume Profile already built in
+`Supply_and_Demand_Zones_XL.pine`: bins a lookback window into price rows, sums each
+row's volume, takes the highest-volume row as POC, expands outward until the Value Area
+% is covered — three lines (POC, VAH, VAL) instead of the source script's full box
+histogram, recomputed on the last bar only. Added as a new "VOL PROFILE" dashboard row
+and folded into `atGoodEntryZone` (informational, alongside the existing Fibonacci and
+RAP pullback zones — not a hard gate). Confirms the Mapping section's prediction: the
+transparent, volume-grounded alternative was straightforward to build and integrate,
+with none of the infrastructure barriers DeepSupp's own pipeline would have required.
