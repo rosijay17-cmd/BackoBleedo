@@ -4,7 +4,8 @@ indicator(
      overlay=true,
      max_labels_count=500,
      max_lines_count=50,
-     max_boxes_count=50
+     max_boxes_count=50,
+     max_bars_back=2000
 )
 
 // =====================================================
@@ -431,6 +432,73 @@ float volumeTrendFallingMaxInput = input.float(
 )
 
 // =====================================================
+// 2E. VOLUME PROFILE INPUTS
+//
+// Ported from Supply_and_Demand_Zones_XL.pine, lean version: just the
+// Point of Control and Value Area High/Low as three lines, not the full
+// visual histogram (that script draws up to vpRows*2 boxes per refresh --
+// fine as a standalone indicator, wasteful here where only the three
+// resulting price levels matter).
+//
+// Evaluated against the DeepSupp paper (arXiv:2507.01971, see the
+// quant-research-notes skill's deepsupp-attention-support-resistance.md)
+// as the practical alternative: that paper's own attention-autoencoder +
+// DBSCAN pipeline isn't portable to Pine at all (no ML training, matrix
+// pipeline, or clustering primitive), and its reported evidence for
+// beating simpler methods is weak on its own numbers. What it's actually
+// chasing -- structural levels that reflect where volume concentrated
+// instead of a mechanical swing pivot -- is exactly what Volume Profile
+// already gives for free, using real traded volume instead of a learned
+// embedding space. This sits alongside the existing swing-pivot "must
+// break" lines rather than replacing them: must-break lines are about
+// price structure (the last swing extreme), POC/VAH/VAL are about where
+// volume actually transacted -- different evidence, both worth having on
+// the chart.
+// =====================================================
+string groupVolProfile = "Volume Profile"
+
+bool useVolumeProfileInput = input.bool(
+     defval=true,
+     title="Show Volume Profile (POC / VAH / VAL)",
+     group=groupVolProfile,
+     tooltip="Master toggle. When off, the profile is not computed, the dashboard row reads OFF, and Value Area no longer contributes to the \"good entry zone\" psychology check."
+)
+
+int vpRowsInput = input.int(
+     defval=50,
+     title="Price Rows",
+     minval=10,
+     maxval=100,
+     group=groupVolProfile,
+     tooltip="Number of horizontal price bins the lookback range is split into before finding the highest-volume row (POC). Higher = finer price resolution, more computation."
+)
+
+int vpLookbackInput = input.int(
+     defval=200,
+     title="Lookback (Bars)",
+     minval=20,
+     maxval=2000,
+     group=groupVolProfile,
+     tooltip="How many bars back the profile is built from. Also sets the price high/low range the rows span."
+)
+
+float vpVaPercentInput = input.float(
+     defval=70,
+     title="Value Area %",
+     minval=10,
+     maxval=95,
+     group=groupVolProfile,
+     tooltip="Share of total volume the Value Area covers, centered on the POC and expanded outward one row at a time toward whichever side has more volume. 70% is the standard convention."
+)
+
+bool showVolumeProfileLinesInput = input.bool(
+     defval=true,
+     title="Draw POC / VAH / VAL Lines",
+     group=groupVolProfile,
+     tooltip="Draws POC as a solid line and VAH/VAL as dashed lines, extending from the start of the lookback window to the current bar. Recomputed on the last bar only, same as the must-break lines, so it stays cheap."
+)
+
+// =====================================================
 // 3. THEME COLORS
 // =====================================================
 color colorThemeBorder = color.rgb(35, 125, 255)
@@ -829,6 +897,136 @@ bool inPullbackZone =
      close >= pullbackZoneBottom
 
 // =====================================================
+// Volume Profile (POC / VAH / VAL)
+// See the "2E" input group above for the full reasoning. Lean port of
+// Supply_and_Demand_Zones_XL.pine's volume profile: bins the lookback
+// range into rows, sums each row's overlapping volume, takes the
+// highest-volume row as POC, then expands outward one row at a time
+// toward whichever side has more volume until the Value Area % is
+// covered. Recomputed on the last bar only -- the nested loop is
+// vpRowsInput * vpLookbackInput work in the worst case, too expensive to
+// run every bar. Placed before the dashboard/router (rather than down in
+// the visual layer with the must-break lines) so vpPOC/vpVAH/vpVAL and
+// inValueArea are fresh -- not one tick stale -- by the time the
+// dashboard row and psychology check below read them.
+// =====================================================
+var line vpPocLine = na
+var line vpVahLine = na
+var line vpValLine = na
+var label vpPocLabel = na
+
+var float vpPOC = na
+var float vpVAH = na
+var float vpVAL = na
+
+if barstate.islast
+    if not na(vpPocLine)
+        line.delete(vpPocLine)
+        vpPocLine := na
+
+    if not na(vpVahLine)
+        line.delete(vpVahLine)
+        vpVahLine := na
+
+    if not na(vpValLine)
+        line.delete(vpValLine)
+        vpValLine := na
+
+    if not na(vpPocLabel)
+        label.delete(vpPocLabel)
+        vpPocLabel := na
+
+    vpPOC := na
+    vpVAH := na
+    vpVAL := na
+
+    if useVolumeProfileInput
+        int vpUse = math.min(vpLookbackInput, bar_index + 1)
+        float vpRangeHigh = na
+        float vpRangeLow = na
+
+        for i = 0 to vpUse - 1
+            float hh = high[i]
+            float ll = low[i]
+            vpRangeHigh := na(vpRangeHigh) ? hh : math.max(vpRangeHigh, hh)
+            vpRangeLow := na(vpRangeLow) ? ll : math.min(vpRangeLow, ll)
+
+        if not na(vpRangeHigh) and not na(vpRangeLow) and vpRangeHigh > vpRangeLow
+            float vpRowH = (vpRangeHigh - vpRangeLow) / vpRowsInput
+            array<float> vpVol = array.new<float>(vpRowsInput, 0.0)
+
+            for i = 0 to vpUse - 1
+                float bH = high[i]
+                float bL = low[i]
+                float bVol = nz(volume[i])
+                float bRange = bH - bL
+
+                if bRange <= 0
+                    int idx = math.max(0, math.min(vpRowsInput - 1, int((close[i] - vpRangeLow) / vpRowH)))
+                    array.set(vpVol, idx, array.get(vpVol, idx) + bVol)
+                else
+                    for r = 0 to vpRowsInput - 1
+                        float rLow = vpRangeLow + r * vpRowH
+                        float rHigh = rLow + vpRowH
+                        float overlap = math.min(bH, rHigh) - math.max(bL, rLow)
+                        if overlap > 0
+                            array.set(vpVol, r, array.get(vpVol, r) + bVol * overlap / bRange)
+
+            float vpMaxVol = 0.0
+            int vpPocIdx = 0
+            float vpGrandTot = 0.0
+
+            for r = 0 to vpRowsInput - 1
+                float t = array.get(vpVol, r)
+                vpGrandTot += t
+                if t > vpMaxVol
+                    vpMaxVol := t
+                    vpPocIdx := r
+
+            float vpVaSum = array.get(vpVol, vpPocIdx)
+            int vpUpPtr = vpPocIdx
+            int vpDnPtr = vpPocIdx
+
+            while vpVaSum < vpGrandTot * (vpVaPercentInput / 100.0) and (vpUpPtr < vpRowsInput - 1 or vpDnPtr > 0)
+                float va = vpUpPtr < vpRowsInput - 1 ? array.get(vpVol, vpUpPtr + 1) : -1.0
+                float vb = vpDnPtr > 0 ? array.get(vpVol, vpDnPtr - 1) : -1.0
+                if va >= vb
+                    vpUpPtr += 1
+                    vpVaSum += va
+                else
+                    vpDnPtr -= 1
+                    vpVaSum += vb
+
+            vpPOC := vpRangeLow + vpPocIdx * vpRowH + vpRowH / 2
+            vpVAH := vpRangeLow + (vpUpPtr + 1) * vpRowH
+            vpVAL := vpRangeLow + vpDnPtr * vpRowH
+
+            if showVolumeProfileLinesInput
+                int vpLineX1 = bar_index - vpUse + 1
+
+                vpPocLine := line.new(x1=vpLineX1, y1=vpPOC, x2=bar_index + 5, y2=vpPOC, color=colorOrange, width=2, style=line.style_solid)
+
+                vpPocLabel := label.new(
+                     x=bar_index + 5,
+                     y=vpPOC,
+                     text="POC",
+                     color=color.new(color.white, 100),
+                     textcolor=colorOrange,
+                     style=label.style_label_left,
+                     size=size.small
+                )
+
+                vpVahLine := line.new(x1=vpLineX1, y1=vpVAH, x2=bar_index + 5, y2=vpVAH, color=colorGray, width=1, style=line.style_dashed)
+                vpValLine := line.new(x1=vpLineX1, y1=vpVAL, x2=bar_index + 5, y2=vpVAL, color=colorGray, width=1, style=line.style_dashed)
+
+bool inValueArea =
+     useVolumeProfileInput and
+     not na(vpVAH) and
+     not na(vpVAL) and
+     close <= vpVAH and
+     close >= vpVAL
+
+// =====================================================
 // 5. ENGINE ROUTER
 // =====================================================
 bool richWeak =
@@ -1000,7 +1198,7 @@ else if dashboardPos == "Bottom Left"
 var table dash = table.new(
      position.top_right,
      2,
-     18,
+     19,
      bgcolor=colorThemeLabel,
      frame_color=colorThemeBorder,
      frame_width=2,
@@ -1269,13 +1467,39 @@ if barstate.islast
              volumeTrendText,
              useVolumeTrendInput ? volumeTrendColor : colorGray
         )
+
+        string vpDashText =
+             not useVolumeProfileInput
+                  ? "OFF"
+                  : na(vpVAH) or na(vpVAL)
+                       ? "N/A"
+                       : close > vpVAH
+                            ? "ABOVE VAH " + str.tostring(vpVAH, format.mintick)
+                            : close < vpVAL
+                                 ? "BELOW VAL " + str.tostring(vpVAL, format.mintick)
+                                 : "IN VALUE AREA"
+
+        color vpDashColor =
+             not useVolumeProfileInput
+                  ? colorGray
+                  : inValueArea
+                       ? colorGreen
+                       : colorThemeValue
+
+        f_dashboardRow(
+             dash,
+             18,
+             "VOL PROFILE",
+             vpDashText,
+             vpDashColor
+        )
     else
         table.clear(
              table_id=dash,
              start_column=0,
              start_row=0,
              end_column=1,
-             end_row=17
+             end_row=18
         )
 
 // =====================================================
@@ -1568,9 +1792,11 @@ if barstate.islast
              size=size.small
         )
 
-// Either method clearing counts as "price has come to you" -- Fibonacci
-// (swing-based) or the RAP pullback zone (mean-reversion-based).
-bool atGoodEntryZone = inRetracement or inPullbackZone
+// Any of the three clearing counts as "price has come to you" -- Fibonacci
+// (swing-based), the RAP pullback zone (mean-reversion-based), or being
+// back inside the Volume Profile's Value Area (where volume actually
+// transacted, not just where price happened to swing).
+bool atGoodEntryZone = inRetracement or inPullbackZone or inValueArea
 
 // =====================================================
 // 9. PSYCHOLOGY GATEKEEPER
@@ -1614,10 +1840,12 @@ else if engine == "WAIT" or engine == "TREND WATCH"
     psychologyColor := colorGray
 else if isTrendEntry and not atGoodEntryZone
     // atGoodEntryZone = inRetracement (Fibonacci) OR inPullbackZone (RAP
-    // mean-reversion) -- either method clearing is enough to stop
-    // "chasing." When neither has, show the RAP-based zone's actual price
-    // range if one exists (the Fibonacci zone has no single frozen range to
-    // quote the same way, since it's recalculated from the live swing).
+    // mean-reversion) OR inValueArea (Volume Profile) -- any one method
+    // clearing is enough to stop "chasing." When none have, show the
+    // RAP-based zone's actual price range if one exists (the Fibonacci and
+    // Value Area zones have no single frozen range to quote the same way,
+    // since both are recalculated live rather than frozen on a trigger
+    // bar).
     string pullbackRangeText =
          not na(pullbackZoneTop) and not na(pullbackZoneBottom)
               ? "\n~" + str.tostring(pullbackZoneBottom, format.mintick) + "-" + str.tostring(pullbackZoneTop, format.mintick)
