@@ -385,12 +385,14 @@ float pullbackZoneWidthAtrInput = input.float(
 // thinning participation as a move continues is a classic tell distinct
 // from any single quiet bar or from delta direction.
 //
-// Deliberately informational, not a hard gate on the router -- CVD
-// divergence already hard-blocks trendLongContext/trendShortContext, and
-// stacking a second hard volume-based block risked making trend signals
-// too rare to be useful. This surfaces as a dashboard row and a psychology
-// banner caution instead, on top of an otherwise-clean trend signal rather
-// than preventing one.
+// CHANGE: originally shipped as informational-only (dashboard row +
+// banner caution, no gating), out of concern that stacking a second hard
+// volume-based block alongside CVD divergence would make trend signals
+// too rare. Switched to a hard gate on request -- avoiding thin,
+// institutionally-unconfirmed participation matters more here than
+// signal frequency, so volumeTrendConfirms is now baked directly into
+// trendLongContext/trendShortContext (see the ENGINE ROUTER section),
+// the same pattern cvdConfirmsLong/cvdConfirmsShort already use.
 // =====================================================
 string groupVolTrend = "Volume Trend"
 
@@ -398,7 +400,7 @@ bool useVolumeTrendInput = input.bool(
      defval=true,
      title="Use Volume Trend",
      group=groupVolTrend,
-     tooltip="Master toggle. When off, Volume Trend reads FLAT unconditionally and the psychology banner's thinning-volume caution never fires."
+     tooltip="Master toggle. When off, Volume Trend reads FLAT unconditionally, never blocks TREND LONG/SHORT, and the psychology banner's thinning-volume caution never fires."
 )
 
 int volumeTrendLenInput = input.int(
@@ -482,6 +484,13 @@ if volumeTrendState == "RISING"
     volumeTrendColor := colorBlue
 else if volumeTrendState == "FALLING"
     volumeTrendColor := colorRed
+
+// CHANGE: was a psychology-banner-only warning; now a hard gate matching
+// cvdConfirmsLong/cvdConfirmsShort's pattern below. Not direction-specific
+// like those two -- thinning participation is a red flag for either side
+// of a trend equally, so one boolean gates both trendLongContext and
+// trendShortContext.
+bool volumeTrendConfirms = not useVolumeTrendInput or volumeTrendState != "FALLING"
 
 [plusDI, minusDI, adx] = ta.dmi(adxLen, adxLen)
 
@@ -830,14 +839,18 @@ bool cheapWeak =
      rapZ <= -misRich and
      acceptScore < mrWeakAcceptMax
 
-// cvdConfirmsLong/cvdConfirmsShort: a pure ADDITIONAL gate, not folded into
-// acceptScore -- keeps "is this regime tradeable" (the score) separate from
-// "does order flow confirm this specific direction" (CVD), matching the
-// architecture's existing when/where split rather than merging every signal
-// into one number. A bearish CVD divergence (rally not backed by net
-// buying) blocks TREND LONG; the mirror case blocks TREND SHORT. With
-// useCVDInput off, both gates pass unconditionally -- zero behavior change
-// from before this module existed.
+// cvdConfirmsLong/cvdConfirmsShort/volumeTrendConfirms: pure ADDITIONAL
+// gates, not folded into acceptScore -- keeps "is this regime tradeable"
+// (the score) separate from "does order flow/participation confirm this"
+// (CVD, volume trend), matching the architecture's existing when/where
+// split rather than merging every signal into one number. A bearish CVD
+// divergence (rally not backed by net buying) blocks TREND LONG; the
+// mirror case blocks TREND SHORT. Falling volume trend blocks BOTH
+// equally -- thinning participation is a red flag regardless of
+// direction, not something to read as a directional tell the way CVD
+// divergence is. With the respective toggles off, each gate passes
+// unconditionally -- zero behavior change from before either module
+// existed.
 bool trendLongContext =
      (regime == "TREND" or regime == "EXPANSION") and
      bias == "BULL" and
@@ -845,7 +858,8 @@ bool trendLongContext =
      plusDI > minusDI and
      vwapSlopeNorm > trendSlopeMin and
      acceptScore >= trendAcceptMinRouter and
-     cvdConfirmsLong
+     cvdConfirmsLong and
+     volumeTrendConfirms
 
 bool trendShortContext =
      (regime == "TREND" or regime == "EXPANSION") and
@@ -854,7 +868,8 @@ bool trendShortContext =
      minusDI > plusDI and
      vwapSlopeNorm < -trendSlopeMin and
      acceptScore >= trendAcceptMinRouter and
-     cvdConfirmsShort
+     cvdConfirmsShort and
+     volumeTrendConfirms
 
 bool mrLongContext =
      regime == "RANGE" and
@@ -1573,6 +1588,12 @@ if engine == "BLOCK"
 else if engine == "WAIT BREAKOUT"
     psychologyMessage := "WAIT\nSQUEEZE COMPRESSION"
     psychologyColor := colorOrange
+else if engine == "TREND WATCH" and (bearishCvdDivergence or bullishCvdDivergence) and useVolumeTrendInput and volumeTrendState == "FALLING"
+    // Both gates vetoed this trend context -- name both causes rather than
+    // picking one, since either alone would already explain the block and
+    // seeing both together is a stronger signal to actually stay out.
+    psychologyMessage := "CAUTION\nCVD DIVERGENCE + THINNING VOLUME"
+    psychologyColor := colorOrange
 else if engine == "TREND WATCH" and (bearishCvdDivergence or bullishCvdDivergence)
     // TREND WATCH is exactly the state a divergence-blocked trend context
     // falls through to (cvdConfirmsLong/Short already vetoed
@@ -1580,6 +1601,13 @@ else if engine == "TREND WATCH" and (bearishCvdDivergence or bullishCvdDivergenc
     // showing up here specifically means "this expansion isn't backed by
     // order flow," worth a distinct message from generic "no commitment."
     psychologyMessage := "CAUTION\nCVD DIVERGENCE -- POSSIBLE EXHAUSTION"
+    psychologyColor := colorOrange
+else if engine == "TREND WATCH" and useVolumeTrendInput and volumeTrendState == "FALLING"
+    // CHANGE: volumeTrendConfirms is now baked into trendLongContext/
+    // trendShortContext the same way cvdConfirmsLong/Short are, so a
+    // falling-volume block lands here too instead of only reaching an
+    // already-live TREND LONG/SHORT the way the old soft-warning version did.
+    psychologyMessage := "CAUTION\nTHINNING VOLUME -- NO INSTITUTIONAL FOLLOW-THROUGH"
     psychologyColor := colorOrange
 else if engine == "WAIT" or engine == "TREND WATCH"
     psychologyMessage := "WAIT\nNO COMMITMENT"
@@ -1596,16 +1624,13 @@ else if isTrendEntry and not atGoodEntryZone
               : ""
     psychologyMessage := "DON'T CHASE\nLET PRICE COME TO YOU" + pullbackRangeText
     psychologyColor := color.yellow
-else if isTrendEntry and useVolumeTrendInput and volumeTrendState == "FALLING"
-    // Reached here only after clearing the entry-zone check above -- this
-    // is specifically "about to call it a clean setup, but participation
-    // has been thinning as the move continues," a fading-breakout warning
-    // distinct from RVOL (single-bar snapshot) or CVD (direction). Warns
-    // without blocking -- see the "2D" input group note on why this stays
-    // informational rather than a hard gate like CVD divergence.
-    psychologyMessage := "CAUTION\nTREND ON THINNING VOLUME"
-    psychologyColor := colorOrange
 else
+    // REMOVED (dead code after the CVD-match change above): a branch here
+    // checking "isTrendEntry and volumeTrendState == FALLING" can no
+    // longer fire -- volumeTrendConfirms is now baked into
+    // trendLongContext/trendShortContext, so engine can never equal TREND
+    // LONG/SHORT while volume trend reads FALLING; that case is caught by
+    // the TREND WATCH branches above instead.
     psychologyMessage := "HIGH QUALITY SETUP\nREADY TO EVALUATE"
     psychologyColor := colorGreen
 
