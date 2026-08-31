@@ -378,6 +378,34 @@ where most sources have at least one hard ML/statistics barrier. The exceptions:
 
 ## Applied in This Repo
 
-*(none yet — this file catalogs prior art and candidate upgrades; see Mapping above for
-the two concrete candidates — ATR-scaled position sizing and MA-family confluence —
-flagged as worth a dedicated implementation pass if the user wants to pursue either.)*
+**2026-08-31** — Built `Kaufman_Trend_System_Swing.pine`, a new standalone daily/swing
+strategy implementing most of this chapter directly: selectable trend engine
+(SMA/EMA/Linear Regression) with optional 2-trend confirmation (enter on agreement,
+exit to flat on conflict); ATR/volatility or Modified Bollinger bands with an optional
+band-clear entry requirement; three entry-timing styles (Immediate, Delay N Bars, ATR
+Retracement-or-Timeout) as a pending-order state machine, with exits always immediate;
+the ATR-scaled position-sizing formula (`investment / (ATR × Big Point Value)`) via
+`syminfo.pointvalue`, applied as the properly-designed fix class for the zero-qty
+sizing bugs root-caused earlier in the Trend Following Strategy v6 files; and
+display-only readouts for the anticipated single-trend flip price, a self-derived
+(not literally transcribed — see the CP2 note below) projected 2-trend crossover price
+and MDI oscillator, and the MA-family confluence count. No profit target of any kind,
+per this chapter's own explicit fat-tail-capture warning; only an optional, off-by-
+default wide catastrophic stop.
+
+**Known residual uncertainty**: the CP2 projected-crossover formula was re-derived
+algebraically from the equal-average condition rather than transcribed literally from
+the source excerpt, because the OCR/vision-extracted text of Kaufman's own printed
+formula did not algebraically reduce to a consistent result on manual re-derivation —
+flagged as a transcription-fidelity risk in the source, not a error in the arithmetic
+used here. The implemented formula is independently verified correct for what it's
+solving (the price at which two moving averages of period m and n will next be equal);
+if exact agreement with Kaufman's own notation matters, check it against the physical
+text.
+
+**Not yet applied**: this build is not compiler-verified (no live Pine editor access
+in this environment) — validated only via this session's established static-analysis
+suite (bracket/paren balance, tabs, single strategy() declaration, ternary-nesting
+depth, duplicate/unused variables, dashboard row-count match) and a manual review pass.
+Flag any compile error back to this session the same way prior scripts' errors were
+resolved this session.
