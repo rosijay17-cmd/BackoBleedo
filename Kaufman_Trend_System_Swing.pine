@@ -272,9 +272,55 @@ bool showConfluenceInput = input.bool(
 )
 
 // =====================================================
-// 7. DISPLAY
+// 7. COOLDOWN & TRADING HOURS
+// Cooldown here uses the same "count bars since the last ACCEPTED signal"
+// technique used to fix Trend_Following_Strategy_v6_Cooldown.pine earlier
+// this session, not a persisted armed/disarmed toggle. That earlier bug
+// was specifically a same-bar race between a rearm trigger and a disarm
+// trigger on two separate boolean checks -- this design has no equivalent
+// race to begin with, because "is cooldown elapsed" is recomputed fresh
+// every bar directly from lastEntryBar (bar_index - lastEntryBar >=
+// cooldownBarsInput), rather than toggled and remembered. lastEntryBar is
+// set at the moment a signal is ACCEPTED (armed into pendingLong/
+// pendingShort), the same "signal bar, not fill bar" choice that made the
+// earlier fix immune to strategy.closedtrades' fill-timing lag.
 // =====================================================
-string groupDisplay = "7. Display"
+string groupCooldown = "7. Cooldown & Trading Hours"
+
+int cooldownBarsInput = input.int(
+     defval=5,
+     title="Cooldown (Bars After Last Entry Signal)",
+     minval=0,
+     maxval=100,
+     group=groupCooldown,
+     tooltip="Blocks any new entry signal (long or short) for this many bars after the last accepted entry signal, regardless of whether that trade has closed yet. Set to 0 to disable."
+)
+
+bool useSessionFilterInput = input.bool(
+     defval=true,
+     title="Restrict Entries To Trading Hours",
+     group=groupCooldown,
+     tooltip="When on, new entry signals are only accepted for bars whose open time falls inside the session below; existing positions are never held up from exiting by this filter. Matters most if this script is ever run on an intraday timeframe -- on Daily bars (the timeframe this system is designed for) every regular session bar typically falls inside a normal trading-hours window already, so this filter will rarely bind there."
+)
+
+string sessionInput = input.session(
+     defval="0930-1600",
+     title="Trading Hours",
+     group=groupCooldown,
+     tooltip="Default is the regular US equity/index-futures RTH window, in the timezone set below (not the symbol's exchange timezone, which can differ -- e.g. CME futures default to Chicago time)."
+)
+
+string sessionTimezoneInput = input.string(
+     defval="America/New_York",
+     title="Trading Hours Timezone",
+     group=groupCooldown,
+     tooltip="Timezone the Trading Hours session string above is interpreted in."
+)
+
+// =====================================================
+// 8. DISPLAY
+// =====================================================
+string groupDisplay = "8. Display"
 
 bool showDashboardInput = input.bool(defval=true, title="Show Dashboard", group=groupDisplay)
 bool showBandsPlotInput = input.bool(defval=true, title="Plot Bands", group=groupDisplay)
@@ -423,9 +469,14 @@ var int pendingLongBar = na
 var int pendingShortBar = na
 var float pendingLongLimit = na
 var float pendingShortLimit = na
+var int lastEntryBar = na
 
-bool freshLongSignal = finalLongCond and not finalLongCond[1] and strategy.position_size <= 0
-bool freshShortSignal = finalShortCond and not finalShortCond[1] and strategy.position_size >= 0
+bool inSession = not na(time(timeframe.period, sessionInput, sessionTimezoneInput))
+bool sessionOk = not useSessionFilterInput or inSession
+bool cooldownElapsed = na(lastEntryBar) or (bar_index - lastEntryBar) >= cooldownBarsInput
+
+bool freshLongSignal = finalLongCond and not finalLongCond[1] and strategy.position_size <= 0 and cooldownElapsed and sessionOk
+bool freshShortSignal = finalShortCond and not finalShortCond[1] and strategy.position_size >= 0 and cooldownElapsed and sessionOk
 bool freshFlatSignal = use2TrendInput and flatCond and not flatCond[1] and strategy.position_size != 0
 
 if freshFlatSignal
@@ -437,12 +488,14 @@ if freshLongSignal
     pendingLongBar := bar_index
     pendingLongLimit := close - retraceAtrMultInput * atrForBand
     pendingShort := false
+    lastEntryBar := bar_index
 
 if freshShortSignal
     pendingShort := true
     pendingShortBar := bar_index
     pendingShortLimit := close + retraceAtrMultInput * atrForBand
     pendingLong := false
+    lastEntryBar := bar_index
 
 if strategy.position_size > 0
     pendingLong := false
@@ -505,7 +558,7 @@ if useCatStopInput and strategy.position_size != 0
 var table dash = table.new(
      position.top_right,
      2,
-     14,
+     16,
      bgcolor=color.rgb(8, 20, 38),
      frame_color=color.rgb(35, 125, 255),
      frame_width=2,
@@ -603,6 +656,14 @@ if barstate.islast and showDashboardInput
     f_row(dash, 12, "OPEN P/L", str.tostring(strategy.openprofit, "#,###"), openPlColor)
 
     f_row(dash, 13, "CLOSED TRADES", str.tostring(strategy.closedtrades), color.rgb(88, 105, 132))
+
+    string cooldownText = cooldownElapsed ? "READY" : str.tostring(cooldownBarsInput - (bar_index - lastEntryBar)) + " BARS LEFT"
+    color cooldownColor = cooldownElapsed ? color.rgb(88, 105, 132) : color.rgb(245, 160, 20)
+    f_row(dash, 14, "COOLDOWN", cooldownBarsInput <= 0 ? "OFF" : cooldownText, cooldownBarsInput <= 0 ? color.rgb(88, 105, 132) : cooldownColor)
+
+    string sessionText = not useSessionFilterInput ? "OFF" : inSession ? "OPEN" : "CLOSED"
+    color sessionColor = not useSessionFilterInput ? color.rgb(88, 105, 132) : inSession ? color.rgb(25, 195, 100) : color.rgb(245, 55, 80)
+    f_row(dash, 15, "TRADING HOURS (" + sessionInput + ")", sessionText, sessionColor)
 
 // =====================================================
 // PLOTS
