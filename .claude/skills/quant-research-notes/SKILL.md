@@ -36,6 +36,7 @@ are shared:
 | 4 | RL + fuzzy-logic hierarchical multi-strategy capital allocation | `references/rl-fuzzy-strategy-allocation.md` | Huang, Chen, Chang & Huang (2025), *Applied Soft Computing* |
 | 5 | Implied vs. historical volatility as a realized-vol predictor | `references/implied-vs-historical-volatility.md` | Szakmary, Ors, Kim & Davidson (2003), *J. of Banking & Finance* |
 | 6 | Optimal trend-following as a two-threshold hysteresis rule on regime probability | `references/optimal-trend-following-boundaries.md` | Dai, Yang, Zhang & Zhu (2016), *Mathematics of Operations Research* |
+| 7 | Attention-autoencoder + correlation clustering for dynamic support/resistance levels | `references/deepsupp-attention-support-resistance.md` | Kriuk, Ng & Al Hossain (2025), arXiv:2507.01971 |
 
 ## Portability Matrix
 
@@ -56,6 +57,10 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
 | HJB free-boundary solve for the exact optimal thresholds | ❌ Not feasible | ⚠️ Possible but heavy | System of variational inequalities — theory-grounding for a design choice, not a library to import |
 | Two-threshold hysteresis band (strict entry, loose exit) on a regime signal | ✅ Direct — the *structure*, not the exact optimal levels | ✅ | Doesn't need a real Wonham filter; apply to any 0-1 regime proxy Pine already computes |
 | Wonham filter for a literal regime-probability `p_t` | ⚠️ Not really — needs a filtering recursion each bar | ✅ Feasible, lighter than paper #2's TVTP pipeline | A genuinely tractable middle-ground project if a literal implementation is ever wanted |
+| Multi-head attention autoencoder (training) | ❌ Not feasible | ✅ Required | No backprop/gradient training of any kind in Pine |
+| Rolling Spearman correlation matrix (32×32, per paper #7) | ❌ Not feasible as a matrix pipeline | ✅ Required | Pine has single-pair `ta.correlation`, not a batched matrix operation |
+| DBSCAN density-based clustering | ❌ Not feasible | ✅ Required | No clustering primitives in Pine at all |
+| Volume-clustered structural levels (the *goal* paper #7 targets) | ✅ Direct, via Volume Profile (POC/VAH/VAL) | — | Already built in `Supply_and_Demand_Zones_XL.pine` — achieves paper #7's stated aim (avoid redundant, evenly-spaced levels) with transparent, causally-grounded math instead of a trained model whose own reported edge is weak (see reference file's Critique) |
 
 ## Cross-Paper Synthesis
 
@@ -183,3 +188,22 @@ can be corrected against the real implementation rather than inference.
   empirical and a theoretical direction respectively. Directly informs the MNQ
   trend-following strategy design discussed the same session (see the Mapping section
   above): the regime/bias gate should be a genuine two-threshold band from the start.
+- **2026-08-31** — Ingested paper #7: Kriuk, Ng & Al Hossain (2025), "DeepSupp:
+  Attention-Driven Correlation Pattern Analysis for Dynamic Time Series Support and
+  Resistance Levels Identification" (arXiv:2507.01971) — a 4-stage deep learning
+  pipeline (VWAP/volume feature engineering → rolling Spearman correlation matrices →
+  multi-head attention autoencoder → DBSCAN clustering) for support/resistance
+  detection. Evaluated against `Regime_Engine_TCO_Gatekeeper.pine` on user request; not
+  recommended for implementation — see the new reference file's Independent Critique
+  (the paper's own Table 1 shows ~40% of its weighted composite score resting on
+  metrics that don't differentiate between any of the 7 methods it tests, and it loses
+  the highest-weighted metric to the simplest baseline) and Portability section (no ML
+  training, matrix-correlation pipeline, or clustering primitive exists in Pine — a
+  hard barrier, not extra effort). No contradiction with papers #1-6; this is the
+  skill's first pure market-microstructure/level-detection paper, largely
+  non-overlapping with the regime/allocation/volatility papers already ingested. The
+  conceptual goal DeepSupp targets (non-redundant structural levels vs. naive methods)
+  is already achievable in this repo via the Volume Profile (POC/VAH/VAL) module built
+  in `Supply_and_Demand_Zones_XL.pine` this session — flagged as the practical
+  alternative if `Regime_Engine_TCO_Gatekeeper.pine`'s simple swing-pivot levels are
+  ever upgraded.
