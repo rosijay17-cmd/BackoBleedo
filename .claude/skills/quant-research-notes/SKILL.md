@@ -1,6 +1,6 @@
 ---
 name: quant-research-notes
-description: Persistent knowledge base of reusable concepts, formulas, and documented pitfalls from academic papers on algorithmic/quantitative trading (signal volatility, Markov-switching regimes, breakout/multi-indicator combination, RL+fuzzy multi-strategy allocation, implied-vs-historical volatility). Load this before designing, revising, or backtesting any Pine Script strategy or indicator in this repo, or before doing quant research for the PANDA/QUANTS/quantor work — check it for an applicable technique or a known failure mode before building new logic from scratch.
+description: Persistent knowledge base of reusable concepts, formulas, and documented pitfalls from academic papers and reference texts on algorithmic/quantitative trading (signal volatility, Markov-switching regimes, breakout/multi-indicator combination, RL+fuzzy multi-strategy allocation, implied-vs-historical volatility, support/resistance detection, cycle analysis). Load this before designing, revising, or backtesting any Pine Script strategy or indicator in this repo, or before doing quant research for the PANDA/QUANTS/quantor work — check it for an applicable technique or a known failure mode before building new logic from scratch.
 ---
 
 # Quant Research Notes
@@ -37,6 +37,7 @@ are shared:
 | 5 | Implied vs. historical volatility as a realized-vol predictor | `references/implied-vs-historical-volatility.md` | Szakmary, Ors, Kim & Davidson (2003), *J. of Banking & Finance* |
 | 6 | Optimal trend-following as a two-threshold hysteresis rule on regime probability | `references/optimal-trend-following-boundaries.md` | Dai, Yang, Zhang & Zhu (2016), *Mathematics of Operations Research* |
 | 7 | Attention-autoencoder + correlation clustering for dynamic support/resistance levels | `references/deepsupp-attention-support-resistance.md` | Kriuk, Ng & Al Hossain (2025), arXiv:2507.01971 |
+| 8 | Cycle identification (peak/valley measurement, triangular-weighted MACD, trigonometric curve fitting) | `references/cycle-analysis-kaufman.md` | Kaufman (2019), *Trading Systems and Methods*, Ch. 11 |
 
 ## Portability Matrix
 
@@ -61,6 +62,10 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
 | Rolling Spearman correlation matrix (32×32, per paper #7) | ❌ Not feasible as a matrix pipeline | ✅ Required | Pine has single-pair `ta.correlation`, not a batched matrix operation |
 | DBSCAN density-based clustering | ❌ Not feasible | ✅ Required | No clustering primitives in Pine at all |
 | Volume-clustered structural levels (the *goal* paper #7 targets) | ✅ Direct, via Volume Profile (POC/VAH/VAL) | — | Already built in `Supply_and_Demand_Zones_XL.pine` — achieves paper #7's stated aim (avoid redundant, evenly-spaced levels) with transparent, causally-grounded math instead of a trained model whose own reported edge is weak (see reference file's Critique) |
+| Triangular-weighted MA / triangular MACD (fixed, known period) | ✅ Direct — a custom weighted-average kernel, same shape as any Pine MA | — | Just math; the hard part is picking a real period (see next row), not the indicator itself |
+| Peak/valley cycle-length measurement (discover a candidate period) | ❌ Not for live Pine | ✅ Preferred (offline, once) | Find the period offline first, then hardcode it into a Pine oscillator — never search for it live bar-by-bar |
+| Trigonometric least-squares curve fit, searching over frequency `ω` | ❌ Not feasible as a live search | ✅ Required (Solver/`scipy.optimize` or equivalent) | A *fixed*-`ω` single-frequency fit reduces to closed-form OLS Pine could compute, but finding `ω` itself is the same class of iterative/nonlinear problem as the MLE and clustering steps already flagged elsewhere in this matrix |
+| Fourier/spectral analysis, MESA (Ehlers) | ⚠️ Unassessed | ⚠️ Unassessed | Not covered in the source excerpt ingested (paper #8) — flagged as a gap, not evaluated either way yet |
 
 ## Cross-Paper Synthesis
 
@@ -106,6 +111,27 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
   stated objective is return-maximizing, the optimal policy it derives still conditions
   on nothing but the regime signal itself, the same "predict the regime, not the
   return" prescription paper #2 reaches empirically.
+- **A cycle-based decomposition (paper #8) is a genuinely different generative model
+  from the regime-switching paradigm papers #2 and #6 already established here, not a
+  variant of it.** Trend+seasonal+cycle+noise treats price as a sum of continuous,
+  periodic components; Markov-switching treats it as a discrete hidden state with
+  transition probabilities. This repo's own TCO engine (REGIME: TREND/EXPANSION/CHOP/SQZ)
+  is architecturally a regime-switching classifier, not a cycle detector — paper #8
+  doesn't contradict anything already recorded, but it's a reminder that "the market has
+  structure" can mean two different mathematical things, and this repo has so far only
+  built the regime-switching kind. Adding a genuine cycle-based signal would need its
+  own from-scratch validation (see the next point), not an extension of existing gates.
+- **Paper #8's own worked examples are the clearest illustration yet, across this
+  entire skill, of a source policing its own claims' evidence quality in real time** —
+  the cattle cycle (real fundamental mechanism, consistent measured period across two
+  disjoint eras) is presented as valid, the Swiss franc "cycle" (inconsistent period,
+  no proposed mechanism) as a deliberate negative example, and multi-decade
+  political/war cycles as citations the author himself flags as too thin to trust
+  (incompatible period claims between sources, "only three full cycles... difficult to
+  tell... if the entire pattern is just a coincidence"). Worth internalizing as a
+  template for evaluating *any* future pattern-detection claim in this skill, cycle or
+  otherwise: does a real mechanism exist, and does the claimed period hold up across
+  multiple independent samples — not just "does the chart look periodic."
 - **A single backtest run is a single sample path, and paper #6 proves how wide that
   variance can be even under a correctly-specified model** (identical parameters,
   identical thresholds, single-path total returns spanning roughly 0.08x to ~1,888x
@@ -207,3 +233,20 @@ can be corrected against the real implementation rather than inference.
   in `Supply_and_Demand_Zones_XL.pine` this session — flagged as the practical
   alternative if `Regime_Engine_TCO_Gatekeeper.pine`'s simple swing-pivot levels are
   ever upgraded.
+- **2026-08-31** — Ingested paper #8: Kaufman (2019), "Cycle Analysis" (Ch. 11 of
+  *Trading Systems and Methods*, uploaded as a 21-page excerpt). A textbook survey, not
+  an empirical study — first source in this skill of that kind, and it introduces a
+  genuinely new generative-model paradigm (trend+seasonal+cycle+noise decomposition)
+  distinct from the Markov-switching regime paradigm papers #2/#6 already established
+  here; see the new Cross-Paper Synthesis notes. Practical takeaways: the triangular
+  MACD (a triangular-weighted MA pair, differenced) is directly portable to Pine, but
+  only once a genuine periodic component is confirmed offline for the actual
+  instrument/timeframe — the source's own cattle-cycle (valid, fundamentals-backed) vs.
+  Swiss-franc (invalid, no mechanism, inconsistent period) contrast is the operative
+  lesson, more than any formula. Several of the source's own later cycle claims
+  (8.6-year business cycle, 25/54-year political cycles) are flagged by the author
+  himself as too thin to trust — carried into the reference file's Key Findings rather
+  than treated as usable signal. No contradiction with papers #1-7. The excerpt stops
+  before the chapter's own stated main methods (Fourier/spectral analysis, Ehlers'
+  MESA) — flagged as an open gap if the rest of the chapter or a dedicated source is
+  ever supplied.
