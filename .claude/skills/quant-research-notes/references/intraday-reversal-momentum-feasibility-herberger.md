@@ -164,5 +164,18 @@ a signal to implement directly:
 
 ## Applied in This Repo
 
-*(none yet — the transaction-cost break-even check is the concrete, ready-to-apply
-technique; note here if it's run against any of this repo's intraday strategies.)*
+**2026-09-01** — Built `Herberger_Intraday_Reversal_Feasibility.pine`, a standalone
+strategy porting this paper's methodology and its own feasibility check directly. The
+paper's cross-sectional "worst of 30 stocks" selection is adapted to a time-series
+equivalent (rolling percentile rank of this instrument's own ranking-period return
+history — the same TSM-vs-CSM adaptation already noted for paper #12), long-only per
+the paper's own retail-cost framing, with the ranking/skip/holding structure ported
+literally (skip bars between ranking and holding, fixed holding-period exit, no
+signal-driven stop by default). The centerpiece is a live implementation of this
+paper's actual headline finding: the script tracks its own realized gross (pre-cost)
+average return per closed trade via `strategy.closedtrades.entry_price`/`exit_price`
+and compares it directly, in the same units, against an estimated round-trip cost —
+producing a live VIABLE / NOT VIABLE verdict on the dashboard, the same comparison
+that produced this paper's 0.19bp-effect-vs-0.48bp-fee result. Expect NOT VIABLE most
+of the time on a live run — that would be this paper's own finding replicating on
+MNQ/NQ, not a bug in the script.
