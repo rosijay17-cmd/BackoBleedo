@@ -40,6 +40,7 @@ are shared:
 | 8 | Cycle identification (peak/valley measurement, triangular-weighted MACD, trigonometric curve fitting) | `references/cycle-analysis-kaufman.md` | Kaufman (2019), *Trading Systems and Methods*, Ch. 11 |
 | 9 | Trend systems toolkit (bands/channels, single/multi-trend crossovers, ATR position sizing, MA-family confluence, projected crossovers) | `references/trend-systems-kaufman.md` | Kaufman (2019), *Trading Systems and Methods*, Ch. 8 |
 | 10 | Intraday pivot/exhaustion concepts (ORB Kilroy, Break-Away Pivots/Laps, Y-High/Low exhaustion, gap-close reversal, EMA-translation, Inverse 78.6% target) | `references/pivot-exhaustion-grid-scheier.md` | Scheier (2014), *Pivots, Patterns, and Intraday Swing Trades*, Ch. 3 |
+| 11 | Candlestick pattern catalog + pivot-point confluence (multi-timeframe agreement, first-test-only fade rule, P3T signal architecture) | `references/candlestick-patterns-and-pivot-confluence-person.md` | Person (2004), *A Complete Guide to Technical Trading Tactics*, Ch. 4 & 6 |
 
 ## Portability Matrix
 
@@ -81,6 +82,9 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
 | Inverse 78.6% Projection Rule (exit target) | ✅ Direct, once a Break-Away Pivot is identified | — | Projection arithmetic is trivial; detecting the Ledge itself is the harder, judgment-based part |
 | Break-Away Pivot/Ledge detection, manual trend lines, Measured-Move chart-pattern targets (triangle/H&S/channel/wedge) | ⚠️ Needs a real detection algorithm | — | None of these are specified mechanically in the source; this repo's `Auto_Pattern_Detector_Targets_MarkitTick_Session_Strategy.pine` may already be relevant prior art for the pattern-target family |
 | True Market Profile (TPO-based Value Area/POC) | ❌ Not native to Pine | — | No time-price-opportunity primitive in Pine; Volume Profile (already built this session) is the source's own named substitute |
+| Full candlestick pattern catalog (hammer/doji variants/engulfing/harami/dark cloud/piercing/three-candle/three-method patterns) | ✅ Direct | — | Every pattern is pure `open`/`high`/`low`/`close` geometry with a bar or two of history — the most cleanly portable content in this skill so far; no repo script currently implements formal candle-pattern recognition |
+| Multi-timeframe pivot confluence, "first test only" pivot-fade rule | ✅ Direct | — | Mechanical once a base pivot-point module exists; no current analogue in this repo |
+| "Eight to ten new records" exhaustion counter, "pillar of strength/weakness" (multi-candle engulfing) | ✅ Direct | — | Streak counters and consumed-candle-count checks; straightforward extensions of patterns already in the candle catalog |
 
 ## Cross-Paper Synthesis
 
@@ -191,6 +195,27 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
   convergence from an unrelated, much less rigorous source doesn't upgrade either
   claim to "proven," but it's a real reason for modest additional confidence beyond
   what either source alone would justify.
+- **Paper #11 gives this repo's entire confluence-gate architecture a named,
+  citable, decades-old precedent.** Sklarew's 1980 "Rule of Multiple Techniques"
+  ("the more indicators that confirm each other, the better the chance of an accurate
+  forecast"), quoted by Person, is the same structural idea as this repo's
+  `Regime_Engine_TCO_Gatekeeper.pine` AND-gating regime + bias + acceptance score +
+  CVD confirmation + volume trend confirmation before calling anything tradeable —
+  and Person's own "P3T signal" (pivot level + candle pattern + oscillator
+  confirmation) is a concrete three-part instance of exactly that pattern. Worth
+  treating as independent confirmation that this repo's confluence-first design
+  philosophy has real pedigree, not as license to keep stacking gates indefinitely —
+  paper #9's "a 2-trend system helps a trending market, not a noisy one" finding is
+  still the operative caution on how far to take it.
+- **Papers #10 and #11 independently describe the same Floor Trader's Pivot Point
+  formula and the same all-session-vs-day-only session-range pitfall**, a decade
+  apart (Person, 2004; Scheier, 2014) without either citing the other. Two unrelated
+  practitioner sources converging on identical mechanics is a mild point in favor of
+  the formula being genuinely standard trading-floor knowledge rather than one
+  author's idiosyncratic construction — though it says nothing about whether trading
+  off the resulting levels actually has an edge, which neither source tests
+  systematically. See `references/candlestick-patterns-and-pivot-confluence-person.md`'s
+  Overlap note for the full cross-reference.
 - **A single backtest run is a single sample path, and paper #6 proves how wide that
   variance can be even under a correctly-specified model** (identical parameters,
   identical thresholds, single-path total returns spanning roughly 0.08x to ~1,888x
@@ -341,3 +366,19 @@ can be corrected against the real implementation rather than inference.
   Two claims independently converge with existing skill entries without either source
   citing the other — see the new Cross-Paper Synthesis note. No contradiction with
   papers #1-9.
+- **2026-09-01** — Ingested paper #11: Person (2004), "A Complete Guide to Technical
+  Trading Tactics" (Ch. 4 "Candle Charts" and Ch. 6 "Pivot Point Analysis"). Same
+  evidentiary category as paper #10 (practitioner's book, worked chart examples, no
+  systematic backtest) — logged with that weighting stated explicitly. Two chapters
+  worth of content: a full, precisely-defined, and unusually cleanly-portable
+  candlestick pattern catalog (hammer/star/doji variants/engulfing/harami/dark cloud/
+  piercing/three-candle patterns/three-method continuation patterns) that no script in
+  this repo currently implements; and pivot-point techniques including multi-
+  timeframe pivot confluence, a "first test only" pivot-fade rule, an "eight to ten
+  new records" exhaustion counter, and the "pillar of strength/weakness" multi-candle
+  engulfing refinement. Overlaps with paper #10 on the Floor Trader's Pivot Point
+  formula and its all-session-vs-day-only pitfall — cross-referenced rather than
+  re-derived; see the new reference file's Overlap note and the new Cross-Paper
+  Synthesis note on that convergence. Also surfaces Sklarew's 1980 "Rule of Multiple
+  Techniques," a decades-old, explicitly-named precedent for this repo's own
+  confluence-gate architecture. No contradiction with papers #1-10.
