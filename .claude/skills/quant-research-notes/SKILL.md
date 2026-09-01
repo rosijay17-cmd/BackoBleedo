@@ -224,6 +224,50 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
   kind of single path — walk-forward validation across multiple periods in `quantor`,
   not one in-sample run, is the only way to see whether an edge is really there.
 
+## Known Gaps / Wishlist
+
+Every source ingested so far (papers #1-11) falls into one of two buckets: academic
+regime/allocation/volatility papers, or discretionary practitioner books on levels and
+candle patterns. Two whole categories that matter directly for this repo's actual work
+are missing entirely. Ranked by expected value if the user's library can supply them:
+
+1. **Time-series momentum / trend-following, the actual academic literature** —
+   Moskowitz, Ooi & Pedersen, "Time Series Momentum" (*Journal of Financial
+   Economics*, 2012) is the seminal modern paper here, with real risk-adjusted return
+   statistics across dozens of futures markets including equity index futures. Given
+   how much trend-following work this session has done (Kaufman's two chapters, the
+   new Kaufman Trend System strategy), it's a real gap that this repo has never had
+   the core academic trend-following paper itself, only a textbook's treatment of it.
+2. **Backtest overfitting / statistical validation tools** — Bailey, Borwein, López de
+   Prado & Zhu, "The Probability of Backtest Overfitting" and the companion
+   "Deflated Sharpe Ratio" paper; López de Prado's *Advances in Financial Machine
+   Learning* (the triple-barrier method, meta-labeling, purged/embargoed
+   cross-validation). Nearly every paper in this skill's Cross-Paper Synthesis flags
+   overfitting as a risk (papers #2, #3, #4, #6, #9) without giving a rigorous way to
+   *measure* it — this is the natural, high-value next step, directly usable in the
+   `quantor` Python pipeline.
+3. **Order flow / market microstructure** — Easley, López de Prado & O'Hara on VPIN
+   ("The Volume Clock: Insights into the High-Frequency Paradigm"); Cont, Kukanov &
+   Stoikov, "The Price Impact of Order Book Events." Directly relevant to sharpening
+   (or honestly bounding the limits of) the CVD/order-flow module already built this
+   session in `Regime_Engine_TCO_Gatekeeper.pine` — real academic microstructure work
+   would clarify what a Pine-computable proxy can and can't actually capture relative
+   to true order-flow signals.
+4. **Position sizing / money management theory** — Ralph Vince, *Portfolio Management
+   Formulas* or *The Mathematics of Money Management* (Optimal f); the original Kelly
+   criterion paper (J. L. Kelly, 1956) and Ed Thorp's trading adaptations of it. This
+   repo currently uses ad hoc ATR-based and percent-of-equity sizing (see paper #9's
+   Mapping section) with no formal framework to check whether that sizing is leaving
+   edge on the table or risking ruin.
+5. **Volatility modeling beyond IV-vs-HV** — Corsi's HAR-RV ("heterogeneous
+   autoregressive" realized volatility) model, notably simple and effective relative
+   to GARCH; the original Engle/Bollerslev ARCH/GARCH papers for foundational
+   grounding beneath paper #5's IV/HV comparison.
+6. *(Lower priority, still useful)* Regime-detection alternatives beyond TVTP
+   Markov-switching — Bayesian online changepoint detection (Adams & MacKay) or
+   hidden semi-Markov models — since paper #2 is currently this skill's only
+   regime-detection paradigm.
+
 ## Mapping to This Repo's Architecture
 
 The user's own naming — **PANDA** (a 3-gate signal architecture), **QUANTS**
