@@ -42,6 +42,7 @@ are shared:
 | 10 | Intraday pivot/exhaustion concepts (ORB Kilroy, Break-Away Pivots/Laps, Y-High/Low exhaustion, gap-close reversal, EMA-translation, Inverse 78.6% target) | `references/pivot-exhaustion-grid-scheier.md` | Scheier (2014), *Pivots, Patterns, and Intraday Swing Trades*, Ch. 3 |
 | 11 | Candlestick pattern catalog + pivot-point confluence (multi-timeframe agreement, first-test-only fade rule, P3T signal architecture) | `references/candlestick-patterns-and-pivot-confluence-person.md` | Person (2004), *A Complete Guide to Technical Trading Tactics*, Ch. 4 & 6 |
 | 12 | Cross-asset time-series momentum (industrial metals lead equity momentum) + bootstrap/shuffle overfitting test | `references/cross-asset-time-series-momentum-xu.md` | Xu, Li, Singh & Park (2025), *Accounting & Finance* |
+| 13 | Intraday reversal vs. momentum feasibility (statistically real reversal effect, economically worthless net of costs) | `references/intraday-reversal-momentum-feasibility-herberger.md` | Herberger, Horn & Oehler (2020), *Financial Markets and Portfolio Management* |
 
 ## Portability Matrix
 
@@ -89,6 +90,10 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
 | Cross-asset momentum signal (e.g. industrial metals trailing 1-month return sign confirming/vetoing equity momentum) | ✅ Direct | — | A single `request.security()` call on a correlated instrument (e.g. COMEX copper) plus a sign check — no infrastructure barrier at all |
 | Bootstrap/shuffle overfitting test (randomize return-sequence order, compare real result to the shuffled distribution) | ❌ Not for live Pine | ✅ Direct, and cheap | No numerical optimization needed — just repeated resampling and rerunning a rule already implementable in plain Python; a concrete, buildable partial answer to this skill's own Known Gaps item #2 |
 | Six-factor alpha test (Fama-French/Carhart + Q5) to check if excess return is real timing skill vs. disguised risk exposure | ❌ Not for live Pine | ✅ Required (`statsmodels` or equivalent) | Standard regression tooling, not a barrier — just not something Pine can do |
+| Linear time-rescaling of a monthly/annual framework to intraday periods | ✅ Direct | — | Just arithmetic on lookback lengths — a principled alternative to picking intraday periods by feel |
+| Skip-period between signal computation and entry (avoid bid-ask bounce/price pressure) | ✅ Direct | — | A one-bar lag between ranking and acting on it; check this repo's own scripts for whether they already do this |
+| Market-adjusted return calculation (return minus an equal-weighted basket, not raw) | ✅ Direct | — | Simple subtraction; directly reusable in `quantor` to isolate idiosyncratic edge from broad market movement during the test window |
+| Transaction-cost break-even check (state the effect size in the same units as the real fee schedule, compare) | ✅ Direct | ✅ Direct | The single most actionable technique in paper #13 — apply before trusting any small statistically-significant edge as economically tradeable |
 
 ## Cross-Paper Synthesis
 
@@ -241,6 +246,27 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
   and the Moskowitz et al. (2012) TSM work it extends. `Kaufman_Trend_System_Swing.pine`
   remains the right home for anything built from this lineage, not this repo's
   intraday scripts.
+- **Paper #13 is the clearest, most numerically concrete example in this skill of
+  "statistically significant" and "economically tradeable" coming apart.** Its
+  intraday reversal effect is real and robust (survives portfolio-size, skip-period,
+  and calendar-effect checks, p<0.01 across every combination tested) — and still
+  worthless, because its largest measured value (0.19 basis points) is roughly 2.5x
+  smaller than the exchange's own minimum transaction fee (0.48 basis points). Every
+  other source in this skill *asserts* this distinction matters; this is the one
+  source that puts a number on both sides of it. The transaction-cost break-even
+  check this demonstrates — state the edge in the same units as the real fee
+  schedule, then compare — is worth applying to any of this repo's own small-edge
+  intraday strategies before trusting a promising backtest number.
+- **Papers #9, #12, and #13 together sketch a horizon-dependent regime, not a
+  universal truth about trend vs. reversion.** Papers #9 (Kaufman) and #12 (Xu et
+  al.) find genuine, validated momentum/trend-following at multi-month horizons;
+  paper #13 finds the opposite at intraday hours-scale horizons — real reversal,
+  *no* momentum at all in the shortest windows tested. None of these contradict each
+  other; they're evidence for different horizons behaving differently, which is
+  itself a real finding worth taking seriously before assuming a technique validated
+  at one horizon (e.g. Kaufman's trend systems) transfers cleanly to this repo's much
+  shorter-horizon scripts, or that a short-horizon finding (this paper) says anything
+  about the multi-month swing systems.
 - **A single backtest run is a single sample path, and paper #6 proves how wide that
   variance can be even under a correctly-specified model** (identical parameters,
   identical thresholds, single-path total returns spanning roughly 0.08x to ~1,888x
@@ -474,3 +500,21 @@ can be corrected against the real implementation rather than inference.
   literature-validated momentum operates on multi-month holding periods, reinforcing
   that `Kaufman_Trend_System_Swing.pine`, not this repo's intraday scripts, is the
   right home for anything built from this lineage. No contradiction with papers #1-11.
+- **2026-09-01** — Ingested paper #13: Herberger, Horn & Oehler (2020), "Are intraday
+  reversal and momentum trading strategies feasible? An analysis for German blue chip
+  stocks" (*Financial Markets and Portfolio Management*). Linearly time-rescales De
+  Bondt & Thaler's (1985) reversal and Jegadeesh & Titman's (1993) momentum
+  frameworks from monthly to 5-minute-candle intraday periods, tested on all 30 DAX
+  stocks over ~14 months. Finds a statistically robust intraday reversal effect
+  (survives every robustness check) and no momentum effect at all at short intraday
+  horizons — but the reversal effect's largest value (0.19 basis points) is smaller
+  than the exchange's own minimum transaction fee (0.48 basis points), making it
+  economically untradeable for ordinary participants despite being real. The clearest,
+  most numerically concrete "statistically significant but economically worthless"
+  case in this skill so far — see the new Cross-Paper Synthesis note. Also supplies
+  a directly reusable transaction-cost break-even check and a skip-period technique
+  for avoiding bid-ask-bounce contamination in signal construction. A second
+  Cross-Paper Synthesis note connects this paper's short-horizon reversal finding
+  with papers #9 and #12's multi-month momentum findings as evidence of a
+  horizon-dependent regime rather than a contradiction. No contradiction with papers
+  #1-12.
