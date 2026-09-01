@@ -318,9 +318,63 @@ string sessionTimezoneInput = input.string(
 )
 
 // =====================================================
-// 8. DISPLAY
+// 9. CROSS-ASSET CONFIRMATION (Xu, Li, Singh & Park 2025)
+// Ported from quant-research-notes paper #12, "Cross-asset time-series
+// momentum strategy: A new perspective" -- their I-XTSM finding that
+// industrial metals' returns lead equity returns by about a month
+// (Jacobsen et al. 2019's diffusion story), used as a cross-asset
+// confirming/vetoing signal alongside the stock's own trend.
+//
+// The paper's regime construction is deliberately ASYMMETRIC, not a
+// mirror "both must agree" gate:
+//   stock +, cross-asset +  -> stay long  (Call)
+//   stock -, cross-asset -  -> stay short (Put)
+//   stock +, cross-asset -  -> stay long  (kept -- a bullish trend with a
+//                                          waning cross-asset undercurrent
+//                                          is still net positive)
+//   stock -, cross-asset +  -> JUMP OUT  (the only disagreement case that
+//                                         overrides -- a bearish stock
+//                                         trend against a bullish
+//                                         industrial-metals undercurrent
+//                                         is read as an unreliable
+//                                         downtrend, per the paper's own
+//                                         momentum-collapse-avoidance
+//                                         result)
+// So this only ever blocks/exits SHORTS, never longs -- faithful to the
+// paper's own asymmetry, not a simplification of it. GSCI-IND itself
+// isn't a chartable TradingView symbol; copper futures are used as the
+// live proxy, since copper was individually one of the paper's own
+// strongest-predicting metals (Table 4/5), not an arbitrary substitute.
 // =====================================================
-string groupDisplay = "8. Display"
+string groupCrossAsset = "9. Cross-Asset Confirmation"
+
+bool useCrossAssetInput = input.bool(
+     defval=true,
+     title="Use Cross-Asset Confirmation",
+     group=groupCrossAsset,
+     tooltip="When on: a bearish stock trend gets overridden to flat if the cross-asset (copper) is bullish, per Xu et al. (2025)'s I-XTSM asymmetric regime -- this never blocks or overrides a bullish stock trend, only a bearish one. When off, this module is fully inert."
+)
+
+string crossAssetSymbolInput = input.symbol(
+     defval="COMEX:HG1!",
+     title="Cross-Asset Symbol",
+     group=groupCrossAsset,
+     tooltip="Defaults to COMEX copper futures -- a live proxy for the GSCI Industrial Metals Index used in the paper (GSCI-IND itself isn't a chartable TradingView symbol). Copper was individually one of the paper's own strongest-predicting metals, not an arbitrary stand-in. Requires a market-data subscription covering this symbol/exchange; if it isn't available on your plan, this module reads N/A and never overrides anything (never blocks a long) rather than breaking the script -- switch to a copper-adjacent symbol your plan does cover, or turn the module off."
+)
+
+int crossAssetLookbackDaysInput = input.int(
+     defval=21,
+     title="Cross-Asset Lookback (Bars)",
+     minval=5,
+     maxval=60,
+     group=groupCrossAsset,
+     tooltip="The paper uses a 1-month lookback for the cross-asset signal specifically (shorter than the stock-side K, since industrial-metals information diffuses into equity prices within about a month). Default 21 approximates one trading month on a Daily chart."
+)
+
+// =====================================================
+// 10. DISPLAY
+// =====================================================
+string groupDisplay = "10. Display"
 
 bool showDashboardInput = input.bool(defval=true, title="Show Dashboard", group=groupDisplay)
 bool showBandsPlotInput = input.bool(defval=true, title="Plot Bands", group=groupDisplay)
@@ -352,6 +406,20 @@ bool fastUp = fastTrend > fastTrend[1]
 bool longCond = use2TrendInput ? (slowUp and fastUp) : slowUp
 bool shortCond = use2TrendInput ? (not slowUp and not fastUp) : not slowUp
 bool flatCond = use2TrendInput and (slowUp != fastUp)
+
+// =====================================================
+// CROSS-ASSET CONFIRMATION (Xu et al. 2025) -- see the "9." input group
+// above for the full reasoning. "Stock signal negative" is read from
+// slowUp (the primary trend), matching the paper's own single-signal
+// (sign of the trailing K-month return) construction, not the compound
+// 2-trend gate.
+// =====================================================
+float crossAssetClose = request.security(crossAssetSymbolInput, timeframe.period, close, lookahead=barmerge.lookahead_off)
+float crossAssetPrior = crossAssetClose[crossAssetLookbackDaysInput]
+float crossAssetReturn = (not na(crossAssetPrior) and crossAssetPrior != 0) ? (crossAssetClose / crossAssetPrior - 1) * 100 : na
+bool crossAssetUp = not na(crossAssetReturn) and crossAssetReturn > 0
+
+bool crossAssetOverrideActive = useCrossAssetInput and not na(crossAssetReturn) and (not slowUp) and crossAssetUp
 
 // =====================================================
 // BANDS
@@ -395,7 +463,7 @@ bool bandClearLong = not useBandFilterInput or close > upperBand
 bool bandClearShort = not useBandFilterInput or close < lowerBand
 
 bool finalLongCond = longCond and bandClearLong
-bool finalShortCond = shortCond and bandClearShort
+bool finalShortCond = shortCond and bandClearShort and not crossAssetOverrideActive
 
 // =====================================================
 // ANTICIPATING THE SIGNAL / PROJECTED CROSSOVER (display only)
@@ -478,10 +546,14 @@ bool cooldownElapsed = na(lastEntryBar) or (bar_index - lastEntryBar) >= cooldow
 bool freshLongSignal = finalLongCond and not finalLongCond[1] and strategy.position_size <= 0 and cooldownElapsed and sessionOk
 bool freshShortSignal = finalShortCond and not finalShortCond[1] and strategy.position_size >= 0 and cooldownElapsed and sessionOk
 bool freshFlatSignal = use2TrendInput and flatCond and not flatCond[1] and strategy.position_size != 0
+bool freshCrossAssetJumpOut = crossAssetOverrideActive and not crossAssetOverrideActive[1] and strategy.position_size < 0
 
 if freshFlatSignal
     strategy.close("Long", comment="Trend Conflict")
     strategy.close("Short", comment="Trend Conflict")
+
+if freshCrossAssetJumpOut
+    strategy.close("Short", comment="Cross-Asset Jump Out")
 
 if freshLongSignal
     pendingLong := true
@@ -558,7 +630,7 @@ if useCatStopInput and strategy.position_size != 0
 var table dash = table.new(
      position.top_right,
      2,
-     16,
+     18,
      bgcolor=color.rgb(8, 20, 38),
      frame_color=color.rgb(35, 125, 255),
      frame_width=2,
@@ -664,6 +736,14 @@ if barstate.islast and showDashboardInput
     string sessionText = not useSessionFilterInput ? "OFF" : inSession ? "OPEN" : "CLOSED"
     color sessionColor = not useSessionFilterInput ? color.rgb(88, 105, 132) : inSession ? color.rgb(25, 195, 100) : color.rgb(245, 55, 80)
     f_row(dash, 15, "TRADING HOURS (" + sessionInput + ")", sessionText, sessionColor)
+
+    string crossAssetText = not useCrossAssetInput ? "OFF" : na(crossAssetReturn) ? "N/A" : (crossAssetUp ? "UP " : "DOWN ") + str.tostring(crossAssetReturn, "#.00") + "%"
+    color crossAssetColor = not useCrossAssetInput ? color.rgb(88, 105, 132) : crossAssetUp ? color.rgb(25, 195, 100) : color.rgb(245, 55, 80)
+    f_row(dash, 16, "CROSS-ASSET (COPPER)", crossAssetText, crossAssetColor)
+
+    string jumpOutText = not useCrossAssetInput ? "OFF" : crossAssetOverrideActive ? "ACTIVE -- SHORT BLOCKED" : "INACTIVE"
+    color jumpOutColor = not useCrossAssetInput ? color.rgb(88, 105, 132) : crossAssetOverrideActive ? color.rgb(245, 160, 20) : color.rgb(88, 105, 132)
+    f_row(dash, 17, "JUMP OUT OVERRIDE", jumpOutText, jumpOutColor)
 
 // =====================================================
 // PLOTS

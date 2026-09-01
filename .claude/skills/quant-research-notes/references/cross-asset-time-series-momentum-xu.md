@@ -228,6 +228,14 @@ unlike most sources in this skill, nothing here requires infrastructure Pine or
 
 ## Applied in This Repo
 
-*(none yet — the copper/industrial-metals cross-asset confirmation signal for
-`Kaufman_Trend_System_Swing.pine`, and the bootstrap/shuffle validation technique for
-`quantor`, are the two concrete, ready-to-build candidates from this paper.)*
+**2026-09-01** — Built a "Cross-Asset Confirmation" module into
+`Kaufman_Trend_System_Swing.pine`, porting the I-XTSM asymmetric regime construction
+directly: COMEX copper futures (`COMEX:HG1!`, chosen as the live proxy since GSCI-IND
+itself isn't a chartable TradingView symbol, and because copper was individually one
+of the paper's own strongest-predicting metals) supplies a 1-month trailing return
+sign via `request.security()`. Faithful to the paper's actual asymmetry, not a
+simplified mirror of it: a bullish stock trend is never blocked or overridden
+regardless of copper's reading, but a bearish stock trend against a bullish copper
+signal triggers "Jump Out" — blocking a fresh short entry and force-closing an
+existing one. The bootstrap/shuffle validation technique (for `quantor`) remains
+unbuilt — still a good next candidate if the user wants it.
