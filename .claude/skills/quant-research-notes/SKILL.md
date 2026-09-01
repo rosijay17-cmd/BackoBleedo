@@ -39,6 +39,7 @@ are shared:
 | 7 | Attention-autoencoder + correlation clustering for dynamic support/resistance levels | `references/deepsupp-attention-support-resistance.md` | Kriuk, Ng & Al Hossain (2025), arXiv:2507.01971 |
 | 8 | Cycle identification (peak/valley measurement, triangular-weighted MACD, trigonometric curve fitting) | `references/cycle-analysis-kaufman.md` | Kaufman (2019), *Trading Systems and Methods*, Ch. 11 |
 | 9 | Trend systems toolkit (bands/channels, single/multi-trend crossovers, ATR position sizing, MA-family confluence, projected crossovers) | `references/trend-systems-kaufman.md` | Kaufman (2019), *Trading Systems and Methods*, Ch. 8 |
+| 10 | Intraday pivot/exhaustion concepts (ORB Kilroy, Break-Away Pivots/Laps, Y-High/Low exhaustion, gap-close reversal, EMA-translation, Inverse 78.6% target) | `references/pivot-exhaustion-grid-scheier.md` | Scheier (2014), *Pivots, Patterns, and Intraday Swing Trades*, Ch. 3 |
 
 ## Portability Matrix
 
@@ -75,6 +76,11 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
 | "Ahead of the crowd" positioning, portfolio replication | ⚠️ Codeable but unverified | — | No barrier to building, but paper #9 gives no backtest evidence either works |
 | Techno-fundamental discretionary exit | ❌ Not systematizable | — | Requires real-time discretionary judgment about *why* a trend is happening; source's own worked example (2010→2011 Fed case) shows it failing |
 | Ehlers' quotient transform (early trend ID) | ⚠️ Partial | ⚠️ Unassessed | Formula given; the roofing filter/AGC steps that complete the actual indicator aren't in the source excerpt — same shape as the Fourier/MESA gap above |
+| ORB far-side exhaustion ("Kilroy"), Break-Away Lap, Y-High/Low exhaustion read | ✅ Direct | — | Mechanical level/comparison logic; this repo already has the underlying ORB/level infrastructure in several scripts (see paper #10's Mapping) |
+| Floor Trader's Pivot Points (DP/S/R formula) | ✅ Direct | — | Formula is trivial; getting the all-session-vs-day-only H/L/C convention right is the actual pitfall, not the math |
+| Inverse 78.6% Projection Rule (exit target) | ✅ Direct, once a Break-Away Pivot is identified | — | Projection arithmetic is trivial; detecting the Ledge itself is the harder, judgment-based part |
+| Break-Away Pivot/Ledge detection, manual trend lines, Measured-Move chart-pattern targets (triangle/H&S/channel/wedge) | ⚠️ Needs a real detection algorithm | — | None of these are specified mechanically in the source; this repo's `Auto_Pattern_Detector_Targets_MarkitTick_Session_Strategy.pine` may already be relevant prior art for the pattern-target family |
+| True Market Profile (TPO-based Value Area/POC) | ❌ Not native to Pine | — | No time-price-opportunity primitive in Pine; Volume Profile (already built this session) is the source's own named substitute |
 
 ## Cross-Paper Synthesis
 
@@ -169,6 +175,22 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
   political cycles and the Swiss franc cycle**: reputation, age, or a colorful name is
   never evidence. Treat any "classic"/"well-known" parameter combination proposed for
   this repo's scripts with the same skepticism as a brand-new, untested one.
+- **Paper #10 is this skill's weakest evidentiary source so far — one discretionary
+  practitioner's chart-based philosophy, with exactly one quantified sample (39 gaps,
+  one contract, one 90-day window) in the whole chapter — and is logged with that
+  weighting made explicit, the same discipline already applied to paper #8's political
+  cycles. It still earns its place for two reasons: several of its techniques are
+  precise and mechanically portable regardless of validation status (Break-Away Lap,
+  the EMA HTF-to-LTF translation ratio, the pivot-point session-range pitfall, the
+  Inverse 78.6% projection rule), and two of its claims **independently converge with
+  sources already in this skill without either one citing the other** — its Y-High/
+  Y-Low "initial break is exhaustion, not confirmation" claim matches this repo's
+  existing liquidity-sweep/fakeout scripts, and its explicit endorsement of
+  Volume-at-Price as a Market-Profile substitute matches the DeepSupp-critique-driven
+  decision (paper #7) to build Volume Profile into this repo's scripts. Independent
+  convergence from an unrelated, much less rigorous source doesn't upgrade either
+  claim to "proven," but it's a real reason for modest additional confidence beyond
+  what either source alone would justify.
 - **A single backtest run is a single sample path, and paper #6 proves how wide that
   variance can be even under a correctly-specified model** (identical parameters,
   identical thresholds, single-path total returns spanning roughly 0.08x to ~1,888x
@@ -306,3 +328,16 @@ can be corrected against the real implementation rather than inference.
   root-caused earlier this session in the Trend Following Strategy v6 files) and a
   moving-average-family confluence count as a genuinely new confirmation axis for
   `Regime_Engine_TCO_Gatekeeper.pine`. No contradiction with papers #1-8.
+- **2026-09-01** — Ingested paper #10: Scheier (2014), "Pivot/Exhaustion Grid" (Ch. 3 of
+  *Pivots, Patterns, and Intraday Swing Trades*). This skill's first purely
+  discretionary/practitioner source — logged with an explicit evidentiary-weight
+  caveat (one 39-gap anecdotal sample is the only quantified claim in the chapter; see
+  the new reference file's opening note). Covers ORB-as-all-day-level exhaustion
+  ("Kilroy"), Break-Away Pivots/Ledges, Break-Away Laps (same family as a Fair Value
+  Gap, which the user already chose to drop from `Regime_Engine_TCO_Gatekeeper.pine`
+  earlier this session), Y-High/Y-Low exhaustion (not continuation), gap-close
+  reversal behavior, an HTF-to-LTF EMA-period translation ratio, the Floor Trader's
+  Pivot session-range pitfall, and the Inverse 78.6% Projection Rule for exit targets.
+  Two claims independently converge with existing skill entries without either source
+  citing the other — see the new Cross-Paper Synthesis note. No contradiction with
+  papers #1-9.
