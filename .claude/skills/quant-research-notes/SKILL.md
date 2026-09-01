@@ -41,6 +41,7 @@ are shared:
 | 9 | Trend systems toolkit (bands/channels, single/multi-trend crossovers, ATR position sizing, MA-family confluence, projected crossovers) | `references/trend-systems-kaufman.md` | Kaufman (2019), *Trading Systems and Methods*, Ch. 8 |
 | 10 | Intraday pivot/exhaustion concepts (ORB Kilroy, Break-Away Pivots/Laps, Y-High/Low exhaustion, gap-close reversal, EMA-translation, Inverse 78.6% target) | `references/pivot-exhaustion-grid-scheier.md` | Scheier (2014), *Pivots, Patterns, and Intraday Swing Trades*, Ch. 3 |
 | 11 | Candlestick pattern catalog + pivot-point confluence (multi-timeframe agreement, first-test-only fade rule, P3T signal architecture) | `references/candlestick-patterns-and-pivot-confluence-person.md` | Person (2004), *A Complete Guide to Technical Trading Tactics*, Ch. 4 & 6 |
+| 12 | Cross-asset time-series momentum (industrial metals lead equity momentum) + bootstrap/shuffle overfitting test | `references/cross-asset-time-series-momentum-xu.md` | Xu, Li, Singh & Park (2025), *Accounting & Finance* |
 
 ## Portability Matrix
 
@@ -85,6 +86,9 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
 | Full candlestick pattern catalog (hammer/doji variants/engulfing/harami/dark cloud/piercing/three-candle/three-method patterns) | ✅ Direct | — | Every pattern is pure `open`/`high`/`low`/`close` geometry with a bar or two of history — the most cleanly portable content in this skill so far; no repo script currently implements formal candle-pattern recognition |
 | Multi-timeframe pivot confluence, "first test only" pivot-fade rule | ✅ Direct | — | Mechanical once a base pivot-point module exists; no current analogue in this repo |
 | "Eight to ten new records" exhaustion counter, "pillar of strength/weakness" (multi-candle engulfing) | ✅ Direct | — | Streak counters and consumed-candle-count checks; straightforward extensions of patterns already in the candle catalog |
+| Cross-asset momentum signal (e.g. industrial metals trailing 1-month return sign confirming/vetoing equity momentum) | ✅ Direct | — | A single `request.security()` call on a correlated instrument (e.g. COMEX copper) plus a sign check — no infrastructure barrier at all |
+| Bootstrap/shuffle overfitting test (randomize return-sequence order, compare real result to the shuffled distribution) | ❌ Not for live Pine | ✅ Direct, and cheap | No numerical optimization needed — just repeated resampling and rerunning a rule already implementable in plain Python; a concrete, buildable partial answer to this skill's own Known Gaps item #2 |
+| Six-factor alpha test (Fama-French/Carhart + Q5) to check if excess return is real timing skill vs. disguised risk exposure | ❌ Not for live Pine | ✅ Required (`statsmodels` or equivalent) | Standard regression tooling, not a barrier — just not something Pine can do |
 
 ## Cross-Paper Synthesis
 
@@ -216,6 +220,27 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
   off the resulting levels actually has an edge, which neither source tests
   systematically. See `references/candlestick-patterns-and-pivot-confluence-person.md`'s
   Overlap note for the full cross-reference.
+- **Paper #12's bootstrap/shuffle test is this skill's first concrete, ready-to-use
+  overfitting-validation tool** (Known Gaps item #2), and it sharpens exactly what
+  "no free edge" should mean going forward: not just "beat a buy-and-hold benchmark,"
+  but "beat what the same set of returns would earn under thousands of random
+  time-orderings." Cheap enough to run in `quantor` on any of this repo's existing
+  backtests without needing the heavier Bailey/López de Prado machinery still on the
+  wishlist.
+- **A third independent occurrence of the same recurring pattern**: paper #12's
+  headline (K=12, H=3) result is the best of 25 tested parameter combinations,
+  reported prominently without an explicit multiple-comparisons correction — the
+  same unaddressed grid-search risk this skill already flagged in papers #3 and #4.
+  Three independent papers now exhibiting this exact gap is enough to treat it as a
+  standing rule rather than a per-paper caveat: any parameter grid search in
+  `quantor` needs a walk-forward/holdout split or an explicit correction for the
+  number of combinations tried, full stop.
+- **A fourth independent source now confirms genuine, literature-validated momentum
+  operates on multi-month holding periods** — paper #12's (K,H) grid runs 1-24
+  *months*, the same order of magnitude as Kaufman's trend-systems chapter (paper #9)
+  and the Moskowitz et al. (2012) TSM work it extends. `Kaufman_Trend_System_Swing.pine`
+  remains the right home for anything built from this lineage, not this repo's
+  intraday scripts.
 - **A single backtest run is a single sample path, and paper #6 proves how wide that
   variance can be even under a correctly-specified model** (identical parameters,
   identical thresholds, single-path total returns spanning roughly 0.08x to ~1,888x
@@ -234,18 +259,21 @@ are missing entirely. Ranked by expected value if the user's library can supply 
 1. **Time-series momentum / trend-following, the actual academic literature** —
    Moskowitz, Ooi & Pedersen, "Time Series Momentum" (*Journal of Financial
    Economics*, 2012) is the seminal modern paper here, with real risk-adjusted return
-   statistics across dozens of futures markets including equity index futures. Given
-   how much trend-following work this session has done (Kaufman's two chapters, the
-   new Kaufman Trend System strategy), it's a real gap that this repo has never had
-   the core academic trend-following paper itself, only a textbook's treatment of it.
+   statistics across dozens of futures markets including equity index futures.
+   **Partially filled by paper #12** (Xu et al. 2025), which extends and directly
+   tests the original TSM strategy — but the 2012 original is still worth getting on
+   its own, since paper #12 only summarizes it as a benchmark rather than reproducing
+   its full cross-market evidence base.
 2. **Backtest overfitting / statistical validation tools** — Bailey, Borwein, López de
    Prado & Zhu, "The Probability of Backtest Overfitting" and the companion
    "Deflated Sharpe Ratio" paper; López de Prado's *Advances in Financial Machine
    Learning* (the triple-barrier method, meta-labeling, purged/embargoed
    cross-validation). Nearly every paper in this skill's Cross-Paper Synthesis flags
-   overfitting as a risk (papers #2, #3, #4, #6, #9) without giving a rigorous way to
-   *measure* it — this is the natural, high-value next step, directly usable in the
-   `quantor` Python pipeline.
+   overfitting as a risk (papers #2, #3, #4, #6, #9, #12) without giving a rigorous
+   way to *measure* it. **Partially filled by paper #12's bootstrap/shuffle test** —
+   a real, concrete, cheap-to-implement validation technique now logged and ready to
+   use in `quantor` — but the heavier machinery (PBO, Deflated Sharpe, purged CV) is
+   still worth getting for a more rigorous treatment.
 3. **Order flow / market microstructure** — Easley, López de Prado & O'Hara on VPIN
    ("The Volume Clock: Insights into the High-Frequency Paradigm"); Cont, Kukanov &
    Stoikov, "The Price Impact of Order Book Events." Directly relevant to sharpening
@@ -426,3 +454,23 @@ can be corrected against the real implementation rather than inference.
   Synthesis note on that convergence. Also surfaces Sklarew's 1980 "Rule of Multiple
   Techniques," a decades-old, explicitly-named precedent for this repo's own
   confluence-gate architecture. No contradiction with papers #1-10.
+- **2026-09-01** — Ingested paper #12: Xu, Li, Singh & Park (2025), "Cross-asset
+  time-series momentum strategy: A new perspective" (*Accounting & Finance*),
+  supplied by the user in response to this skill's own Known Gaps item #1. A genuine
+  academic paper extending Moskowitz et al. (2012)'s TSM and Pitkäjärvi et al.
+  (2020)'s XTSM: replaces XTSM's bond cross-asset signal with the GSCI Industrial
+  Metals Index (motivated by industrial metals' ~1-month information diffusion into
+  equity prices), with an asymmetric 3-regime construction (Call/Put/Jump Out). Five
+  independent validation methods (predictive regressions with in- and out-of-sample
+  tests, six-factor alpha tests, risk-adjusted performance, transaction costs, and a
+  bootstrap/shuffle test) — the most rigorous evidentiary basis of any source in this
+  skill so far. The bootstrap test partially fills Known Gaps item #2 as a concrete,
+  ready-to-use overfitting-validation tool. Independent critique flags the headline
+  (K=12,H=3) result as the best of 25 tested combinations without a multiple-
+  comparisons correction — a third occurrence of the same pattern already flagged in
+  papers #3 and #4, now treated as a standing rule rather than a per-paper caveat —
+  and notes the paper's XTSM benchmark may not fairly reproduce Pitkäjärvi et al.'s
+  own dual stock+bond result. Confirms (a fourth independent source) that
+  literature-validated momentum operates on multi-month holding periods, reinforcing
+  that `Kaufman_Trend_System_Swing.pine`, not this repo's intraday scripts, is the
+  right home for anything built from this lineage. No contradiction with papers #1-11.
