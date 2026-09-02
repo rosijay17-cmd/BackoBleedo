@@ -322,6 +322,12 @@ f_formatState(int state) =>
 
     stateName
 
+// Renders a single entry-gate as a pass/fail glyph, for the "Long/Short
+// Filters" diagnostic dashboard rows below -- so a "no entry signal"
+// report can be answered by reading the dashboard instead of guessing
+// blind at which of longSignal's several ANDed gates is the blocker.
+f_boolIcon(bool b) => b ? "✓" : "✗"
+
 //──────────────────────────────────────────────────────────────────────────────
 // CORE MARKET CALCULATIONS
 //──────────────────────────────────────────────────────────────────────────────
@@ -1004,7 +1010,7 @@ alertcondition(
 var table statsTable = table.new(
      position.top_left,
      2,
-     11,
+     13,
      border_width = 1
 )
 
@@ -1058,3 +1064,14 @@ if barstate.islast and showMarkovTable
     string activeZoneText = entryZoneDir == 0 ? "None" : (entryZoneDir == 1 ? "Demand " : "Supply ") + str.tostring(entryZoneBottom, format.mintick) + "-" + str.tostring(entryZoneTop, format.mintick)
     table.cell(statsTable, 0, 10, "Active Trade Zone")
     table.cell(statsTable, 1, 10, activeZoneText, text_color = entryZoneDir == 1 ? color.lime : entryZoneDir == -1 ? color.red : color.gray)
+
+    // Diagnostic rows: every gate longSignal/shortSignal ANDs together,
+    // in order (Trigger / PD-PDL / Zone / Trend / Markov / Size / Cooldown),
+    // so "why is nothing firing" is a read of the dashboard, not a guess.
+    string longFiltersText = f_boolIcon(longTrigger) + " " + f_boolIcon(longPDFilter) + " " + f_boolIcon(longRetracementFilter) + " " + f_boolIcon(longTrendFilter) + " " + f_boolIcon(longMarkovFilter) + " " + f_boolIcon(positionQty > 0) + " " + f_boolIcon(cooldownElapsed)
+    table.cell(statsTable, 0, 11, "Long (Trg PD Zn Trd Mkv Qty CD)")
+    table.cell(statsTable, 1, 11, longFiltersText, text_color = longSignal ? color.lime : color.gray)
+
+    string shortFiltersText = f_boolIcon(shortTrigger) + " " + f_boolIcon(shortPDFilter) + " " + f_boolIcon(shortRetracementFilter) + " " + f_boolIcon(shortTrendFilter) + " " + f_boolIcon(shortMarkovFilter) + " " + f_boolIcon(positionQty > 0) + " " + f_boolIcon(cooldownElapsed)
+    table.cell(statsTable, 0, 12, "Short (Trg PD Zn Trd Mkv Qty CD)")
+    table.cell(statsTable, 1, 12, shortFiltersText, text_color = (shortSignal and allowShorts) ? color.lime : color.gray)
