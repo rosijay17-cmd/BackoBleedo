@@ -11,8 +11,16 @@ strategy(
      slippage = 1,
      process_orders_on_close = true,
      max_lines_count = 300,
-     max_labels_count = 100
+     max_labels_count = 100,
+     max_bars_back = 1100
 )
+// max_bars_back: the Markov transition loop below indexes close[i]/atr[i]
+// with a VARIABLE loop index up to markovLookback (max input 1000), which
+// Pine's auto-detection cannot size from a for-loop bound alone -- without
+// this, the model silently runs out of history sooner on higher timeframes
+// (e.g. 1H) than on lower ones, since the same bar count reaches further
+// back in calendar time, and "Current Markov State" gets stuck at its
+// default (Neutral, 33/33/33) instead of ever computing a real read.
 
 //──────────────────────────────────────────────────────────────────────────────
 // INPUTS — RISK / TRADING CAPACITY
@@ -161,6 +169,16 @@ touchDecayInput = input.float(
      step = 0.05,
      group = groupFib,
      tooltip = "Each zone's displayed hold probability is multiplied by this factor for every time price has already touched it -- a first test carries full weight, each retest is discounted, per the \"a level gets less reliable each time it's retested\" finding in this repo's quant-research-notes skill (Person 2004, references/candlestick-patterns-and-pivot-confluence-person.md). 0.7 means each retest keeps 70% of the prior confidence."
+)
+
+minZoneHoldProbabilityInput = input.float(
+     defval = 40.0,
+     title = "Minimum Zone Hold Probability For Entry (%)",
+     minval = 0.0,
+     maxval = 100.0,
+     step = 5.0,
+     group = groupFib,
+     tooltip = "When \"Require Price Within Retracement Zone\" is on, an entry now only counts if price is inside an UNBROKEN zone whose live hold-probability score (the same one shown on its label) is at least this. Replaces the old check, which only tested raw price-in-band math and had no idea whether that specific zone had already failed."
 )
 
 //──────────────────────────────────────────────────────────────────────────────
@@ -444,15 +462,15 @@ float bearishZoneUpper = impulseDirection == -1
 float activeZoneUpper = impulseDirection == 1 ? bullishZoneUpper : bearishZoneUpper
 float activeZoneLower = impulseDirection == 1 ? bullishZoneLower : bearishZoneLower
 
-bool inBullishRetracement = impulseDirection == 1 and
-     not na(bullishZoneLower) and
-     close >= bullishZoneLower and
-     close <= bullishZoneUpper
-
-bool inBearishRetracement = impulseDirection == -1 and
-     not na(bearishZoneLower) and
-     close >= bearishZoneLower and
-     close <= bearishZoneUpper
+// NOTE: the raw "is price between these two numbers" check that used to
+// live here (inBullishRetracement/inBearishRetracement) has been removed.
+// It only tested the latest impulse's band arithmetic and had no idea
+// whether that specific zone was already marked BROKEN or had decayed to
+// a low hold-probability from repeated touches -- so an entry could fire
+// inside a zone the dashboard itself had already invalidated. The trade
+// filter now uses inActiveDemandZone/inActiveSupplyZone instead, computed
+// further below from the same zone-array/probability system the display
+// already uses (see "TRADE CONDITIONS" and the zone-scoring loop above it).
 
 //──────────────────────────────────────────────────────────────────────────────
 // RETRACEMENT ZONES -- FRESH-IMPULSE TRIGGER ONLY
@@ -579,6 +597,13 @@ else
 // finding from this repo's quant-research-notes skill (Person 2004,
 // references/candlestick-patterns-and-pivot-confluence-person.md) --
 // each retest of the same zone is discounted, never boosted.
+//
+// This score is no longer display-only: inActiveDemandZone/
+// inActiveSupplyZone (set inside the loop below) feed directly into
+// longRetracementFilter/shortRetracementFilter in the TRADE CONDITIONS
+// section, so an entry can only fire inside a zone that is both unbroken
+// AND currently scoring at or above "Minimum Zone Hold Probability For
+// Entry" -- not just anywhere the old raw band math happened to overlap.
 //──────────────────────────────────────────────────────────────────────────────
 var array<box>   zoneBoxes      = array.new<box>()
 var array<label> zoneLabels     = array.new<label>()
@@ -587,6 +612,9 @@ var array<float> zoneBottomArr  = array.new<float>()
 var array<int>   zoneDirArr     = array.new<int>()
 var array<bool>  zoneBrokenArr  = array.new<bool>()
 var array<int>   zoneTouchArr   = array.new<int>()
+
+bool inActiveDemandZone = false
+bool inActiveSupplyZone = false
 
 if showRetracementZone and freshImpulseZone and not na(activeZoneUpper) and not na(activeZoneLower)
     color newZoneColor = impulseDirection == 1 ? color.lime : color.red
@@ -653,6 +681,14 @@ if array.size(zoneBoxes) > 0
             string zLabelText = (zDir == 1 ? "DEMAND ZONE " : "SUPPLY ZONE ") + str.tostring(holdProbabilityPct, "#") + "%"
             label.set_text(zLabel, zLabelText)
 
+            // Entry-qualifying: price must be inside THIS unbroken zone
+            // right now, and its live score must clear the minimum.
+            if insideNow and holdProbabilityPct >= minZoneHoldProbabilityInput
+                if zDir == 1
+                    inActiveDemandZone := true
+                else
+                    inActiveSupplyZone := true
+
 //──────────────────────────────────────────────────────────────────────────────
 // COOLDOWN
 //
@@ -686,8 +722,8 @@ bool cooldownElapsed = na(lastEntryBar) or (bar_index - lastEntryBar) >= cooldow
 bool longPDFilter = not usePDH_PDLFilter or close > pdl
 bool shortPDFilter = not usePDH_PDLFilter or close < pdh
 
-bool longRetracementFilter = not requireRetracement or inBullishRetracement
-bool shortRetracementFilter = not requireRetracement or inBearishRetracement
+bool longRetracementFilter = not requireRetracement or inActiveDemandZone
+bool shortRetracementFilter = not requireRetracement or inActiveSupplyZone
 
 bool longTrendFilter = not useTrendFilter or bullishTrend
 bool shortTrendFilter = not useTrendFilter or bearishTrend
@@ -873,8 +909,10 @@ if barstate.islast and showMarkovTable
     table.cell(statsTable, 0, 6, "Liquidity Capacity")
     table.cell(statsTable, 1, 6, str.tostring(liquidityCapacity, "#.##"))
 
+    string qtyText = positionQty > 0 ? str.tostring(positionQty, "#.##") : "TOO SMALL"
+    color qtyColor = positionQty > 0 ? color.lime : color.red
     table.cell(statsTable, 0, 7, "Usable Position Size")
-    table.cell(statsTable, 1, 7, str.tostring(positionQty, "#.##"), text_color = color.lime)
+    table.cell(statsTable, 1, 7, qtyText, text_color = qtyColor)
 
     table.cell(statsTable, 0, 8, "Impulse Direction")
     table.cell(
