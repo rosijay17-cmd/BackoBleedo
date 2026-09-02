@@ -280,6 +280,20 @@ slowEmaLength = input.int(
      group = groupExecution
 )
 
+useZoneBreakExitInput = input.bool(
+     defval = true,
+     title = "Exit on Entry Zone Break",
+     group = groupExecution,
+     tooltip = "Closes the position if the specific supply/demand zone the trade entered from is broken (price closes fully through it), independent of the static ATR stop. Uses the zone captured at entry time, not just whatever is newest in the zone array."
+)
+
+useMarkovFlipExitInput = input.bool(
+     defval = true,
+     title = "Exit on Markov Regime Flip",
+     group = groupExecution,
+     tooltip = "Closes the position if the live Markov transition model's probability for the opposing direction rises to or above this strategy's own entry threshold (Minimum Bull/Bear Probability in the Markov group), i.e. the regime that justified the entry has flipped against it."
+)
+
 //──────────────────────────────────────────────────────────────────────────────
 // FUNCTIONS
 //──────────────────────────────────────────────────────────────────────────────
@@ -636,6 +650,10 @@ var array<int>   zoneTouchArr   = array.new<int>()
 
 bool inActiveDemandZone = false
 bool inActiveSupplyZone = false
+float qualifyingDemandTop = na
+float qualifyingDemandBottom = na
+float qualifyingSupplyTop = na
+float qualifyingSupplyBottom = na
 
 if showRetracementZone and freshImpulseZone and not na(activeZoneUpper) and not na(activeZoneLower)
     color newZoneColor = impulseDirection == 1 ? color.lime : color.red
@@ -703,12 +721,22 @@ if array.size(zoneBoxes) > 0
             label.set_text(zLabel, zLabelText)
 
             // Entry-qualifying: price must be inside THIS unbroken zone
-            // right now, and its live score must clear the minimum.
+            // right now, and its live score must clear the minimum. Also
+            // remember which specific zone qualified (its own top/bottom,
+            // not just a yes/no flag) so an entry can later track THIS
+            // zone's break independent of the array -- same "freeze the
+            // specific level at entry" pattern already used in
+            // Supply_and_Demand_Zones_XL_Strategy.pine, robust against a
+            // newer zone pushing this one out of the array mid-trade.
             if insideNow and holdProbabilityPct >= minZoneHoldProbabilityInput
                 if zDir == 1
                     inActiveDemandZone := true
+                    qualifyingDemandTop := zTop
+                    qualifyingDemandBottom := zBottom
                 else
                     inActiveSupplyZone := true
+                    qualifyingSupplyTop := zTop
+                    qualifyingSupplyBottom := zBottom
 
 //──────────────────────────────────────────────────────────────────────────────
 // COOLDOWN
@@ -752,9 +780,18 @@ bool shortTrendFilter = not useTrendFilter or bearishTrend
 bool longMarkovFilter = probabilityBull >= minimumBullProbability
 bool shortMarkovFilter = probabilityBear >= minimumBearProbability
 
-// These crossover conditions provide a directional trigger after confluence.
-bool longTrigger = ta.crossover(close, fastEma)
-bool shortTrigger = ta.crossunder(close, fastEma)
+// Rejection-candle trigger, replacing the former EMA-crossover trigger.
+// A crossover treated the zone concept as decoration -- the actual
+// signal fired purely on EMA math, with no reference to the zone at all,
+// so a "DEMAND ZONE" label and the entry that supposedly traded off it
+// could be looking at completely different things. This ties the trigger
+// directly to the same zone infrastructure the dashboard and probability
+// score already use: a bullish (bearish) candle closing above (below)
+// its open while price is inside a currently-active, above-threshold
+// demand (supply) zone -- i.e. price entered the zone and was rejected
+// back in the expected direction on this bar, not just "EMA crossed."
+bool longTrigger = inActiveDemandZone and close > open
+bool shortTrigger = inActiveSupplyZone and close < open
 
 bool longSignal = longTrigger and
      longPDFilter and
@@ -775,6 +812,18 @@ bool shortSignal = shortTrigger and
 //──────────────────────────────────────────────────────────────────────────────
 // ORDER AND STOP LOGIC
 //──────────────────────────────────────────────────────────────────────────────
+
+// Entry-zone tracking, frozen at the moment the signal fires -- the same
+// "freeze the specific level at entry" pattern already used in
+// Supply_and_Demand_Zones_XL_Strategy.pine. Captured here (on the signal
+// bar, from the qualifying* values the zone-scoring loop already computed
+// this same bar) rather than one bar later on fill detection, so it can't
+// be thrown off by price having moved out of the zone by the time the
+// order actually fills. Feeds the dynamic zone-break exit below.
+var float entryZoneTop = na
+var float entryZoneBottom = na
+var int entryZoneDir = 0
+
 if longSignal
     strategy.entry(
          id = "Long",
@@ -783,6 +832,9 @@ if longSignal
     )
 
     lastEntryBar := bar_index
+    entryZoneTop := qualifyingDemandTop
+    entryZoneBottom := qualifyingDemandBottom
+    entryZoneDir := 1
 
 if shortSignal and allowShorts
     strategy.entry(
@@ -792,6 +844,9 @@ if shortSignal and allowShorts
     )
 
     lastEntryBar := bar_index
+    entryZoneTop := qualifyingSupplyTop
+    entryZoneBottom := qualifyingSupplyBottom
+    entryZoneDir := -1
 
 // Stops lock when a newly opened position is detected.
 // This retains the ATR-based risk assumption used in capacity sizing.
@@ -812,6 +867,9 @@ if newShortPosition
 if strategy.position_size == 0
     activeLongStop := na
     activeShortStop := na
+    entryZoneTop := na
+    entryZoneBottom := na
+    entryZoneDir := 0
 
 strategy.exit(
      id = "Long ATR Stop",
@@ -824,6 +882,42 @@ strategy.exit(
      from_entry = "Short",
      stop = activeShortStop
 )
+
+//──────────────────────────────────────────────────────────────────────────────
+// DYNAMIC EXITS -- ZONE BREAK / MARKOV FLIP
+//
+// The static ATR stop above is a backstop for a large, sudden adverse
+// move -- not the primary exit. These two conditions react to the same
+// infrastructure that justified the entry in the first place, closing
+// the trade the moment its own thesis breaks, which is usually well
+// before the ATR stop is ever touched:
+//   1. Zone break: the SPECIFIC zone the trade entered from (frozen at
+//      entry into entryZoneTop/entryZoneBottom, immune to that zone
+//      being pushed out of the live zoneBoxes array by a newer one)
+//      gets closed through.
+//   2. Markov flip: the live regime-transition model's probability for
+//      the OPPOSING direction rises to this strategy's own entry
+//      threshold (Minimum Bull/Bear Probability, "5. Dynamic Markov
+//      Regime Model") -- the same probability math that gated entry now
+//      gates exit, symmetrically.
+//──────────────────────────────────────────────────────────────────────────────
+bool zoneBreakExitLong = useZoneBreakExitInput and strategy.position_size > 0 and not na(entryZoneBottom) and close < entryZoneBottom
+bool zoneBreakExitShort = useZoneBreakExitInput and strategy.position_size < 0 and not na(entryZoneTop) and close > entryZoneTop
+
+bool markovFlipExitLong = useMarkovFlipExitInput and strategy.position_size > 0 and probabilityBear >= minimumBearProbability
+bool markovFlipExitShort = useMarkovFlipExitInput and strategy.position_size < 0 and probabilityBull >= minimumBullProbability
+
+if zoneBreakExitLong or markovFlipExitLong
+    strategy.close(
+         id = "Long",
+         comment = zoneBreakExitLong ? "Zone Break" : "Markov Flip"
+    )
+
+if zoneBreakExitShort or markovFlipExitShort
+    strategy.close(
+         id = "Short",
+         comment = zoneBreakExitShort ? "Zone Break" : "Markov Flip"
+    )
 
 //──────────────────────────────────────────────────────────────────────────────
 // VISUALS
@@ -904,7 +998,7 @@ alertcondition(
 var table statsTable = table.new(
      position.top_left,
      2,
-     10,
+     11,
      border_width = 1
 )
 
@@ -954,3 +1048,7 @@ if barstate.islast and showMarkovTable
     string cooldownText = cooldownBars <= 0 ? "OFF" : cooldownElapsed ? "READY" : str.tostring(cooldownBars - (bar_index - lastEntryBar)) + " BARS LEFT"
     table.cell(statsTable, 0, 9, "Cooldown")
     table.cell(statsTable, 1, 9, cooldownText, text_color = cooldownElapsed ? color.lime : color.orange)
+
+    string activeZoneText = entryZoneDir == 0 ? "None" : (entryZoneDir == 1 ? "Demand " : "Supply ") + str.tostring(entryZoneBottom, format.mintick) + "-" + str.tostring(entryZoneTop, format.mintick)
+    table.cell(statsTable, 0, 10, "Active Trade Zone")
+    table.cell(statsTable, 1, 10, activeZoneText, text_color = entryZoneDir == 1 ? color.lime : entryZoneDir == -1 ? color.red : color.gray)
