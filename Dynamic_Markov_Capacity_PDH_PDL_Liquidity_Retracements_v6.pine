@@ -144,6 +144,25 @@ requireRetracement = input.bool(
      tooltip = "Longs use retracements from a confirmed upward impulse. Shorts use retracements from a confirmed downward impulse."
 )
 
+maxZonesInput = input.int(
+     defval = 5,
+     title = "Maximum Zones Kept On Chart",
+     minval = 1,
+     maxval = 20,
+     group = groupFib,
+     tooltip = "Keeps this many of the most recent supply/demand zones visible at once instead of only the single latest one -- so a larger, still-relevant zone from an earlier impulse doesn't silently disappear the moment a newer, smaller impulse confirms."
+)
+
+touchDecayInput = input.float(
+     defval = 0.7,
+     title = "Probability Decay Per Prior Touch",
+     minval = 0.1,
+     maxval = 1.0,
+     step = 0.05,
+     group = groupFib,
+     tooltip = "Each zone's displayed hold probability is multiplied by this factor for every time price has already touched it -- a first test carries full weight, each retest is discounted, per the \"a level gets less reliable each time it's retested\" finding in this repo's quant-research-notes skill (Person 2004, references/candlestick-patterns-and-pivot-confluence-person.md). 0.7 means each retest keeps 70% of the prior confidence."
+)
+
 //──────────────────────────────────────────────────────────────────────────────
 // INPUTS — DYNAMIC MARKOV MODEL
 //──────────────────────────────────────────────────────────────────────────────
@@ -436,60 +455,12 @@ bool inBearishRetracement = impulseDirection == -1 and
      close <= bearishZoneUpper
 
 //──────────────────────────────────────────────────────────────────────────────
-// RETRACEMENT ZONES DISPLAYED AS SUPPLY / DEMAND ZONES
-//
-// An upward-impulse retracement (buy the pullback toward the 50-61.8%
-// band) is functionally a DEMAND zone -- where buyers are expected to
-// step back in. A downward-impulse retracement is functionally a SUPPLY
-// zone -- where sellers are expected to step back in. Same math as
-// before (50%-61.8% of the confirmed impulse), displayed with the
-// colored/labeled box convention already used in this repo's
-// Supply_and_Demand_Zones_XL.pine, instead of a plain plot+fill band.
-// The box is created fresh on a new impulse (impulseSetBar == bar_index)
-// and its right edge is extended every bar after that, matching the
-// box.new() + box.set_right() pattern already used in that file.
+// RETRACEMENT ZONES -- FRESH-IMPULSE TRIGGER ONLY
+// The actual zone boxes/labels/scoring are built further below, AFTER the
+// Markov model, because each zone's displayed hold-probability uses the
+// live probabilityBull/probabilityBear reading computed there.
 //──────────────────────────────────────────────────────────────────────────────
-var box zoneBox = na
-var label zoneLabel = na
-
 bool freshImpulseZone = not na(impulseSetBar) and impulseSetBar == bar_index
-
-if showRetracementZone and not na(activeZoneUpper) and not na(activeZoneLower)
-    if freshImpulseZone
-        if not na(zoneBox)
-            box.delete(zoneBox)
-
-        color zoneColor = impulseDirection == 1 ? color.lime : color.red
-
-        zoneBox := box.new(
-             left = na(impulseAnchorBar) ? bar_index : impulseAnchorBar,
-             top = activeZoneUpper,
-             right = bar_index,
-             bottom = activeZoneLower,
-             xloc = xloc.bar_index,
-             bgcolor = color.new(zoneColor, 85),
-             border_color = color.new(zoneColor, 40),
-             border_width = 1
-        )
-    else if not na(zoneBox)
-        box.set_right(zoneBox, bar_index)
-
-    if not na(zoneLabel)
-        label.delete(zoneLabel)
-
-    color labelColor = impulseDirection == 1 ? color.lime : color.red
-    string zoneLabelText = impulseDirection == 1 ? "DEMAND ZONE" : "SUPPLY ZONE"
-
-    zoneLabel := label.new(
-         x = bar_index,
-         y = (activeZoneUpper + activeZoneLower) / 2,
-         text = zoneLabelText,
-         xloc = xloc.bar_index,
-         style = label.style_label_left,
-         color = color.new(color.white, 100),
-         textcolor = labelColor,
-         size = size.small
-    )
 
 //──────────────────────────────────────────────────────────────────────────────
 // DYNAMIC THREE-STATE MARKOV MODEL
@@ -577,6 +548,109 @@ else
     probabilityBear := (bullToBear + 1.0) / (bullTotal + 3.0)
     probabilityNeutral := (bullToNeutral + 1.0) / (bullTotal + 3.0)
     probabilityBull := (bullToBull + 1.0) / (bullTotal + 3.0)
+
+//──────────────────────────────────────────────────────────────────────────────
+// RETRACEMENT ZONES DISPLAYED AS SUPPLY / DEMAND ZONES, WITH A LIVE
+// HOLD-PROBABILITY SCORE
+//
+// An upward-impulse retracement (buy the pullback toward the 50-61.8%
+// band) is functionally a DEMAND zone -- where buyers are expected to
+// step back in. A downward-impulse retracement is functionally a SUPPLY
+// zone -- where sellers are expected to step back in.
+//
+// Two upgrades over a single static zone:
+//   1. HISTORY, not just the latest one. Every confirmed impulse pushes
+//      a new zone into a capped array (maxZonesInput) instead of
+//      overwriting the previous one -- so a larger, still-relevant zone
+//      from an earlier impulse stays visible instead of silently
+//      disappearing the moment a newer, smaller impulse confirms.
+//   2. INVALIDATION. A zone is marked broken the first time price closes
+//      fully through it (not just wicks into it), stops extending
+//      rightward, and is redrawn in gray -- rather than extending
+//      forever at a price level price has already moved past.
+//
+// Each ACTIVE (unbroken) zone's label shows a live hold-probability
+// score, not just a name:
+//   score = (Markov P(next state agrees with the zone's own direction))
+//           x (touchDecayInput ^ times already touched)
+// The Markov term uses this script's own live regime-probability engine
+// (an on-chart use of infrastructure already built here, not a bolted-on
+// number). The touch-decay term is the "first test only" pivot-fade
+// finding from this repo's quant-research-notes skill (Person 2004,
+// references/candlestick-patterns-and-pivot-confluence-person.md) --
+// each retest of the same zone is discounted, never boosted.
+//──────────────────────────────────────────────────────────────────────────────
+var array<box>   zoneBoxes      = array.new<box>()
+var array<label> zoneLabels     = array.new<label>()
+var array<float> zoneTopArr     = array.new<float>()
+var array<float> zoneBottomArr  = array.new<float>()
+var array<int>   zoneDirArr     = array.new<int>()
+var array<bool>  zoneBrokenArr  = array.new<bool>()
+var array<int>   zoneTouchArr   = array.new<int>()
+
+if showRetracementZone and freshImpulseZone and not na(activeZoneUpper) and not na(activeZoneLower)
+    color newZoneColor = impulseDirection == 1 ? color.lime : color.red
+
+    box newZoneBox = box.new(
+         left = na(impulseAnchorBar) ? bar_index : impulseAnchorBar,
+         top = activeZoneUpper,
+         right = bar_index,
+         bottom = activeZoneLower,
+         xloc = xloc.bar_index,
+         bgcolor = color.new(newZoneColor, 85),
+         border_color = color.new(newZoneColor, 40),
+         border_width = 1
+    )
+
+    array.push(zoneBoxes, newZoneBox)
+    array.push(zoneLabels, label.new(x = bar_index, y = (activeZoneUpper + activeZoneLower) / 2, text = "", xloc = xloc.bar_index, style = label.style_label_left, color = color.new(color.white, 100), textcolor = newZoneColor, size = size.small))
+    array.push(zoneTopArr, activeZoneUpper)
+    array.push(zoneBottomArr, activeZoneLower)
+    array.push(zoneDirArr, impulseDirection)
+    array.push(zoneBrokenArr, false)
+    array.push(zoneTouchArr, 0)
+
+    if array.size(zoneBoxes) > maxZonesInput
+        box.delete(array.shift(zoneBoxes))
+        label.delete(array.shift(zoneLabels))
+        array.shift(zoneTopArr)
+        array.shift(zoneBottomArr)
+        array.shift(zoneDirArr)
+        array.shift(zoneBrokenArr)
+        array.shift(zoneTouchArr)
+
+for zi = 0 to array.size(zoneBoxes) - 1
+    bool zBroken = array.get(zoneBrokenArr, zi)
+    float zTop = array.get(zoneTopArr, zi)
+    float zBottom = array.get(zoneBottomArr, zi)
+    int zDir = array.get(zoneDirArr, zi)
+    box zBox = array.get(zoneBoxes, zi)
+    label zLabel = array.get(zoneLabels, zi)
+
+    bool insideNow = close <= zTop and close >= zBottom
+    bool insidePrev = close[1] <= zTop and close[1] >= zBottom
+
+    if not zBroken and insideNow and not insidePrev
+        array.set(zoneTouchArr, zi, array.get(zoneTouchArr, zi) + 1)
+
+    bool justBroke = not zBroken and ((zDir == 1 and close < zBottom) or (zDir == -1 and close > zTop))
+
+    if justBroke
+        array.set(zoneBrokenArr, zi, true)
+        box.set_bgcolor(zBox, color.new(color.gray, 90))
+        box.set_border_color(zBox, color.new(color.gray, 60))
+        label.set_textcolor(zLabel, color.gray)
+        label.set_text(zLabel, (zDir == 1 ? "DEMAND ZONE " : "SUPPLY ZONE ") + "BROKEN")
+    else if not zBroken
+        box.set_right(zBox, bar_index)
+        label.set_x(zLabel, bar_index)
+
+        float baseRegimeProb = zDir == 1 ? probabilityBull : probabilityBear
+        float touchDecay = math.pow(touchDecayInput, array.get(zoneTouchArr, zi))
+        float holdProbabilityPct = baseRegimeProb * touchDecay * 100
+
+        string zLabelText = (zDir == 1 ? "DEMAND ZONE " : "SUPPLY ZONE ") + str.tostring(holdProbabilityPct, "#") + "%"
+        label.set_text(zLabel, zLabelText)
 
 //──────────────────────────────────────────────────────────────────────────────
 // COOLDOWN
