@@ -96,6 +96,13 @@ lotIncrement = input.float(
      group = groupRisk
 )
 
+bypassCapacityGateInput = input.bool(
+     defval = true,
+     title = "Bypass Capacity Gate (I Manage My Own Risk)",
+     group = groupRisk,
+     tooltip = "The Risk/Liquidity Capacity math above can floor Position Size to 0 (\"TOO SMALL\") and block every entry regardless of what the trigger/trend/Markov gates say. With this on, entries are never blocked by that math -- orders use at least one lot/contract (finalPositionQty = max(Position Size, Order-Size Increment)) even if the calculated capacity rounds to zero. Turn this off to let the Risk % / ATR stop / capacity inputs above actually govern order size again."
+)
+
 //──────────────────────────────────────────────────────────────────────────────
 // INPUTS — PREVIOUS-DAY HIGH / LOW
 //──────────────────────────────────────────────────────────────────────────────
@@ -405,6 +412,13 @@ rawPositionCapacity := math.min(rawPositionCapacity, maxUnits)
 
 // Round down to avoid sizing above the calculated risk allowance.
 float positionQty = math.floor(rawPositionCapacity / lotIncrement) * lotIncrement
+
+// The actual size/gate every entry and order below uses. With the bypass
+// off, this is identical to positionQty -- the capacity math still fully
+// governs sizing and can still floor to 0 and block entries, unchanged.
+// With it on, floored-to-zero capacity no longer blocks anything; orders
+// fall back to one lot/contract instead.
+float finalPositionQty = bypassCapacityGateInput ? math.max(positionQty, lotIncrement) : positionQty
 
 //──────────────────────────────────────────────────────────────────────────────
 // CONFIRMED SWING LIQUIDITY LEVELS
@@ -832,7 +846,7 @@ bool zoneLongSignal = longTrigger and
      longRetracementFilter and
      longTrendFilter and
      longMarkovFilter and
-     positionQty > 0 and
+     finalPositionQty > 0 and
      cooldownElapsed
 
 bool zoneShortSignal = shortTrigger and
@@ -840,7 +854,7 @@ bool zoneShortSignal = shortTrigger and
      shortRetracementFilter and
      shortTrendFilter and
      shortMarkovFilter and
-     positionQty > 0 and
+     finalPositionQty > 0 and
      cooldownElapsed
 
 // PDH/PDL BREAKOUT -- a second, independent entry path, not the same
@@ -860,13 +874,13 @@ bool pdlBreakoutTrigger = usePDBreakoutTrigger and ta.crossunder(close, pdl)
 bool longBreakoutSignal = pdhBreakoutTrigger and
      longTrendFilter and
      longMarkovFilter and
-     positionQty > 0 and
+     finalPositionQty > 0 and
      cooldownElapsed
 
 bool shortBreakoutSignal = pdlBreakoutTrigger and
      shortTrendFilter and
      shortMarkovFilter and
-     positionQty > 0 and
+     finalPositionQty > 0 and
      cooldownElapsed
 
 bool longSignal = zoneLongSignal or longBreakoutSignal
@@ -890,7 +904,7 @@ if showBlockedBreakoutLabelsInput and pdhBreakoutTrigger and not longBreakoutSig
     label.new(
          x = bar_index,
          y = high,
-         text = "PDH x, blocked: " + f_blockReason(longTrendFilter, longMarkovFilter, positionQty > 0, cooldownElapsed),
+         text = "PDH x, blocked: " + f_blockReason(longTrendFilter, longMarkovFilter, finalPositionQty > 0, cooldownElapsed),
          style = label.style_label_down,
          color = color.new(color.orange, 80),
          textcolor = color.orange,
@@ -901,7 +915,7 @@ if showBlockedBreakoutLabelsInput and pdlBreakoutTrigger and not shortBreakoutSi
     label.new(
          x = bar_index,
          y = low,
-         text = "PDL x, blocked: " + f_blockReason(shortTrendFilter, shortMarkovFilter, positionQty > 0, cooldownElapsed),
+         text = "PDL x, blocked: " + f_blockReason(shortTrendFilter, shortMarkovFilter, finalPositionQty > 0, cooldownElapsed),
          style = label.style_label_up,
          color = color.new(color.orange, 80),
          textcolor = color.orange,
@@ -927,7 +941,7 @@ if longSignal
     strategy.entry(
          id = "Long",
          direction = strategy.long,
-         qty = positionQty
+         qty = finalPositionQty
     )
 
     lastEntryBar := bar_index
@@ -942,7 +956,7 @@ if shortSignal and allowShorts
     strategy.entry(
          id = "Short",
          direction = strategy.short,
-         qty = positionQty
+         qty = finalPositionQty
     )
 
     lastEntryBar := bar_index
@@ -1141,8 +1155,9 @@ if barstate.islast and showMarkovTable
     f_row(5, "Risk Capacity", str.tostring(riskCapacity, "#.##"), color.black)
     f_row(6, "Liquidity Capacity", str.tostring(liquidityCapacity, "#.##"), color.black)
 
-    string qtyText = positionQty > 0 ? str.tostring(positionQty, "#.##") : "TOO SMALL"
-    color qtyColor = positionQty > 0 ? color.lime : color.red
+    bool sizeBypassed = bypassCapacityGateInput and positionQty <= 0
+    string qtyText = finalPositionQty > 0 ? str.tostring(finalPositionQty, "#.##") + (sizeBypassed ? " (bypassed)" : "") : "TOO SMALL"
+    color qtyColor = sizeBypassed ? color.orange : finalPositionQty > 0 ? color.lime : color.red
     f_row(7, "Position Size", qtyText, qtyColor)
 
     string impulseText = impulseDirection == 1 ? "Upward" : impulseDirection == -1 ? "Downward" : "Not Set"
@@ -1158,21 +1173,21 @@ if barstate.islast and showMarkovTable
     // order (Trigger / PD-PDL / Zone / Trend / Markov / Size / Cooldown).
     // Labels are kept short (fits a narrow phone column); the full legend
     // is on the cell's tooltip instead of in the label text.
-    string longFiltersText = f_boolIcon(longTrigger) + " " + f_boolIcon(longPDFilter) + " " + f_boolIcon(longRetracementFilter) + " " + f_boolIcon(longTrendFilter) + " " + f_boolIcon(longMarkovFilter) + " " + f_boolIcon(positionQty > 0) + " " + f_boolIcon(cooldownElapsed)
+    string longFiltersText = f_boolIcon(longTrigger) + " " + f_boolIcon(longPDFilter) + " " + f_boolIcon(longRetracementFilter) + " " + f_boolIcon(longTrendFilter) + " " + f_boolIcon(longMarkovFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
     table.cell(statsTable, 0, 11, "Long Zone Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: Trigger, PDH/PDL filter, Zone, Trend, Markov, Size, Cooldown")
     table.cell(statsTable, 1, 11, longFiltersText, text_color = zoneLongSignal ? color.lime : color.gray, text_size = resolvedDashboardSize, text_halign = text.align_right)
 
-    string shortFiltersText = f_boolIcon(shortTrigger) + " " + f_boolIcon(shortPDFilter) + " " + f_boolIcon(shortRetracementFilter) + " " + f_boolIcon(shortTrendFilter) + " " + f_boolIcon(shortMarkovFilter) + " " + f_boolIcon(positionQty > 0) + " " + f_boolIcon(cooldownElapsed)
+    string shortFiltersText = f_boolIcon(shortTrigger) + " " + f_boolIcon(shortPDFilter) + " " + f_boolIcon(shortRetracementFilter) + " " + f_boolIcon(shortTrendFilter) + " " + f_boolIcon(shortMarkovFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
     table.cell(statsTable, 0, 12, "Short Zone Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: Trigger, PDH/PDL filter, Zone, Trend, Markov, Size, Cooldown")
     table.cell(statsTable, 1, 12, shortFiltersText, text_color = zoneShortSignal ? color.lime : color.gray, text_size = resolvedDashboardSize, text_halign = text.align_right)
 
     // PDH/PDL breakout path's own gates -- independent of the zone path
     // above, so a "why didn't the breakout fire" question reads straight
     // off this row instead of being folded into the zone diagnostics.
-    string longBreakoutText = f_boolIcon(pdhBreakoutTrigger) + " " + f_boolIcon(longTrendFilter) + " " + f_boolIcon(longMarkovFilter) + " " + f_boolIcon(positionQty > 0) + " " + f_boolIcon(cooldownElapsed)
+    string longBreakoutText = f_boolIcon(pdhBreakoutTrigger) + " " + f_boolIcon(longTrendFilter) + " " + f_boolIcon(longMarkovFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
     table.cell(statsTable, 0, 13, "Long Breakout Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: PDH Cross, Trend, Markov, Size, Cooldown")
     table.cell(statsTable, 1, 13, longBreakoutText, text_color = longBreakoutSignal ? color.lime : color.gray, text_size = resolvedDashboardSize, text_halign = text.align_right)
 
-    string shortBreakoutText = f_boolIcon(pdlBreakoutTrigger) + " " + f_boolIcon(shortTrendFilter) + " " + f_boolIcon(shortMarkovFilter) + " " + f_boolIcon(positionQty > 0) + " " + f_boolIcon(cooldownElapsed)
+    string shortBreakoutText = f_boolIcon(pdlBreakoutTrigger) + " " + f_boolIcon(shortTrendFilter) + " " + f_boolIcon(shortMarkovFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
     table.cell(statsTable, 0, 14, "Short Breakout Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: PDL Cross, Trend, Markov, Size, Cooldown")
     table.cell(statsTable, 1, 14, shortBreakoutText, text_color = shortBreakoutSignal ? color.lime : color.gray, text_size = resolvedDashboardSize, text_halign = text.align_right)
