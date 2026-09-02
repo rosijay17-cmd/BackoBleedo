@@ -228,6 +228,14 @@ showMarkovTable = input.bool(
      group = groupMarkov
 )
 
+dashboardPositionInput = input.string(
+     defval = "Top Left",
+     title = "Dashboard Position",
+     options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"],
+     group = groupMarkov,
+     tooltip = "Default moved off the top-right corner, on purpose -- that's where the zone price-scale tags, PDH/PDL labels, and the live price marker all already stack up, which can bury the table behind them. Top Left keeps it clear of that clutter."
+)
+
 //──────────────────────────────────────────────────────────────────────────────
 // INPUTS — EXECUTION
 //──────────────────────────────────────────────────────────────────────────────
@@ -881,13 +889,21 @@ alertcondition(
 // MARKOV / CAPACITY TABLE
 //──────────────────────────────────────────────────────────────────────────────
 var table statsTable = table.new(
-     position.top_right,
+     position.top_left,
      2,
      10,
      border_width = 1
 )
 
+string dashboardPosition = switch dashboardPositionInput
+    "Top Left" => position.top_left
+    "Top Right" => position.top_right
+    "Bottom Left" => position.bottom_left
+    "Bottom Right" => position.bottom_right
+    => position.top_left
+
 if barstate.islast and showMarkovTable
+    table.set_position(statsTable, dashboardPosition)
     table.cell(statsTable, 0, 0, "Dynamic Model", text_color = color.white, bgcolor = color.rgb(20, 50, 90))
     table.cell(statsTable, 1, 0, "Value", text_color = color.white, bgcolor = color.rgb(20, 50, 90))
 
