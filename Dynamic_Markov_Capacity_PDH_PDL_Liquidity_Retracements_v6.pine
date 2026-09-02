@@ -720,15 +720,21 @@ if array.size(zoneBoxes) > 0
             string zLabelText = (zDir == 1 ? "DEMAND ZONE " : "SUPPLY ZONE ") + str.tostring(holdProbabilityPct, "#") + "%"
             label.set_text(zLabel, zLabelText)
 
-            // Entry-qualifying: price must be inside THIS unbroken zone
-            // right now, and its live score must clear the minimum. Also
-            // remember which specific zone qualified (its own top/bottom,
-            // not just a yes/no flag) so an entry can later track THIS
-            // zone's break independent of the array -- same "freeze the
-            // specific level at entry" pattern already used in
-            // Supply_and_Demand_Zones_XL_Strategy.pine, robust against a
-            // newer zone pushing this one out of the array mid-trade.
-            if insideNow and holdProbabilityPct >= minZoneHoldProbabilityInput
+            // Entry-qualifying: the bar must have WICKED into THIS unbroken
+            // zone (not just closed inside it -- a real rejection candle
+            // routinely closes back through and beyond the zone entirely,
+            // which "insideNow"/close-only would have wrongly excluded),
+            // without confirming a break of it, and its live score must
+            // clear the minimum. Also remember which specific zone
+            // qualified (its own top/bottom, not just a yes/no flag) so an
+            // entry can later track THIS zone's break independent of the
+            // array -- same "freeze the specific level at entry" pattern
+            // already used in Supply_and_Demand_Zones_XL_Strategy.pine,
+            // robust against a newer zone pushing this one out of the
+            // array mid-trade.
+            bool touchedZone = zDir == 1 ? (low <= zTop and close >= zBottom) : (high >= zBottom and close <= zTop)
+
+            if touchedZone and holdProbabilityPct >= minZoneHoldProbabilityInput
                 if zDir == 1
                     inActiveDemandZone := true
                     qualifyingDemandTop := zTop
