@@ -43,6 +43,7 @@ are shared:
 | 11 | Candlestick pattern catalog + pivot-point confluence (multi-timeframe agreement, first-test-only fade rule, P3T signal architecture) | `references/candlestick-patterns-and-pivot-confluence-person.md` | Person (2004), *A Complete Guide to Technical Trading Tactics*, Ch. 4 & 6 |
 | 12 | Cross-asset time-series momentum (industrial metals lead equity momentum) + bootstrap/shuffle overfitting test | `references/cross-asset-time-series-momentum-xu.md` | Xu, Li, Singh & Park (2025), *Accounting & Finance* |
 | 13 | Intraday reversal vs. momentum feasibility (statistically real reversal effect, economically worthless net of costs) | `references/intraday-reversal-momentum-feasibility-herberger.md` | Herberger, Horn & Oehler (2020), *Financial Markets and Portfolio Management* |
+| 14 | Breakout signs-of-strength/weakness checklist, measured-move gap targets, dynamic mid-trade position sizing | `references/breakout-price-action-brooks.md` | Brooks (2012), *Trading Price Action Trading Ranges*, Part I |
 
 ## Portability Matrix
 
@@ -94,6 +95,9 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
 | Skip-period between signal computation and entry (avoid bid-ask bounce/price pressure) | ✅ Direct | — | A one-bar lag between ranking and acting on it; check this repo's own scripts for whether they already do this |
 | Market-adjusted return calculation (return minus an equal-weighted basket, not raw) | ✅ Direct | — | Simple subtraction; directly reusable in `quantor` to isolate idiosyncratic edge from broad market movement during the test window |
 | Transaction-cost break-even check (state the effect size in the same units as the real fee schedule, compare) | ✅ Direct | ✅ Direct | The single most actionable technique in paper #13 — apply before trusting any small statistically-significant edge as economically tradeable |
+| Breakout signs-of-strength/weakness checklist (body/tail ratio, volume multiple, pullback depth/timing, micro-gap, close-reversal count) | ✅ Direct, as a scored checklist | — | Every item is computable from OHLCV; the source doesn't specify how to weight/combine them, so this repo would need its own combination rule |
+| Gap-based measured-move target calculation (spike height, gap-midpoint, negative-gap variants) | ✅ Direct | — | Pure arithmetic; a third independently-sourced, non-Fibonacci target method alongside paper #10's Inverse 78.6% rule and the CP2 concept already in `Kaufman_Trend_System_Swing.pine` |
+| Dynamic mid-trade position-size scaling (re-size as the logical stop distance changes, not just at entry) | ✅ Direct | — | Extends the ATR-scaled sizing formula already used in this repo's swing/reversal scripts |
 
 ## Cross-Paper Synthesis
 
@@ -267,6 +271,20 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
   at one horizon (e.g. Kaufman's trend systems) transfers cleanly to this repo's much
   shorter-horizon scripts, or that a short-horizon finding (this paper) says anything
   about the multi-month swing systems.
+- **Paper #14 is this skill's weakest-evidence source yet — weaker even than papers
+  #10 and #11** — 63 pages of bar-by-bar narrative with no backtest, no sample size,
+  and no cited study anywhere, only a handful of the author's own stated experience-
+  based percentages. Logged with that explicitly stated, the same discipline applied
+  to every discretionary source in this skill. It still earns its place because one
+  section (the signs-of-strength/weakness checklist) is unusually precise and
+  mechanizable despite the surrounding narrative style — most of a source's evidence
+  quality doesn't have to be uniform for parts of it to be worth using.
+- **A third independent, unrelated author now touches "repeated tests of the same
+  level get less reliable"** — paper #11's explicit "first test only" pivot-fade
+  rule, paper #10's Y-High/Y-Low exhaustion framing, and now paper #14's breakout-
+  test-precision discussion (a test that falls just short of the level reads as
+  strength; each failed retest erodes the losing side's confidence) all converge on
+  the same underlying idea from three sources that don't cite each other.
 - **A single backtest run is a single sample path, and paper #6 proves how wide that
   variance can be even under a correctly-specified model** (identical parameters,
   identical thresholds, single-path total returns spanning roughly 0.08x to ~1,888x
@@ -518,3 +536,16 @@ can be corrected against the real implementation rather than inference.
   with papers #9 and #12's multi-month momentum findings as evidence of a
   horizon-dependent regime rather than a contradiction. No contradiction with papers
   #1-12.
+- **2026-09-02** — Ingested paper #14: Brooks (2012), "Breakouts: Transitioning into a
+  New Trend" (Part I, Ch. 1-6 of *Trading Price Action Trading Ranges*). This skill's
+  weakest-evidence source yet — 63 pages of bar-by-bar narrative, no backtest, no
+  cited study — logged with that explicitly stated. Standout content despite the thin
+  evidence: a precise, mechanizable signs-of-strength/weakness checklist for scoring a
+  live breakout (body/tail ratio, volume multiple, pullback depth/timing/duration,
+  micro-gap presence, close-reversal count); gap-based measured-move target
+  calculations (spike height, gap-midpoint, negative-gap variants); a "trader's
+  equation" 60-70% follow-through heuristic (unvalidated, stated as experience); and
+  dynamic mid-trade position-size scaling as a developing spike's logical stop
+  distance changes. A third independent source now touches "repeated tests of a level
+  get less reliable" alongside papers #10 and #11 — see the new Cross-Paper Synthesis
+  note. No contradiction with papers #1-13.
