@@ -619,38 +619,39 @@ if showRetracementZone and freshImpulseZone and not na(activeZoneUpper) and not 
         array.shift(zoneBrokenArr)
         array.shift(zoneTouchArr)
 
-for zi = 0 to array.size(zoneBoxes) - 1
-    bool zBroken = array.get(zoneBrokenArr, zi)
-    float zTop = array.get(zoneTopArr, zi)
-    float zBottom = array.get(zoneBottomArr, zi)
-    int zDir = array.get(zoneDirArr, zi)
-    box zBox = array.get(zoneBoxes, zi)
-    label zLabel = array.get(zoneLabels, zi)
+if array.size(zoneBoxes) > 0
+    for zi = 0 to array.size(zoneBoxes) - 1
+        bool zBroken = array.get(zoneBrokenArr, zi)
+        float zTop = array.get(zoneTopArr, zi)
+        float zBottom = array.get(zoneBottomArr, zi)
+        int zDir = array.get(zoneDirArr, zi)
+        box zBox = array.get(zoneBoxes, zi)
+        label zLabel = array.get(zoneLabels, zi)
 
-    bool insideNow = close <= zTop and close >= zBottom
-    bool insidePrev = close[1] <= zTop and close[1] >= zBottom
+        bool insideNow = close <= zTop and close >= zBottom
+        bool insidePrev = close[1] <= zTop and close[1] >= zBottom
 
-    if not zBroken and insideNow and not insidePrev
-        array.set(zoneTouchArr, zi, array.get(zoneTouchArr, zi) + 1)
+        if not zBroken and insideNow and not insidePrev
+            array.set(zoneTouchArr, zi, array.get(zoneTouchArr, zi) + 1)
 
-    bool justBroke = not zBroken and ((zDir == 1 and close < zBottom) or (zDir == -1 and close > zTop))
+        bool justBroke = not zBroken and ((zDir == 1 and close < zBottom) or (zDir == -1 and close > zTop))
 
-    if justBroke
-        array.set(zoneBrokenArr, zi, true)
-        box.set_bgcolor(zBox, color.new(color.gray, 90))
-        box.set_border_color(zBox, color.new(color.gray, 60))
-        label.set_textcolor(zLabel, color.gray)
-        label.set_text(zLabel, (zDir == 1 ? "DEMAND ZONE " : "SUPPLY ZONE ") + "BROKEN")
-    else if not zBroken
-        box.set_right(zBox, bar_index)
-        label.set_x(zLabel, bar_index)
+        if justBroke
+            array.set(zoneBrokenArr, zi, true)
+            box.set_bgcolor(zBox, color.new(color.gray, 90))
+            box.set_border_color(zBox, color.new(color.gray, 60))
+            label.set_textcolor(zLabel, color.gray)
+            label.set_text(zLabel, (zDir == 1 ? "DEMAND ZONE " : "SUPPLY ZONE ") + "BROKEN")
+        else if not zBroken
+            box.set_right(zBox, bar_index)
+            label.set_x(zLabel, bar_index)
 
-        float baseRegimeProb = zDir == 1 ? probabilityBull : probabilityBear
-        float touchDecay = math.pow(touchDecayInput, array.get(zoneTouchArr, zi))
-        float holdProbabilityPct = baseRegimeProb * touchDecay * 100
+            float baseRegimeProb = zDir == 1 ? probabilityBull : probabilityBear
+            float touchDecay = math.pow(touchDecayInput, array.get(zoneTouchArr, zi))
+            float holdProbabilityPct = baseRegimeProb * touchDecay * 100
 
-        string zLabelText = (zDir == 1 ? "DEMAND ZONE " : "SUPPLY ZONE ") + str.tostring(holdProbabilityPct, "#") + "%"
-        label.set_text(zLabel, zLabelText)
+            string zLabelText = (zDir == 1 ? "DEMAND ZONE " : "SUPPLY ZONE ") + str.tostring(holdProbabilityPct, "#") + "%"
+            label.set_text(zLabel, zLabelText)
 
 //──────────────────────────────────────────────────────────────────────────────
 // COOLDOWN
