@@ -11,7 +11,7 @@ strategy(
      slippage = 1,
      process_orders_on_close = true,
      max_lines_count = 300,
-     max_labels_count = 100,
+     max_labels_count = 300,
      max_bars_back = 1100,
      calc_on_every_tick = true
 )
@@ -119,6 +119,13 @@ usePDBreakoutTrigger = input.bool(
      title = "Enable PDH/PDL Breakout Entries",
      group = groupPD,
      tooltip = "A genuine second, independent entry path: close crossing above PDH goes long, close crossing below PDL goes short -- fires on its own, in addition to the zone-based rejection-candle trigger, not instead of it. Still gated by the Trend/Markov/Capacity/Cooldown filters, but NOT by the retracement-zone filter (a breakout is, by definition, not a pullback into a zone)."
+)
+
+showBlockedBreakoutLabelsInput = input.bool(
+     defval = true,
+     title = "Label Blocked PDH/PDL Breakouts",
+     group = groupPD,
+     tooltip = "The dashboard's gate rows only ever show the CURRENT bar's state (they redraw on the latest bar only) -- scrolling back to an old PDH/PDL cross and reading the dashboard next to it compares two different points in time. This draws a small label directly ON every historical bar where price actually crossed PDH/PDL but the trade was blocked, naming the specific gate that blocked it, so an old screenshot carries its own explanation."
 )
 
 //──────────────────────────────────────────────────────────────────────────────
@@ -864,6 +871,42 @@ bool shortBreakoutSignal = pdlBreakoutTrigger and
 
 bool longSignal = zoneLongSignal or longBreakoutSignal
 bool shortSignal = zoneShortSignal or shortBreakoutSignal
+
+// Historical "why didn't this breakout fire" labels. The dashboard table
+// only draws inside `if barstate.islast` (standard practice -- redrawing
+// a table on every historical bar is wasted work), so it only ever shows
+// the LATEST bar's gate state. Scrolling the chart back to an old PDH/PDL
+// cross and reading the live dashboard next to it is comparing two
+// different points in time, which is exactly what looked like "PDH/PDL
+// isn't working" in a scrolled-back screenshot even though the trigger
+// fired correctly and a filter genuinely blocked it. These labels are
+// drawn AT the historical bar itself, wherever a real cross happened but
+// got blocked, naming the first gate responsible.
+f_blockReason(bool trend, bool markov, bool qty, bool cooldown) =>
+    string reason = not trend ? "Trend" : not markov ? "Markov" : not qty ? "Size" : not cooldown ? "Cooldown" : "?"
+    reason
+
+if showBlockedBreakoutLabelsInput and pdhBreakoutTrigger and not longBreakoutSignal
+    label.new(
+         x = bar_index,
+         y = high,
+         text = "PDH x, blocked: " + f_blockReason(longTrendFilter, longMarkovFilter, positionQty > 0, cooldownElapsed),
+         style = label.style_label_down,
+         color = color.new(color.orange, 80),
+         textcolor = color.orange,
+         size = size.tiny
+    )
+
+if showBlockedBreakoutLabelsInput and pdlBreakoutTrigger and not shortBreakoutSignal
+    label.new(
+         x = bar_index,
+         y = low,
+         text = "PDL x, blocked: " + f_blockReason(shortTrendFilter, shortMarkovFilter, positionQty > 0, cooldownElapsed),
+         style = label.style_label_up,
+         color = color.new(color.orange, 80),
+         textcolor = color.orange,
+         size = size.tiny
+    )
 
 //──────────────────────────────────────────────────────────────────────────────
 // ORDER AND STOP LOGIC
