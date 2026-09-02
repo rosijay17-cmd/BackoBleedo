@@ -1095,9 +1095,9 @@ plotshape(
 plotshape(
      longBreakoutSignal,
      title = "Long Signal (PDH Breakout)",
-     style = shape.arrowup,
+     style = shape.circle,
      location = location.belowbar,
-     size = size.small,
+     size = size.normal,
      color = color.aqua,
      text = "LONG-B"
 )
@@ -1115,9 +1115,9 @@ plotshape(
 plotshape(
      shortBreakoutSignal and allowShorts,
      title = "Short Signal (PDL Breakout)",
-     style = shape.arrowdown,
+     style = shape.circle,
      location = location.abovebar,
-     size = size.small,
+     size = size.normal,
      color = color.orange,
      text = "SHORT-B"
 )
