@@ -1073,24 +1073,51 @@ plot(
      linewidth = 2
 )
 
+// Split by which of the two independent paths actually fired -- a single
+// shared "LONG"/"SHORT" marker couldn't tell you whether a fill came from
+// the zone-rejection trigger or the PDH/PDL breakout trigger, which
+// mattered once both paths could fire on nearby bars (pyramiding = 0
+// caps the position either way, so this is a labeling distinction, not
+// a risk one). Different marker style AND color per path so two firing
+// on the same bar are both still visible rather than fully overlapping.
 plotshape(
-     longSignal,
-     title = "Long Signal",
+     zoneLongSignal,
+     title = "Long Signal (Zone)",
      style = shape.triangleup,
      location = location.belowbar,
      size = size.small,
      color = color.lime,
-     text = "LONG"
+     text = "LONG-Z"
 )
 
 plotshape(
-     shortSignal and allowShorts,
-     title = "Short Signal",
+     longBreakoutSignal,
+     title = "Long Signal (PDH Breakout)",
+     style = shape.arrowup,
+     location = location.belowbar,
+     size = size.tiny,
+     color = color.aqua,
+     text = "LONG-B"
+)
+
+plotshape(
+     zoneShortSignal and allowShorts,
+     title = "Short Signal (Zone)",
      style = shape.triangledown,
      location = location.abovebar,
      size = size.small,
      color = color.red,
-     text = "SHORT"
+     text = "SHORT-Z"
+)
+
+plotshape(
+     shortBreakoutSignal and allowShorts,
+     title = "Short Signal (PDL Breakout)",
+     style = shape.arrowdown,
+     location = location.abovebar,
+     size = size.tiny,
+     color = color.orange,
+     text = "SHORT-B"
 )
 
 //──────────────────────────────────────────────────────────────────────────────
