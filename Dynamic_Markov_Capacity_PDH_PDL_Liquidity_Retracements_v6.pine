@@ -12,8 +12,21 @@ strategy(
      process_orders_on_close = true,
      max_lines_count = 300,
      max_labels_count = 100,
-     max_bars_back = 1100
+     max_bars_back = 1100,
+     calc_on_every_tick = true
 )
+// calc_on_every_tick: "dashboard only comes at candle open" is this
+// parameter's default (false) doing exactly what it's documented to do --
+// with it false, the WHOLE script (table draws included, not just orders)
+// only re-executes once per bar for the still-forming realtime bar, so
+// everything freezes at whatever it read at that bar's open until the next
+// bar opens. Setting it true makes the script re-run on every incoming
+// price tick, so the dashboard (and every other live read) stays current
+// through the whole bar, not just its first instant. Cost: the Markov
+// loop (up to 1000 iterations) now runs on every tick instead of once per
+// bar, and backtest fills simulate intrabar movement more precisely rather
+// than only at bar boundaries -- both expected, acceptable trade-offs for
+// a script meant to be watched live, not a bug to work around.
 // max_bars_back: the Markov transition loop below indexes close[i]/atr[i]
 // with a VARIABLE loop index up to markovLookback (max input 1000), which
 // Pine's auto-detection cannot size from a for-loop bound alone -- without
