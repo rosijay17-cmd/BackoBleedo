@@ -129,10 +129,10 @@ usePDBreakoutTrigger = input.bool(
 )
 
 showBlockedBreakoutLabelsInput = input.bool(
-     defval = true,
-     title = "Label Blocked PDH/PDL Breakouts",
+     defval = false,
+     title = "Label Blocked PDH/PDL Breakouts (Debug)",
      group = groupPD,
-     tooltip = "The dashboard's gate rows only ever show the CURRENT bar's state (they redraw on the latest bar only) -- scrolling back to an old PDH/PDL cross and reading the dashboard next to it compares two different points in time. This draws a small label directly ON every historical bar where price actually crossed PDH/PDL but the trade was blocked, naming the specific gate that blocked it, so an old screenshot carries its own explanation."
+     tooltip = "Off by default -- these were a debugging aid (cluttered the chart with a label on every blocked PDH/PDL cross) and are no longer needed now that the Markov threshold that caused most of them is lowered. Turn on again if you need to diagnose why a specific breakout didn't fire: draws a small label directly ON the historical bar naming the gate that blocked it (the dashboard's gate rows only ever reflect the CURRENT bar, not one you've scrolled back to)."
 )
 
 //──────────────────────────────────────────────────────────────────────────────
@@ -239,21 +239,23 @@ stateThresholdATR = input.float(
 )
 
 minimumBullProbability = input.float(
-     defval = 0.45,
+     defval = 0.38,
      title = "Minimum Bull Probability for Longs",
      minval = 0.01,
      maxval = 0.99,
      step = 0.01,
-     group = groupMarkov
+     group = groupMarkov,
+     tooltip = "Lowered from the original 0.45 default -- across live testing this 3-state model's Bull/Bear reads routinely land in the mid-30s to low-40s% (Neutral typically absorbs 20-30% of the distribution), so 45% was rarely clearable and was the single most common gate blocker across both the zone and PDH/PDL breakout paths."
 )
 
 minimumBearProbability = input.float(
-     defval = 0.45,
+     defval = 0.38,
      title = "Minimum Bear Probability for Shorts",
      minval = 0.01,
      maxval = 0.99,
      step = 0.01,
-     group = groupMarkov
+     group = groupMarkov,
+     tooltip = "Lowered from the original 0.45 default -- across live testing this 3-state model's Bull/Bear reads routinely land in the mid-30s to low-40s% (Neutral typically absorbs 20-30% of the distribution), so 45% was rarely clearable and was the single most common gate blocker across both the zone and PDH/PDL breakout paths."
 )
 
 showMarkovTable = input.bool(
