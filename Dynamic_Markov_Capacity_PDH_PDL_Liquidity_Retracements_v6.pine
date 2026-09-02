@@ -1095,7 +1095,7 @@ plotshape(
      title = "Long Signal (PDH Breakout)",
      style = shape.arrowup,
      location = location.belowbar,
-     size = size.tiny,
+     size = size.small,
      color = color.aqua,
      text = "LONG-B"
 )
@@ -1115,7 +1115,7 @@ plotshape(
      title = "Short Signal (PDL Breakout)",
      style = shape.arrowdown,
      location = location.abovebar,
-     size = size.tiny,
+     size = size.small,
      color = color.orange,
      text = "SHORT-B"
 )
