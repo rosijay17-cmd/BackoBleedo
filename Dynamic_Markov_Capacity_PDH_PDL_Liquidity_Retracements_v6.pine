@@ -885,13 +885,13 @@ footprintWindowInput = input.int(
 )
 
 footprintImbalancePctInput = input.float(
-     defval = 300.0,
+     defval = 130.0,
      title = "Imbalance Threshold (%)",
      minval = 100.0,
      maxval = 1000.0,
-     step = 25.0,
+     step = 10.0,
      group = groupFootprint,
-     tooltip = "One side's window volume must exceed the opposing side's by this percentage to count as an imbalance -- 300%, the classical figure, demands three times the opposing volume. Matches Volume_Footprint_Math_Geometry_Intro.pine's own default."
+     tooltip = "One side's window volume must exceed the opposing side's by this percentage to count as an imbalance. 300%, the classical figure, is Volume_Footprint_Math_Geometry_Intro.pine's own default -- but that threshold is meant for a SINGLE price-level row in a footprint table, a genuinely rare, extreme single-tick event. Applied here to a rolling multi-bar TOTAL volume sum instead, 300% was nearly unclearable in practice (live testing saw a real 1.39:1 buy lean still read as NEUTRAL) and was blocking every entry path regardless of what the trigger/trend/Markov gates said. Lowered to 130% (one side needs ~30% more volume than the other) so it reads real, achievable leans in this window-sum context."
 )
 
 [footprintLtfClose, footprintLtfOpen, footprintLtfVolume] = request.security_lower_tf(
