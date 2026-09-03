@@ -103,6 +103,23 @@ bypassCapacityGateInput = input.bool(
      tooltip = "The Risk/Liquidity Capacity math above can floor Position Size to 0 (\"TOO SMALL\") and block every entry regardless of what the trigger/trend/Markov gates say. With this on, entries are never blocked by that math -- orders use at least one lot/contract (finalPositionQty = max(Position Size, Order-Size Increment)) even if the calculated capacity rounds to zero. Turn this off to let the Risk % / ATR stop / capacity inputs above actually govern order size again."
 )
 
+useConfidenceSizingInput = input.bool(
+     defval = true,
+     title = "Scale Size by Markov Confidence",
+     group = groupRisk,
+     tooltip = "Every qualifying entry currently uses the same finalPositionQty regardless of whether probabilityBull/probabilityBear barely cleared its threshold or read near certainty -- the entry gate keeps only pass/fail, discarding how confident the model actually was. With this on, size scales linearly from the floor below (at the threshold) up to 100% of finalPositionQty (at 100% probability). This is a risk-SHAPING tool, not an edge-multiplier -- per this repo's quant-research-notes skill (Kuntz 2020, beta dispersion/market timing), the equivalent pattern there reduced volatility with a modest trade-off in average return, not the other way around. Rounds down to whole lots, floored at one lot/contract minimum -- at Position Size 1, this has no visible effect since there's nothing smaller than one lot to scale down to; it only differentiates once finalPositionQty is 2 or more."
+)
+
+confidenceSizingFloorPctInput = input.float(
+     defval = 50.0,
+     title = "Minimum Size At Threshold (%)",
+     minval = 10.0,
+     maxval = 100.0,
+     step = 5.0,
+     group = groupRisk,
+     tooltip = "The fraction of finalPositionQty used when the Markov probability is sitting exactly at its entry threshold (barely qualifying). Scales up linearly to 100% as the probability approaches certainty. 100% here disables any scaling effect (every qualifying signal trades full size, same as before this feature existed)."
+)
+
 //──────────────────────────────────────────────────────────────────────────────
 // INPUTS — PREVIOUS-DAY HIGH / LOW
 //──────────────────────────────────────────────────────────────────────────────
@@ -1042,6 +1059,49 @@ if showBlockedBreakoutLabelsInput and pdlBreakoutTrigger and not shortBreakoutSi
     )
 
 //──────────────────────────────────────────────────────────────────────────────
+// CONFIDENCE-PROPORTIONAL POSITION SIZING
+//
+// Every qualifying signal has so far used the same finalPositionQty
+// regardless of HOW confident the Markov model was -- the entry gate
+// (longMarkovFilter/shortMarkovFilter) keeps only pass/fail, discarding
+// the actual probabilityBull/probabilityBear reading once it clears the
+// bar. This scales size using that same number the gate already reads,
+// no new signal required.
+//
+// Deliberately NOT paper #16's raw formula (X = 2*(p - 0.5), meant for a
+// reading that straddles 50% both ways) -- here probabilityBull/Bear is
+// only ever acted on once it's ALREADY above minimumBullProbability/
+// minimumBearProbability (0.38 default), so that formula would compute
+// a negative scalar right at the threshold. Rescaled instead: linear
+// from confidenceSizingFloorPctInput at the threshold itself, up to
+// 100% at full (1.0) probability. A signal that barely qualified trades
+// smaller; one the model is highly confident in trades closer to full
+// computed size.
+//──────────────────────────────────────────────────────────────────────────────
+float longConfidenceScalar = 1.0
+float shortConfidenceScalar = 1.0
+
+if useConfidenceSizingInput
+    float confidenceFloor = confidenceSizingFloorPctInput / 100.0
+
+    if minimumBullProbability < 1.0
+        float longConfidenceProgress = math.max(0.0, math.min(1.0, (probabilityBull - minimumBullProbability) / (1.0 - minimumBullProbability)))
+        longConfidenceScalar := confidenceFloor + (1.0 - confidenceFloor) * longConfidenceProgress
+
+    if minimumBearProbability < 1.0
+        float shortConfidenceProgress = math.max(0.0, math.min(1.0, (probabilityBear - minimumBearProbability) / (1.0 - minimumBearProbability)))
+        shortConfidenceScalar := confidenceFloor + (1.0 - confidenceFloor) * shortConfidenceProgress
+
+// Rounded down to whole lots and floored at one lot/contract minimum --
+// a fractional contract isn't a real order, and letting the scalar drop
+// a trade to zero would silently block it rather than just shrink it.
+// At finalPositionQty == lotIncrement (one lot), this floors right back
+// to finalPositionQty every time -- the feature only visibly
+// differentiates once finalPositionQty is two lots or more.
+float longConfidenceQty = math.max(lotIncrement, math.floor((finalPositionQty * longConfidenceScalar) / lotIncrement) * lotIncrement)
+float shortConfidenceQty = math.max(lotIncrement, math.floor((finalPositionQty * shortConfidenceScalar) / lotIncrement) * lotIncrement)
+
+//──────────────────────────────────────────────────────────────────────────────
 // ORDER AND STOP LOGIC
 //──────────────────────────────────────────────────────────────────────────────
 
@@ -1060,7 +1120,7 @@ if longSignal
     strategy.entry(
          id = "Long",
          direction = strategy.long,
-         qty = finalPositionQty
+         qty = longConfidenceQty
     )
 
     lastEntryBar := bar_index
@@ -1075,7 +1135,7 @@ if shortSignal and allowShorts
     strategy.entry(
          id = "Short",
          direction = strategy.short,
-         qty = finalPositionQty
+         qty = shortConfidenceQty
     )
 
     lastEntryBar := bar_index
@@ -1260,7 +1320,7 @@ alertcondition(
 var table statsTable = table.new(
      position.top_left,
      2,
-     17,
+     18,
      border_width = 1
 )
 
@@ -1347,3 +1407,13 @@ if barstate.islast and showMarkovTable
 
     string footprintPocText = na(footprintPocPrice) ? "None" : str.tostring(footprintPocPrice, format.mintick)
     f_row(16, "Footprint POC", footprintPocText, color.black)
+
+    // Confidence-proportional sizing readout -- shows the scalar that
+    // would apply to WHICHEVER side currently reads more probable, so
+    // this row means something even while flat (no open position to
+    // anchor "long" vs "short" to yet).
+    bool confidenceShowLong = probabilityBull >= probabilityBear
+    float confidenceScalarShown = confidenceShowLong ? longConfidenceScalar : shortConfidenceScalar
+    float confidenceQtyShown = confidenceShowLong ? longConfidenceQty : shortConfidenceQty
+    string confidenceText = not useConfidenceSizingInput ? "OFF" : (confidenceShowLong ? "Long " : "Short ") + str.tostring(confidenceScalarShown * 100, "#") + "% -> " + str.tostring(confidenceQtyShown, "#.##")
+    f_row(17, "Confidence Sizing", confidenceText, useConfidenceSizingInput ? (confidenceShowLong ? color.lime : color.red) : color.gray)
