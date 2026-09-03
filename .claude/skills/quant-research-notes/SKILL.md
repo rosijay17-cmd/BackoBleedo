@@ -1,6 +1,6 @@
 ---
 name: quant-research-notes
-description: Persistent knowledge base of reusable concepts, formulas, and documented pitfalls from academic papers and reference texts on algorithmic/quantitative trading (signal volatility, Markov-switching regimes, breakout/multi-indicator combination, RL+fuzzy multi-strategy allocation, implied-vs-historical volatility, support/resistance detection, cycle analysis). Load this before designing, revising, or backtesting any Pine Script strategy or indicator in this repo, or before doing quant research for the PANDA/QUANTS/quantor work — check it for an applicable technique or a known failure mode before building new logic from scratch.
+description: Persistent knowledge base of reusable concepts, formulas, and documented pitfalls from academic papers and reference texts on algorithmic/quantitative trading (signal volatility, Markov-switching regimes, breakout/multi-indicator combination, RL+fuzzy multi-strategy allocation, implied-vs-historical volatility, support/resistance detection, cycle analysis, intraday volume-volatility correlation, beta dispersion/market timing). Load this before designing, revising, or backtesting any Pine Script strategy or indicator in this repo, or before doing quant research for the PANDA/QUANTS/quantor work — check it for an applicable technique or a known failure mode before building new logic from scratch.
 ---
 
 # Quant Research Notes
@@ -44,6 +44,8 @@ are shared:
 | 12 | Cross-asset time-series momentum (industrial metals lead equity momentum) + bootstrap/shuffle overfitting test | `references/cross-asset-time-series-momentum-xu.md` | Xu, Li, Singh & Park (2025), *Accounting & Finance* |
 | 13 | Intraday reversal vs. momentum feasibility (statistically real reversal effect, economically worthless net of costs) | `references/intraday-reversal-momentum-feasibility-herberger.md` | Herberger, Horn & Oehler (2020), *Financial Markets and Portfolio Management* |
 | 14 | Breakout signs-of-strength/weakness checklist, measured-move gap targets, dynamic mid-trade position sizing | `references/breakout-price-action-brooks.md` | Brooks (2012), *Trading Price Action Trading Ranges*, Part I |
+| 15 | Intraday volatility-volume correlation profile (hump-shaped not U-shaped, MDH/SIAH), FOMC-window spike | `references/intraday-volume-volatility-correlation-graczyk.md` | Graczyk & Duarte Queirós (2018), *Physica A* |
+| 16 | Beta dispersion as a systemic-risk/market-vulnerability measure, market timing via distributional regression | `references/beta-dispersion-market-timing-kuntz.md` | Kuntz (2020), *J. of Empirical Finance* |
 
 ## Portability Matrix
 
@@ -98,6 +100,14 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
 | Breakout signs-of-strength/weakness checklist (body/tail ratio, volume multiple, pullback depth/timing, micro-gap, close-reversal count) | ✅ Direct, as a scored checklist | — | Every item is computable from OHLCV; the source doesn't specify how to weight/combine them, so this repo would need its own combination rule |
 | Gap-based measured-move target calculation (spike height, gap-midpoint, negative-gap variants) | ✅ Direct | — | Pure arithmetic; a third independently-sourced, non-Fibonacci target method alongside paper #10's Inverse 78.6% rule and the CP2 concept already in `Kaufman_Trend_System_Swing.pine` |
 | Dynamic mid-trade position-size scaling (re-size as the logical stop distance changes, not just at entry) | ✅ Direct | — | Extends the ATR-scaled sizing formula already used in this repo's swing/reversal scripts |
+| Time-of-day weighting for a volume-confirms-volatility gate (weak at open/close, strong midday) | ✅ Direct, as a design pattern | — | `session.ampm`/`hour` conditionals on top of existing CVD/Volume Trend gates; exact curve shape needs re-derivation, not copied from DJIA-equity numbers |
+| Scheduled-news correlation window (FOMC Minutes/Beige Book, 2:00pm ET) | ✅ Direct | — | A calendar/time check with real justification behind treating it as a higher-confidence confirmation window |
+| Full cross-stock volatility-volume correlation matrix, semester non-stationarity test | ❌ Not feasible | ✅ Required | Cross-sectional, multi-security, offline research machinery — same barrier class as papers #2/#7 |
+| Beta dispersion computation (QBD or stdev-based BD) from a constituent universe's rolling betas | ❌ Not feasible | ✅ Required | Needs a full index constituent list and per-stock rolling regressions — Pine has no multi-security universe/basket primitive |
+| Using a computed beta-dispersion reading as a live overlay in Pine | ⚠️ Via `request.seed()` or a periodically-updated manual input | ✅ Compute offline, refresh periodically | Same offline-then-import pattern already used for TVTP regimes (#2) and DeepSupp levels (#7) |
+| Structured additive distributional regression (joint mean+stdev modeling, penalized likelihood) | ❌ Not feasible | ✅ Required (e.g. `statsmodels`, R `gamlss`) | A genuinely new technique class for this skill — richer than the plain linear predictive regressions in papers #1/#5/#12/#13 |
+| Confidence-proportional position sizing (`X = 2·(p − 0.5)`, capped at ±100%) from any existing 0-1 probability | ✅ Direct | — | Reusable today on `Dynamic_Markov_Capacity_...`'s own `probabilityBull`/`probabilityBear`, which currently only hard-thresholds instead of sizing continuously |
+| Rebalancing-threshold rule (only re-signal when weight drift exceeds a limit) | ✅ Direct | — | Reduces overtrading/cost drag on any continuously-varying position-sizing scheme |
 
 ## Cross-Paper Synthesis
 
@@ -292,6 +302,47 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
   Tester run on one instrument over one historical window in this repo is exactly that
   kind of single path — walk-forward validation across multiple periods in `quantor`,
   not one in-sample run, is the only way to see whether an edge is really there.
+- **Paper #15 gives this skill a third framework for "why does the market move,"
+  alongside regime-switching (papers #2, #6) and cycle-decomposition (paper #8).**
+  MDH/SIAH is specifically about the volume-volatility-information relationship
+  changing character through the trading day — weak/sequential at the open and close,
+  strong/simultaneous mid-session — a different axis from "which hidden state is the
+  market in" or "what periodic components does price decompose into." It doesn't
+  replace either paradigm; it's most directly relevant to the volume/order-flow-adjacent
+  modules already in this repo (`Regime_Engine_TCO_Gatekeeper.pine`'s CVD divergence
+  check, `Stacked_Buy_Sell_Volume_Columns.pine`'s buy/sell split), which currently treat
+  a volume-confirms-move reading as equally meaningful at every time of day.
+- **Paper #16 (beta dispersion) is a genuinely new risk axis, not a competing signal —
+  and lands in the same hard-barrier bucket as papers #2 and #7.** Every predictor
+  already in this skill answers a *directional or timing* question; beta dispersion
+  answers "how fragile is the broad market to a cascading shock right now," shown to
+  add information beyond seven other known predictors tested jointly. Like paper #2's
+  TVTP regimes and paper #7's DeepSupp levels, the actual computation (cross-sectional,
+  needs a full index constituent universe) cannot run inside a single-symbol Pine
+  script at all — it belongs in `quantor` as a periodic offline computation, fed back
+  into Pine as a slow-moving overlay, not a per-bar live calculation.
+- **A fifth-ish independent occurrence of "a predictor's power is regime-dependent, not
+  universal"** — paper #16's beta dispersion is a significant, useful predictor
+  specifically in *bad* market regimes and statistically indistinguishable from noise in
+  *good* ones, the same shape of result already logged from papers #2, #6, #9, and #13's
+  Cross-Paper notes above. This is no longer an occasional finding — treat "does this
+  predictor's power hold up separately in both regimes" as a standing question to ask
+  of any new predictor considered for this repo, not a one-off caveat.
+- **Paper #16's distributional-regression technique is a general-purpose upgrade path
+  for every point-forecast predictor already in this skill, not something specific to
+  beta dispersion.** Papers #1 (signal volatility), #12 (cross-asset momentum), and #13
+  (intraday reversal) all currently produce a bare sign/magnitude forecast; modeling
+  both the conditional mean *and* standard deviation jointly (as paper #16 does) yields
+  a full `P(favorable outcome)` that can size a position continuously — the same
+  weighted-timing improvement paper #16 demonstrates — rather than triggering off a
+  single point estimate. A concrete `quantor`-side technique upgrade worth considering
+  independent of whether beta dispersion itself is ever implemented.
+- **A confidence-proportional position-sizing pattern (paper #16's `X = 2·(p − 0.5)`,
+  capped at ±100%) is usable in Pine today with zero new infrastructure**, on any
+  existing 0-1 probability this repo already computes — most directly the Markov
+  regime-probability engine in `Dynamic_Markov_Capacity_PDH_PDL_Liquidity_Retracements_v6
+  .pine`, which currently only hard-thresholds `probabilityBull`/`probabilityBear`
+  rather than sizing off its own confidence level continuously.
 
 ## Known Gaps / Wishlist
 
@@ -549,3 +600,26 @@ can be corrected against the real implementation rather than inference.
   distance changes. A third independent source now touches "repeated tests of a level
   get less reliable" alongside papers #10 and #11 — see the new Cross-Paper Synthesis
   note. No contradiction with papers #1-13.
+- **2026-09-03** — Ingested paper #15: Graczyk & Duarte Queirós (2018), "Volatility–
+  Trading volume intraday correlation profiles and its nonstationary features"
+  (*Physica A*) — a 10-year, 30-DJIA-stock econophysics study finding the intraday
+  volatility-volume correlation is hump-shaped (not the usual ∪-shape), weakest at the
+  open/close and peaking ~2:00pm, with a sharp spike specifically coinciding with
+  scheduled FOMC Minutes/Beige Book releases. Introduces MDH/SIAH as a third
+  market-dynamics framework alongside this skill's regime-switching and cycle-
+  decomposition paradigms — see the new Cross-Paper Synthesis note. Directly relevant
+  to time-of-day-weighting any of this repo's volume-confirmation gates
+  (`Regime_Engine_TCO_Gatekeeper.pine`'s CVD check, this session's new
+  `Stacked_Buy_Sell_Volume_Columns.pine`). Also ingested paper #16: Kuntz (2020), "Beta
+  dispersion and market timing" (*J. of Empirical Finance*) — 52 years of S&P 500 data
+  showing the cross-sectional spread of stock betas is a significant, out-of-sample-
+  validated predictor of the market's future return (concentrated in bad regimes, a
+  now-recurring pattern — see Cross-Paper Synthesis), interpreted as a systemic-
+  cascading-shock vulnerability measure distinct from any volatility measure already in
+  this skill. Introduces structured additive distributional regression (joint mean+
+  stdev modeling) as a new predictor-upgrade technique, and a confidence-proportional
+  position-sizing pattern directly reusable today on
+  `Dynamic_Markov_Capacity_PDH_PDL_Liquidity_Retracements_v6.pine`'s own regime
+  probabilities. The beta-dispersion computation itself joins papers #2 and #7 in
+  needing an offline `quantor` pipeline — genuinely cross-sectional, no single-symbol
+  Pine equivalent exists. No contradiction with papers #1-14.
