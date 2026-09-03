@@ -1,0 +1,201 @@
+//@version=6
+indicator(
+     title = "Stacked Buy/Sell Volume Columns",
+     shorttitle = "Stacked Vol Delta",
+     overlay = false,
+     max_bars_back = 500
+)
+
+//──────────────────────────────────────────────────────────────────────────────
+// WHAT THIS IS AND ISN'T
+//
+// Real order-flow data -- bid/ask depth, trade-by-trade aggressor side,
+// footprint charts -- comes from the exchange's tick/quote feed. Pine
+// Script has NO access to that at all, on any TradingView plan. This is
+// the closest legitimate approximation available in Pine, and the same
+// method already used for the CVD module in Regime_Engine_TCO_Gatekeeper
+// .pine in this repo: pull the actual lower-timeframe sub-bars inside
+// each chart bar via request.security_lower_tf(), classify each one
+// up/down by its own close-vs-open, and sum the volume on each side. A
+// large passive limit order sitting at the ask still gets counted as
+// "buy volume" if price ticks up through it -- this is a directional-
+// print proxy, not true bid/ask delta -- but it is a materially better
+// approximation than a single-bar close-position heuristic (Chaikin-
+// style), since it is built from many smaller directional prints
+// instead of one bar's shape.
+//
+// What's new here vs. that CVD module: this plots each bar's OWN
+// buy/sell split as a stacked column (the "stacking" the user asked
+// for), not a running cumulative total -- see the "STACKED COLUMNS"
+// section below for how that's actually drawn in Pine, which has no
+// native stacked-column primitive.
+//──────────────────────────────────────────────────────────────────────────────
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS — INTRABAR RESOLUTION
+//──────────────────────────────────────────────────────────────────────────────
+groupTF = "1. Intrabar Resolution"
+
+lowerTFModeInput = input.string(
+     defval = "Auto",
+     title = "Lower-Timeframe Mode",
+     options = ["Auto", "Manual"],
+     group = groupTF,
+     tooltip = "Auto picks a sub-timeframe from the chart's own timeframe, targeting roughly 5-15 sub-bars per chart bar -- enough directional prints to be meaningful without hitting the sub-bar-count limits TradingView enforces per request.security_lower_tf() call. Switch to Manual to pick your own."
+)
+
+lowerTFManualInput = input.timeframe(
+     defval = "1",
+     title = "Manual Lower Timeframe",
+     group = groupTF,
+     tooltip = "Only used when Mode is Manual. Must be strictly lower than the chart's own timeframe, or TradingView raises a runtime error."
+)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS — VISUALS
+//──────────────────────────────────────────────────────────────────────────────
+groupVisual = "2. Visuals"
+
+buyColorInput = input.color(
+     defval = color.lime,
+     title = "Buy Volume Color (Top Segment)",
+     group = groupVisual
+)
+
+sellColorInput = input.color(
+     defval = color.red,
+     title = "Sell Volume Color (Bottom Segment)",
+     group = groupVisual
+)
+
+showNetDeltaLineInput = input.bool(
+     defval = true,
+     title = "Show Net Delta Line",
+     group = groupVisual,
+     tooltip = "Plots buyVolume - sellVolume for the bar as a line over the stacked columns -- a quick read of which side dominated that bar, without having to compare the two segment heights by eye."
+)
+
+netDeltaColorInput = input.color(
+     defval = color.white,
+     title = "Net Delta Line Color",
+     group = groupVisual
+)
+
+showDashboardInput = input.bool(
+     defval = true,
+     title = "Show Dashboard",
+     group = groupVisual
+)
+
+//──────────────────────────────────────────────────────────────────────────────
+// AUTO LOWER-TIMEFRAME SELECTION
+//
+// Written as if/else-if, not a chained multi-line ternary -- a nested
+// ternary spread across several lines like this has previously hit
+// Pine's line-continuation parser limit (CE10013) elsewhere in this
+// repo (Regime_Engine_TCO_Gatekeeper.pine); if/else-if has no such
+// limit and is the established fix.
+//──────────────────────────────────────────────────────────────────────────────
+f_autoLowerTF() =>
+    float chartSeconds = timeframe.in_seconds()
+    string result = "240"
+
+    if chartSeconds <= 60
+        result := "1S"
+    else if chartSeconds <= 300
+        result := "1"
+    else if chartSeconds <= 900
+        result := "5"
+    else if chartSeconds <= 3600
+        result := "15"
+    else if chartSeconds <= 14400
+        result := "60"
+
+    result
+
+string lowerTF = lowerTFModeInput == "Auto" ? f_autoLowerTF() : lowerTFManualInput
+
+//──────────────────────────────────────────────────────────────────────────────
+// INTRABAR BUY/SELL VOLUME SPLIT
+//
+// Guarded with `if array.size(...) > 0` before the for..in loop -- an
+// empty array (e.g. right at the start of history, before the lower-tf
+// feed has any bars yet, or a symbol with a data gap) would otherwise
+// make Pine's `for i = 0 to array.size(x) - 1` infer a DECREMENTING
+// step from `-1 < 0` and run once with i = 0 instead of skipping,
+// throwing an array.get() out-of-bounds error -- the same for-loop
+// step-direction gotcha already fixed in several other scripts in this
+// repo (Dynamic_Markov_Capacity_PDH_PDL_..., STRONG_NQ_ORB_BREAKOUTS,
+// Execution_Signals_1m_13m, NQ_Hourly_Retracement_Levels).
+//──────────────────────────────────────────────────────────────────────────────
+[lowerClose, lowerOpen, lowerVolume] = request.security_lower_tf(
+     syminfo.tickerid,
+     lowerTF,
+     [close, open, volume]
+)
+
+float buyVolume = 0.0
+float sellVolume = 0.0
+
+if array.size(lowerClose) > 0
+    for i = 0 to array.size(lowerClose) - 1
+        float subClose = array.get(lowerClose, i)
+        float subOpen = array.get(lowerOpen, i)
+        float subVolume = array.get(lowerVolume, i)
+
+        if subClose > subOpen
+            buyVolume += subVolume
+        else if subClose < subOpen
+            sellVolume += subVolume
+        else
+            // Sub-bar closed flat -- can't classify direction, so split
+            // the volume evenly rather than assigning it to either side.
+            buyVolume += subVolume * 0.5
+            sellVolume += subVolume * 0.5
+
+float netDelta = buyVolume - sellVolume
+float totalVolume = buyVolume + sellVolume
+
+//──────────────────────────────────────────────────────────────────────────────
+// STACKED COLUMNS
+//
+// plot(style = plot.style_columns) always draws from 0 -- Pine has no
+// native "stack segment B on top of segment A" primitive. The standard
+// workaround, and what actually makes this a STACKED column rather than
+// two overlapping ones: plot the FULL total (buy+sell) as one column in
+// the buy color first, then plot JUST the sell portion (0 to sellVolume)
+// as a second, later column in the sell color at the same x. Later
+// plots render on top in Pine, so the shorter sell column overdraws the
+// bottom of the taller total column, leaving the buy-colored portion of
+// the total column showing through above it. Net visible result: one
+// column, bottom segment sell-colored, top segment buy-colored, total
+// height = total volume for the bar.
+//──────────────────────────────────────────────────────────────────────────────
+plot(totalVolume, title = "Buy Volume (Top Segment)", style = plot.style_columns, color = buyColorInput)
+plot(sellVolume, title = "Sell Volume (Bottom Segment)", style = plot.style_columns, color = sellColorInput)
+
+plot(showNetDeltaLineInput ? netDelta : na, title = "Net Delta", color = netDeltaColorInput, linewidth = 2)
+hline(0, title = "Zero Line", color = color.new(color.gray, 50))
+
+//──────────────────────────────────────────────────────────────────────────────
+// DASHBOARD
+//──────────────────────────────────────────────────────────────────────────────
+var table statsTable = table.new(
+     position.top_right,
+     2,
+     4,
+     border_width = 1
+)
+
+if barstate.islast and showDashboardInput
+    table.cell(statsTable, 0, 0, "Stacked Vol Delta", text_color = color.white, bgcolor = color.rgb(20, 50, 90))
+    table.cell(statsTable, 1, 0, lowerTF + " sub-bars", text_color = color.white, bgcolor = color.rgb(20, 50, 90))
+
+    table.cell(statsTable, 0, 1, "Buy Volume")
+    table.cell(statsTable, 1, 1, str.tostring(buyVolume, format.volume), text_color = buyColorInput)
+
+    table.cell(statsTable, 0, 2, "Sell Volume")
+    table.cell(statsTable, 1, 2, str.tostring(sellVolume, format.volume), text_color = sellColorInput)
+
+    table.cell(statsTable, 0, 3, "Net Delta")
+    table.cell(statsTable, 1, 3, str.tostring(netDelta, format.volume), text_color = netDelta >= 0 ? buyColorInput : sellColorInput)
