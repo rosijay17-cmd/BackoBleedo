@@ -816,6 +816,116 @@ var int lastEntryBar = na
 bool cooldownElapsed = na(lastEntryBar) or (bar_index - lastEntryBar) >= cooldownBars
 
 //──────────────────────────────────────────────────────────────────────────────
+// FOOTPRINT ORDER-FLOW CONFIRMATION
+//
+// A single footprint-style imbalance is one technique, not confluence on
+// its own (paper #9's own finding: "a 2-trend system improves an already
+// trending market, but barely moves the needle on a noisy one" -- the
+// same caution applies to any single order-flow read). This is wired in
+// as an ADDITIONAL confirmation gate on every existing entry path, not a
+// new trigger of its own, per this repo's quant-research-notes skill
+// (references/intraday-volume-volatility-correlation-graczyk.md and the
+// Volume_Footprint_Math_Geometry_Intro.pine indicator this session).
+//
+// Classification method is the same intrabar-tick approximation already
+// used twice elsewhere in this repo (Regime_Engine_TCO_Gatekeeper.pine's
+// CVD module, Stacked_Buy_Sell_Volume_Columns.pine): pull each bar's own
+// lower-timeframe sub-bars via request.security_lower_tf(), classify each
+// by its own close-vs-open, sum volume per side. Real bid/ask order-flow
+// data is not available to Pine Script at all, on any TradingView plan --
+// this is the closest legitimate proxy, not the real thing.
+//
+// Deliberately lighter than the full per-tick lattice/profile in
+// Volume_Footprint_Math_Geometry_Intro.pine: a confirmation gate only
+// needs "did recent order flow lean hard enough to agree with this
+// trade's direction," not a full price-level table. Porting the specific
+// computation, not the whole indicator, per the plan discussed this
+// session.
+//──────────────────────────────────────────────────────────────────────────────
+groupFootprint = "8. Footprint Confirmation"
+
+useFootprintFilterInput = input.bool(
+     defval = true,
+     title = "Require Order-Flow Imbalance Confirmation",
+     group = groupFootprint,
+     tooltip = "Only allow an entry (either path, either direction) when the trailing footprint window's buy/sell volume leans hard enough in the trade's own direction. An additional confirmation gate, not a new trigger -- it can only block a signal the trigger/trend/Markov gates already approved, never fire one on its own."
+)
+
+footprintLtfInput = input.timeframe(
+     defval = "1",
+     title = "Footprint Sub-Timeframe",
+     group = groupFootprint,
+     tooltip = "Lower timeframe sampled for the buy/sell volume classification. Must be lower than the chart timeframe."
+)
+
+footprintWindowInput = input.int(
+     defval = 5,
+     title = "Footprint Window (Bars)",
+     minval = 2,
+     maxval = 60,
+     group = groupFootprint,
+     tooltip = "How many trailing bars' buy/sell volume are summed for the imbalance read. Matches Volume_Footprint_Math_Geometry_Intro.pine's own default Window Bars."
+)
+
+footprintImbalancePctInput = input.float(
+     defval = 300.0,
+     title = "Imbalance Threshold (%)",
+     minval = 100.0,
+     maxval = 1000.0,
+     step = 25.0,
+     group = groupFootprint,
+     tooltip = "One side's window volume must exceed the opposing side's by this percentage to count as an imbalance -- 300%, the classical figure, demands three times the opposing volume. Matches Volume_Footprint_Math_Geometry_Intro.pine's own default."
+)
+
+[footprintLtfClose, footprintLtfOpen, footprintLtfVolume] = request.security_lower_tf(
+     syminfo.tickerid,
+     footprintLtfInput,
+     [close, open, volume]
+)
+
+float footprintBarBuyVol = 0.0
+float footprintBarSellVol = 0.0
+
+if array.size(footprintLtfClose) > 0
+    for footprintI = 0 to array.size(footprintLtfClose) - 1
+        float footprintSubClose = array.get(footprintLtfClose, footprintI)
+        float footprintSubOpen = array.get(footprintLtfOpen, footprintI)
+        float footprintSubVolume = array.get(footprintLtfVolume, footprintI)
+
+        if footprintSubClose > footprintSubOpen
+            footprintBarBuyVol += footprintSubVolume
+        else if footprintSubClose < footprintSubOpen
+            footprintBarSellVol += footprintSubVolume
+        else
+            // Sub-bar closed flat -- can't classify direction, so split
+            // the volume evenly rather than assigning it to either side.
+            footprintBarBuyVol += footprintSubVolume * 0.5
+            footprintBarSellVol += footprintSubVolume * 0.5
+
+// Rolling window sums -- math.sum() over the per-bar totals just
+// computed, rather than a manually maintained running accumulator.
+float footprintWindowBuyVol = math.sum(footprintBarBuyVol, footprintWindowInput)
+float footprintWindowSellVol = math.sum(footprintBarSellVol, footprintWindowInput)
+
+float footprintImbalanceRatio = footprintImbalancePctInput / 100.0
+bool footprintBuyImbalance = footprintWindowBuyVol > footprintWindowSellVol * footprintImbalanceRatio
+bool footprintSellImbalance = footprintWindowSellVol > footprintWindowBuyVol * footprintImbalanceRatio
+
+// Footprint POC -- a lightweight reference, not a gate. Which bar in the
+// trailing window carried the most total volume, using that bar's HL2 as
+// its representative price. Display-only (dashboard row below); unlike
+// imbalance, a POC being nearby isn't inherently bullish or bearish, so
+// it isn't wired into any AND-condition.
+float footprintPocPrice = na
+float footprintPocVol = 0.0
+
+for footprintJ = 0 to footprintWindowInput - 1
+    float footprintBarTotal = nz(footprintBarBuyVol[footprintJ]) + nz(footprintBarSellVol[footprintJ])
+    if footprintBarTotal > footprintPocVol
+        footprintPocVol := footprintBarTotal
+        footprintPocPrice := hl2[footprintJ]
+
+//──────────────────────────────────────────────────────────────────────────────
 // TRADE CONDITIONS
 //──────────────────────────────────────────────────────────────────────────────
 bool longPDFilter = not usePDH_PDLFilter or close > pdl
@@ -829,6 +939,9 @@ bool shortTrendFilter = not useTrendFilter or bearishTrend
 
 bool longMarkovFilter = probabilityBull >= minimumBullProbability
 bool shortMarkovFilter = probabilityBear >= minimumBearProbability
+
+bool longFootprintFilter = not useFootprintFilterInput or footprintBuyImbalance
+bool shortFootprintFilter = not useFootprintFilterInput or footprintSellImbalance
 
 // Rejection-candle trigger, replacing the former EMA-crossover trigger.
 // A crossover treated the zone concept as decoration -- the actual
@@ -848,6 +961,7 @@ bool zoneLongSignal = longTrigger and
      longRetracementFilter and
      longTrendFilter and
      longMarkovFilter and
+     longFootprintFilter and
      finalPositionQty > 0 and
      cooldownElapsed
 
@@ -856,6 +970,7 @@ bool zoneShortSignal = shortTrigger and
      shortRetracementFilter and
      shortTrendFilter and
      shortMarkovFilter and
+     shortFootprintFilter and
      finalPositionQty > 0 and
      cooldownElapsed
 
@@ -876,12 +991,14 @@ bool pdlBreakoutTrigger = usePDBreakoutTrigger and ta.crossunder(close, pdl)
 bool longBreakoutSignal = pdhBreakoutTrigger and
      longTrendFilter and
      longMarkovFilter and
+     longFootprintFilter and
      finalPositionQty > 0 and
      cooldownElapsed
 
 bool shortBreakoutSignal = pdlBreakoutTrigger and
      shortTrendFilter and
      shortMarkovFilter and
+     shortFootprintFilter and
      finalPositionQty > 0 and
      cooldownElapsed
 
@@ -898,15 +1015,15 @@ bool shortSignal = zoneShortSignal or shortBreakoutSignal
 // fired correctly and a filter genuinely blocked it. These labels are
 // drawn AT the historical bar itself, wherever a real cross happened but
 // got blocked, naming the first gate responsible.
-f_blockReason(bool trend, bool markov, bool qty, bool cooldown) =>
-    string reason = not trend ? "Trend" : not markov ? "Markov" : not qty ? "Size" : not cooldown ? "Cooldown" : "?"
+f_blockReason(bool trend, bool markov, bool footprint, bool qty, bool cooldown) =>
+    string reason = not trend ? "Trend" : not markov ? "Markov" : not footprint ? "Footprint" : not qty ? "Size" : not cooldown ? "Cooldown" : "?"
     reason
 
 if showBlockedBreakoutLabelsInput and pdhBreakoutTrigger and not longBreakoutSignal
     label.new(
          x = bar_index,
          y = high,
-         text = "PDH x, blocked: " + f_blockReason(longTrendFilter, longMarkovFilter, finalPositionQty > 0, cooldownElapsed),
+         text = "PDH x, blocked: " + f_blockReason(longTrendFilter, longMarkovFilter, longFootprintFilter, finalPositionQty > 0, cooldownElapsed),
          style = label.style_label_down,
          color = color.new(color.orange, 80),
          textcolor = color.orange,
@@ -917,7 +1034,7 @@ if showBlockedBreakoutLabelsInput and pdlBreakoutTrigger and not shortBreakoutSi
     label.new(
          x = bar_index,
          y = low,
-         text = "PDL x, blocked: " + f_blockReason(shortTrendFilter, shortMarkovFilter, finalPositionQty > 0, cooldownElapsed),
+         text = "PDL x, blocked: " + f_blockReason(shortTrendFilter, shortMarkovFilter, shortFootprintFilter, finalPositionQty > 0, cooldownElapsed),
          style = label.style_label_up,
          color = color.new(color.orange, 80),
          textcolor = color.orange,
@@ -1143,7 +1260,7 @@ alertcondition(
 var table statsTable = table.new(
      position.top_left,
      2,
-     15,
+     17,
      border_width = 1
 )
 
@@ -1202,21 +1319,31 @@ if barstate.islast and showMarkovTable
     // order (Trigger / PD-PDL / Zone / Trend / Markov / Size / Cooldown).
     // Labels are kept short (fits a narrow phone column); the full legend
     // is on the cell's tooltip instead of in the label text.
-    string longFiltersText = f_boolIcon(longTrigger) + " " + f_boolIcon(longPDFilter) + " " + f_boolIcon(longRetracementFilter) + " " + f_boolIcon(longTrendFilter) + " " + f_boolIcon(longMarkovFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
-    table.cell(statsTable, 0, 11, "Long Zone Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: Trigger, PDH/PDL filter, Zone, Trend, Markov, Size, Cooldown")
+    string longFiltersText = f_boolIcon(longTrigger) + " " + f_boolIcon(longPDFilter) + " " + f_boolIcon(longRetracementFilter) + " " + f_boolIcon(longTrendFilter) + " " + f_boolIcon(longMarkovFilter) + " " + f_boolIcon(longFootprintFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
+    table.cell(statsTable, 0, 11, "Long Zone Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: Trigger, PDH/PDL filter, Zone, Trend, Markov, Footprint, Size, Cooldown")
     table.cell(statsTable, 1, 11, longFiltersText, text_color = zoneLongSignal ? color.lime : color.gray, text_size = resolvedDashboardSize, text_halign = text.align_right)
 
-    string shortFiltersText = f_boolIcon(shortTrigger) + " " + f_boolIcon(shortPDFilter) + " " + f_boolIcon(shortRetracementFilter) + " " + f_boolIcon(shortTrendFilter) + " " + f_boolIcon(shortMarkovFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
-    table.cell(statsTable, 0, 12, "Short Zone Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: Trigger, PDH/PDL filter, Zone, Trend, Markov, Size, Cooldown")
+    string shortFiltersText = f_boolIcon(shortTrigger) + " " + f_boolIcon(shortPDFilter) + " " + f_boolIcon(shortRetracementFilter) + " " + f_boolIcon(shortTrendFilter) + " " + f_boolIcon(shortMarkovFilter) + " " + f_boolIcon(shortFootprintFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
+    table.cell(statsTable, 0, 12, "Short Zone Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: Trigger, PDH/PDL filter, Zone, Trend, Markov, Footprint, Size, Cooldown")
     table.cell(statsTable, 1, 12, shortFiltersText, text_color = zoneShortSignal ? color.lime : color.gray, text_size = resolvedDashboardSize, text_halign = text.align_right)
 
     // PDH/PDL breakout path's own gates -- independent of the zone path
     // above, so a "why didn't the breakout fire" question reads straight
     // off this row instead of being folded into the zone diagnostics.
-    string longBreakoutText = f_boolIcon(pdhBreakoutTrigger) + " " + f_boolIcon(longTrendFilter) + " " + f_boolIcon(longMarkovFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
-    table.cell(statsTable, 0, 13, "Long Breakout Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: PDH Cross, Trend, Markov, Size, Cooldown")
+    string longBreakoutText = f_boolIcon(pdhBreakoutTrigger) + " " + f_boolIcon(longTrendFilter) + " " + f_boolIcon(longMarkovFilter) + " " + f_boolIcon(longFootprintFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
+    table.cell(statsTable, 0, 13, "Long Breakout Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: PDH Cross, Trend, Markov, Footprint, Size, Cooldown")
     table.cell(statsTable, 1, 13, longBreakoutText, text_color = longBreakoutSignal ? color.lime : color.gray, text_size = resolvedDashboardSize, text_halign = text.align_right)
 
-    string shortBreakoutText = f_boolIcon(pdlBreakoutTrigger) + " " + f_boolIcon(shortTrendFilter) + " " + f_boolIcon(shortMarkovFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
-    table.cell(statsTable, 0, 14, "Short Breakout Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: PDL Cross, Trend, Markov, Size, Cooldown")
+    string shortBreakoutText = f_boolIcon(pdlBreakoutTrigger) + " " + f_boolIcon(shortTrendFilter) + " " + f_boolIcon(shortMarkovFilter) + " " + f_boolIcon(shortFootprintFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
+    table.cell(statsTable, 0, 14, "Short Breakout Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: PDL Cross, Trend, Markov, Footprint, Size, Cooldown")
     table.cell(statsTable, 1, 14, shortBreakoutText, text_color = shortBreakoutSignal ? color.lime : color.gray, text_size = resolvedDashboardSize, text_halign = text.align_right)
+
+    // Footprint order-flow confirmation readout -- the same window/
+    // threshold the longFootprintFilter/shortFootprintFilter gates above
+    // use, so the dashboard and the gate rows always tell one story.
+    string footprintFlowText = footprintBuyImbalance ? "BUY" : footprintSellImbalance ? "SELL" : "NEUTRAL"
+    color footprintFlowColor = footprintBuyImbalance ? color.lime : footprintSellImbalance ? color.red : color.gray
+    f_row(15, "Footprint Flow", footprintFlowText + " (" + str.tostring(footprintWindowBuyVol, format.volume) + "/" + str.tostring(footprintWindowSellVol, format.volume) + ")", footprintFlowColor)
+
+    string footprintPocText = na(footprintPocPrice) ? "None" : str.tostring(footprintPocPrice, format.mintick)
+    f_row(16, "Footprint POC", footprintPocText, color.black)
