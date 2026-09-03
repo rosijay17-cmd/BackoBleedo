@@ -12,6 +12,7 @@ strategy(
      process_orders_on_close = true,
      max_lines_count = 300,
      max_labels_count = 300,
+     max_boxes_count = 300,
      max_bars_back = 1100,
      calc_on_every_tick = true
 )
@@ -183,6 +184,14 @@ showLiquidityLevels = input.bool(
      defval = true,
      title = "Plot Swing Liquidity Levels",
      group = groupLiquidity
+)
+
+liquidityZoneCapacityMultInput = input.float(
+     defval = 5.0,
+     title = "Zone Volume Capacity (x Avg Volume)",
+     minval = 1.0,
+     group = groupLiquidity,
+     tooltip = "Each liquidity zone's 'health' starts at 100% and decays toward 0% as buy+sell volume trades inside it, based on this multiple of the average bar volume -- a zone that has absorbed a lot of volume without being swept reads as weaker/more contested than a fresh one. Same general concept as LuxAlgo's Liquidity Delta Profiler indicator, reimplemented here using this script's own intrabar buy/sell classification rather than porting that (CC BY-NC-SA licensed) script's code directly."
 )
 
 //──────────────────────────────────────────────────────────────────────────────
@@ -440,91 +449,276 @@ float positionQty = math.floor(rawPositionCapacity / lotIncrement) * lotIncremen
 float finalPositionQty = bypassCapacityGateInput ? math.max(positionQty, lotIncrement) : positionQty
 
 //──────────────────────────────────────────────────────────────────────────────
-// CONFIRMED SWING LIQUIDITY LEVELS
+// FOOTPRINT ORDER-FLOW CONFIRMATION
 //
-// Pivot highs = potential buy-side liquidity.
-// Pivot lows  = potential sell-side liquidity.
+// A single footprint-style imbalance is one technique, not confluence on
+// its own (paper #9's own finding: "a 2-trend system improves an already
+// trending market, but barely moves the needle on a noisy one" -- the
+// same caution applies to any single order-flow read). This is wired in
+// as an ADDITIONAL confirmation gate on every existing entry path, not a
+// new trigger of its own, per this repo's quant-research-notes skill
+// (references/intraday-volume-volatility-correlation-graczyk.md and the
+// Volume_Footprint_Math_Geometry_Intro.pine indicator this session).
 //
-// Pivots are deliberately confirmation-delayed by pivotRight bars.
-// Once plotted, the levels do not repaint.
+// Classification method is the same intrabar-tick approximation already
+// used twice elsewhere in this repo (Regime_Engine_TCO_Gatekeeper.pine's
+// CVD module, Stacked_Buy_Sell_Volume_Columns.pine): pull each bar's own
+// lower-timeframe sub-bars via request.security_lower_tf(), classify each
+// by its own close-vs-open, sum volume per side. Real bid/ask order-flow
+// data is not available to Pine Script at all, on any TradingView plan --
+// this is the closest legitimate proxy, not the real thing.
+//
+// Deliberately lighter than the full per-tick lattice/profile in
+// Volume_Footprint_Math_Geometry_Intro.pine: a confirmation gate only
+// needs "did recent order flow lean hard enough to agree with this
+// trade's direction," not a full price-level table. Porting the specific
+// computation, not the whole indicator, per the plan discussed this
+// session.
+//──────────────────────────────────────────────────────────────────────────────
+groupFootprint = "8. Footprint Confirmation"
+
+useFootprintFilterInput = input.bool(
+     defval = true,
+     title = "Require Order-Flow Imbalance Confirmation",
+     group = groupFootprint,
+     tooltip = "Only allow an entry (either path, either direction) when the trailing footprint window's buy/sell volume leans hard enough in the trade's own direction. An additional confirmation gate, not a new trigger -- it can only block a signal the trigger/trend/Markov gates already approved, never fire one on its own."
+)
+
+footprintLtfInput = input.timeframe(
+     defval = "1",
+     title = "Footprint Sub-Timeframe",
+     group = groupFootprint,
+     tooltip = "Lower timeframe sampled for the buy/sell volume classification. Must be lower than the chart timeframe."
+)
+
+footprintWindowInput = input.int(
+     defval = 5,
+     title = "Footprint Window (Bars)",
+     minval = 2,
+     maxval = 60,
+     group = groupFootprint,
+     tooltip = "How many trailing bars' buy/sell volume are summed for the imbalance read. Matches Volume_Footprint_Math_Geometry_Intro.pine's own default Window Bars."
+)
+
+footprintImbalancePctInput = input.float(
+     defval = 130.0,
+     title = "Imbalance Threshold (%)",
+     minval = 100.0,
+     maxval = 1000.0,
+     step = 10.0,
+     group = groupFootprint,
+     tooltip = "One side's window volume must exceed the opposing side's by this percentage to count as an imbalance. 300%, the classical figure, is Volume_Footprint_Math_Geometry_Intro.pine's own default -- but that threshold is meant for a SINGLE price-level row in a footprint table, a genuinely rare, extreme single-tick event. Applied here to a rolling multi-bar TOTAL volume sum instead, 300% was nearly unclearable in practice (live testing saw a real 1.39:1 buy lean still read as NEUTRAL) and was blocking every entry path regardless of what the trigger/trend/Markov gates said. Lowered to 130% (one side needs ~30% more volume than the other) so it reads real, achievable leans in this window-sum context."
+)
+
+[footprintLtfClose, footprintLtfOpen, footprintLtfVolume] = request.security_lower_tf(
+     syminfo.tickerid,
+     footprintLtfInput,
+     [close, open, volume]
+)
+
+float footprintBarBuyVol = 0.0
+float footprintBarSellVol = 0.0
+
+if array.size(footprintLtfClose) > 0
+    for footprintI = 0 to array.size(footprintLtfClose) - 1
+        float footprintSubClose = array.get(footprintLtfClose, footprintI)
+        float footprintSubOpen = array.get(footprintLtfOpen, footprintI)
+        float footprintSubVolume = array.get(footprintLtfVolume, footprintI)
+
+        if footprintSubClose > footprintSubOpen
+            footprintBarBuyVol += footprintSubVolume
+        else if footprintSubClose < footprintSubOpen
+            footprintBarSellVol += footprintSubVolume
+        else
+            // Sub-bar closed flat -- can't classify direction, so split
+            // the volume evenly rather than assigning it to either side.
+            footprintBarBuyVol += footprintSubVolume * 0.5
+            footprintBarSellVol += footprintSubVolume * 0.5
+
+// Rolling window sums -- math.sum() over the per-bar totals just
+// computed, rather than a manually maintained running accumulator.
+float footprintWindowBuyVol = math.sum(footprintBarBuyVol, footprintWindowInput)
+float footprintWindowSellVol = math.sum(footprintBarSellVol, footprintWindowInput)
+
+float footprintImbalanceRatio = footprintImbalancePctInput / 100.0
+bool footprintBuyImbalance = footprintWindowBuyVol > footprintWindowSellVol * footprintImbalanceRatio
+bool footprintSellImbalance = footprintWindowSellVol > footprintWindowBuyVol * footprintImbalanceRatio
+
+// Footprint POC -- a lightweight reference, not a gate. Which bar in the
+// trailing window carried the most total volume, using that bar's HL2 as
+// its representative price. Display-only (dashboard row below); unlike
+// imbalance, a POC being nearby isn't inherently bullish or bearish, so
+// it isn't wired into any AND-condition.
+float footprintPocPrice = na
+float footprintPocVol = 0.0
+
+for footprintJ = 0 to footprintWindowInput - 1
+    float footprintBarTotal = nz(footprintBarBuyVol[footprintJ]) + nz(footprintBarSellVol[footprintJ])
+    if footprintBarTotal > footprintPocVol
+        footprintPocVol := footprintBarTotal
+        footprintPocPrice := hl2[footprintJ]
+
+//──────────────────────────────────────────────────────────────────────────────
+// CONFIRMED SWING LIQUIDITY ZONES -- WITH VOLUME DELTA
+//
+// Pivot highs = potential buy-side liquidity (resting sell-stops/breakout
+// buys above the old high). Pivot lows = potential sell-side liquidity
+// (mirror, below the old low). Pivots are deliberately confirmation-delayed
+// by pivotRight bars; once plotted, a zone's own top/bottom do not repaint.
+//
+// Same general concept as LuxAlgo's "Liquidity Delta Profiler" (CC
+// BY-NC-SA 4.0) -- a zone around the pivot's wick that tracks buy/sell
+// volume as price revisits it, with a decay "health" reading and
+// sweep-invalidation -- reimplemented here as original code rather than
+// porting that script's licensed implementation. Two differences from
+// the source concept, both intentional:
+//   1. Volume split uses this script's OWN intrabar-tick classification
+//      (footprintBarBuyVol/footprintBarSellVol, computed above) instead
+//      of a single-bar close-position approximation -- the same "many
+//      small directional prints beats one bar's shape" upgrade already
+//      applied to the CVD/footprint modules elsewhere in this repo.
+//   2. One box per zone with a combined health/delta label, not four
+//      per-quadrant sub-boxes -- a lighter, "confirmation gate" scale
+//      matching how the footprint module above was scoped, not the full
+//      per-quadrant visual the source indicator builds.
 //──────────────────────────────────────────────────────────────────────────────
 float confirmedPivotHigh = ta.pivothigh(high, pivotLeft, pivotRight)
 float confirmedPivotLow = ta.pivotlow(low, pivotLeft, pivotRight)
 
-// Each line also gets its own price level and direction tracked in
-// parallel arrays, so the invalidation pass below can tell a swept
-// level from a still-live one -- the pre-existing code only ever
-// dropped the OLDEST line once the count exceeded maxLiquidityLevels,
-// so a level price had already traded straight through kept extending
-// indefinitely across the chart, right through live price action,
-// until enough newer pivots eventually pushed it out. That's what was
-// cluttering the chart with dotted "scribble" lines.
-var array<line> liquidityLines = array.new_line()
-var array<float> liquidityLineLevels = array.new_float()
-var array<bool> liquidityLineIsHigh = array.new_bool()
+// @type One swing-liquidity zone. isHigh marks a buy-side (pivot-high)
+//       zone; false marks a sell-side (pivot-low) zone. buyVol/sellVol
+//       accumulate as price revisits the zone; capacity sets how much
+//       volume the zone can absorb before health reads 0%.
+type LiquidityZone
+    float top
+    float bottom
+    bool isHigh
+    bool swept
+    box zoneBox
+    label infoLabel
+    float buyVol
+    float sellVol
+    float capacity
+
+var array<LiquidityZone> liquidityZones = array.new<LiquidityZone>()
 
 if showLiquidityLevels and not na(confirmedPivotHigh)
-    line newHighLine = line.new(
-         x1 = bar_index - pivotRight,
-         y1 = confirmedPivotHigh,
-         x2 = bar_index,
-         y2 = confirmedPivotHigh,
-         extend = extend.right,
-         color = color.new(color.red, 25),
-         style = line.style_dotted,
-         width = 1
+    int pivotBarIndex = bar_index - pivotRight
+    float zoneTop = confirmedPivotHigh
+    // Zone spans from the pivot high down to the top of that bar's own
+    // body (the wick above the body is where the resting liquidity
+    // actually sits) -- with an ATR-based minimum thickness so a
+    // near-zero-wick pivot bar doesn't produce a zero-height zone.
+    float zoneBottom = math.max(close[pivotRight], open[pivotRight])
+    if zoneTop - zoneBottom < atr * 0.1
+        zoneBottom := zoneTop - atr * 0.1
+
+    box newZoneBox = box.new(
+         left = pivotBarIndex,
+         top = zoneTop,
+         right = bar_index,
+         bottom = zoneBottom,
+         xloc = xloc.bar_index,
+         bgcolor = color.new(color.red, 88),
+         border_color = color.new(color.red, 60),
+         border_width = 1
     )
 
-    array.push(liquidityLines, newHighLine)
-    array.push(liquidityLineLevels, confirmedPivotHigh)
-    array.push(liquidityLineIsHigh, true)
+    label newInfoLabel = label.new(
+         x = bar_index,
+         y = (zoneTop + zoneBottom) / 2,
+         text = "",
+         xloc = xloc.bar_index,
+         style = label.style_label_left,
+         color = color.new(color.white, 100),
+         textcolor = color.red,
+         size = size.small
+    )
 
-    if array.size(liquidityLines) > maxLiquidityLevels
-        line.delete(array.shift(liquidityLines))
-        array.shift(liquidityLineLevels)
-        array.shift(liquidityLineIsHigh)
+    array.push(liquidityZones, LiquidityZone.new(zoneTop, zoneBottom, true, false, newZoneBox, newInfoLabel, 0.0, 0.0, averageVolume * liquidityZoneCapacityMultInput))
+
+    if array.size(liquidityZones) > maxLiquidityLevels
+        LiquidityZone oldZone = array.shift(liquidityZones)
+        box.delete(oldZone.zoneBox)
+        label.delete(oldZone.infoLabel)
 
 if showLiquidityLevels and not na(confirmedPivotLow)
-    line newLowLine = line.new(
-         x1 = bar_index - pivotRight,
-         y1 = confirmedPivotLow,
-         x2 = bar_index,
-         y2 = confirmedPivotLow,
-         extend = extend.right,
-         color = color.new(color.lime, 25),
-         style = line.style_dotted,
-         width = 1
+    int pivotBarIndex = bar_index - pivotRight
+    float zoneBottom = confirmedPivotLow
+    float zoneTop = math.min(close[pivotRight], open[pivotRight])
+    if zoneTop - zoneBottom < atr * 0.1
+        zoneTop := zoneBottom + atr * 0.1
+
+    box newZoneBox = box.new(
+         left = pivotBarIndex,
+         top = zoneTop,
+         right = bar_index,
+         bottom = zoneBottom,
+         xloc = xloc.bar_index,
+         bgcolor = color.new(color.lime, 88),
+         border_color = color.new(color.lime, 60),
+         border_width = 1
     )
 
-    array.push(liquidityLines, newLowLine)
-    array.push(liquidityLineLevels, confirmedPivotLow)
-    array.push(liquidityLineIsHigh, false)
+    label newInfoLabel = label.new(
+         x = bar_index,
+         y = (zoneTop + zoneBottom) / 2,
+         text = "",
+         xloc = xloc.bar_index,
+         style = label.style_label_left,
+         color = color.new(color.white, 100),
+         textcolor = color.lime,
+         size = size.small
+    )
 
-    if array.size(liquidityLines) > maxLiquidityLevels
-        line.delete(array.shift(liquidityLines))
-        array.shift(liquidityLineLevels)
-        array.shift(liquidityLineIsHigh)
+    array.push(liquidityZones, LiquidityZone.new(zoneTop, zoneBottom, false, false, newZoneBox, newInfoLabel, 0.0, 0.0, averageVolume * liquidityZoneCapacityMultInput))
 
-// Sweep invalidation: a pivot-high line marks potential buy-side
-// liquidity above price -- once close trades back above it, that
-// liquidity has already been taken, and the line has nothing left to
-// mark. Same mirror logic for a pivot-low line and close trading back
-// below it. Deleting it here (not just capping the count) is what
-// actually stops the "old lines stretching through current price"
-// clutter, rather than just waiting for it to eventually age out.
-// Iterated backward so array.remove() never shifts an index still to
-// be visited.
-if array.size(liquidityLines) > 0
-    for li = array.size(liquidityLines) - 1 to 0
-        float liLevel = array.get(liquidityLineLevels, li)
-        bool liIsHigh = array.get(liquidityLineIsHigh, li)
-        bool liSwept = liIsHigh ? close > liLevel : close < liLevel
+    if array.size(liquidityZones) > maxLiquidityLevels
+        LiquidityZone oldZone = array.shift(liquidityZones)
+        box.delete(oldZone.zoneBox)
+        label.delete(oldZone.infoLabel)
 
-        if liSwept
-            line.delete(array.get(liquidityLines, li))
-            array.remove(liquidityLines, li)
-            array.remove(liquidityLineLevels, li)
-            array.remove(liquidityLineIsHigh, li)
+// Per-bar update: extend unswept zones, attribute this bar's buy/sell
+// volume into them (weighted by how much of the bar's range actually
+// overlaps the zone), refresh the health/delta label, and invalidate on
+// a genuine sweep. A buy-side (pivot-high) zone is swept the moment the
+// bar's HIGH trades through it -- a wick through the level already means
+// the resting liquidity was taken, whether or not the close reclaims it;
+// mirror logic for a sell-side zone and the bar's LOW.
+if array.size(liquidityZones) > 0
+    for zi = array.size(liquidityZones) - 1 to 0
+        LiquidityZone lz = array.get(liquidityZones, zi)
+
+        if not lz.swept
+            box.set_right(lz.zoneBox, bar_index)
+            label.set_x(lz.infoLabel, bar_index)
+
+            float overlapTop = math.min(high, lz.top)
+            float overlapBottom = math.max(low, lz.bottom)
+
+            if overlapTop > overlapBottom
+                float barRange = high - low
+                float overlapFrac = barRange > 0 ? (overlapTop - overlapBottom) / barRange : 1.0
+                lz.buyVol += footprintBarBuyVol * overlapFrac
+                lz.sellVol += footprintBarSellVol * overlapFrac
+
+            bool justSwept = lz.isHigh ? high > lz.top : low < lz.bottom
+
+            if justSwept
+                lz.swept := true
+                box.set_bgcolor(lz.zoneBox, color.new(color.gray, 90))
+                box.set_border_color(lz.zoneBox, color.new(color.gray, 70))
+                label.set_text(lz.infoLabel, (lz.isHigh ? "BSL " : "SSL ") + "SWEPT")
+                label.set_textcolor(lz.infoLabel, color.gray)
+            else
+                float zoneTotalVol = lz.buyVol + lz.sellVol
+                float zoneNetDelta = lz.buyVol - lz.sellVol
+                float zoneHealth = math.max(0.0, 100.0 - (zoneTotalVol / lz.capacity * 100.0))
+                color deltaColor = zoneNetDelta > 0 ? color.lime : zoneNetDelta < 0 ? color.red : color.gray
+
+                box.set_bgcolor(lz.zoneBox, color.new(deltaColor, 88))
+                label.set_text(lz.infoLabel, (lz.isHigh ? "BSL " : "SSL ") + str.tostring(zoneHealth, "#") + "% | " + (zoneNetDelta >= 0 ? "+" : "") + str.tostring(zoneNetDelta, format.volume))
+                label.set_textcolor(lz.infoLabel, deltaColor)
 
 //──────────────────────────────────────────────────────────────────────────────
 // DYNAMIC RETRACEMENT ZONES
@@ -868,116 +1062,6 @@ cooldownBars = input.int(
 var int lastEntryBar = na
 
 bool cooldownElapsed = na(lastEntryBar) or (bar_index - lastEntryBar) >= cooldownBars
-
-//──────────────────────────────────────────────────────────────────────────────
-// FOOTPRINT ORDER-FLOW CONFIRMATION
-//
-// A single footprint-style imbalance is one technique, not confluence on
-// its own (paper #9's own finding: "a 2-trend system improves an already
-// trending market, but barely moves the needle on a noisy one" -- the
-// same caution applies to any single order-flow read). This is wired in
-// as an ADDITIONAL confirmation gate on every existing entry path, not a
-// new trigger of its own, per this repo's quant-research-notes skill
-// (references/intraday-volume-volatility-correlation-graczyk.md and the
-// Volume_Footprint_Math_Geometry_Intro.pine indicator this session).
-//
-// Classification method is the same intrabar-tick approximation already
-// used twice elsewhere in this repo (Regime_Engine_TCO_Gatekeeper.pine's
-// CVD module, Stacked_Buy_Sell_Volume_Columns.pine): pull each bar's own
-// lower-timeframe sub-bars via request.security_lower_tf(), classify each
-// by its own close-vs-open, sum volume per side. Real bid/ask order-flow
-// data is not available to Pine Script at all, on any TradingView plan --
-// this is the closest legitimate proxy, not the real thing.
-//
-// Deliberately lighter than the full per-tick lattice/profile in
-// Volume_Footprint_Math_Geometry_Intro.pine: a confirmation gate only
-// needs "did recent order flow lean hard enough to agree with this
-// trade's direction," not a full price-level table. Porting the specific
-// computation, not the whole indicator, per the plan discussed this
-// session.
-//──────────────────────────────────────────────────────────────────────────────
-groupFootprint = "8. Footprint Confirmation"
-
-useFootprintFilterInput = input.bool(
-     defval = true,
-     title = "Require Order-Flow Imbalance Confirmation",
-     group = groupFootprint,
-     tooltip = "Only allow an entry (either path, either direction) when the trailing footprint window's buy/sell volume leans hard enough in the trade's own direction. An additional confirmation gate, not a new trigger -- it can only block a signal the trigger/trend/Markov gates already approved, never fire one on its own."
-)
-
-footprintLtfInput = input.timeframe(
-     defval = "1",
-     title = "Footprint Sub-Timeframe",
-     group = groupFootprint,
-     tooltip = "Lower timeframe sampled for the buy/sell volume classification. Must be lower than the chart timeframe."
-)
-
-footprintWindowInput = input.int(
-     defval = 5,
-     title = "Footprint Window (Bars)",
-     minval = 2,
-     maxval = 60,
-     group = groupFootprint,
-     tooltip = "How many trailing bars' buy/sell volume are summed for the imbalance read. Matches Volume_Footprint_Math_Geometry_Intro.pine's own default Window Bars."
-)
-
-footprintImbalancePctInput = input.float(
-     defval = 130.0,
-     title = "Imbalance Threshold (%)",
-     minval = 100.0,
-     maxval = 1000.0,
-     step = 10.0,
-     group = groupFootprint,
-     tooltip = "One side's window volume must exceed the opposing side's by this percentage to count as an imbalance. 300%, the classical figure, is Volume_Footprint_Math_Geometry_Intro.pine's own default -- but that threshold is meant for a SINGLE price-level row in a footprint table, a genuinely rare, extreme single-tick event. Applied here to a rolling multi-bar TOTAL volume sum instead, 300% was nearly unclearable in practice (live testing saw a real 1.39:1 buy lean still read as NEUTRAL) and was blocking every entry path regardless of what the trigger/trend/Markov gates said. Lowered to 130% (one side needs ~30% more volume than the other) so it reads real, achievable leans in this window-sum context."
-)
-
-[footprintLtfClose, footprintLtfOpen, footprintLtfVolume] = request.security_lower_tf(
-     syminfo.tickerid,
-     footprintLtfInput,
-     [close, open, volume]
-)
-
-float footprintBarBuyVol = 0.0
-float footprintBarSellVol = 0.0
-
-if array.size(footprintLtfClose) > 0
-    for footprintI = 0 to array.size(footprintLtfClose) - 1
-        float footprintSubClose = array.get(footprintLtfClose, footprintI)
-        float footprintSubOpen = array.get(footprintLtfOpen, footprintI)
-        float footprintSubVolume = array.get(footprintLtfVolume, footprintI)
-
-        if footprintSubClose > footprintSubOpen
-            footprintBarBuyVol += footprintSubVolume
-        else if footprintSubClose < footprintSubOpen
-            footprintBarSellVol += footprintSubVolume
-        else
-            // Sub-bar closed flat -- can't classify direction, so split
-            // the volume evenly rather than assigning it to either side.
-            footprintBarBuyVol += footprintSubVolume * 0.5
-            footprintBarSellVol += footprintSubVolume * 0.5
-
-// Rolling window sums -- math.sum() over the per-bar totals just
-// computed, rather than a manually maintained running accumulator.
-float footprintWindowBuyVol = math.sum(footprintBarBuyVol, footprintWindowInput)
-float footprintWindowSellVol = math.sum(footprintBarSellVol, footprintWindowInput)
-
-float footprintImbalanceRatio = footprintImbalancePctInput / 100.0
-bool footprintBuyImbalance = footprintWindowBuyVol > footprintWindowSellVol * footprintImbalanceRatio
-bool footprintSellImbalance = footprintWindowSellVol > footprintWindowBuyVol * footprintImbalanceRatio
-
-// Footprint POC -- a lightweight reference, not a gate. Which bar in the
-// trailing window carried the most total volume, using that bar's HL2 as
-// its representative price. Display-only (dashboard row below); unlike
-// imbalance, a POC being nearby isn't inherently bullish or bearish, so
-// it isn't wired into any AND-condition.
-float footprintPocPrice = na
-float footprintPocVol = 0.0
-
-for footprintJ = 0 to footprintWindowInput - 1
-    float footprintBarTotal = nz(footprintBarBuyVol[footprintJ]) + nz(footprintBarSellVol[footprintJ])
-    if footprintBarTotal > footprintPocVol
-        footprintPocVol := footprintBarTotal
-        footprintPocPrice := hl2[footprintJ]
 
 //──────────────────────────────────────────────────────────────────────────────
 // TRADE CONDITIONS
