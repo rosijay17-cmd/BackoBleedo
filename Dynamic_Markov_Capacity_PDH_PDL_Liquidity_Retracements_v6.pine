@@ -451,7 +451,17 @@ float finalPositionQty = bypassCapacityGateInput ? math.max(positionQty, lotIncr
 float confirmedPivotHigh = ta.pivothigh(high, pivotLeft, pivotRight)
 float confirmedPivotLow = ta.pivotlow(low, pivotLeft, pivotRight)
 
+// Each line also gets its own price level and direction tracked in
+// parallel arrays, so the invalidation pass below can tell a swept
+// level from a still-live one -- the pre-existing code only ever
+// dropped the OLDEST line once the count exceeded maxLiquidityLevels,
+// so a level price had already traded straight through kept extending
+// indefinitely across the chart, right through live price action,
+// until enough newer pivots eventually pushed it out. That's what was
+// cluttering the chart with dotted "scribble" lines.
 var array<line> liquidityLines = array.new_line()
+var array<float> liquidityLineLevels = array.new_float()
+var array<bool> liquidityLineIsHigh = array.new_bool()
 
 if showLiquidityLevels and not na(confirmedPivotHigh)
     line newHighLine = line.new(
@@ -466,10 +476,13 @@ if showLiquidityLevels and not na(confirmedPivotHigh)
     )
 
     array.push(liquidityLines, newHighLine)
+    array.push(liquidityLineLevels, confirmedPivotHigh)
+    array.push(liquidityLineIsHigh, true)
 
     if array.size(liquidityLines) > maxLiquidityLevels
-        line oldLine = array.shift(liquidityLines)
-        line.delete(oldLine)
+        line.delete(array.shift(liquidityLines))
+        array.shift(liquidityLineLevels)
+        array.shift(liquidityLineIsHigh)
 
 if showLiquidityLevels and not na(confirmedPivotLow)
     line newLowLine = line.new(
@@ -484,10 +497,34 @@ if showLiquidityLevels and not na(confirmedPivotLow)
     )
 
     array.push(liquidityLines, newLowLine)
+    array.push(liquidityLineLevels, confirmedPivotLow)
+    array.push(liquidityLineIsHigh, false)
 
     if array.size(liquidityLines) > maxLiquidityLevels
-        line oldLine = array.shift(liquidityLines)
-        line.delete(oldLine)
+        line.delete(array.shift(liquidityLines))
+        array.shift(liquidityLineLevels)
+        array.shift(liquidityLineIsHigh)
+
+// Sweep invalidation: a pivot-high line marks potential buy-side
+// liquidity above price -- once close trades back above it, that
+// liquidity has already been taken, and the line has nothing left to
+// mark. Same mirror logic for a pivot-low line and close trading back
+// below it. Deleting it here (not just capping the count) is what
+// actually stops the "old lines stretching through current price"
+// clutter, rather than just waiting for it to eventually age out.
+// Iterated backward so array.remove() never shifts an index still to
+// be visited.
+if array.size(liquidityLines) > 0
+    for li = array.size(liquidityLines) - 1 to 0
+        float liLevel = array.get(liquidityLineLevels, li)
+        bool liIsHigh = array.get(liquidityLineIsHigh, li)
+        bool liSwept = liIsHigh ? close > liLevel : close < liLevel
+
+        if liSwept
+            line.delete(array.get(liquidityLines, li))
+            array.remove(liquidityLines, li)
+            array.remove(liquidityLineLevels, li)
+            array.remove(liquidityLineIsHigh, li)
 
 //──────────────────────────────────────────────────────────────────────────────
 // DYNAMIC RETRACEMENT ZONES
