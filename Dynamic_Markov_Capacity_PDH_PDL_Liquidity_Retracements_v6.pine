@@ -351,6 +351,20 @@ useMarkovFlipExitInput = input.bool(
      tooltip = "Closes the position if the live Markov transition model's probability for the opposing direction rises to or above this strategy's own entry threshold (Minimum Bull/Bear Probability in the Markov group), i.e. the regime that justified the entry has flipped against it."
 )
 
+// MERGED: same standardized alert convention now used across this repo's
+// alert-wired scripts (Hierarchical_Trading_System_v6_Fakeout_Protected.pine,
+// Sweep_Trend_Continuation_SVP_Merged.pine) -- kept as its own toggle
+// since strategy.entry()/strategy.exit()/strategy.close() fire order
+// events regardless, but the dynamic alert() message body is the only
+// thing that states WHICH of this script's two independent entry paths
+// (zone rejection vs PDH/PDL breakout) actually triggered.
+enableDynamicAlerts = input.bool(
+     defval = true,
+     title = "Enable Dynamic alert() Calls",
+     group = groupExecution,
+     tooltip = "When on, every accepted entry and every exit (ATR stop, Zone Break, Markov Flip) fires a descriptive alert() message -- BULLISH ENTRY / BEARISH ENTRY naming the entry path (Zone vs PDH/PDL Breakout), LONG EXIT / SHORT EXIT naming the exit reason. When off, entries/exits still happen and the alertcondition() rows below still fire, but no alert() message is sent -- which looks identical to a broken alert if you forget this is off."
+)
+
 //──────────────────────────────────────────────────────────────────────────────
 // FUNCTIONS
 //──────────────────────────────────────────────────────────────────────────────
@@ -384,6 +398,17 @@ f_formatState(int state) =>
 // report can be answered by reading the dashboard instead of guessing
 // blind at which of longSignal's several ANDed gates is the blocker.
 f_boolIcon(bool b) => b ? "✓" : "✗"
+
+// MERGED: standardized alert-message convention used across this repo --
+// every message leads with an ALL-CAPS directional tag (BULLISH ENTRY /
+// BEARISH ENTRY / LONG EXIT / SHORT EXIT), then a label, then
+// ticker/timeframe/price. "Ranger" is this script's alert label from
+// now on, same as Sweep_Trend_Continuation_SVP_Merged.pine.
+f_alertMsg(string kind, string label, float px) =>
+    kind + " | " + label + " | " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(px, format.mintick)
+
+f_price(float value) =>
+    na(value) ? "—" : str.tostring(value, format.mintick)
 
 //──────────────────────────────────────────────────────────────────────────────
 // CORE MARKET CALCULATIONS
@@ -1252,6 +1277,19 @@ if longSignal
     // a breakout trade with zone bounds it never actually came from.
     entryZoneDir := na(qualifyingDemandTop) ? 0 : 1
 
+    // MERGED: dynamic alert -- states WHICH of the two independent long
+    // paths actually fired (zoneLongSignal vs longBreakoutSignal), per
+    // "I want signal triggers type of entry to the alert."
+    string longEntryType = zoneLongSignal ? "Zone Long" : "PDH Breakout Long"
+    if enableDynamicAlerts
+        alert(
+             f_alertMsg("BULLISH ENTRY", "Ranger — " + longEntryType, close) +
+             "\nMarkov: P(Bull) " + str.tostring(probabilityBull * 100.0, "#.#") + "%" +
+             "\nZone: " + (entryZoneDir == 1 ? f_price(entryZoneBottom) + "-" + f_price(entryZoneTop) : "none (breakout)") +
+             "\nPlanned Stop: " + f_price(close - stopDistance) +
+             "\nSize: " + str.tostring(longConfidenceQty, "#.##"),
+             alert.freq_once_per_bar_close)
+
 if shortSignal and allowShorts
     strategy.entry(
          id = "Short",
@@ -1263,6 +1301,18 @@ if shortSignal and allowShorts
     entryZoneTop := qualifyingSupplyTop
     entryZoneBottom := qualifyingSupplyBottom
     entryZoneDir := na(qualifyingSupplyTop) ? 0 : -1
+
+    // MERGED: dynamic alert -- states WHICH of the two independent short
+    // paths actually fired (zoneShortSignal vs shortBreakoutSignal).
+    string shortEntryType = zoneShortSignal ? "Zone Short" : "PDL Breakout Short"
+    if enableDynamicAlerts
+        alert(
+             f_alertMsg("BEARISH ENTRY", "Ranger — " + shortEntryType, close) +
+             "\nMarkov: P(Bear) " + str.tostring(probabilityBear * 100.0, "#.#") + "%" +
+             "\nZone: " + (entryZoneDir == -1 ? f_price(entryZoneBottom) + "-" + f_price(entryZoneTop) : "none (breakout)") +
+             "\nPlanned Stop: " + f_price(close + stopDistance) +
+             "\nSize: " + str.tostring(shortConfidenceQty, "#.##"),
+             alert.freq_once_per_bar_close)
 
 // Stops lock when a newly opened position is detected.
 // This retains the ATR-based risk assumption used in capacity sizing.
@@ -1334,6 +1384,36 @@ if zoneBreakExitShort or markovFlipExitShort
          id = "Short",
          comment = zoneBreakExitShort ? "Zone Break" : "Markov Flip"
     )
+
+//──────────────────────────────────────────────────────────────────────────────
+// MERGED: EXIT ALERTS -- STANDARDIZED "RANGER" CONVENTION
+//
+// Every exit path above (the ATR stop via strategy.exit(), Zone Break /
+// Markov Flip via strategy.close()) only produces an order-fill event,
+// not an alert() message -- the same gap already found and fixed in
+// Sweep_Trend_Continuation_SVP_Merged.pine this session. Detected
+// generically here (position_size hitting 0 from either side) rather
+// than duplicated per exit path, with strategy.closedtrades.exit_comment()
+// reporting which one actually fired -- its own comment string ("Long
+// ATR Stop"/"Short ATR Stop" from the strategy.exit() ids above, or
+// "Zone Break"/"Markov Flip" from the strategy.close() comments above).
+//──────────────────────────────────────────────────────────────────────────────
+bool longPositionClosed = strategy.position_size == 0 and strategy.position_size[1] > 0
+bool shortPositionClosed = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+string lastExitReason = strategy.closedtrades > 0 ? strategy.closedtrades.exit_comment(strategy.closedtrades - 1) : na
+
+if longPositionClosed and enableDynamicAlerts
+    alert(
+         f_alertMsg("LONG EXIT", "Ranger", close) +
+         "\nReason: " + (na(lastExitReason) or lastExitReason == "" ? "—" : lastExitReason),
+         alert.freq_once_per_bar_close)
+
+if shortPositionClosed and enableDynamicAlerts
+    alert(
+         f_alertMsg("SHORT EXIT", "Ranger", close) +
+         "\nReason: " + (na(lastExitReason) or lastExitReason == "" ? "—" : lastExitReason),
+         alert.freq_once_per_bar_close)
 
 //──────────────────────────────────────────────────────────────────────────────
 // VISUALS
@@ -1422,26 +1502,40 @@ plotshape(
 
 //──────────────────────────────────────────────────────────────────────────────
 // ALERT CONDITIONS
+//
+// MERGED: renamed to the standardized "Ranger" label and split by which
+// of the two independent entry paths (Zone vs PDH/PDL Breakout) actually
+// fired, plus new Long/Short Exit conditions -- matching the convention
+// applied to Sweep_Trend_Continuation_SVP_Merged.pine this session.
 //──────────────────────────────────────────────────────────────────────────────
+alertcondition(zoneLongSignal, title = "Ranger Zone Long Entry (Bullish)", message = "BULLISH ENTRY | Ranger — Zone Long | {{ticker}} {{interval}}")
+alertcondition(longBreakoutSignal, title = "Ranger PDH Breakout Long Entry (Bullish)", message = "BULLISH ENTRY | Ranger — PDH Breakout Long | {{ticker}} {{interval}}")
+alertcondition(zoneShortSignal and allowShorts, title = "Ranger Zone Short Entry (Bearish)", message = "BEARISH ENTRY | Ranger — Zone Short | {{ticker}} {{interval}}")
+alertcondition(shortBreakoutSignal and allowShorts, title = "Ranger PDL Breakout Short Entry (Bearish)", message = "BEARISH ENTRY | Ranger — PDL Breakout Short | {{ticker}} {{interval}}")
+
 alertcondition(
      longSignal,
-     title = "Markov Liquidity Long",
-     message = "Long signal: zone rejection or PDH breakout, trend, Markov, and capacity conditions passed."
+     title = "Ranger Any Long Entry",
+     message = "BULLISH ENTRY | Ranger | {{ticker}} {{interval}} — see chart/dashboard for entry type"
 )
 
 alertcondition(
      shortSignal and allowShorts,
-     title = "Markov Liquidity Short",
-     message = "Short signal: zone rejection or PDL breakout, trend, Markov, and capacity conditions passed."
+     title = "Ranger Any Short Entry",
+     message = "BEARISH ENTRY | Ranger | {{ticker}} {{interval}} — see chart/dashboard for entry type"
 )
+
+alertcondition(longPositionClosed, title = "Ranger Long Exit", message = "LONG EXIT | Ranger | {{ticker}} {{interval}}")
+alertcondition(shortPositionClosed, title = "Ranger Short Exit", message = "SHORT EXIT | Ranger | {{ticker}} {{interval}}")
 
 //──────────────────────────────────────────────────────────────────────────────
 // MARKOV / CAPACITY TABLE
 //──────────────────────────────────────────────────────────────────────────────
+// MERGED: rows 18 -> 19 to fit the new ALERTS status row.
 var table statsTable = table.new(
      position.top_left,
      2,
-     18,
+     19,
      border_width = 1
 )
 
@@ -1538,3 +1632,9 @@ if barstate.islast and showMarkovTable
     float confidenceQtyShown = confidenceShowLong ? longConfidenceQty : shortConfidenceQty
     string confidenceText = not useConfidenceSizingInput ? "OFF" : (confidenceShowLong ? "Long " : "Short ") + str.tostring(confidenceScalarShown * 100, "#") + "% -> " + str.tostring(confidenceQtyShown, "#.##")
     f_row(17, "Confidence Sizing", confidenceText, useConfidenceSizingInput ? (confidenceShowLong ? color.lime : color.red) : color.gray)
+
+    // MERGED: surfaces the "Enable Dynamic alert() Calls" toggle -- if
+    // this is off, entries/exits still fire and the alertcondition()
+    // rows still work, but no alert() message is ever sent, which looks
+    // identical to a broken alert.
+    f_row(18, "Alerts (Ranger)", enableDynamicAlerts ? "ON" : "OFF", enableDynamicAlerts ? color.lime : color.red)
