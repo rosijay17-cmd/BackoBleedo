@@ -383,22 +383,6 @@ f_getState(float priceChange, float threshold) =>
 
     result
 
-f_formatState(int state) =>
-    string stateName = "Neutral"
-
-    if state == 1
-        stateName := "Bullish"
-    else if state == -1
-        stateName := "Bearish"
-
-    stateName
-
-// Renders a single entry-gate as a pass/fail glyph, for the "Long/Short
-// Filters" diagnostic dashboard rows below -- so a "no entry signal"
-// report can be answered by reading the dashboard instead of guessing
-// blind at which of longSignal's several ANDed gates is the blocker.
-f_boolIcon(bool b) => b ? "✓" : "✗"
-
 // MERGED: standardized alert-message convention used across this repo --
 // every message leads with an ALL-CAPS directional tag (BULLISH ENTRY /
 // BEARISH ENTRY / LONG EXIT / SHORT EXIT), then a label, then
@@ -1532,10 +1516,20 @@ alertcondition(shortPositionClosed, title = "Ranger Short Exit", message = "SHOR
 // MARKOV / CAPACITY TABLE
 //──────────────────────────────────────────────────────────────────────────────
 // MERGED: rows 18 -> 19 to fit the new ALERTS status row.
+// Downsized from 19 rows to 5 -- the individual Markov-probability
+// breakdown, per-gate icon strings (Long/Short Zone Gates, Long/Short
+// Breakout Gates), Active Zone, Impulse Direction, Footprint Flow/POC,
+// Confidence Sizing, and Alerts status all still compute and gate
+// entries exactly as before; they just no longer each get their own
+// dashboard row. What's left is only what actually changes a trade
+// decision at a glance: the model's directional lean, whether Long/
+// Short is clear to fire right now (or which single gate is blocking
+// it, using the same "first blocking gate" logic the alert-diagnostic
+// f_blockReason() helper below already established), and position size.
 var table statsTable = table.new(
      position.top_left,
      2,
-     19,
+     5,
      border_width = 1
 )
 
@@ -1566,75 +1560,63 @@ f_row(int row, string left, string right, color rightColor) =>
 
 if barstate.islast and showMarkovTable
     table.set_position(statsTable, dashboardPosition)
-    table.cell(statsTable, 0, 0, "Dynamic Model", text_color = color.white, bgcolor = color.rgb(20, 50, 90), text_size = resolvedDashboardSize, text_halign = text.align_left)
-    table.cell(statsTable, 1, 0, "Value", text_color = color.white, bgcolor = color.rgb(20, 50, 90), text_size = resolvedDashboardSize, text_halign = text.align_right)
+    table.cell(statsTable, 0, 0, "RANGER MARKOV", text_color = color.white, bgcolor = color.rgb(20, 50, 90), text_size = resolvedDashboardSize, text_halign = text.align_left)
+    table.cell(statsTable, 1, 0, "LIVE", text_color = color.white, bgcolor = color.rgb(20, 50, 90), text_size = resolvedDashboardSize, text_halign = text.align_right)
 
-    f_row(1, "Current Markov State", f_formatState(currentState), color.black)
-    f_row(2, "P(Next Bullish)", str.tostring(probabilityBull * 100.0, "#.##") + "%", color.black)
-    f_row(3, "P(Next Neutral)", str.tostring(probabilityNeutral * 100.0, "#.##") + "%", color.black)
-    f_row(4, "P(Next Bearish)", str.tostring(probabilityBear * 100.0, "#.##") + "%", color.black)
-    f_row(5, "Risk Capacity", str.tostring(riskCapacity, "#.##"), color.black)
-    f_row(6, "Liquidity Capacity", str.tostring(liquidityCapacity, "#.##"), color.black)
+    // Bias: the model's own next-state forecast (whichever of Bull/
+    // Neutral/Bear currently reads highest), not the backward-looking
+    // "Current Markov State" -- this is the number longMarkovFilter/
+    // shortMarkovFilter actually gate on.
+    float maxProbability = math.max(probabilityBull, math.max(probabilityNeutral, probabilityBear))
+    string biasText =
+         probabilityBull == maxProbability ? "BULLISH " + str.tostring(probabilityBull * 100.0, "#") + "%" :
+         probabilityBear == maxProbability ? "BEARISH " + str.tostring(probabilityBear * 100.0, "#") + "%" :
+         "NEUTRAL " + str.tostring(probabilityNeutral * 100.0, "#") + "%"
+    color biasColor = probabilityBull == maxProbability ? color.lime : probabilityBear == maxProbability ? color.red : color.gray
+    f_row(1, "Bias", biasText, biasColor)
+
+    // Long/Short: "SIGNAL" if a trade is firing (either the zone or the
+    // breakout path) on this exact bar, "READY" if every persistent gate
+    // (size, cooldown, trend, Markov, footprint, PD filter, zone-hold
+    // probability) already passes and it's purely waiting on a trigger
+    // candle/crossover, or the name of the first gate actually blocking
+    // it right now -- same "first blocking gate" logic already used by
+    // f_blockReason() below for the historical blocked-breakout labels.
+    string longStatus =
+         (zoneLongSignal or longBreakoutSignal) ? "SIGNAL" :
+         not (finalPositionQty > 0) ? "SIZE 0" :
+         not cooldownElapsed ? "COOLDOWN" :
+         not longTrendFilter ? "TREND" :
+         not longMarkovFilter ? "MARKOV" :
+         not longFootprintFilter ? "FOOTPRINT" :
+         not longPDFilter ? "PD FILTER" :
+         not longRetracementFilter ? "ZONE PROB" :
+         "READY"
+    color longStatusColor =
+         longStatus == "SIGNAL" ? color.new(color.lime, 0) :
+         longStatus == "READY" ? color.lime :
+         color.orange
+    f_row(2, "Long", longStatus, longStatusColor)
+
+    string shortStatus =
+         not allowShorts ? "OFF" :
+         (zoneShortSignal or shortBreakoutSignal) ? "SIGNAL" :
+         not (finalPositionQty > 0) ? "SIZE 0" :
+         not cooldownElapsed ? "COOLDOWN" :
+         not shortTrendFilter ? "TREND" :
+         not shortMarkovFilter ? "MARKOV" :
+         not shortFootprintFilter ? "FOOTPRINT" :
+         not shortPDFilter ? "PD FILTER" :
+         not shortRetracementFilter ? "ZONE PROB" :
+         "READY"
+    color shortStatusColor =
+         not allowShorts ? color.gray :
+         shortStatus == "SIGNAL" ? color.new(color.red, 0) :
+         shortStatus == "READY" ? color.lime :
+         color.orange
+    f_row(3, "Short", shortStatus, shortStatusColor)
 
     bool sizeBypassed = bypassCapacityGateInput and positionQty <= 0
     string qtyText = finalPositionQty > 0 ? str.tostring(finalPositionQty, "#.##") + (sizeBypassed ? " (bypassed)" : "") : "TOO SMALL"
     color qtyColor = sizeBypassed ? color.orange : finalPositionQty > 0 ? color.lime : color.red
-    f_row(7, "Position Size", qtyText, qtyColor)
-
-    string impulseText = impulseDirection == 1 ? "Upward" : impulseDirection == -1 ? "Downward" : "Not Set"
-    f_row(8, "Impulse Direction", impulseText, color.black)
-
-    string cooldownText = cooldownBars <= 0 ? "OFF" : cooldownElapsed ? "READY" : str.tostring(cooldownBars - (bar_index - lastEntryBar)) + " BARS LEFT"
-    f_row(9, "Cooldown", cooldownText, cooldownElapsed ? color.lime : color.orange)
-
-    string activeZoneText = entryZoneDir == 0 ? "None" : (entryZoneDir == 1 ? "Demand " : "Supply ") + str.tostring(entryZoneBottom, format.mintick) + "-" + str.tostring(entryZoneTop, format.mintick)
-    f_row(10, "Active Zone", activeZoneText, entryZoneDir == 1 ? color.lime : entryZoneDir == -1 ? color.red : color.gray)
-
-    // Diagnostic rows: every gate longSignal/shortSignal ANDs together, in
-    // order (Trigger / PD-PDL / Zone / Trend / Markov / Size / Cooldown).
-    // Labels are kept short (fits a narrow phone column); the full legend
-    // is on the cell's tooltip instead of in the label text.
-    string longFiltersText = f_boolIcon(longTrigger) + " " + f_boolIcon(longPDFilter) + " " + f_boolIcon(longRetracementFilter) + " " + f_boolIcon(longTrendFilter) + " " + f_boolIcon(longMarkovFilter) + " " + f_boolIcon(longFootprintFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
-    table.cell(statsTable, 0, 11, "Long Zone Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: Trigger, PDH/PDL filter, Zone, Trend, Markov, Footprint, Size, Cooldown")
-    table.cell(statsTable, 1, 11, longFiltersText, text_color = zoneLongSignal ? color.lime : color.gray, text_size = resolvedDashboardSize, text_halign = text.align_right)
-
-    string shortFiltersText = f_boolIcon(shortTrigger) + " " + f_boolIcon(shortPDFilter) + " " + f_boolIcon(shortRetracementFilter) + " " + f_boolIcon(shortTrendFilter) + " " + f_boolIcon(shortMarkovFilter) + " " + f_boolIcon(shortFootprintFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
-    table.cell(statsTable, 0, 12, "Short Zone Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: Trigger, PDH/PDL filter, Zone, Trend, Markov, Footprint, Size, Cooldown")
-    table.cell(statsTable, 1, 12, shortFiltersText, text_color = zoneShortSignal ? color.lime : color.gray, text_size = resolvedDashboardSize, text_halign = text.align_right)
-
-    // PDH/PDL breakout path's own gates -- independent of the zone path
-    // above, so a "why didn't the breakout fire" question reads straight
-    // off this row instead of being folded into the zone diagnostics.
-    string longBreakoutText = f_boolIcon(pdhBreakoutTrigger) + " " + f_boolIcon(longTrendFilter) + " " + f_boolIcon(longMarkovFilter) + " " + f_boolIcon(longFootprintFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
-    table.cell(statsTable, 0, 13, "Long Breakout Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: PDH Cross, Trend, Markov, Footprint, Size, Cooldown")
-    table.cell(statsTable, 1, 13, longBreakoutText, text_color = longBreakoutSignal ? color.lime : color.gray, text_size = resolvedDashboardSize, text_halign = text.align_right)
-
-    string shortBreakoutText = f_boolIcon(pdlBreakoutTrigger) + " " + f_boolIcon(shortTrendFilter) + " " + f_boolIcon(shortMarkovFilter) + " " + f_boolIcon(shortFootprintFilter) + " " + f_boolIcon(finalPositionQty > 0) + " " + f_boolIcon(cooldownElapsed)
-    table.cell(statsTable, 0, 14, "Short Breakout Gates", text_size = resolvedDashboardSize, text_halign = text.align_left, tooltip = "Order: PDL Cross, Trend, Markov, Footprint, Size, Cooldown")
-    table.cell(statsTable, 1, 14, shortBreakoutText, text_color = shortBreakoutSignal ? color.lime : color.gray, text_size = resolvedDashboardSize, text_halign = text.align_right)
-
-    // Footprint order-flow confirmation readout -- the same window/
-    // threshold the longFootprintFilter/shortFootprintFilter gates above
-    // use, so the dashboard and the gate rows always tell one story.
-    string footprintFlowText = footprintBuyImbalance ? "BUY" : footprintSellImbalance ? "SELL" : "NEUTRAL"
-    color footprintFlowColor = footprintBuyImbalance ? color.lime : footprintSellImbalance ? color.red : color.gray
-    f_row(15, "Footprint Flow", footprintFlowText + " (" + str.tostring(footprintWindowBuyVol, format.volume) + "/" + str.tostring(footprintWindowSellVol, format.volume) + ")", footprintFlowColor)
-
-    string footprintPocText = na(footprintPocPrice) ? "None" : str.tostring(footprintPocPrice, format.mintick)
-    f_row(16, "Footprint POC", footprintPocText, color.black)
-
-    // Confidence-proportional sizing readout -- shows the scalar that
-    // would apply to WHICHEVER side currently reads more probable, so
-    // this row means something even while flat (no open position to
-    // anchor "long" vs "short" to yet).
-    bool confidenceShowLong = probabilityBull >= probabilityBear
-    float confidenceScalarShown = confidenceShowLong ? longConfidenceScalar : shortConfidenceScalar
-    float confidenceQtyShown = confidenceShowLong ? longConfidenceQty : shortConfidenceQty
-    string confidenceText = not useConfidenceSizingInput ? "OFF" : (confidenceShowLong ? "Long " : "Short ") + str.tostring(confidenceScalarShown * 100, "#") + "% -> " + str.tostring(confidenceQtyShown, "#.##")
-    f_row(17, "Confidence Sizing", confidenceText, useConfidenceSizingInput ? (confidenceShowLong ? color.lime : color.red) : color.gray)
-
-    // MERGED: surfaces the "Enable Dynamic alert() Calls" toggle -- if
-    // this is off, entries/exits still fire and the alertcondition()
-    // rows still work, but no alert() message is ever sent, which looks
-    // identical to a broken alert.
-    f_row(18, "Alerts (Ranger)", enableDynamicAlerts ? "ON" : "OFF", enableDynamicAlerts ? color.lime : color.red)
+    f_row(4, "Size", qtyText, qtyColor)
