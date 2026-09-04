@@ -270,6 +270,14 @@ f_price(float value) =>
 f_number(float value) =>
     na(value) ? "—" : str.tostring(value, "#.00")
 
+// MERGED: standardized alert-message convention used across this repo --
+// every message leads with an ALL-CAPS directional tag (BULLISH ENTRY /
+// BEARISH ENTRY / LONG EXIT / SHORT EXIT), then a label, then
+// ticker/timeframe/price. "Ranger" is this script's alert label from
+// now on -- every alert() and alertcondition() message below uses it.
+f_alertMsg(string kind, string label, float px) =>
+    kind + " | " + label + " | " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(px, format.mintick)
+
 // ═══════════════════════════════════════════════════════════════════
 // INDICATORS
 // ═══════════════════════════════════════════════════════════════════
@@ -838,8 +846,10 @@ var int entryBar = na
 // ═══════════════════════════════════════════════════════════════════
 // ENTRIES
 // ═══════════════════════════════════════════════════════════════════
-// MERGED: alert() bodies now include a Profile/MaxVol/Daily-Bias
-// context line.
+// MERGED: alert() bodies now lead with the standardized f_alertMsg()
+// convention -- BULLISH ENTRY / BEARISH ENTRY, labeled "Ranger", plus
+// the entry mechanism that actually fired (this script has exactly one:
+// the sweep+reclaim), then a Profile/MaxVol/Daily-Bias context line.
 
 if longEntry
     pendingStop := candidateLongStop
@@ -849,8 +859,7 @@ if longEntry
 
     if enableDynamicAlerts
         alert(
-             "🔵 BULLISH SWEEP — LONG ENTRY\n" +
-             syminfo.ticker + " | " + timeframe.period +
+             f_alertMsg("BULLISH ENTRY", "Ranger — Sweep Long", close) +
              "\nTrend: EMA " + str.tostring(trendFastLen) + "/" + str.tostring(trendSlowLen) + " bullish, ADX " + str.tostring(adx, "#.0") +
              "\nMomentum: ROC " + str.tostring(roc, "#.00") + ", BOP " + str.tostring(bop, "#.00") +
              "\nProfile: POC " + f_price(pocPrice) + " VAH " + f_price(vahPrice) + " VAL " + f_price(valPrice) +
@@ -866,8 +875,7 @@ if shortEntry
 
     if enableDynamicAlerts
         alert(
-             "🟣 BEARISH SWEEP — SHORT ENTRY\n" +
-             syminfo.ticker + " | " + timeframe.period +
+             f_alertMsg("BEARISH ENTRY", "Ranger — Sweep Short", close) +
              "\nTrend: EMA " + str.tostring(trendFastLen) + "/" + str.tostring(trendSlowLen) + " bearish, ADX " + str.tostring(adx, "#.0") +
              "\nMomentum: ROC " + str.tostring(roc, "#.00") + ", BOP " + str.tostring(bop, "#.00") +
              "\nProfile: POC " + f_price(pocPrice) + " VAH " + f_price(vahPrice) + " VAL " + f_price(valPrice) +
@@ -984,6 +992,33 @@ if closeAtSessionEnd and sessionEndBar and strategy.position_size != 0
 // ═══════════════════════════════════════════════════════════════════
 
 bool positionJustClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+bool longPositionClosed = positionJustClosed and strategy.position_size[1] > 0
+bool shortPositionClosed = positionJustClosed and strategy.position_size[1] < 0
+
+// MERGED: exit alerts using the same standardized convention as the
+// entries above (LONG EXIT / SHORT EXIT, labeled "Ranger"). The source
+// strategy never called alert() on exits at all -- strategy.exit()/
+// strategy.close_all() only produce order-fill events, not alert()
+// messages -- so this is new, not a reformat of an existing call.
+// strategy.closedtrades.exit_comment() reports which leg actually
+// closed the trade (TP1/TP2/the underlying stop comment/the time-stop
+// or session-close comment above), read before entryPrice is reset
+// below.
+string lastExitReason = strategy.closedtrades > 0 ? strategy.closedtrades.exit_comment(strategy.closedtrades - 1) : na
+
+if longPositionClosed and enableDynamicAlerts
+    alert(
+         f_alertMsg("LONG EXIT", "Ranger", close) +
+         "\nReason: " + (na(lastExitReason) or lastExitReason == "" ? "—" : lastExitReason) +
+         "\nEntry: " + f_price(entryPrice) + " | Exit: " + f_price(close),
+         alert.freq_once_per_bar_close)
+
+if shortPositionClosed and enableDynamicAlerts
+    alert(
+         f_alertMsg("SHORT EXIT", "Ranger", close) +
+         "\nReason: " + (na(lastExitReason) or lastExitReason == "" ? "—" : lastExitReason) +
+         "\nEntry: " + f_price(entryPrice) + " | Exit: " + f_price(close),
+         alert.freq_once_per_bar_close)
 
 if positionJustClosed
     lastClosedTradeBar := bar_index
@@ -1174,10 +1209,14 @@ if not showDashboard and barstate.islast
 // bars that already closed before the alert was created.
 // ═══════════════════════════════════════════════════════════════════
 
-alertcondition(longEntry, title="Sweep Long Entry (Bullish)", message="🔵 BULLISH — Sweep Trend LONG entry — {{ticker}} {{interval}}")
-alertcondition(shortEntry, title="Sweep Short Entry (Bearish)", message="🟣 BEARISH — Sweep Trend SHORT entry — {{ticker}} {{interval}}")
-alertcondition(longEntry or shortEntry, title="Sweep Any Entry (Check Chart For Bias)", message="Sweep Trend entry — {{ticker}} {{interval}} — see chart/dashboard for bias")
-alertcondition(positionJustClosed, title="Sweep Position Closed", message="Sweep Trend position closed — {{ticker}} {{interval}}")
+// MERGED: renamed to the "Ranger" alert label and split the closed-
+// position condition into LONG EXIT / SHORT EXIT, matching the
+// standardized convention used by f_alertMsg() above.
+alertcondition(longEntry, title="Ranger Long Entry (Bullish)", message="BULLISH ENTRY | Ranger — Sweep Long | {{ticker}} {{interval}}")
+alertcondition(shortEntry, title="Ranger Short Entry (Bearish)", message="BEARISH ENTRY | Ranger — Sweep Short | {{ticker}} {{interval}}")
+alertcondition(longEntry or shortEntry, title="Ranger Any Entry (Check Chart For Bias)", message="Ranger entry — {{ticker}} {{interval}} — see chart/dashboard for bias")
+alertcondition(longPositionClosed, title="Ranger Long Exit", message="LONG EXIT | Ranger | {{ticker}} {{interval}}")
+alertcondition(shortPositionClosed, title="Ranger Short Exit", message="SHORT EXIT | Ranger | {{ticker}} {{interval}}")
 
 // ═══════════════════════════════════════════════════════════════════
 // DATA WINDOW
