@@ -144,6 +144,17 @@ bool requireOneMinuteChart = input.bool(
      group=G_CORE
 )
 
+// MERGED: same standardized alert convention now used across this
+// repo's alert-wired scripts (Hierarchical_Trading_System_v6_Fakeout_
+// Protected.pine, Sweep_Trend_Continuation_SVP_Merged.pine,
+// Dynamic_Markov_Capacity_PDH_PDL_Liquidity_Retracements_v6.pine).
+bool enableDynamicAlerts = input.bool(
+     true,
+     "Enable Dynamic alert() Calls",
+     tooltip="When on, every accepted entry and every exit (bracket stop/target, Session Close, Time Exit) fires a descriptive alert() message -- BULLISH ENTRY / BEARISH ENTRY naming the regime and size, LONG EXIT / SHORT EXIT naming the exit reason. When off, entries/exits still happen and the alertcondition() rows below still fire, but no alert() message is sent -- which looks identical to a broken alert if you forget this is off.",
+     group=G_CORE
+)
+
 //====================================================================
 // EXIT INPUTS
 //====================================================================
@@ -586,6 +597,15 @@ f_pct(float v) =>
 
 f_price(float v) =>
     na(v) ? "—" : str.tostring(v, format.mintick)
+
+// MERGED: standardized alert-message convention used across this repo --
+// every message leads with an ALL-CAPS directional tag (BULLISH ENTRY /
+// BEARISH ENTRY / LONG EXIT / SHORT EXIT), then a label, then
+// ticker/timeframe/price. "Ranger" is this script's alert label, same
+// as Sweep_Trend_Continuation_SVP_Merged.pine and
+// Dynamic_Markov_Capacity_PDH_PDL_Liquidity_Retracements_v6.pine.
+f_alertMsg(string kind, string label, float px) =>
+    kind + " | " + label + " | " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(px, format.mintick)
 
 f_dirName(int d) =>
     switch d
@@ -1578,6 +1598,20 @@ if longSignal
          comment="TORB Vol Long"
     )
 
+    // MERGED: dynamic alert -- standardized BULLISH ENTRY tag, "Ranger"
+    // label, naming the volatility regime that set this trade's
+    // buffer/size, per "I want signal triggers type of entry to the
+    // alert."
+    if enableDynamicAlerts
+        alert(
+             f_alertMsg("BULLISH ENTRY", "Ranger — TORB Breakout Long", close) +
+             "\nRegime: " + f_regimeName(volRegime) + " (" + f_pct(volCompositeScore) + ")" +
+             "\nBuffer: " + f_num(regimeBreakBufferATR) + " ATR" +
+             "\nStop: " + f_price(plannedStop) + " | Target: " + f_price(plannedTarget) +
+             "\nExit Model: " + f_exitName(exitMode) +
+             "\nQty: " + str.tostring(effectiveContracts),
+             alert.freq_once_per_bar_close)
+
 if shortSignal
     entryATR := atr
     entryRVOL := rvol
@@ -1623,16 +1657,34 @@ if shortSignal
          comment="TORB Vol Short"
     )
 
+    // MERGED: dynamic alert -- standardized BEARISH ENTRY tag, "Ranger"
+    // label, naming the volatility regime that set this trade's
+    // buffer/size.
+    if enableDynamicAlerts
+        alert(
+             f_alertMsg("BEARISH ENTRY", "Ranger — TORB Breakout Short", close) +
+             "\nRegime: " + f_regimeName(volRegime) + " (" + f_pct(volCompositeScore) + ")" +
+             "\nBuffer: " + f_num(regimeBreakBufferATR) + " ATR" +
+             "\nStop: " + f_price(plannedStop) + " | Target: " + f_price(plannedTarget) +
+             "\nExit Model: " + f_exitName(exitMode) +
+             "\nQty: " + str.tostring(effectiveContracts),
+             alert.freq_once_per_bar_close)
+
 //====================================================================
 // EXIT ENGINE
 //====================================================================
 
+// MERGED: comment_loss/comment_profit added so the exit alert below can
+// name which leg actually filled via strategy.closedtrades.exit_comment()
+// -- previously neither was set, so that call would have returned "".
 if strategy.position_size > 0 and bracketMode
     strategy.exit(
          "Long Exit",
          from_entry="Long",
          stop=plannedStop,
-         limit=plannedTarget
+         limit=plannedTarget,
+         comment_loss="Stop",
+         comment_profit="Target"
     )
 
 if strategy.position_size < 0 and bracketMode
@@ -1640,7 +1692,9 @@ if strategy.position_size < 0 and bracketMode
          "Short Exit",
          from_entry="Short",
          stop=plannedStop,
-         limit=plannedTarget
+         limit=plannedTarget,
+         comment_loss="Stop",
+         comment_profit="Target"
     )
 
 bool sessionCloseExit = (
@@ -1714,6 +1768,38 @@ bool positionJustClosed = (
 if positionJustClosed and not na(entryATR) and entryATR > 0
     lastTradeMFEATR := tradeMFE / entryATR
     lastTradeMAEATR := tradeMAE / entryATR
+
+//====================================================================
+// MERGED: EXIT ALERTS -- STANDARDIZED "RANGER" CONVENTION
+//
+// Every exit path above (the bracket stop/target via strategy.exit(),
+// Session Close / Time Exit via strategy.close_all()) only produces an
+// order-fill event, not an alert() message -- the same gap already
+// found and fixed in Sweep_Trend_Continuation_SVP_Merged.pine and
+// Dynamic_Markov_Capacity_PDH_PDL_Liquidity_Retracements_v6.pine this
+// session. Detected generically here (position_size hitting 0 from
+// either side) with strategy.closedtrades.exit_comment() naming which
+// one actually fired ("Stop"/"Target" from the bracket exit() above, or
+// "TORB Session Close"/"TORB Time Exit" from the close_all() calls).
+//====================================================================
+bool longPositionClosed = strategy.position_size == 0 and strategy.position_size[1] > 0
+bool shortPositionClosed = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+string lastExitReason = strategy.closedtrades > 0 ? strategy.closedtrades.exit_comment(strategy.closedtrades - 1) : na
+
+if longPositionClosed and enableDynamicAlerts
+    alert(
+         f_alertMsg("LONG EXIT", "Ranger", close) +
+         "\nReason: " + (na(lastExitReason) or lastExitReason == "" ? "—" : lastExitReason) +
+         "\nMFE/MAE: " + f_num(lastTradeMFEATR) + " / " + f_num(lastTradeMAEATR) + " ATR",
+         alert.freq_once_per_bar_close)
+
+if shortPositionClosed and enableDynamicAlerts
+    alert(
+         f_alertMsg("SHORT EXIT", "Ranger", close) +
+         "\nReason: " + (na(lastExitReason) or lastExitReason == "" ? "—" : lastExitReason) +
+         "\nMFE/MAE: " + f_num(lastTradeMFEATR) + " / " + f_num(lastTradeMAEATR) + " ATR",
+         alert.freq_once_per_bar_close)
 
 //====================================================================
 // DASHBOARD STATE
@@ -1864,10 +1950,11 @@ bgcolor(
 // COMPACT DASHBOARD
 //====================================================================
 
+// MERGED: rows 14 -> 15 to fit the new "Alerts (Ranger)" status row.
 var table dash = table.new(
      position.top_right,
      2,
-     14,
+     15,
      border_width=1
 )
 
@@ -1906,7 +1993,7 @@ if drawDashboard
          0,
          0,
          1,
-         13
+         14
     )
 
     color statusColor = color.gray
@@ -2046,6 +2133,17 @@ if drawDashboard
          posColor
     )
 
+    // MERGED: surfaces the "Enable Dynamic alert() Calls" toggle -- if
+    // this is off, entries/exits still fire and the alertcondition()
+    // rows still work, but no alert() message is ever sent, which looks
+    // identical to a broken alert.
+    f_cell(
+         14,
+         "Alerts (Ranger)",
+         enableDynamicAlerts ? "ON" : "OFF",
+         enableDynamicAlerts ? color.green : color.red
+    )
+
 //====================================================================
 // REDUCED DATA WINDOW
 //====================================================================
@@ -2100,28 +2198,46 @@ plot(
 
 //====================================================================
 // ALERTS
+//
+// MERGED: renamed to the standardized "Ranger" label/tag convention
+// (BULLISH ENTRY / BEARISH ENTRY / LONG EXIT / SHORT EXIT) and added
+// Long/Short Exit conditions -- matching the convention already applied
+// to Sweep_Trend_Continuation_SVP_Merged.pine and
+// Dynamic_Markov_Capacity_PDH_PDL_Liquidity_Retracements_v6.pine.
 //====================================================================
 
 alertcondition(
      longSignal,
-     "Academia TORB v1.5 — Long",
-     "TORB volatility-regime long breakout."
+     "Ranger TORB Long Entry (Bullish)",
+     "BULLISH ENTRY | Ranger — TORB Breakout Long | {{ticker}} {{interval}}"
 )
 
 alertcondition(
      shortSignal,
-     "Academia TORB v1.5 — Short",
-     "TORB volatility-regime short breakout."
+     "Ranger TORB Short Entry (Bearish)",
+     "BEARISH ENTRY | Ranger — TORB Breakout Short | {{ticker}} {{interval}}"
 )
 
 alertcondition(
      blockedLongSignal,
-     "Academia TORB v1.5 — Long Blocked",
-     "TORB long breakout blocked by regime, IV, precondition, or risk."
+     "Ranger TORB Long Blocked",
+     "Ranger — TORB long breakout blocked by regime, IV, precondition, or risk. {{ticker}} {{interval}}"
 )
 
 alertcondition(
      blockedShortSignal,
-     "Academia TORB v1.5 — Short Blocked",
-     "TORB short breakout blocked by regime, IV, precondition, or risk."
+     "Ranger TORB Short Blocked",
+     "Ranger — TORB short breakout blocked by regime, IV, precondition, or risk. {{ticker}} {{interval}}"
+)
+
+alertcondition(
+     longPositionClosed,
+     "Ranger TORB Long Exit",
+     "LONG EXIT | Ranger | {{ticker}} {{interval}}"
+)
+
+alertcondition(
+     shortPositionClosed,
+     "Ranger TORB Short Exit",
+     "SHORT EXIT | Ranger | {{ticker}} {{interval}}"
 )
