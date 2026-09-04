@@ -126,31 +126,40 @@ if mrLongCondition or mrShortCondition or tfLongCondition or tfShortCondition
 // ticker/timeframe/price, so a single "Any alert() function call" alert
 // created on this script tells you exactly what happened without opening
 // the chart.
-f_alertMsg(string label, float px) =>
-    label + " | " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(px, format.mintick)
+//
+// STANDARD ALERT FORMAT (apply to every future script's alerts the same
+// way): every message leads with an ALL-CAPS type tag stating the
+// direction up front -- "BULLISH ENTRY" / "BEARISH ENTRY" for entries,
+// "LONG EXIT" / "SHORT EXIT" for exits -- so the notification itself
+// (phone lock screen, webhook payload, whatever reads it) says which way
+// the signal is without needing to open the chart or parse a strategy-
+// specific label. Everything after that tag is context: which
+// sub-strategy/kind fired, then ticker, timeframe, and price.
+f_alertMsg(string kind, string label, float px) =>
+    kind + " | " + label + " | " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(px, format.mintick)
 
 // ==========================================
 // --- EXECUTION ENGINE ---
 // ==========================================
 // 1. Mean Reversion Execution (MR)
 if mrLongCondition
-    string msg = f_alertMsg("MR LONG entry (mean reversion)", close)
+    string msg = f_alertMsg("BULLISH ENTRY", "MR (mean reversion)", close)
     strategy.entry("MR Long", strategy.long, comment="MR Buy", alert_message=msg)
     alert(msg, alert.freq_once_per_bar_close)
 
 if mrShortCondition
-    string msg = f_alertMsg("MR SHORT entry (mean reversion)", close)
+    string msg = f_alertMsg("BEARISH ENTRY", "MR (mean reversion)", close)
     strategy.entry("MR Short", strategy.short, comment="MR Short", alert_message=msg)
     alert(msg, alert.freq_once_per_bar_close)
 
 // 2. Trend Following Execution (TF)
 if tfLongCondition
-    string msg = f_alertMsg("TF LONG entry (breakout)", close)
+    string msg = f_alertMsg("BULLISH ENTRY", "TF (breakout)", close)
     strategy.entry("TF Long", strategy.long, comment="TF Breakout Buy", alert_message=msg)
     alert(msg, alert.freq_once_per_bar_close)
 
 if tfShortCondition
-    string msg = f_alertMsg("TF SHORT entry (breakout)", close)
+    string msg = f_alertMsg("BEARISH ENTRY", "TF (breakout)", close)
     strategy.entry("TF Short", strategy.short, comment="TF Breakout Short", alert_message=msg)
     alert(msg, alert.freq_once_per_bar_close)
 
@@ -160,22 +169,22 @@ if tfShortCondition
 // MR Exits (Reversion to Mean)
 if isRanging
     if ta.crossover(close, basis) and (strategy.position_size < 0)
-        string msg = f_alertMsg("MR SHORT exit (cover, reverted to mean)", close)
+        string msg = f_alertMsg("SHORT EXIT", "MR cover (reverted to mean)", close)
         strategy.close("MR Short", comment="MR Short Cover", alert_message=msg)
         alert(msg, alert.freq_once_per_bar_close)
     if ta.crossunder(close, basis) and (strategy.position_size > 0)
-        string msg = f_alertMsg("MR LONG exit (sell, reverted to mean)", close)
+        string msg = f_alertMsg("LONG EXIT", "MR sell (reverted to mean)", close)
         strategy.close("MR Long", comment="MR Long Sell", alert_message=msg)
         alert(msg, alert.freq_once_per_bar_close)
 
 // TF Exits (Trailing Highs/Lows)
 if isTrending
     if ta.crossunder(close, dcExitLower) and (strategy.position_size > 0)
-        string msg = f_alertMsg("TF LONG exit (trailing stop)", close)
+        string msg = f_alertMsg("LONG EXIT", "TF trailing stop", close)
         strategy.close("TF Long", comment="TF Trail Exit", alert_message=msg)
         alert(msg, alert.freq_once_per_bar_close)
     if ta.crossover(close, dcExitUpper) and (strategy.position_size < 0)
-        string msg = f_alertMsg("TF SHORT exit (trailing stop)", close)
+        string msg = f_alertMsg("SHORT EXIT", "TF trailing stop", close)
         strategy.close("TF Short", comment="TF Trail Exit", alert_message=msg)
         alert(msg, alert.freq_once_per_bar_close)
 
@@ -195,7 +204,7 @@ plotshape(tfShortCondition, title="TF Short Signal", style=shape.triangledown, l
 // this script from the "Condition" dropdown (rather than "Any alert()
 // function call") -- pick whichever workflow you prefer in the Create
 // Alert dialog; both are wired to fire on the same bars.
-alertcondition(mrLongCondition, title="MR Long Entry", message="Hierarchical System: MR LONG entry (mean reversion) | {{ticker}} | {{interval}}")
-alertcondition(mrShortCondition, title="MR Short Entry", message="Hierarchical System: MR SHORT entry (mean reversion) | {{ticker}} | {{interval}}")
-alertcondition(tfLongCondition, title="TF Long Entry", message="Hierarchical System: TF LONG entry (breakout) | {{ticker}} | {{interval}}")
-alertcondition(tfShortCondition, title="TF Short Entry", message="Hierarchical System: TF SHORT entry (breakout) | {{ticker}} | {{interval}}")
+alertcondition(mrLongCondition, title="MR Long Entry", message="BULLISH ENTRY | MR (mean reversion) | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(mrShortCondition, title="MR Short Entry", message="BEARISH ENTRY | MR (mean reversion) | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(tfLongCondition, title="TF Long Entry", message="BULLISH ENTRY | TF (breakout) | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(tfShortCondition, title="TF Short Entry", message="BEARISH ENTRY | TF (breakout) | {{ticker}} {{interval}} @ {{close}}")
