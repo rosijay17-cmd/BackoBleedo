@@ -1,0 +1,2300 @@
+//@version=6
+strategy(
+    title = "Ranger V2.2 — Clean POC State + Delta Profiles",
+    shorttitle = "Ranger V2.2",
+    overlay = true,
+    pyramiding = 0,
+    process_orders_on_close = true,
+    calc_on_every_tick = false,
+    calc_on_order_fills = false,
+    max_bars_back = 5000,
+    initial_capital = 50000,
+    default_qty_type = strategy.fixed,
+    default_qty_value = 1,
+    commission_type = strategy.commission.percent,
+    commission_value = 0.02,
+    slippage = 1,
+    max_labels_count = 500,
+    max_lines_count = 500,
+    max_boxes_count = 500
+)
+
+// ============================================================================
+// INPUT GROUPS
+// ============================================================================
+
+const string GRP_TREND   = "01 — Trend"
+const string GRP_MOM     = "02 — Optional Momentum"
+const string GRP_SWEEP   = "03 — Liquidity Sweep"
+const string GRP_STATE   = "04 — POC State Engine"
+const string GRP_DELTA   = "05 — LTF Volume Delta"
+const string GRP_FREQ    = "06 — Trade Frequency"
+const string GRP_SESSION = "07 — Trading Session"
+const string GRP_SIZE    = "08 — Position Sizing"
+const string GRP_RISK    = "09 — Risk Management"
+const string GRP_TRAIL   = "10 — Trailing Stop"
+const string GRP_PROFILE = "11 — Session Volume Profiles"
+const string GRP_VISUAL  = "12 — Visuals"
+const string GRP_ALERTS  = "13 — Alerts"
+
+// ============================================================================
+// TREND INPUTS
+// ============================================================================
+
+int trendFastLen = input.int(20, "Fast EMA", minval = 2, group = GRP_TREND)
+int trendSlowLen = input.int(50, "Slow EMA", minval = 3, group = GRP_TREND)
+int adxLen = input.int(14, "ADX Length", minval = 2, group = GRP_TREND)
+float adxMin = input.float(15.0, "Minimum ADX", minval = 1.0, step = 0.5, group = GRP_TREND)
+bool requireDIAlignment = input.bool(true, "Require DI Alignment", group = GRP_TREND)
+bool useHtfTrendFilter = input.bool(true, "Use Confirmed HTF Trend", group = GRP_TREND)
+string htfTimeframe = input.timeframe("60", "Higher Timeframe", group = GRP_TREND)
+int htfFastLen = input.int(20, "HTF Fast EMA", minval = 2, group = GRP_TREND)
+int htfSlowLen = input.int(50, "HTF Slow EMA", minval = 3, group = GRP_TREND)
+
+// ============================================================================
+// OPTIONAL MOMENTUM INPUTS
+// ============================================================================
+
+bool requireMomentumAgreement = input.bool(false, "Require ROC / BOP Agreement", group = GRP_MOM)
+int rocLen = input.int(14, "ROC Length", minval = 2, group = GRP_MOM)
+float rocMinAbs = input.float(0.05, "Minimum |ROC|", minval = 0.0, step = 0.05, group = GRP_MOM)
+int bopLen = input.int(14, "BOP Smoothing", minval = 2, group = GRP_MOM)
+
+// ============================================================================
+// SWEEP INPUTS
+// ============================================================================
+
+int atrLen = input.int(14, "ATR Length", minval = 2, group = GRP_SWEEP)
+int sweepPivotLength = input.int(5, "Swing Pivot Length", minval = 1, group = GRP_SWEEP)
+int sweepStoredLevels = input.int(20, "Stored Liquidity Levels", minval = 5, maxval = 100, group = GRP_SWEEP)
+float sweepMinDistanceAtr = input.float(0.10, "Minimum Sweep Distance / ATR", minval = 0.01, step = 0.01, group = GRP_SWEEP)
+
+string sweepReclaimRule = input.string(
+    "Close Back Inside",
+    "Sweep Reclaim Rule",
+    options = ["Close Back Inside", "Strong Reclaim"],
+    group = GRP_SWEEP
+)
+
+float sweepMinWickPercent = input.float(0.25, "Minimum Wick %", minval = 0.0, maxval = 1.0, step = 0.01, group = GRP_SWEEP)
+float sweepMaxBodyPercent = input.float(0.75, "Maximum Body %", minval = 0.05, maxval = 1.0, step = 0.01, group = GRP_SWEEP)
+float sweepMinRangeAtr = input.float(0.15, "Minimum Candle Range / ATR", minval = 0.01, step = 0.01, group = GRP_SWEEP)
+bool sweepRequireBullishBody = input.bool(true, "Long Reclaim Must Be Bullish", group = GRP_SWEEP)
+bool sweepRequireBearishBody = input.bool(true, "Short Reclaim Must Be Bearish", group = GRP_SWEEP)
+bool sweepRequireMidlineBreak = input.bool(true, "Require Sweep Midline Reclaim", group = GRP_SWEEP)
+
+// ============================================================================
+// POC STATE INPUTS
+// ============================================================================
+
+int setupWindowBars = input.int(
+    6,
+    "Setup Memory — Bars",
+    minval = 2,
+    maxval = 30,
+    tooltip = "Behavior may arrive in different orders, but all remembered evidence must remain inside one setup window.",
+    group = GRP_STATE
+)
+
+float pocAnchorDistanceAtr = input.float(
+    0.55,
+    "Sweep ↔ POC Distance — ATR",
+    minval = 0.05,
+    maxval = 3.0,
+    step = 0.05,
+    tooltip = "Maximum distance from the frozen setup POC for a liquidity sweep to count as POC-anchored.",
+    group = GRP_STATE
+)
+
+float setupInvalidationAtr = input.float(
+    1.25,
+    "Setup Invalidation Distance — ATR",
+    minval = 0.25,
+    maxval = 5.0,
+    step = 0.05,
+    group = GRP_STATE
+)
+
+bool invalidateOnOppositeSweep = input.bool(true, "Opposite Sweep Invalidates Setup", group = GRP_STATE)
+bool useRelativeVolumeConfirm = input.bool(true, "Require Relative Volume", group = GRP_STATE)
+int relativeVolLen = input.int(20, "Relative Volume Average", minval = 2, group = GRP_STATE)
+float relativeVolMin = input.float(1.10, "Minimum Relative Volume", minval = 0.10, step = 0.05, group = GRP_STATE)
+
+bool usePocMigrationConfirm = input.bool(
+    false,
+    "Require POC Migration",
+    tooltip = "Long requires the developing POC to migrate higher. Short requires it to migrate lower.",
+    group = GRP_STATE
+)
+
+int pocMigrationLookback = input.int(3, "POC Migration Lookback", minval = 1, maxval = 20, group = GRP_STATE)
+
+// ============================================================================
+// LTF DELTA INPUTS
+// ============================================================================
+
+string deltaLtf = input.timeframe("2", "Delta Lower Timeframe", tooltip = "For MNQ 10m, start with 2m.", group = GRP_DELTA)
+bool deltaFallbackToBar = input.bool(true, "Fallback To Bar Estimate", group = GRP_DELTA)
+int minDeltaIntrabars = input.int(3, "Minimum Intrabars", minval = 1, maxval = 100, group = GRP_DELTA)
+float deltaPctThreshold = input.float(8.0, "Directional Delta % Threshold", minval = 0.0, maxval = 100.0, step = 0.5, group = GRP_DELTA)
+float directionalSubbarShare = input.float(0.55, "Directional Sub-Bar Share", minval = 0.50, maxval = 1.0, step = 0.05, group = GRP_DELTA)
+bool requireStackedSubbars = input.bool(true, "Require Stacked Directional Sub-Bars", group = GRP_DELTA)
+int minStackedSubbars = input.int(2, "Minimum Stacked Sub-Bars", minval = 1, maxval = 20, group = GRP_DELTA)
+
+string deltaConfirmationMode = input.string(
+    "Directional OR Absorption",
+    "Delta Confirmation Mode",
+    options = ["Directional", "Directional OR Absorption", "Directional + Absorption"],
+    tooltip = "The + mode requires both behaviors inside the same setup state, but does not require a fixed event sequence.",
+    group = GRP_DELTA
+)
+
+int absorptionLookback = input.int(6, "Absorption / Divergence Lookback", minval = 2, maxval = 50, group = GRP_DELTA)
+float absorptionDeltaPct = input.float(8.0, "Absorption Opposing Delta %", minval = 0.0, step = 0.5, group = GRP_DELTA)
+float absorptionCloseLocation = input.float(0.60, "Absorption Close Location", minval = 0.50, maxval = 0.95, step = 0.05, group = GRP_DELTA)
+float divergenceDeltaImprovement = input.float(5.0, "Delta Divergence Improvement %", minval = 0.0, step = 0.5, group = GRP_DELTA)
+
+// ============================================================================
+// FREQUENCY INPUTS
+// ============================================================================
+
+string tradeDirection = input.string("Both", "Trade Direction", options = ["Long Only", "Short Only", "Both"], group = GRP_FREQ)
+int cooldownBars = input.int(8, "Full Cooldown Bars After Exit", minval = 0, maxval = 200, group = GRP_FREQ)
+int minBarsBetweenEntries = input.int(5, "Minimum Full Bars Between Entries", minval = 0, maxval = 100, group = GRP_FREQ)
+int maxTradesPerDay = input.int(5, "Maximum Trades Per Day", minval = 1, maxval = 20, group = GRP_FREQ)
+
+// ============================================================================
+// TRADING SESSION INPUTS
+// ============================================================================
+
+bool useSessionFilter = input.bool(false, "Restrict Entries To Session", group = GRP_SESSION)
+string tradeSession = input.session("0930-1600", "Entry Session", group = GRP_SESSION)
+string sessionTimezone = input.string("America/New_York", "Session Timezone", group = GRP_SESSION)
+bool closeAtSessionEnd = input.bool(false, "Close Position At Session End", group = GRP_SESSION)
+
+// ============================================================================
+// POSITION SIZING INPUTS
+// ============================================================================
+
+string sizingMode = input.string("Fixed", "Sizing Mode", options = ["Fixed", "Risk %", "Risk $"], group = GRP_SIZE)
+float baseQty = input.float(1.0, "Fixed Contracts", minval = 1.0, step = 1.0, group = GRP_SIZE)
+float riskPerTradePct = input.float(0.50, "Risk Per Trade %", minval = 0.05, maxval = 10.0, step = 0.05, group = GRP_SIZE)
+float maxRiskDollars = input.float(500.0, "Risk $", minval = 1.0, step = 25.0, group = GRP_SIZE)
+
+// ============================================================================
+// RISK INPUTS
+// ============================================================================
+
+float stopBufferATR = input.float(0.15, "Stop Buffer Beyond Swept Level — ATR", minval = 0.0, step = 0.05, group = GRP_RISK)
+float maxStopATR = input.float(2.0, "Maximum Stop Distance — ATR", minval = 0.25, step = 0.25, group = GRP_RISK)
+float tp1R = input.float(1.0, "TP1 — R", minval = 0.25, step = 0.25, group = GRP_RISK)
+float tp2R = input.float(2.5, "TP2 — R", minval = 0.50, step = 0.25, group = GRP_RISK)
+float tp1Qty = input.float(50.0, "TP1 Quantity %", minval = 1.0, maxval = 99.0, step = 1.0, group = GRP_RISK)
+bool useBreakEven = input.bool(true, "Break Even After TP1", group = GRP_RISK)
+int breakEvenOffsetTicks = input.int(0, "Break-Even Offset — Ticks", minval = 0, maxval = 100, group = GRP_RISK)
+int maximumHoldingBars = input.int(100, "Maximum Holding Bars", minval = 1, maxval = 2000, group = GRP_RISK)
+
+// ============================================================================
+// TRAILING INPUTS
+// ============================================================================
+
+bool useTrail = input.bool(true, "Trail After TP1", group = GRP_TRAIL)
+float tightTrailATR = input.float(1.0, "Tight Trail ATR", minval = 0.1, step = 0.1, group = GRP_TRAIL)
+float looseTrailATR = input.float(2.0, "Loose Trail ATR", minval = 0.1, step = 0.1, group = GRP_TRAIL)
+
+// ============================================================================
+// PROFILE INPUTS
+// ============================================================================
+
+string profileSessionType = input.string("Custom", "Profile Session Type", options = ["Custom", "All"], group = GRP_PROFILE)
+string profileSession = input.session("0930-1600", "Profile Session", group = GRP_PROFILE)
+
+int profileRows = input.int(
+    24,
+    "Profile Rows",
+    minval = 10,
+    maxval = 40,
+    tooltip = "24–30 is recommended. Each row can use separate estimated buy/sell boxes.",
+    group = GRP_PROFILE
+)
+
+int valueAreaPct = input.int(70, "Value Area %", minval = 1, maxval = 100, group = GRP_PROFILE)
+int profileWidthBars = input.int(8, "Histogram Maximum Width — Bars", minval = 3, maxval = 30, group = GRP_PROFILE)
+string profileAlignment = input.string("Right", "Histogram Alignment", options = ["Left", "Right"], group = GRP_PROFILE)
+bool showCurrentProfile = input.bool(true, "Show Developing Profile", group = GRP_PROFILE)
+bool showHistoricalProfiles = input.bool(true, "Show Completed Profiles", group = GRP_PROFILE)
+int historicalProfileCount = input.int(2, "Completed Profiles", minval = 1, maxval = 4, group = GRP_PROFILE)
+bool showProfileLevels = input.bool(true, "Show POC / VAH / VAL", group = GRP_PROFILE)
+bool showProfileTags = input.bool(false, "Show Current Profile Tags", group = GRP_PROFILE)
+
+// ============================================================================
+// VISUAL INPUTS
+// ============================================================================
+
+string visualPreset = input.string(
+    "Clean",
+    "Visual Preset",
+    options = ["Clean", "Detailed"],
+    tooltip = "Clean is the minimal Lux-inspired layout. Detailed restores extra diagnostics and split-volume profile detail.",
+    group = GRP_VISUAL
+)
+
+bool showTrendRibbon = input.bool(true, "Show Trend Ribbon", group = GRP_VISUAL)
+bool showSignals = input.bool(true, "Show Entry Signals", group = GRP_VISUAL)
+bool showRawSweeps = input.bool(false, "Show Raw Sweeps", group = GRP_VISUAL)
+bool showAbsorptionMarkers = input.bool(false, "Show Absorption / Divergence", group = GRP_VISUAL)
+bool showStateBubbles = input.bool(false, "Show Current Setup State", group = GRP_VISUAL)
+bool showTradeOverlay = input.bool(true, "Show Active Trade Overlay", group = GRP_VISUAL)
+bool colorTrendBars = input.bool(false, "Color Candles By Trend", group = GRP_VISUAL)
+int rightProjectionBars = input.int(8, "Right Projection Bars", minval = 3, maxval = 50, group = GRP_VISUAL)
+bool showDashboard = input.bool(true, "Show Dashboard", group = GRP_VISUAL)
+string dashboardPosition = input.string("Top Right", "Dashboard Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = GRP_VISUAL)
+string dashboardFont = input.string("Compact", "Dashboard Font", options = ["Compact", "Phone", "Large"], group = GRP_VISUAL)
+
+bool cleanVisualMode = visualPreset == "Clean"
+
+// ============================================================================
+// ALERT INPUTS
+// ============================================================================
+
+bool enableDynamicAlerts = input.bool(true, "Enable Dynamic Alerts", group = GRP_ALERTS)
+
+// ============================================================================
+// COLORS
+// ============================================================================
+
+color C_NAVY   = color.rgb(10, 15, 25)
+color C_CARD   = color.rgb(21, 29, 43)
+color C_BLUE   = color.rgb(34, 159, 217)
+color C_SELL   = color.rgb(220, 82, 126)
+color C_GREEN  = color.rgb(16, 185, 129)
+color C_ORANGE = color.rgb(245, 158, 11)
+color C_RED    = color.rgb(239, 68, 68)
+color C_GRAY   = color.rgb(107, 114, 128)
+color C_WHITE  = color.rgb(245, 247, 250)
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+f_price(float value) =>
+    na(value) ? "—" : str.tostring(value, format.mintick)
+
+f_number(float value) =>
+    na(value) ? "—" : str.tostring(value, "#.00")
+
+f_recent(int eventBar, int windowBars) =>
+    not na(eventBar) and bar_index - eventBar <= windowBars
+
+f_alertMsg(string kind, string label, float px) =>
+    kind + " | " + label + " | " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(px, format.mintick)
+
+// ============================================================================
+// BASE INDICATORS
+// ============================================================================
+
+float atr = ta.atr(atrLen)
+float emaFast = ta.ema(close, trendFastLen)
+float emaSlow = ta.ema(close, trendSlowLen)
+[plusDI, minusDI, adx] = ta.dmi(adxLen, adxLen)
+float roc = ta.roc(close, rocLen)
+float candleRange = math.max(high - low, syminfo.mintick)
+float candleCloseLocation = math.max(0.0, math.min(1.0, (close - low) / candleRange))
+float bopRaw = (close - open) / candleRange
+float bop = ta.ema(bopRaw, bopLen)
+bool dataReady = not na(atr) and not na(emaFast) and not na(emaSlow) and not na(adx) and not na(roc) and not na(bop)
+
+// ============================================================================
+// CONFIRMED HTF TREND
+// ============================================================================
+
+float htfEmaFast = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, htfFastLen)[1], lookahead = barmerge.lookahead_on)
+float htfEmaSlow = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, htfSlowLen)[1], lookahead = barmerge.lookahead_on)
+
+bool htfValid = not na(htfEmaFast) and not na(htfEmaSlow)
+bool htfBullish = htfValid and htfEmaFast > htfEmaSlow
+bool htfBearish = htfValid and htfEmaFast < htfEmaSlow
+bool longHtfOk = not useHtfTrendFilter or htfBullish
+bool shortHtfOk = not useHtfTrendFilter or htfBearish
+
+// ============================================================================
+// LIVE TREND / MOMENTUM GATES
+// ============================================================================
+
+bool localBullish = emaFast > emaSlow and close > emaFast
+bool localBearish = emaFast < emaSlow and close < emaFast
+bool adxOk = adx >= adxMin
+bool diLongOk = not requireDIAlignment or plusDI > minusDI
+bool diShortOk = not requireDIAlignment or minusDI > plusDI
+bool longTrendOk = dataReady and localBullish and adxOk and diLongOk and longHtfOk
+bool shortTrendOk = dataReady and localBearish and adxOk and diShortOk and shortHtfOk
+bool longMomentumOk = not requireMomentumAgreement or (roc >= rocMinAbs and bop > 0.0)
+bool shortMomentumOk = not requireMomentumAgreement or (roc <= -rocMinAbs and bop < 0.0)
+bool longRegimeOk = longTrendOk and longMomentumOk
+bool shortRegimeOk = shortTrendOk and shortMomentumOk
+
+// ============================================================================
+// TRADING SESSION / DAILY LIMIT
+// ============================================================================
+
+bool inSessionRaw = not na(time(timeframe.period, tradeSession, sessionTimezone))
+bool inTradeSession = not useSessionFilter or inSessionRaw
+bool sessionEndBar = useSessionFilter and not inSessionRaw and inSessionRaw[1]
+int dayIdentifier = year(time, sessionTimezone) * 10000 + month(time, sessionTimezone) * 100 + dayofmonth(time, sessionTimezone)
+bool newTradingDay = barstate.isfirst or dayIdentifier != dayIdentifier[1]
+
+var int tradesToday = 0
+if newTradingDay
+    tradesToday := 0
+
+bool dailyTradeLimitPass = tradesToday < maxTradesPerDay
+
+// ============================================================================
+// COOLDOWN / ENTRY SPACING
+// ============================================================================
+
+int latestClosedTradeBar = na
+if strategy.closedtrades > 0
+    latestClosedTradeBar := strategy.closedtrades.exit_bar_index(strategy.closedtrades - 1)
+
+int nextAllowedEntryBar = na
+if not na(latestClosedTradeBar)
+    nextAllowedEntryBar := latestClosedTradeBar + cooldownBars + 1
+
+bool cooldownPass = na(nextAllowedEntryBar) or bar_index >= nextAllowedEntryBar
+
+int cooldownRemaining = 0
+if not cooldownPass and not na(nextAllowedEntryBar)
+    cooldownRemaining := math.max(nextAllowedEntryBar - bar_index, 0)
+
+var int lastEntrySignalBar = na
+bool entrySpacingPass = na(lastEntrySignalBar) or bar_index - lastEntrySignalBar > minBarsBetweenEntries
+bool tradeDirectionLongOk = tradeDirection == "Long Only" or tradeDirection == "Both"
+bool tradeDirectionShortOk = tradeDirection == "Short Only" or tradeDirection == "Both"
+bool commonLiveGate = inTradeSession and dailyTradeLimitPass and cooldownPass and entrySpacingPass
+
+// ============================================================================
+// LTF DELTA ENGINE
+// ============================================================================
+
+[ltfOpenArray, ltfCloseArray, ltfVolumeArray] = request.security_lower_tf(
+    syminfo.tickerid,
+    deltaLtf,
+    [open, close, volume],
+    ignore_invalid_timeframe = true
+)
+
+int intrabarCount = array.size(ltfVolumeArray)
+
+float ltfBuyVolume = 0.0
+float ltfSellVolume = 0.0
+int bullishIntrabars = 0
+int bearishIntrabars = 0
+int currentBullStreak = 0
+int currentBearStreak = 0
+int maxBullStreak = 0
+int maxBearStreak = 0
+
+if intrabarCount > 0
+    for i = 0 to intrabarCount - 1
+        float intraOpen = array.get(ltfOpenArray, i)
+        float intraClose = array.get(ltfCloseArray, i)
+        float intraVolume = nz(array.get(ltfVolumeArray, i), 0.0)
+        float previousIntraClose = intraOpen
+        if i > 0
+            previousIntraClose := array.get(ltfCloseArray, i - 1)
+
+        int intraDirection = 0
+        if intraClose > intraOpen
+            intraDirection := 1
+        else if intraClose < intraOpen
+            intraDirection := -1
+        else if intraClose > previousIntraClose
+            intraDirection := 1
+        else if intraClose < previousIntraClose
+            intraDirection := -1
+
+        if intraDirection > 0
+            ltfBuyVolume += intraVolume
+            bullishIntrabars += 1
+            currentBullStreak += 1
+            currentBearStreak := 0
+            maxBullStreak := math.max(maxBullStreak, currentBullStreak)
+        else if intraDirection < 0
+            ltfSellVolume += intraVolume
+            bearishIntrabars += 1
+            currentBearStreak += 1
+            currentBullStreak := 0
+            maxBearStreak := math.max(maxBearStreak, currentBearStreak)
+        else
+            ltfBuyVolume += intraVolume * 0.5
+            ltfSellVolume += intraVolume * 0.5
+            currentBullStreak := 0
+            currentBearStreak := 0
+
+bool hasLtfDelta = intrabarCount >= minDeltaIntrabars and ltfBuyVolume + ltfSellVolume > 0.0
+float estimatedBuyVolume = volume * candleCloseLocation
+float estimatedSellVolume = math.max(volume - estimatedBuyVolume, 0.0)
+
+float deltaBuyVolume = na
+float deltaSellVolume = na
+if hasLtfDelta
+    deltaBuyVolume := ltfBuyVolume
+    deltaSellVolume := ltfSellVolume
+else if deltaFallbackToBar
+    deltaBuyVolume := estimatedBuyVolume
+    deltaSellVolume := estimatedSellVolume
+
+float deltaTotalVolume = deltaBuyVolume + deltaSellVolume
+float deltaNet = deltaBuyVolume - deltaSellVolume
+
+float deltaPct = na
+if not na(deltaTotalVolume) and deltaTotalVolume > 0.0
+    deltaPct := deltaNet / deltaTotalVolume * 100.0
+
+bool deltaReady = not na(deltaPct)
+int directionalIntrabars = bullishIntrabars + bearishIntrabars
+
+float bullishSubbarShare = 0.5
+if hasLtfDelta and directionalIntrabars > 0
+    bullishSubbarShare := float(bullishIntrabars) / float(directionalIntrabars)
+else if close > open
+    bullishSubbarShare := 1.0
+else if close < open
+    bullishSubbarShare := 0.0
+
+float bearishSubbarShare = 1.0 - bullishSubbarShare
+bool bullStackOk = not requireStackedSubbars or not hasLtfDelta or maxBullStreak >= minStackedSubbars
+bool bearStackOk = not requireStackedSubbars or not hasLtfDelta or maxBearStreak >= minStackedSubbars
+bool bullDirectionalDeltaNow = deltaReady and deltaPct >= deltaPctThreshold and bullishSubbarShare >= directionalSubbarShare and bullStackOk
+bool bearDirectionalDeltaNow = deltaReady and deltaPct <= -deltaPctThreshold and bearishSubbarShare >= directionalSubbarShare and bearStackOk
+
+// ============================================================================
+// ABSORPTION / DELTA DIVERGENCE
+// ============================================================================
+
+float previousPriceLow = ta.lowest(low[1], absorptionLookback)
+float previousPriceHigh = ta.highest(high[1], absorptionLookback)
+float previousDeltaLow = ta.lowest(deltaPct[1], absorptionLookback)
+float previousDeltaHigh = ta.highest(deltaPct[1], absorptionLookback)
+
+bool bullAbsorptionNow = deltaReady and not na(previousPriceLow) and low < previousPriceLow and deltaPct <= -absorptionDeltaPct and candleCloseLocation >= absorptionCloseLocation
+bool bearAbsorptionNow = deltaReady and not na(previousPriceHigh) and high > previousPriceHigh and deltaPct >= absorptionDeltaPct and candleCloseLocation <= 1.0 - absorptionCloseLocation
+bool bullDeltaDivergenceNow = deltaReady and not na(previousPriceLow) and not na(previousDeltaLow) and low < previousPriceLow and deltaPct > previousDeltaLow + divergenceDeltaImprovement and candleCloseLocation >= 0.50
+bool bearDeltaDivergenceNow = deltaReady and not na(previousPriceHigh) and not na(previousDeltaHigh) and high > previousPriceHigh and deltaPct < previousDeltaHigh - divergenceDeltaImprovement and candleCloseLocation <= 0.50
+bool bullAbsorptionEvent = bullAbsorptionNow or bullDeltaDivergenceNow
+bool bearAbsorptionEvent = bearAbsorptionNow or bearDeltaDivergenceNow
+
+// ============================================================================
+// RELATIVE VOLUME
+// ============================================================================
+
+float relativeVolumeAverage = ta.sma(volume, relativeVolLen)
+
+float relativeVolume = na
+if not na(relativeVolumeAverage) and relativeVolumeAverage > 0.0
+    relativeVolume := volume / relativeVolumeAverage
+
+bool relativeVolumeNow = not na(relativeVolume) and relativeVolume >= relativeVolMin
+
+// ============================================================================
+// GLOBAL BEHAVIOR MEMORY
+// ============================================================================
+
+var int lastBullDirectionalDeltaBar = na
+var int lastBearDirectionalDeltaBar = na
+var int lastBullAbsorptionBar = na
+var int lastBearAbsorptionBar = na
+var int lastRelativeVolumeBar = na
+
+if bullDirectionalDeltaNow
+    lastBullDirectionalDeltaBar := bar_index
+
+if bearDirectionalDeltaNow
+    lastBearDirectionalDeltaBar := bar_index
+
+if bullAbsorptionEvent
+    lastBullAbsorptionBar := bar_index
+
+if bearAbsorptionEvent
+    lastBearAbsorptionBar := bar_index
+
+if relativeVolumeNow
+    lastRelativeVolumeBar := bar_index
+
+// ============================================================================
+// LIQUIDITY SWEEP ENGINE
+// ============================================================================
+
+float sweepCandleRange = high - low
+float sweepCandleBody = math.abs(close - open)
+float sweepUpperWick = high - math.max(open, close)
+float sweepLowerWick = math.min(open, close) - low
+
+float sweepBodyPercent = 0.0
+float sweepUpperWickPercent = 0.0
+float sweepLowerWickPercent = 0.0
+if sweepCandleRange > 0.0
+    sweepBodyPercent := sweepCandleBody / sweepCandleRange
+    sweepUpperWickPercent := sweepUpperWick / sweepCandleRange
+    sweepLowerWickPercent := sweepLowerWick / sweepCandleRange
+
+float sweepMinDistancePx = na
+if atr > 0.0
+    sweepMinDistancePx := sweepMinDistanceAtr * atr
+
+float sweepMinRangePx = na
+if atr > 0.0
+    sweepMinRangePx := sweepMinRangeAtr * atr
+
+float sweepPivotHigh = ta.pivothigh(high, sweepPivotLength, sweepPivotLength)
+float sweepPivotLow = ta.pivotlow(low, sweepPivotLength, sweepPivotLength)
+
+var float[] storedHighLevels = array.new_float()
+var int[] storedHighBars = array.new_int()
+var float[] storedLowLevels = array.new_float()
+var int[] storedLowBars = array.new_int()
+
+if not na(sweepPivotHigh)
+    array.push(storedHighLevels, sweepPivotHigh)
+    array.push(storedHighBars, bar_index - sweepPivotLength)
+    if array.size(storedHighLevels) > sweepStoredLevels
+        array.shift(storedHighLevels)
+        array.shift(storedHighBars)
+
+if not na(sweepPivotLow)
+    array.push(storedLowLevels, sweepPivotLow)
+    array.push(storedLowBars, bar_index - sweepPivotLength)
+    if array.size(storedLowLevels) > sweepStoredLevels
+        array.shift(storedLowLevels)
+        array.shift(storedLowBars)
+
+float sweptHighLevel = na
+float sweptLowLevel = na
+int highLevelCount = array.size(storedHighLevels)
+
+if highLevelCount > 0
+    for offset = 0 to highLevelCount - 1
+        int index = highLevelCount - 1 - offset
+        float level = array.get(storedHighLevels, index)
+        int levelBar = array.get(storedHighBars, index)
+        bool highSweepCandidate = levelBar < bar_index and high > level and not na(sweepMinDistancePx) and high - level >= sweepMinDistancePx
+        if highSweepCandidate
+            sweptHighLevel := level
+            break
+
+int lowLevelCount = array.size(storedLowLevels)
+
+if lowLevelCount > 0
+    for offset = 0 to lowLevelCount - 1
+        int index = lowLevelCount - 1 - offset
+        float level = array.get(storedLowLevels, index)
+        int levelBar = array.get(storedLowBars, index)
+        bool lowSweepCandidate = levelBar < bar_index and low < level and not na(sweepMinDistancePx) and level - low >= sweepMinDistancePx
+        if lowSweepCandidate
+            sweptLowLevel := level
+            break
+
+bool bearishSweepReclaim = false
+bool bullishSweepReclaim = false
+
+if not na(sweptHighLevel)
+    if sweepReclaimRule == "Close Back Inside"
+        bearishSweepReclaim := close < sweptHighLevel
+    else
+        bearishSweepReclaim := close < sweptHighLevel and close < (high + low) / 2.0
+
+if not na(sweptLowLevel)
+    if sweepReclaimRule == "Close Back Inside"
+        bullishSweepReclaim := close > sweptLowLevel
+    else
+        bullishSweepReclaim := close > sweptLowLevel and close > (high + low) / 2.0
+
+bool validSellSweep = not na(sweptHighLevel) and bearishSweepReclaim and sweepUpperWickPercent >= sweepMinWickPercent and sweepBodyPercent <= sweepMaxBodyPercent and not na(sweepMinRangePx) and sweepCandleRange >= sweepMinRangePx
+bool validBuySweep = not na(sweptLowLevel) and bullishSweepReclaim and sweepLowerWickPercent >= sweepMinWickPercent and sweepBodyPercent <= sweepMaxBodyPercent and not na(sweepMinRangePx) and sweepCandleRange >= sweepMinRangePx
+
+// ============================================================================
+// SESSION VOLUME PROFILE ENGINE
+// ============================================================================
+
+var float[] profileVolumes = array.new_float(profileRows, 0.0)
+var float[] profileBuyVolumes = array.new_float(profileRows, 0.0)
+var float[] profileSellVolumes = array.new_float(profileRows, 0.0)
+
+var float profileHigh = na
+var float profileLow = na
+var int profileStartBar = na
+var float pocPrice = na
+var float vahPrice = na
+var float valPrice = na
+var int profilePocIndex = na
+var int profileVahIndex = na
+var int profileValIndex = na
+var float profileRowInterval = na
+var float profileMaxVolume = na
+
+bool customProfileInSession = not na(time(timeframe.period, profileSession, sessionTimezone))
+bool profileInSession = profileSessionType == "All" or customProfileInSession
+bool profileNewDay = not barstate.isfirst and dayIdentifier != dayIdentifier[1]
+
+bool profileStartNow = false
+if profileSessionType == "All"
+    profileStartNow := barstate.isfirst or profileNewDay
+else
+    profileStartNow := profileInSession and (barstate.isfirst or not profileInSession[1])
+
+bool profileFinalizeNow = false
+if profileSessionType == "All"
+    profileFinalizeNow := profileNewDay
+else
+    profileFinalizeNow := not profileInSession and profileInSession[1]
+
+// ============================================================================
+// HISTORICAL PROFILE DRAWING STORAGE
+// ============================================================================
+
+var box[] historicalProfileBoxes = array.new_box()
+var line[] historicalProfileLines = array.new_line()
+var int[] historicalSessionBoxCounts = array.new_int()
+var int[] historicalSessionLineCounts = array.new_int()
+
+// ============================================================================
+// FINALIZE COMPLETED PROFILE
+// ============================================================================
+
+bool profileCanFinalize = profileFinalizeNow and not na(profileStartBar) and not na(profileMaxVolume) and profileMaxVolume > 0.0 and not na(profileRowInterval) and not na(profilePocIndex) and not na(profileVahIndex) and not na(profileValIndex)
+
+if profileCanFinalize
+    int finalEndBar = bar_index - 1
+
+    if showHistoricalProfiles
+        int availableSessionBars = math.max(2, finalEndBar - profileStartBar + 1)
+        int maxHistogramWidth = math.min(profileWidthBars, availableSessionBars)
+        int newBoxCount = 0
+        int newLineCount = 0
+
+        for row = 0 to profileRows - 1
+            float rowVolume = array.get(profileVolumes, row)
+            float rowBuyVolume = array.get(profileBuyVolumes, row)
+            float rowBottom = profileLow + profileRowInterval * row
+            float rowTop = profileLow + profileRowInterval * (row + 1)
+            bool rowInsideVA = row >= profileValIndex and row <= profileVahIndex
+            bool rowIsPoc = row == profilePocIndex
+
+            if rowVolume > 0.0
+                int totalWidth = math.max(1, int(math.round(rowVolume / profileMaxVolume * maxHistogramWidth)))
+                float buyShare = math.max(0.0, math.min(1.0, rowBuyVolume / rowVolume))
+
+                int rowLeft = profileStartBar
+                if profileAlignment == "Right"
+                    rowLeft := finalEndBar - totalWidth
+
+                int rowRight = rowLeft + totalWidth
+
+                if cleanVisualMode
+                    color dominantColor = buyShare >= 0.50 ? C_BLUE : C_SELL
+                    int cleanTransparency = 91
+                    if rowIsPoc
+                        cleanTransparency := 58
+                    else if rowInsideVA
+                        cleanTransparency := 82
+
+                    box profileBox = box.new(rowLeft, rowTop, rowRight, rowBottom, border_color = color.new(dominantColor, 100), bgcolor = color.new(dominantColor, cleanTransparency))
+                    array.push(historicalProfileBoxes, profileBox)
+                    newBoxCount += 1
+                else
+                    int buyWidth = int(math.round(totalWidth * buyShare))
+                    buyWidth := math.max(0, math.min(totalWidth, buyWidth))
+                    int sellWidth = totalWidth - buyWidth
+                    int buyRight = rowLeft + buyWidth
+                    int sellLeft = buyRight
+
+                    int rowTransparency = 82
+                    if rowIsPoc
+                        rowTransparency := 28
+                    else if rowInsideVA
+                        rowTransparency := 62
+
+                    color rowBorder = rowIsPoc ? C_ORANGE : color.new(C_GRAY, 100)
+
+                    if buyWidth > 0
+                        box buyBox = box.new(rowLeft, rowTop, buyRight, rowBottom, border_color = rowBorder, border_width = 1, bgcolor = color.new(C_BLUE, rowTransparency))
+                        array.push(historicalProfileBoxes, buyBox)
+                        newBoxCount += 1
+
+                    if sellWidth > 0
+                        box sellBox = box.new(sellLeft, rowTop, rowRight, rowBottom, border_color = rowBorder, border_width = 1, bgcolor = color.new(C_SELL, rowTransparency))
+                        array.push(historicalProfileBoxes, sellBox)
+                        newBoxCount += 1
+
+        if showProfileLevels
+            int historicalLevelLeft = math.max(profileStartBar, finalEndBar - maxHistogramWidth)
+            line pocLine = line.new(historicalLevelLeft, pocPrice, finalEndBar, pocPrice, color = color.new(C_ORANGE, 40), width = cleanVisualMode ? 1 : 2)
+            array.push(historicalProfileLines, pocLine)
+            newLineCount += 1
+
+            if not cleanVisualMode
+                line vahLine = line.new(profileStartBar, vahPrice, finalEndBar, vahPrice, color = color.new(C_GRAY, 65), style = line.style_dashed)
+                line valLine = line.new(profileStartBar, valPrice, finalEndBar, valPrice, color = color.new(C_GRAY, 65), style = line.style_dashed)
+                array.push(historicalProfileLines, vahLine)
+                array.push(historicalProfileLines, valLine)
+                newLineCount += 2
+
+        array.push(historicalSessionBoxCounts, newBoxCount)
+        array.push(historicalSessionLineCounts, newLineCount)
+
+        while array.size(historicalSessionBoxCounts) > historicalProfileCount
+            int boxesToDelete = array.shift(historicalSessionBoxCounts)
+            int linesToDelete = array.shift(historicalSessionLineCounts)
+
+            if boxesToDelete > 0
+                for i = 0 to boxesToDelete - 1
+                    if array.size(historicalProfileBoxes) > 0
+                        box.delete(array.shift(historicalProfileBoxes))
+
+            if linesToDelete > 0
+                for i = 0 to linesToDelete - 1
+                    if array.size(historicalProfileLines) > 0
+                        line.delete(array.shift(historicalProfileLines))
+
+// ============================================================================
+// START NEW PROFILE
+// ============================================================================
+
+if profileStartNow
+    array.fill(profileVolumes, 0.0)
+    array.fill(profileBuyVolumes, 0.0)
+    array.fill(profileSellVolumes, 0.0)
+    profileHigh := high
+    profileLow := low
+    profileStartBar := bar_index
+    pocPrice := na
+    vahPrice := na
+    valPrice := na
+    profilePocIndex := na
+    profileVahIndex := na
+    profileValIndex := na
+    profileRowInterval := na
+    profileMaxVolume := na
+
+// ============================================================================
+// DEVELOP CURRENT PROFILE
+// ============================================================================
+
+if profileInSession
+    profileHigh := math.max(nz(profileHigh, high), high)
+    profileLow := math.min(nz(profileLow, low), low)
+
+bool profileCanCalculate = barstate.isconfirmed and profileInSession and not na(profileStartBar) and not na(profileHigh) and not na(profileLow)
+
+if profileCanCalculate
+    int profileLookback = bar_index - profileStartBar + 1
+    float profilePriceRange = profileHigh - profileLow
+
+    if profilePriceRange > 0.0 and profileLookback > 0
+        profileRowInterval := profilePriceRange / profileRows
+        array.fill(profileVolumes, 0.0)
+        array.fill(profileBuyVolumes, 0.0)
+        array.fill(profileSellVolumes, 0.0)
+
+        for i = 0 to profileLookback - 1
+            int startRow = int(math.floor((low[i] - profileLow) / profileRowInterval))
+            int endRow = int(math.floor((high[i] - profileLow) / profileRowInterval))
+            startRow := math.max(0, math.min(profileRows - 1, startRow))
+            endRow := math.max(0, math.min(profileRows - 1, endRow))
+            int rowsTouched = endRow - startRow + 1
+            float sourceBarRange = high[i] - low[i]
+
+            float historicalBuy = deltaBuyVolume[i]
+            float historicalSell = deltaSellVolume[i]
+            float historicalDeltaTotal = historicalBuy + historicalSell
+
+            float historicalBuyShare = 0.5
+            if not na(historicalDeltaTotal) and historicalDeltaTotal > 0.0
+                historicalBuyShare := historicalBuy / historicalDeltaTotal
+            historicalBuyShare := math.max(0.0, math.min(1.0, historicalBuyShare))
+
+            for row = startRow to endRow
+                float rowBottom = profileLow + profileRowInterval * row
+                float rowTop = profileLow + profileRowInterval * (row + 1)
+                float overlapTop = math.min(high[i], rowTop)
+                float overlapBottom = math.max(low[i], rowBottom)
+                float overlapRange = math.max(0.0, overlapTop - overlapBottom)
+
+                float volumeToAdd = 0.0
+                if sourceBarRange > 0.0
+                    volumeToAdd := volume[i] * (overlapRange / sourceBarRange)
+                else
+                    volumeToAdd := volume[i] / rowsTouched
+
+                float buyToAdd = volumeToAdd * historicalBuyShare
+                float sellToAdd = volumeToAdd - buyToAdd
+
+                array.set(profileVolumes, row, array.get(profileVolumes, row) + volumeToAdd)
+                array.set(profileBuyVolumes, row, array.get(profileBuyVolumes, row) + buyToAdd)
+                array.set(profileSellVolumes, row, array.get(profileSellVolumes, row) + sellToAdd)
+
+        profileMaxVolume := array.max(profileVolumes)
+
+        if profileMaxVolume > 0.0
+            profilePocIndex := array.indexof(profileVolumes, profileMaxVolume)
+            pocPrice := profileLow + profileRowInterval * (profilePocIndex + 0.5)
+
+            float totalProfileVolume = array.sum(profileVolumes)
+            float targetVaVolume = totalProfileVolume * valueAreaPct / 100.0
+            int workingVahIndex = profilePocIndex
+            int workingValIndex = profilePocIndex
+            float accumulatedVolume = array.get(profileVolumes, profilePocIndex)
+
+            while accumulatedVolume < targetVaVolume and (workingVahIndex < profileRows - 1 or workingValIndex > 0)
+                float volumeAbove = 0.0
+                float volumeBelow = 0.0
+                if workingVahIndex < profileRows - 1
+                    volumeAbove := array.get(profileVolumes, workingVahIndex + 1)
+                if workingValIndex > 0
+                    volumeBelow := array.get(profileVolumes, workingValIndex - 1)
+
+                if volumeAbove > volumeBelow and workingVahIndex < profileRows - 1
+                    workingVahIndex += 1
+                    accumulatedVolume += volumeAbove
+                else if workingValIndex > 0
+                    workingValIndex -= 1
+                    accumulatedVolume += volumeBelow
+                else if workingVahIndex < profileRows - 1
+                    workingVahIndex += 1
+                    accumulatedVolume += volumeAbove
+                else
+                    break
+
+            profileVahIndex := workingVahIndex
+            profileValIndex := workingValIndex
+            vahPrice := profileLow + profileRowInterval * (profileVahIndex + 0.5)
+            valPrice := profileLow + profileRowInterval * (profileValIndex + 0.5)
+
+// ============================================================================
+// POC MIGRATION
+// ============================================================================
+
+int profileAge = 0
+if not na(profileStartBar)
+    profileAge := bar_index - profileStartBar
+
+bool bullishPocMigration = profileAge >= pocMigrationLookback and not na(pocPrice[pocMigrationLookback]) and pocPrice > pocPrice[pocMigrationLookback]
+bool bearishPocMigration = profileAge >= pocMigrationLookback and not na(pocPrice[pocMigrationLookback]) and pocPrice < pocPrice[pocMigrationLookback]
+
+// ============================================================================
+// BEHAVIOR STATE MACHINE
+// ============================================================================
+
+const int STATE_IDLE  = 0
+const int STATE_BUILD = 1
+const int STATE_READY = 2
+
+var int longState = STATE_IDLE
+var int shortState = STATE_IDLE
+var int longSetupStartBar = na
+var int shortSetupStartBar = na
+var float longAnchorPoc = na
+var float shortAnchorPoc = na
+var int longPocTouchBar = na
+var int shortPocTouchBar = na
+var int longAnchoredSweepBar = na
+var int shortAnchoredSweepBar = na
+var int longReclaimBar = na
+var int shortReclaimBar = na
+var int longDirectionalDeltaBar = na
+var int shortDirectionalDeltaBar = na
+var int longAbsorptionBar = na
+var int shortAbsorptionBar = na
+var int longRelativeVolumeBar = na
+var int shortRelativeVolumeBar = na
+var float longSweepMid = na
+var float shortSweepMid = na
+var float longSetupStructure = na
+var float shortSetupStructure = na
+
+bool flat = strategy.position_size == 0
+float pocTolerance = atr * pocAnchorDistanceAtr
+bool pocAvailable = profileInSession and not na(pocPrice)
+
+bool longPocTouchNow = pocAvailable and (math.abs(low - pocPrice) <= pocTolerance or math.abs(close - pocPrice) <= pocTolerance)
+bool shortPocTouchNow = pocAvailable and (math.abs(high - pocPrice) <= pocTolerance or math.abs(close - pocPrice) <= pocTolerance)
+bool longAnchoredSweepNow = validBuySweep and pocAvailable and math.abs(low - pocPrice) <= pocTolerance
+bool shortAnchoredSweepNow = validSellSweep and pocAvailable and math.abs(high - pocPrice) <= pocTolerance
+
+// ============================================================================
+// RESET STATE ON NEW PROFILE
+// ============================================================================
+
+if profileStartNow and not barstate.isfirst
+    longState := STATE_IDLE
+    shortState := STATE_IDLE
+    longSetupStartBar := na
+    shortSetupStartBar := na
+    longAnchorPoc := na
+    shortAnchorPoc := na
+    longPocTouchBar := na
+    shortPocTouchBar := na
+    longAnchoredSweepBar := na
+    shortAnchoredSweepBar := na
+    longReclaimBar := na
+    shortReclaimBar := na
+    longDirectionalDeltaBar := na
+    shortDirectionalDeltaBar := na
+    longAbsorptionBar := na
+    shortAbsorptionBar := na
+    longRelativeVolumeBar := na
+    shortRelativeVolumeBar := na
+    longSweepMid := na
+    shortSweepMid := na
+    longSetupStructure := na
+    shortSetupStructure := na
+
+// ============================================================================
+// SEED LONG HYPOTHESIS
+// ============================================================================
+
+bool longSeedEvent = flat and inTradeSession and pocAvailable and (longPocTouchNow or longAnchoredSweepNow)
+
+if longState == STATE_IDLE and longSeedEvent
+    longState := STATE_BUILD
+    longSetupStartBar := bar_index
+    longAnchorPoc := pocPrice
+
+    if longPocTouchNow
+        longPocTouchBar := bar_index
+
+    if longAnchoredSweepNow
+        longAnchoredSweepBar := bar_index
+        longSetupStructure := sweptLowLevel
+        longSweepMid := (high + low) / 2.0
+
+    if f_recent(lastBullDirectionalDeltaBar, setupWindowBars)
+        longDirectionalDeltaBar := lastBullDirectionalDeltaBar
+
+    if f_recent(lastBullAbsorptionBar, setupWindowBars)
+        longAbsorptionBar := lastBullAbsorptionBar
+
+    if f_recent(lastRelativeVolumeBar, setupWindowBars)
+        longRelativeVolumeBar := lastRelativeVolumeBar
+
+// ============================================================================
+// SEED SHORT HYPOTHESIS
+// ============================================================================
+
+bool shortSeedEvent = flat and inTradeSession and pocAvailable and (shortPocTouchNow or shortAnchoredSweepNow)
+
+if shortState == STATE_IDLE and shortSeedEvent
+    shortState := STATE_BUILD
+    shortSetupStartBar := bar_index
+    shortAnchorPoc := pocPrice
+
+    if shortPocTouchNow
+        shortPocTouchBar := bar_index
+
+    if shortAnchoredSweepNow
+        shortAnchoredSweepBar := bar_index
+        shortSetupStructure := sweptHighLevel
+        shortSweepMid := (high + low) / 2.0
+
+    if f_recent(lastBearDirectionalDeltaBar, setupWindowBars)
+        shortDirectionalDeltaBar := lastBearDirectionalDeltaBar
+
+    if f_recent(lastBearAbsorptionBar, setupWindowBars)
+        shortAbsorptionBar := lastBearAbsorptionBar
+
+    if f_recent(lastRelativeVolumeBar, setupWindowBars)
+        shortRelativeVolumeBar := lastRelativeVolumeBar
+
+// ============================================================================
+// UPDATE LONG HYPOTHESIS
+// ============================================================================
+
+if longState != STATE_IDLE
+    if math.abs(low - longAnchorPoc) <= pocTolerance or math.abs(close - longAnchorPoc) <= pocTolerance
+        longPocTouchBar := bar_index
+
+    if bullDirectionalDeltaNow
+        longDirectionalDeltaBar := bar_index
+
+    if bullAbsorptionEvent
+        longAbsorptionBar := bar_index
+
+    if relativeVolumeNow
+        longRelativeVolumeBar := bar_index
+
+    if validBuySweep and math.abs(low - longAnchorPoc) <= pocTolerance
+        longAnchoredSweepBar := bar_index
+        longSetupStructure := sweptLowLevel
+        longSweepMid := (high + low) / 2.0
+
+    bool longBodyReclaimOk = not sweepRequireBullishBody or close > open
+    bool longMidReclaimOk = not sweepRequireMidlineBreak or (not na(longSweepMid) and close > longSweepMid)
+    bool longReclaimNow = not na(longAnchoredSweepBar) and close > longAnchorPoc and longBodyReclaimOk and longMidReclaimOk
+
+    if longReclaimNow
+        longReclaimBar := bar_index
+
+// ============================================================================
+// UPDATE SHORT HYPOTHESIS
+// ============================================================================
+
+if shortState != STATE_IDLE
+    if math.abs(high - shortAnchorPoc) <= pocTolerance or math.abs(close - shortAnchorPoc) <= pocTolerance
+        shortPocTouchBar := bar_index
+
+    if bearDirectionalDeltaNow
+        shortDirectionalDeltaBar := bar_index
+
+    if bearAbsorptionEvent
+        shortAbsorptionBar := bar_index
+
+    if relativeVolumeNow
+        shortRelativeVolumeBar := bar_index
+
+    if validSellSweep and math.abs(high - shortAnchorPoc) <= pocTolerance
+        shortAnchoredSweepBar := bar_index
+        shortSetupStructure := sweptHighLevel
+        shortSweepMid := (high + low) / 2.0
+
+    bool shortBodyReclaimOk = not sweepRequireBearishBody or close < open
+    bool shortMidReclaimOk = not sweepRequireMidlineBreak or (not na(shortSweepMid) and close < shortSweepMid)
+    bool shortReclaimNow = not na(shortAnchoredSweepBar) and close < shortAnchorPoc and shortBodyReclaimOk and shortMidReclaimOk
+
+    if shortReclaimNow
+        shortReclaimBar := bar_index
+
+// ============================================================================
+// RECENT STATE EVIDENCE
+// ============================================================================
+
+bool longPocRecent = f_recent(longPocTouchBar, setupWindowBars)
+bool shortPocRecent = f_recent(shortPocTouchBar, setupWindowBars)
+bool longSweepRecent = f_recent(longAnchoredSweepBar, setupWindowBars)
+bool shortSweepRecent = f_recent(shortAnchoredSweepBar, setupWindowBars)
+bool longReclaimRecent = f_recent(longReclaimBar, setupWindowBars)
+bool shortReclaimRecent = f_recent(shortReclaimBar, setupWindowBars)
+bool longDirectionalDeltaRecent = f_recent(longDirectionalDeltaBar, setupWindowBars)
+bool shortDirectionalDeltaRecent = f_recent(shortDirectionalDeltaBar, setupWindowBars)
+bool longAbsorptionRecent = f_recent(longAbsorptionBar, setupWindowBars)
+bool shortAbsorptionRecent = f_recent(shortAbsorptionBar, setupWindowBars)
+bool longRelativeVolumeRecent = f_recent(longRelativeVolumeBar, setupWindowBars)
+bool shortRelativeVolumeRecent = f_recent(shortRelativeVolumeBar, setupWindowBars)
+
+// ============================================================================
+// DELTA STATE
+// ============================================================================
+
+bool longDeltaStateOk = false
+bool shortDeltaStateOk = false
+
+if deltaConfirmationMode == "Directional"
+    longDeltaStateOk := longDirectionalDeltaRecent
+    shortDeltaStateOk := shortDirectionalDeltaRecent
+else if deltaConfirmationMode == "Directional OR Absorption"
+    longDeltaStateOk := longDirectionalDeltaRecent or longAbsorptionRecent
+    shortDeltaStateOk := shortDirectionalDeltaRecent or shortAbsorptionRecent
+else
+    longDeltaStateOk := longDirectionalDeltaRecent and longAbsorptionRecent
+    shortDeltaStateOk := shortDirectionalDeltaRecent and shortAbsorptionRecent
+
+bool longRvolStateOk = not useRelativeVolumeConfirm or longRelativeVolumeRecent
+bool shortRvolStateOk = not useRelativeVolumeConfirm or shortRelativeVolumeRecent
+bool longPocMigrationOk = not usePocMigrationConfirm or bullishPocMigration
+bool shortPocMigrationOk = not usePocMigrationConfirm or bearishPocMigration
+
+bool longEvidenceReady = longPocRecent and longSweepRecent and longReclaimRecent and longDeltaStateOk and longRvolStateOk and longPocMigrationOk
+bool shortEvidenceReady = shortPocRecent and shortSweepRecent and shortReclaimRecent and shortDeltaStateOk and shortRvolStateOk and shortPocMigrationOk
+
+// ============================================================================
+// READY STATE
+// ============================================================================
+
+if longState != STATE_IDLE
+    if longEvidenceReady
+        longState := STATE_READY
+    else
+        longState := STATE_BUILD
+
+if shortState != STATE_IDLE
+    if shortEvidenceReady
+        shortState := STATE_READY
+    else
+        shortState := STATE_BUILD
+
+// ============================================================================
+// STATE INVALIDATION
+// ============================================================================
+
+int longSetupAge = 0
+int shortSetupAge = 0
+
+if not na(longSetupStartBar)
+    longSetupAge := bar_index - longSetupStartBar
+
+if not na(shortSetupStartBar)
+    shortSetupAge := bar_index - shortSetupStartBar
+
+bool longInvalidated = longState != STATE_IDLE and (longSetupAge > setupWindowBars or profileFinalizeNow or (useSessionFilter and not inSessionRaw) or (invalidateOnOppositeSweep and validSellSweep) or (not na(longAnchorPoc) and close < longAnchorPoc - atr * setupInvalidationAtr))
+bool shortInvalidated = shortState != STATE_IDLE and (shortSetupAge > setupWindowBars or profileFinalizeNow or (useSessionFilter and not inSessionRaw) or (invalidateOnOppositeSweep and validBuySweep) or (not na(shortAnchorPoc) and close > shortAnchorPoc + atr * setupInvalidationAtr))
+
+if longInvalidated
+    longState := STATE_IDLE
+    longSetupStartBar := na
+    longAnchorPoc := na
+    longPocTouchBar := na
+    longAnchoredSweepBar := na
+    longReclaimBar := na
+    longDirectionalDeltaBar := na
+    longAbsorptionBar := na
+    longRelativeVolumeBar := na
+    longSweepMid := na
+    longSetupStructure := na
+
+if shortInvalidated
+    shortState := STATE_IDLE
+    shortSetupStartBar := na
+    shortAnchorPoc := na
+    shortPocTouchBar := na
+    shortAnchoredSweepBar := na
+    shortReclaimBar := na
+    shortDirectionalDeltaBar := na
+    shortAbsorptionBar := na
+    shortRelativeVolumeBar := na
+    shortSweepMid := na
+    shortSetupStructure := na
+
+// ============================================================================
+// STRUCTURAL STOP / POSITION SIZE
+// ============================================================================
+
+float rawLongStop = close - atr * maxStopATR
+if not na(longSetupStructure)
+    rawLongStop := longSetupStructure - atr * stopBufferATR
+
+float cappedLongStop = close - atr * maxStopATR
+float candidateLongStop = math.max(rawLongStop, cappedLongStop)
+
+float rawShortStop = close + atr * maxStopATR
+if not na(shortSetupStructure)
+    rawShortStop := shortSetupStructure + atr * stopBufferATR
+
+float cappedShortStop = close + atr * maxStopATR
+float candidateShortStop = math.min(rawShortStop, cappedShortStop)
+
+float candidateLongRisk = close - candidateLongStop
+float candidateShortRisk = candidateShortStop - close
+bool longRiskValid = candidateLongRisk > syminfo.mintick
+bool shortRiskValid = candidateShortRisk > syminfo.mintick
+
+float pointValue = 1.0
+if not na(syminfo.pointvalue) and syminfo.pointvalue > 0.0
+    pointValue := syminfo.pointvalue
+
+bool useDollarSizing = sizingMode == "Risk %" or sizingMode == "Risk $"
+
+float riskBudget = maxRiskDollars
+if sizingMode == "Risk %"
+    riskBudget := strategy.equity * riskPerTradePct / 100.0
+
+float longRiskQty = baseQty
+float shortRiskQty = baseQty
+
+if useDollarSizing and longRiskValid
+    longRiskQty := math.floor(riskBudget / (candidateLongRisk * pointValue))
+
+if useDollarSizing and shortRiskValid
+    shortRiskQty := math.floor(riskBudget / (candidateShortRisk * pointValue))
+
+bool longSizePass = longRiskValid and (not useDollarSizing or longRiskQty >= 1.0)
+bool shortSizePass = shortRiskValid and (not useDollarSizing or shortRiskQty >= 1.0)
+
+float longOrderQty = baseQty
+float shortOrderQty = baseQty
+if useDollarSizing
+    longOrderQty := longRiskQty
+    shortOrderQty := shortRiskQty
+
+// ============================================================================
+// FINAL ENTRY SIGNALS
+// ============================================================================
+
+bool longEntry = barstate.isconfirmed and flat and tradeDirectionLongOk and commonLiveGate and longState == STATE_READY and longRegimeOk and longSizePass
+bool shortEntry = barstate.isconfirmed and flat and tradeDirectionShortOk and commonLiveGate and shortState == STATE_READY and shortRegimeOk and shortSizePass and not longEntry
+
+// ============================================================================
+// BLOCKER DIAGNOSTICS
+// ============================================================================
+
+string longBlocker = "CLEAR"
+if tradeDirection == "Short Only"
+    longBlocker := "LONGS OFF"
+else if not inTradeSession
+    longBlocker := "SESSION"
+else if not dailyTradeLimitPass
+    longBlocker := "TRADE LIMIT"
+else if not cooldownPass
+    longBlocker := "COOLDOWN"
+else if not entrySpacingPass
+    longBlocker := "SPACING"
+else if longState == STATE_IDLE
+    longBlocker := "WAIT SETUP"
+else if not longPocRecent
+    longBlocker := "POC"
+else if not longSweepRecent
+    longBlocker := "SWEEP"
+else if not longReclaimRecent
+    longBlocker := "RECLAIM"
+else if not longDeltaStateOk
+    longBlocker := "DELTA"
+else if not longRvolStateOk
+    longBlocker := "RVOL"
+else if not longPocMigrationOk
+    longBlocker := "POC SLOPE"
+else if not longTrendOk
+    longBlocker := "TREND"
+else if not longMomentumOk
+    longBlocker := "MOMENTUM"
+else if not longSizePass
+    longBlocker := "SIZE"
+else if strategy.position_size != 0
+    longBlocker := "POSITION"
+
+string shortBlocker = "CLEAR"
+if tradeDirection == "Long Only"
+    shortBlocker := "SHORTS OFF"
+else if not inTradeSession
+    shortBlocker := "SESSION"
+else if not dailyTradeLimitPass
+    shortBlocker := "TRADE LIMIT"
+else if not cooldownPass
+    shortBlocker := "COOLDOWN"
+else if not entrySpacingPass
+    shortBlocker := "SPACING"
+else if shortState == STATE_IDLE
+    shortBlocker := "WAIT SETUP"
+else if not shortPocRecent
+    shortBlocker := "POC"
+else if not shortSweepRecent
+    shortBlocker := "SWEEP"
+else if not shortReclaimRecent
+    shortBlocker := "RECLAIM"
+else if not shortDeltaStateOk
+    shortBlocker := "DELTA"
+else if not shortRvolStateOk
+    shortBlocker := "RVOL"
+else if not shortPocMigrationOk
+    shortBlocker := "POC SLOPE"
+else if not shortTrendOk
+    shortBlocker := "TREND"
+else if not shortMomentumOk
+    shortBlocker := "MOMENTUM"
+else if not shortSizePass
+    shortBlocker := "SIZE"
+else if strategy.position_size != 0
+    shortBlocker := "POSITION"
+
+// ============================================================================
+// TRADE STATE
+// ============================================================================
+
+var float pendingStop = na
+var float entryPrice = na
+var float initialRisk = na
+var float longStop = na
+var float shortStop = na
+var float tp1Price = na
+var float tp2Price = na
+var bool tp1Hit = false
+var bool breakEvenActive = false
+var bool trailingActive = false
+var float highestSinceEntry = na
+var float lowestSinceEntry = na
+var int entryBar = na
+var int activeTradeDirection = 0
+
+// ============================================================================
+// ENTRIES
+// ============================================================================
+
+if longEntry
+    pendingStop := candidateLongStop
+    tradesToday += 1
+    lastEntrySignalBar := bar_index
+
+    strategy.entry("Long", strategy.long, qty = longOrderQty, comment = "Ranger V2.2 Long", alert_message = "RANGER_V22_LONG")
+    strategy.exit("L-INIT", from_entry = "Long", stop = candidateLongStop, comment_loss = "Initial Stop")
+
+    if enableDynamicAlerts
+        alert(f_alertMsg("BULLISH ENTRY", "Ranger V2.2", close) + "\nFrozen POC: " + f_price(longAnchorPoc) + "\nDelta: " + f_number(deltaPct) + "%\nRVOL: " + f_number(relativeVolume), alert.freq_once_per_bar_close)
+
+    longState := STATE_IDLE
+    shortState := STATE_IDLE
+    longSetupStartBar := na
+    shortSetupStartBar := na
+    longAnchorPoc := na
+    shortAnchorPoc := na
+    longPocTouchBar := na
+    shortPocTouchBar := na
+    longAnchoredSweepBar := na
+    shortAnchoredSweepBar := na
+    longReclaimBar := na
+    shortReclaimBar := na
+    longDirectionalDeltaBar := na
+    shortDirectionalDeltaBar := na
+    longAbsorptionBar := na
+    shortAbsorptionBar := na
+    longRelativeVolumeBar := na
+    shortRelativeVolumeBar := na
+    longSweepMid := na
+    shortSweepMid := na
+    longSetupStructure := na
+    shortSetupStructure := na
+
+if shortEntry
+    pendingStop := candidateShortStop
+    tradesToday += 1
+    lastEntrySignalBar := bar_index
+
+    strategy.entry("Short", strategy.short, qty = shortOrderQty, comment = "Ranger V2.2 Short", alert_message = "RANGER_V22_SHORT")
+    strategy.exit("S-INIT", from_entry = "Short", stop = candidateShortStop, comment_loss = "Initial Stop")
+
+    if enableDynamicAlerts
+        alert(f_alertMsg("BEARISH ENTRY", "Ranger V2.2", close) + "\nFrozen POC: " + f_price(shortAnchorPoc) + "\nDelta: " + f_number(deltaPct) + "%\nRVOL: " + f_number(relativeVolume), alert.freq_once_per_bar_close)
+
+    longState := STATE_IDLE
+    shortState := STATE_IDLE
+    longSetupStartBar := na
+    shortSetupStartBar := na
+    longAnchorPoc := na
+    shortAnchorPoc := na
+    longPocTouchBar := na
+    shortPocTouchBar := na
+    longAnchoredSweepBar := na
+    shortAnchoredSweepBar := na
+    longReclaimBar := na
+    shortReclaimBar := na
+    longDirectionalDeltaBar := na
+    shortDirectionalDeltaBar := na
+    longAbsorptionBar := na
+    shortAbsorptionBar := na
+    longRelativeVolumeBar := na
+    shortRelativeVolumeBar := na
+    longSweepMid := na
+    shortSweepMid := na
+    longSetupStructure := na
+    shortSetupStructure := na
+
+// ============================================================================
+// POSITION INITIALIZATION
+// ============================================================================
+
+if strategy.position_size > 0 and na(entryPrice)
+    strategy.cancel("L-INIT")
+    entryPrice := strategy.position_avg_price
+
+    if not na(pendingStop)
+        longStop := math.min(pendingStop, entryPrice - syminfo.mintick)
+    else
+        longStop := entryPrice - atr * maxStopATR
+
+    initialRisk := entryPrice - longStop
+    tp1Price := entryPrice + initialRisk * tp1R
+    tp2Price := entryPrice + initialRisk * tp2R
+    highestSinceEntry := high
+    lowestSinceEntry := low
+    entryBar := bar_index
+    activeTradeDirection := 1
+    tp1Hit := false
+    breakEvenActive := false
+    trailingActive := false
+
+if strategy.position_size < 0 and na(entryPrice)
+    strategy.cancel("S-INIT")
+    entryPrice := strategy.position_avg_price
+
+    if not na(pendingStop)
+        shortStop := math.max(pendingStop, entryPrice + syminfo.mintick)
+    else
+        shortStop := entryPrice + atr * maxStopATR
+
+    initialRisk := shortStop - entryPrice
+    tp1Price := entryPrice - initialRisk * tp1R
+    tp2Price := entryPrice - initialRisk * tp2R
+    highestSinceEntry := high
+    lowestSinceEntry := low
+    entryBar := bar_index
+    activeTradeDirection := -1
+    tp1Hit := false
+    breakEvenActive := false
+    trailingActive := false
+
+// ============================================================================
+// TP1 DETECTION
+// ============================================================================
+
+if strategy.position_size > 0 and not tp1Hit and not na(tp1Price) and high >= tp1Price
+    tp1Hit := true
+
+if strategy.position_size < 0 and not tp1Hit and not na(tp1Price) and low <= tp1Price
+    tp1Hit := true
+
+// ============================================================================
+// BREAK EVEN + DELTA-AWARE TRAILING
+// ============================================================================
+
+float breakEvenOffset = breakEvenOffsetTicks * syminfo.mintick
+
+if strategy.position_size > 0
+    highestSinceEntry := math.max(nz(highestSinceEntry, high), high)
+    lowestSinceEntry := math.min(nz(lowestSinceEntry, low), low)
+
+    if tp1Hit and useBreakEven
+        longStop := math.max(longStop, entryPrice + breakEvenOffset)
+        breakEvenActive := true
+
+    if tp1Hit and useTrail
+        bool longOrderFlowFading = not deltaReady or deltaPct <= 0.0
+        float trailMultiplier = looseTrailATR
+        if longOrderFlowFading
+            trailMultiplier := tightTrailATR
+
+        float proposedTrail = highestSinceEntry - atr * trailMultiplier
+        longStop := math.max(longStop, proposedTrail)
+        trailingActive := true
+
+if strategy.position_size < 0
+    highestSinceEntry := math.max(nz(highestSinceEntry, high), high)
+    lowestSinceEntry := math.min(nz(lowestSinceEntry, low), low)
+
+    if tp1Hit and useBreakEven
+        shortStop := math.min(shortStop, entryPrice - breakEvenOffset)
+        breakEvenActive := true
+
+    if tp1Hit and useTrail
+        bool shortOrderFlowFading = not deltaReady or deltaPct >= 0.0
+        float trailMultiplier = looseTrailATR
+        if shortOrderFlowFading
+            trailMultiplier := tightTrailATR
+
+        float proposedTrail = lowestSinceEntry + atr * trailMultiplier
+        shortStop := math.min(shortStop, proposedTrail)
+        trailingActive := true
+
+// ============================================================================
+// MAIN EXITS
+// ============================================================================
+
+if strategy.position_size > 0 and not na(entryPrice)
+    strategy.cancel("L-INIT")
+    strategy.exit("L-TP1", from_entry = "Long", qty_percent = tp1Qty, stop = longStop, limit = tp1Price, comment_loss = "ATR Stop", comment_profit = "TP1")
+    strategy.exit("L-TP2", from_entry = "Long", qty_percent = 100.0 - tp1Qty, stop = longStop, limit = tp2Price, comment_loss = "ATR Stop", comment_profit = "TP2")
+
+if strategy.position_size < 0 and not na(entryPrice)
+    strategy.cancel("S-INIT")
+    strategy.exit("S-TP1", from_entry = "Short", qty_percent = tp1Qty, stop = shortStop, limit = tp1Price, comment_loss = "ATR Stop", comment_profit = "TP1")
+    strategy.exit("S-TP2", from_entry = "Short", qty_percent = 100.0 - tp1Qty, stop = shortStop, limit = tp2Price, comment_loss = "ATR Stop", comment_profit = "TP2")
+
+// ============================================================================
+// TIME / SESSION EXIT
+// ============================================================================
+
+int barsInTrade = 0
+if strategy.position_size != 0 and not na(entryBar)
+    barsInTrade := bar_index - entryBar
+
+if strategy.position_size != 0 and barsInTrade >= maximumHoldingBars
+    strategy.close_all(comment = "Time Stop", immediately = true)
+
+if closeAtSessionEnd and sessionEndBar and strategy.position_size != 0
+    strategy.close_all(comment = "Session Close", immediately = true)
+
+// ============================================================================
+// CLOSED POSITION RESET
+// ============================================================================
+
+bool positionJustClosed = strategy.position_size == 0 and not na(entryPrice)
+bool longPositionClosed = positionJustClosed and activeTradeDirection == 1
+bool shortPositionClosed = positionJustClosed and activeTradeDirection == -1
+
+string lastExitReason = ""
+if strategy.closedtrades > 0
+    lastExitReason := strategy.closedtrades.exit_comment(strategy.closedtrades - 1)
+
+if longPositionClosed and enableDynamicAlerts
+    string reason = lastExitReason
+    if na(reason) or reason == ""
+        reason := "—"
+    alert(f_alertMsg("LONG EXIT", "Ranger V2.2", close) + "\nReason: " + reason, alert.freq_once_per_bar_close)
+
+if shortPositionClosed and enableDynamicAlerts
+    string reason = lastExitReason
+    if na(reason) or reason == ""
+        reason := "—"
+    alert(f_alertMsg("SHORT EXIT", "Ranger V2.2", close) + "\nReason: " + reason, alert.freq_once_per_bar_close)
+
+if positionJustClosed
+    pendingStop := na
+    entryPrice := na
+    initialRisk := na
+    longStop := na
+    shortStop := na
+    tp1Price := na
+    tp2Price := na
+    highestSinceEntry := na
+    lowestSinceEntry := na
+    entryBar := na
+    activeTradeDirection := 0
+    tp1Hit := false
+    breakEvenActive := false
+    trailingActive := false
+
+// ============================================================================
+// TREND RIBBON
+// ============================================================================
+
+bool ribbonBullish = emaFast >= emaSlow
+color ribbonColor = C_SELL
+if ribbonBullish
+    ribbonColor := C_BLUE
+
+fastPlot = plot(showTrendRibbon ? emaFast : na, "Trend Trail", color = color.new(ribbonColor, cleanVisualMode ? 18 : 8), linewidth = cleanVisualMode ? 2 : 1)
+slowPlot = plot(showTrendRibbon ? emaSlow : na, "Trend Base", color = cleanVisualMode ? color.new(C_GRAY, 100) : color.new(C_GRAY, 60), linewidth = 1)
+
+fill(fastPlot, slowPlot, color = showTrendRibbon ? color.new(ribbonColor, cleanVisualMode ? 92 : 88) : na, title = "Trend Cloud")
+
+color trendBarColor = na
+if localBullish
+    trendBarColor := color.new(C_BLUE, 55)
+else if localBearish
+    trendBarColor := color.new(C_SELL, 55)
+
+barcolor(colorTrendBars ? trendBarColor : na)
+
+// ============================================================================
+// SIGNAL / ORDER-FLOW MARKERS
+// ============================================================================
+
+plotshape(showSignals and cleanVisualMode and longEntry, title = "Ranger V2.2 Clean Buy", style = shape.triangleup, location = location.belowbar, color = C_BLUE, size = size.tiny)
+plotshape(showSignals and cleanVisualMode and shortEntry, title = "Ranger V2.2 Clean Sell", style = shape.triangledown, location = location.abovebar, color = C_SELL, size = size.tiny)
+plotshape(showSignals and not cleanVisualMode and longEntry, title = "Ranger V2.2 Buy", style = shape.labelup, location = location.belowbar, color = C_BLUE, textcolor = color.white, text = "BUY", size = size.tiny)
+plotshape(showSignals and not cleanVisualMode and shortEntry, title = "Ranger V2.2 Sell", style = shape.labeldown, location = location.abovebar, color = C_SELL, textcolor = color.white, text = "SELL", size = size.tiny)
+plotshape(showRawSweeps and validBuySweep, title = "Bull Sweep", style = shape.diamond, location = location.belowbar, color = color.new(C_BLUE, 45), size = size.tiny)
+plotshape(showRawSweeps and validSellSweep, title = "Bear Sweep", style = shape.diamond, location = location.abovebar, color = color.new(C_SELL, 45), size = size.tiny)
+plotshape(showAbsorptionMarkers and not cleanVisualMode and bullAbsorptionEvent, title = "Bull Absorption / Delta Divergence", style = shape.circle, location = location.belowbar, color = color.new(C_GREEN, 20), size = size.tiny)
+plotshape(showAbsorptionMarkers and not cleanVisualMode and bearAbsorptionEvent, title = "Bear Absorption / Delta Divergence", style = shape.circle, location = location.abovebar, color = color.new(C_RED, 20), size = size.tiny)
+
+// ============================================================================
+// CURRENT PROFILE HISTOGRAM
+// ============================================================================
+
+var box[] currentBuyBoxes = array.new_box()
+var box[] currentSellBoxes = array.new_box()
+var line currentPocLine = na
+var line currentVahLine = na
+var line currentValLine = na
+var label currentPocTag = na
+var label currentVahTag = na
+var label currentValTag = na
+
+if barstate.islast
+    bool currentProfileReady = showCurrentProfile and profileInSession and not na(profileMaxVolume) and profileMaxVolume > 0.0 and not na(profileRowInterval) and not na(profileStartBar) and not na(profilePocIndex) and not na(profileVahIndex) and not na(profileValIndex)
+
+    if currentProfileReady
+        if array.size(currentBuyBoxes) != profileRows
+            if array.size(currentBuyBoxes) > 0
+                for i = 0 to array.size(currentBuyBoxes) - 1
+                    box.delete(array.get(currentBuyBoxes, i))
+
+            if array.size(currentSellBoxes) > 0
+                for i = 0 to array.size(currentSellBoxes) - 1
+                    box.delete(array.get(currentSellBoxes, i))
+
+            array.clear(currentBuyBoxes)
+            array.clear(currentSellBoxes)
+
+            for i = 0 to profileRows - 1
+                box mainPlaceholder = box.new(bar_index, close, bar_index, close, border_color = color.new(C_BLUE, 100), bgcolor = color.new(C_BLUE, 100))
+                box splitPlaceholder = box.new(bar_index, close, bar_index, close, border_color = color.new(C_SELL, 100), bgcolor = color.new(C_SELL, 100))
+                array.push(currentBuyBoxes, mainPlaceholder)
+                array.push(currentSellBoxes, splitPlaceholder)
+
+        int availableCurrentBars = math.max(2, bar_index - profileStartBar + 1)
+        int currentMaxWidth = math.min(profileWidthBars, availableCurrentBars)
+
+        for row = 0 to profileRows - 1
+            box mainBox = array.get(currentBuyBoxes, row)
+            box splitBox = array.get(currentSellBoxes, row)
+            float rowVolume = array.get(profileVolumes, row)
+            float rowBuyVolume = array.get(profileBuyVolumes, row)
+            float rowBottom = profileLow + profileRowInterval * row
+            float rowTop = profileLow + profileRowInterval * (row + 1)
+            bool rowInsideVA = row >= profileValIndex and row <= profileVahIndex
+            bool rowIsPoc = row == profilePocIndex
+
+            int totalWidth = 0
+            if rowVolume > 0.0
+                totalWidth := math.max(1, int(math.round(rowVolume / profileMaxVolume * currentMaxWidth)))
+
+            float buyShare = 0.5
+            if rowVolume > 0.0
+                buyShare := rowBuyVolume / rowVolume
+            buyShare := math.max(0.0, math.min(1.0, buyShare))
+
+            int rowLeft = profileStartBar
+            if profileAlignment == "Right"
+                rowLeft := bar_index - totalWidth
+
+            int rowRight = rowLeft + totalWidth
+
+            if cleanVisualMode
+                color dominantColor = C_SELL
+                if buyShare >= 0.50
+                    dominantColor := C_BLUE
+
+                int cleanTransparency = 88
+                if rowIsPoc
+                    cleanTransparency := 42
+                else if rowInsideVA
+                    cleanTransparency := 72
+
+                box.set_left(mainBox, rowLeft)
+                box.set_right(mainBox, rowRight)
+                box.set_top(mainBox, rowTop)
+                box.set_bottom(mainBox, rowBottom)
+
+                if totalWidth > 0
+                    box.set_bgcolor(mainBox, color.new(dominantColor, cleanTransparency))
+                else
+                    box.set_bgcolor(mainBox, color.new(dominantColor, 100))
+
+                box.set_border_color(mainBox, color.new(dominantColor, 100))
+
+                box.set_left(splitBox, rowLeft)
+                box.set_right(splitBox, rowLeft)
+                box.set_top(splitBox, rowTop)
+                box.set_bottom(splitBox, rowBottom)
+                box.set_bgcolor(splitBox, color.new(C_SELL, 100))
+                box.set_border_color(splitBox, color.new(C_SELL, 100))
+            else
+                int buyWidth = 0
+                if totalWidth > 0
+                    buyWidth := int(math.round(totalWidth * buyShare))
+                buyWidth := math.max(0, math.min(totalWidth, buyWidth))
+
+                int sellWidth = totalWidth - buyWidth
+                int buyRight = rowLeft + buyWidth
+                int sellLeft = buyRight
+
+                int rowTransparency = 82
+                if rowIsPoc
+                    rowTransparency := 25
+                else if rowInsideVA
+                    rowTransparency := 58
+
+                color rowBorder = color.new(C_GRAY, 100)
+                if rowIsPoc
+                    rowBorder := C_ORANGE
+
+                box.set_left(mainBox, rowLeft)
+                box.set_right(mainBox, buyRight)
+                box.set_top(mainBox, rowTop)
+                box.set_bottom(mainBox, rowBottom)
+
+                if buyWidth > 0
+                    box.set_bgcolor(mainBox, color.new(C_BLUE, rowTransparency))
+                    box.set_border_color(mainBox, rowBorder)
+                else
+                    box.set_bgcolor(mainBox, color.new(C_BLUE, 100))
+                    box.set_border_color(mainBox, color.new(C_BLUE, 100))
+
+                box.set_left(splitBox, sellLeft)
+                box.set_right(splitBox, rowRight)
+                box.set_top(splitBox, rowTop)
+                box.set_bottom(splitBox, rowBottom)
+
+                if sellWidth > 0
+                    box.set_bgcolor(splitBox, color.new(C_SELL, rowTransparency))
+                    box.set_border_color(splitBox, rowBorder)
+                else
+                    box.set_bgcolor(splitBox, color.new(C_SELL, 100))
+                    box.set_border_color(splitBox, color.new(C_SELL, 100))
+
+        if showProfileLevels
+            int profileRight = bar_index + rightProjectionBars
+            int profileLevelLeft = profileStartBar
+            if cleanVisualMode
+                profileLevelLeft := math.max(profileStartBar, bar_index - currentMaxWidth)
+
+            if na(currentPocLine)
+                currentPocLine := line.new(profileLevelLeft, pocPrice, profileRight, pocPrice, color = C_ORANGE, width = 2)
+
+            if na(currentVahLine)
+                currentVahLine := line.new(profileLevelLeft, vahPrice, profileRight, vahPrice, color = color.new(C_GRAY, 70), style = line.style_dashed)
+
+            if na(currentValLine)
+                currentValLine := line.new(profileLevelLeft, valPrice, profileRight, valPrice, color = color.new(C_GRAY, 70), style = line.style_dashed)
+
+            line.set_xy1(currentPocLine, profileLevelLeft, pocPrice)
+            line.set_xy2(currentPocLine, profileRight, pocPrice)
+
+            int pocTransparency = 0
+            if cleanVisualMode
+                pocTransparency := 12
+            line.set_color(currentPocLine, color.new(C_ORANGE, pocTransparency))
+
+            line.set_xy1(currentVahLine, profileLevelLeft, vahPrice)
+            line.set_xy2(currentVahLine, profileRight, vahPrice)
+
+            int vaTransparency = 55
+            if cleanVisualMode
+                vaTransparency := 82
+            line.set_color(currentVahLine, color.new(C_GRAY, vaTransparency))
+
+            line.set_xy1(currentValLine, profileLevelLeft, valPrice)
+            line.set_xy2(currentValLine, profileRight, valPrice)
+            line.set_color(currentValLine, color.new(C_GRAY, vaTransparency))
+
+            if showProfileTags
+                if na(currentPocTag)
+                    currentPocTag := label.new(profileRight, pocPrice, "", style = label.style_label_left, color = C_ORANGE, textcolor = color.white, size = size.tiny)
+
+                label.set_xy(currentPocTag, profileRight, pocPrice)
+                label.set_text(currentPocTag, "POC  " + f_price(pocPrice))
+
+                if not cleanVisualMode
+                    if na(currentVahTag)
+                        currentVahTag := label.new(profileRight, vahPrice, "", style = label.style_label_left, color = C_CARD, textcolor = C_WHITE, size = size.tiny)
+
+                    if na(currentValTag)
+                        currentValTag := label.new(profileRight, valPrice, "", style = label.style_label_left, color = C_CARD, textcolor = C_WHITE, size = size.tiny)
+
+                    label.set_xy(currentVahTag, profileRight, vahPrice)
+                    label.set_text(currentVahTag, "VAH  " + f_price(vahPrice))
+                    label.set_xy(currentValTag, profileRight, valPrice)
+                    label.set_text(currentValTag, "VAL  " + f_price(valPrice))
+                else
+                    if not na(currentVahTag)
+                        label.delete(currentVahTag)
+                        currentVahTag := na
+
+                    if not na(currentValTag)
+                        label.delete(currentValTag)
+                        currentValTag := na
+            else
+                if not na(currentPocTag)
+                    label.delete(currentPocTag)
+                    currentPocTag := na
+
+                if not na(currentVahTag)
+                    label.delete(currentVahTag)
+                    currentVahTag := na
+
+                if not na(currentValTag)
+                    label.delete(currentValTag)
+                    currentValTag := na
+        else
+            if not na(currentPocLine)
+                line.delete(currentPocLine)
+                currentPocLine := na
+
+            if not na(currentVahLine)
+                line.delete(currentVahLine)
+                currentVahLine := na
+
+            if not na(currentValLine)
+                line.delete(currentValLine)
+                currentValLine := na
+
+            if not na(currentPocTag)
+                label.delete(currentPocTag)
+                currentPocTag := na
+
+            if not na(currentVahTag)
+                label.delete(currentVahTag)
+                currentVahTag := na
+
+            if not na(currentValTag)
+                label.delete(currentValTag)
+                currentValTag := na
+    else
+        if array.size(currentBuyBoxes) > 0
+            for i = 0 to array.size(currentBuyBoxes) - 1
+                box.delete(array.get(currentBuyBoxes, i))
+
+        if array.size(currentSellBoxes) > 0
+            for i = 0 to array.size(currentSellBoxes) - 1
+                box.delete(array.get(currentSellBoxes, i))
+
+        array.clear(currentBuyBoxes)
+        array.clear(currentSellBoxes)
+
+        if not na(currentPocLine)
+            line.delete(currentPocLine)
+            currentPocLine := na
+
+        if not na(currentVahLine)
+            line.delete(currentVahLine)
+            currentVahLine := na
+
+        if not na(currentValLine)
+            line.delete(currentValLine)
+            currentValLine := na
+
+        if not na(currentPocTag)
+            label.delete(currentPocTag)
+            currentPocTag := na
+
+        if not na(currentVahTag)
+            label.delete(currentVahTag)
+            currentVahTag := na
+
+        if not na(currentValTag)
+            label.delete(currentValTag)
+            currentValTag := na
+
+// ============================================================================
+// STATE SCORE
+// ============================================================================
+
+int longRequirements = 4
+if useRelativeVolumeConfirm
+    longRequirements += 1
+if usePocMigrationConfirm
+    longRequirements += 1
+
+int shortRequirements = longRequirements
+
+int longScore = 0
+if longPocRecent
+    longScore += 1
+if longSweepRecent
+    longScore += 1
+if longReclaimRecent
+    longScore += 1
+if longDeltaStateOk
+    longScore += 1
+if useRelativeVolumeConfirm and longRelativeVolumeRecent
+    longScore += 1
+if usePocMigrationConfirm and longPocMigrationOk
+    longScore += 1
+
+int shortScore = 0
+if shortPocRecent
+    shortScore += 1
+if shortSweepRecent
+    shortScore += 1
+if shortReclaimRecent
+    shortScore += 1
+if shortDeltaStateOk
+    shortScore += 1
+if useRelativeVolumeConfirm and shortRelativeVolumeRecent
+    shortScore += 1
+if usePocMigrationConfirm and shortPocMigrationOk
+    shortScore += 1
+
+// ============================================================================
+// STATE BUBBLES
+// ============================================================================
+
+var label longStateBubble = na
+var label shortStateBubble = na
+
+if barstate.islast
+    if showStateBubbles and not cleanVisualMode and longState != STATE_IDLE
+        string longStateWord = "BUILD"
+        if longState == STATE_READY
+            longStateWord := "READY"
+
+        string longBubbleText = "L " + longStateWord + "  " + str.tostring(longScore) + "/" + str.tostring(longRequirements)
+
+        if na(longStateBubble)
+            color bubbleColor = C_BLUE
+            if longState == STATE_READY
+                bubbleColor := C_GREEN
+
+            longStateBubble := label.new(bar_index + 1, low - atr * 0.35, longBubbleText, style = label.style_label_up, color = bubbleColor, textcolor = color.white, size = size.tiny)
+
+        label.set_xy(longStateBubble, bar_index + 1, low - atr * 0.35)
+        label.set_text(longStateBubble, longBubbleText)
+
+        if longState == STATE_READY
+            label.set_color(longStateBubble, C_GREEN)
+        else
+            label.set_color(longStateBubble, C_BLUE)
+    else
+        if not na(longStateBubble)
+            label.delete(longStateBubble)
+            longStateBubble := na
+
+    if showStateBubbles and not cleanVisualMode and shortState != STATE_IDLE
+        string shortStateWord = "BUILD"
+        if shortState == STATE_READY
+            shortStateWord := "READY"
+
+        string shortBubbleText = "S " + shortStateWord + "  " + str.tostring(shortScore) + "/" + str.tostring(shortRequirements)
+
+        if na(shortStateBubble)
+            color bubbleColor = C_SELL
+            if shortState == STATE_READY
+                bubbleColor := C_GREEN
+
+            shortStateBubble := label.new(bar_index + 1, high + atr * 0.35, shortBubbleText, style = label.style_label_down, color = bubbleColor, textcolor = color.white, size = size.tiny)
+
+        label.set_xy(shortStateBubble, bar_index + 1, high + atr * 0.35)
+        label.set_text(shortStateBubble, shortBubbleText)
+
+        if shortState == STATE_READY
+            label.set_color(shortStateBubble, C_GREEN)
+        else
+            label.set_color(shortStateBubble, C_SELL)
+    else
+        if not na(shortStateBubble)
+            label.delete(shortStateBubble)
+            shortStateBubble := na
+
+// ============================================================================
+// ACTIVE TRADE OVERLAY
+// ============================================================================
+
+var line tradeEntryLine = na
+var line tradeStopLine = na
+var line tradeTp1Line = na
+var line tradeTp2Line = na
+var box tradeRiskBox = na
+var box tradeRewardBox = na
+var label tradeEntryTag = na
+var label tradeStopTag = na
+var label tradeTp1Tag = na
+var label tradeTp2Tag = na
+
+float activeStop = na
+if strategy.position_size > 0
+    activeStop := longStop
+else if strategy.position_size < 0
+    activeStop := shortStop
+
+bool activeTradeVisual = showTradeOverlay and strategy.position_size != 0 and not na(entryPrice) and not na(entryBar) and not na(activeStop) and not na(tp1Price) and not na(tp2Price)
+
+if activeTradeVisual
+    int tradeRight = bar_index + rightProjectionBars
+    color tradeColor = C_SELL
+    if strategy.position_size > 0
+        tradeColor := C_BLUE
+
+    bool stopLocksProfit = false
+    if strategy.position_size > 0
+        stopLocksProfit := activeStop >= entryPrice
+    else
+        stopLocksProfit := activeStop <= entryPrice
+
+    color stopColor = C_RED
+    if stopLocksProfit
+        stopColor := C_GREEN
+
+    if na(tradeEntryLine)
+        tradeEntryLine := line.new(entryBar, entryPrice, tradeRight, entryPrice, color = color.new(C_WHITE, 45), style = line.style_dotted)
+
+    line.set_xy1(tradeEntryLine, entryBar, entryPrice)
+    line.set_xy2(tradeEntryLine, tradeRight, entryPrice)
+
+    if na(tradeStopLine)
+        tradeStopLine := line.new(entryBar, activeStop, tradeRight, activeStop, color = stopColor, width = 2)
+
+    line.set_xy1(tradeStopLine, entryBar, activeStop)
+    line.set_xy2(tradeStopLine, tradeRight, activeStop)
+    line.set_color(tradeStopLine, stopColor)
+
+    if na(tradeTp1Line)
+        tradeTp1Line := line.new(entryBar, tp1Price, tradeRight, tp1Price, color = color.new(C_GREEN, 35), style = line.style_dashed)
+
+    line.set_xy1(tradeTp1Line, entryBar, tp1Price)
+    line.set_xy2(tradeTp1Line, tradeRight, tp1Price)
+
+    if na(tradeTp2Line)
+        tradeTp2Line := line.new(entryBar, tp2Price, tradeRight, tp2Price, color = C_GREEN, width = 2)
+
+    line.set_xy1(tradeTp2Line, entryBar, tp2Price)
+    line.set_xy2(tradeTp2Line, tradeRight, tp2Price)
+
+    float riskTop = math.max(entryPrice, activeStop)
+    float riskBottom = math.min(entryPrice, activeStop)
+    float rewardTop = math.max(entryPrice, tp2Price)
+    float rewardBottom = math.min(entryPrice, tp2Price)
+
+    if na(tradeRiskBox)
+        tradeRiskBox := box.new(entryBar, riskTop, tradeRight, riskBottom, border_color = color.new(stopColor, 100), bgcolor = color.new(stopColor, 92))
+
+    if na(tradeRewardBox)
+        tradeRewardBox := box.new(entryBar, rewardTop, tradeRight, rewardBottom, border_color = color.new(tradeColor, 100), bgcolor = color.new(tradeColor, 94))
+
+    box.set_left(tradeRiskBox, entryBar)
+    box.set_right(tradeRiskBox, tradeRight)
+    box.set_top(tradeRiskBox, riskTop)
+    box.set_bottom(tradeRiskBox, riskBottom)
+    box.set_bgcolor(tradeRiskBox, color.new(stopColor, 92))
+
+    box.set_left(tradeRewardBox, entryBar)
+    box.set_right(tradeRewardBox, tradeRight)
+    box.set_top(tradeRewardBox, rewardTop)
+    box.set_bottom(tradeRewardBox, rewardBottom)
+
+    if na(tradeEntryTag)
+        tradeEntryTag := label.new(tradeRight, entryPrice, "", style = label.style_label_left, color = C_CARD, textcolor = C_WHITE, size = size.tiny)
+
+    if na(tradeStopTag)
+        tradeStopTag := label.new(tradeRight, activeStop, "", style = label.style_label_left, color = stopColor, textcolor = color.white, size = size.tiny)
+
+    if na(tradeTp1Tag)
+        tradeTp1Tag := label.new(tradeRight, tp1Price, "", style = label.style_label_left, color = color.new(C_GREEN, 15), textcolor = color.white, size = size.tiny)
+
+    if na(tradeTp2Tag)
+        tradeTp2Tag := label.new(tradeRight, tp2Price, "", style = label.style_label_left, color = C_GREEN, textcolor = color.white, size = size.tiny)
+
+    label.set_xy(tradeEntryTag, tradeRight, entryPrice)
+    label.set_text(tradeEntryTag, "ENTRY  " + f_price(entryPrice))
+    label.set_xy(tradeStopTag, tradeRight, activeStop)
+
+    string stopLabel = "SL  "
+    if stopLocksProfit
+        stopLabel := "LOCK  "
+
+    label.set_text(tradeStopTag, stopLabel + f_price(activeStop))
+    label.set_color(tradeStopTag, stopColor)
+    label.set_xy(tradeTp1Tag, tradeRight, tp1Price)
+    label.set_text(tradeTp1Tag, "TP1  " + f_price(tp1Price))
+    label.set_xy(tradeTp2Tag, tradeRight, tp2Price)
+    label.set_text(tradeTp2Tag, "TP2  " + f_price(tp2Price))
+else
+    if not na(tradeEntryLine)
+        line.delete(tradeEntryLine)
+        tradeEntryLine := na
+
+    if not na(tradeStopLine)
+        line.delete(tradeStopLine)
+        tradeStopLine := na
+
+    if not na(tradeTp1Line)
+        line.delete(tradeTp1Line)
+        tradeTp1Line := na
+
+    if not na(tradeTp2Line)
+        line.delete(tradeTp2Line)
+        tradeTp2Line := na
+
+    if not na(tradeRiskBox)
+        box.delete(tradeRiskBox)
+        tradeRiskBox := na
+
+    if not na(tradeRewardBox)
+        box.delete(tradeRewardBox)
+        tradeRewardBox := na
+
+    if not na(tradeEntryTag)
+        label.delete(tradeEntryTag)
+        tradeEntryTag := na
+
+    if not na(tradeStopTag)
+        label.delete(tradeStopTag)
+        tradeStopTag := na
+
+    if not na(tradeTp1Tag)
+        label.delete(tradeTp1Tag)
+        tradeTp1Tag := na
+
+    if not na(tradeTp2Tag)
+        label.delete(tradeTp2Tag)
+        tradeTp2Tag := na
+
+// ============================================================================
+// DASHBOARD POSITION
+// ============================================================================
+
+string resolvedDashboardPosition = position.top_right
+if dashboardPosition == "Top Left"
+    resolvedDashboardPosition := position.top_left
+else if dashboardPosition == "Bottom Right"
+    resolvedDashboardPosition := position.bottom_right
+else if dashboardPosition == "Bottom Left"
+    resolvedDashboardPosition := position.bottom_left
+
+// ============================================================================
+// DASHBOARD FONT
+// ============================================================================
+
+string dashboardTextSize = size.tiny
+if dashboardFont == "Large"
+    dashboardTextSize := size.normal
+else if dashboardFont == "Phone"
+    dashboardTextSize := size.small
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+var table dashboard = table.new(resolvedDashboardPosition, 4, 6, bgcolor = color.new(C_NAVY, 12), border_width = 0, frame_width = 1, frame_color = color.new(C_GRAY, 82))
+
+if barstate.isfirst
+    table.merge_cells(dashboard, 0, 0, 3, 0)
+
+f_dashboardCell(int column, int row, string textValue, color background, color foreground) =>
+    table.cell(dashboard, column, row, textValue, bgcolor = background, text_color = foreground, text_size = dashboardTextSize)
+
+f_dashboardPair(int row, string leftLabel, string leftValue, color leftColor, string rightLabel, string rightValue, color rightColor) =>
+    f_dashboardCell(0, row, leftLabel, color.new(C_CARD, 18), color.new(C_WHITE, 35))
+    f_dashboardCell(1, row, leftValue, color.new(leftColor, 22), C_WHITE)
+    f_dashboardCell(2, row, rightLabel, color.new(C_CARD, 18), color.new(C_WHITE, 35))
+    f_dashboardCell(3, row, rightValue, color.new(rightColor, 22), C_WHITE)
+
+// ============================================================================
+// DASHBOARD STATE
+// ============================================================================
+
+string positionText = "FLAT"
+color positionColor = C_GRAY
+if strategy.position_size > 0
+    positionText := "LONG"
+    positionColor := C_BLUE
+else if strategy.position_size < 0
+    positionText := "SHORT"
+    positionColor := C_SELL
+
+string trendText = "MIXED"
+color trendColor = C_GRAY
+if localBullish
+    trendText := "BULL"
+    trendColor := C_BLUE
+else if localBearish
+    trendText := "BEAR"
+    trendColor := C_SELL
+
+string htfText = "MIXED"
+color htfColor = C_ORANGE
+if not useHtfTrendFilter
+    htfText := "OFF"
+    htfColor := C_GRAY
+else if htfBullish
+    htfText := "BULL"
+    htfColor := C_BLUE
+else if htfBearish
+    htfText := "BEAR"
+    htfColor := C_SELL
+
+string setupStateText = "IDLE"
+color setupStateColor = C_GRAY
+if longState == STATE_READY and shortState == STATE_READY
+    setupStateText := "DUAL READY"
+    setupStateColor := C_GREEN
+else if longState == STATE_READY
+    setupStateText := "LONG READY"
+    setupStateColor := C_GREEN
+else if shortState == STATE_READY
+    setupStateText := "SHORT READY"
+    setupStateColor := C_GREEN
+else if longState == STATE_BUILD and shortState == STATE_BUILD
+    setupStateText := "DUAL BUILD"
+    setupStateColor := C_BLUE
+else if longState == STATE_BUILD
+    setupStateText := "LONG BUILD"
+    setupStateColor := C_BLUE
+else if shortState == STATE_BUILD
+    setupStateText := "SHORT BUILD"
+    setupStateColor := C_SELL
+
+string activeBlocker = "NO DIRECTION"
+if longState != STATE_IDLE and shortState == STATE_IDLE
+    activeBlocker := longBlocker
+else if shortState != STATE_IDLE and longState == STATE_IDLE
+    activeBlocker := shortBlocker
+else if localBullish
+    activeBlocker := longBlocker
+else if localBearish
+    activeBlocker := shortBlocker
+
+color blockerColor = C_RED
+if activeBlocker == "CLEAR"
+    blockerColor := C_GREEN
+else if activeBlocker == "WAIT SETUP" or activeBlocker == "NO DIRECTION"
+    blockerColor := C_GRAY
+else if activeBlocker == "COOLDOWN" or activeBlocker == "SPACING"
+    blockerColor := C_ORANGE
+
+string deltaText = "—"
+color deltaColor = C_GRAY
+if deltaReady
+    deltaText := str.tostring(deltaPct, "#.0") + "%"
+    if deltaPct > 0.0
+        deltaColor := C_GREEN
+    else if deltaPct < 0.0
+        deltaColor := C_RED
+
+string managementText = "IDLE"
+color managementColor = C_GRAY
+if strategy.position_size != 0
+    if trailingActive
+        managementText := "TRAIL"
+        managementColor := C_GREEN
+    else if breakEvenActive
+        managementText := "B/E"
+        managementColor := C_BLUE
+    else if tp1Hit
+        managementText := "TP1"
+        managementColor := C_ORANGE
+    else
+        managementText := "ACTIVE"
+        managementColor := C_ORANGE
+
+// ============================================================================
+// DRAW DASHBOARD
+// ============================================================================
+
+if barstate.islast
+    table.clear(dashboard, 0, 0, 3, 5)
+
+    if showDashboard
+        table.cell(dashboard, 0, 0, "RANGER  •  " + syminfo.ticker + "  " + timeframe.period, bgcolor = color.new(C_NAVY, 5), text_color = C_WHITE, text_size = dashboardTextSize, text_halign = text.align_left)
+
+        f_dashboardPair(1, "STATE", setupStateText, setupStateColor, "BLOCK", activeBlocker, blockerColor)
+        f_dashboardPair(2, "TREND", trendText, trendColor, "HTF", htfText, htfColor)
+
+        color rvolColor = C_GRAY
+        if relativeVolumeNow
+            rvolColor := C_GREEN
+
+        f_dashboardPair(3, "DELTA", deltaText, deltaColor, "RVOL", f_number(relativeVolume), rvolColor)
+
+        color adxColor = C_RED
+        if adxOk
+            adxColor := C_GREEN
+
+        f_dashboardPair(4, "POC", f_price(pocPrice), C_ORANGE, "ADX", str.tostring(adx, "#.0"), adxColor)
+        f_dashboardPair(5, "POS", positionText, positionColor, "MANAGE", managementText, managementColor)
+
+// ============================================================================
+// ALERT CONDITIONS
+// ============================================================================
+
+alertcondition(longEntry, title = "Ranger V2.2 Long Entry", message = "BULLISH ENTRY | Ranger V2.2 | {{ticker}} {{interval}}")
+alertcondition(shortEntry, title = "Ranger V2.2 Short Entry", message = "BEARISH ENTRY | Ranger V2.2 | {{ticker}} {{interval}}")
+alertcondition(longPositionClosed, title = "Ranger V2.2 Long Exit", message = "LONG EXIT | Ranger V2.2 | {{ticker}} {{interval}}")
+alertcondition(shortPositionClosed, title = "Ranger V2.2 Short Exit", message = "SHORT EXIT | Ranger V2.2 | {{ticker}} {{interval}}")
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+
+plot(deltaPct, "LTF Delta %", display = display.data_window)
+plot(deltaNet, "LTF Net Delta", display = display.data_window)
+plot(deltaBuyVolume, "Estimated Buy Volume", display = display.data_window)
+plot(deltaSellVolume, "Estimated Sell Volume", display = display.data_window)
+plot(bullishSubbarShare * 100.0, "Bull Intrabar %", display = display.data_window)
+plot(bearishSubbarShare * 100.0, "Bear Intrabar %", display = display.data_window)
+plot(relativeVolume, "Relative Volume", display = display.data_window)
+plot(pocPrice, "Developing POC", display = display.data_window)
+plot(vahPrice, "Developing VAH", display = display.data_window)
+plot(valPrice, "Developing VAL", display = display.data_window)
+plot(longAnchorPoc, "Frozen Long POC", display = display.data_window)
+plot(shortAnchorPoc, "Frozen Short POC", display = display.data_window)
+plot(roc, "ROC", display = display.data_window)
+plot(bop, "BOP", display = display.data_window)
+plot(adx, "ADX", display = display.data_window)
