@@ -19,9 +19,16 @@ strategy(title = "MNQ Volume Delta Strategy", shorttitle = "MNQ VolD", overlay =
 // ============================================================================
 // STAGE 1 — VOLUME DELTA / CVD INPUTS
 // ============================================================================
+// NOTE: seconds-based lower timeframes (e.g. "1S") raise a runtime error
+// (RE10063) on accounts below TradingView Premium. "Bar Polarity" is the
+// default so the script runs on any plan out of the box; switch to
+// "Lower Timeframe (Accurate)" only if both (a) your plan supports the
+// resolution you pick and (b) it is strictly below the chart's own
+// timeframe (e.g. "1" on a 3m/5m/15m chart) — a 1-minute chart has no
+// valid non-seconds lower timeframe at all without Premium.
 const string G_DELTA = "Volume Delta"
-deltaMethodInput    = input.string("Lower Timeframe (Accurate)", "Delta Calculation Method", options = ["Lower Timeframe (Accurate)", "Bar Polarity (Simple)"], group = G_DELTA)
-ltfResolutionInput  = input.timeframe("1S", "Lower Timeframe Resolution", group = G_DELTA)
+deltaMethodInput    = input.string("Bar Polarity (Simple)", "Delta Calculation Method", options = ["Lower Timeframe (Accurate)", "Bar Polarity (Simple)"], group = G_DELTA)
+ltfResolutionInput  = input.timeframe("1", "Lower Timeframe Resolution", group = G_DELTA)
 deltaMaLenInput     = input.int(20, "Delta Moving Average Length", minval = 2, group = G_DELTA)
 deltaZLenInput      = input.int(20, "Delta Z-Score Lookback", minval = 2, group = G_DELTA)
 cvdResetDailyInput  = input.bool(true, "Reset CVD Daily", group = G_DELTA)
@@ -187,7 +194,19 @@ showQualityScoreInput = input.bool(true, "Show Entry Quality Score Label", group
 // ============================================================================
 // STAGE 1 — VOLUME DELTA / CVD CALCULATIONS
 // ============================================================================
-[ltfClose, ltfOpen, ltfVol] = request.security_lower_tf(syminfo.tickerid, ltfResolutionInput, [close, open, volume])
+// Only call request.security_lower_tf() when the configured resolution is
+// strictly below the chart's own timeframe (e.g. "1" is invalid on a
+// 1-minute chart with no seconds-based plan) — otherwise skip it entirely
+// and fall through to the bar-polarity method automatically.
+bool ltfResolutionValid = timeframe.in_seconds(ltfResolutionInput) < timeframe.in_seconds(timeframe.period)
+array<float> ltfClose = array.new_float(0)
+array<float> ltfOpen = array.new_float(0)
+array<float> ltfVol = array.new_float(0)
+if ltfResolutionValid
+    [ltfC, ltfO, ltfV] = request.security_lower_tf(syminfo.tickerid, ltfResolutionInput, [close, open, volume])
+    ltfClose := ltfC
+    ltfOpen := ltfO
+    ltfVol := ltfV
 
 float ltfBuyVol = 0.0
 float ltfSellVol = 0.0
