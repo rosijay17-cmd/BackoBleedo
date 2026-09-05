@@ -1144,8 +1144,7 @@ bool shortEntry = barstate.isconfirmed and flat and tradeDirectionShortOk and co
 // BLOCKER DIAGNOSTICS
 // ============================================================================
 
-string longBlocker =
-    tradeDirection == "Short Only" ? "LONGS OFF" :
+string longBlocker = tradeDirection == "Short Only" ? "LONGS OFF" :
     not inTradeSession ? "SESSION" :
     not dailyTradeLimitPass ? "TRADE LIMIT" :
     not cooldownPass ? "COOLDOWN" :
@@ -1163,8 +1162,7 @@ string longBlocker =
     strategy.position_size != 0 ? "POSITION" :
     "CLEAR"
 
-string shortBlocker =
-    tradeDirection == "Long Only" ? "SHORTS OFF" :
+string shortBlocker = tradeDirection == "Long Only" ? "SHORTS OFF" :
     not inTradeSession ? "SESSION" :
     not dailyTradeLimitPass ? "TRADE LIMIT" :
     not cooldownPass ? "COOLDOWN" :
@@ -1866,14 +1864,12 @@ else
 // DASHBOARD
 // ============================================================================
 
-resolvedDashboardPosition =
-    dashboardPosition == "Top Left" ? position.top_left :
+resolvedDashboardPosition = dashboardPosition == "Top Left" ? position.top_left :
     dashboardPosition == "Bottom Right" ? position.bottom_right :
     dashboardPosition == "Bottom Left" ? position.bottom_left :
     position.top_right
 
-dashboardTextSize =
-    dashboardFont == "Large" ? size.normal :
+dashboardTextSize = dashboardFont == "Large" ? size.normal :
     dashboardFont == "Phone" ? size.small :
     size.tiny
 
