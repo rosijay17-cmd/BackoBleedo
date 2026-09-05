@@ -1,0 +1,1622 @@
+//@version=6
+strategy(
+     title = "Dynamic Markov Capacity + PDH/PDL + Liquidity + Retracements [v6]",
+     shorttitle = "Markov Liquidity Capacity v6",
+     overlay = true,
+     initial_capital = 100000,
+     currency = currency.USD,
+     pyramiding = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.05,
+     slippage = 1,
+     process_orders_on_close = true,
+     max_lines_count = 300,
+     max_labels_count = 300,
+     max_boxes_count = 300,
+     max_bars_back = 1100,
+     calc_on_every_tick = true
+)
+// calc_on_every_tick: "dashboard only comes at candle open" is this
+// parameter's default (false) doing exactly what it's documented to do --
+// with it false, the WHOLE script (table draws included, not just orders)
+// only re-executes once per bar for the still-forming realtime bar, so
+// everything freezes at whatever it read at that bar's open until the next
+// bar opens. Setting it true makes the script re-run on every incoming
+// price tick, so the dashboard (and every other live read) stays current
+// through the whole bar, not just its first instant. Cost: the Markov
+// loop (up to 1000 iterations) now runs on every tick instead of once per
+// bar, and backtest fills simulate intrabar movement more precisely rather
+// than only at bar boundaries -- both expected, acceptable trade-offs for
+// a script meant to be watched live, not a bug to work around.
+// max_bars_back: the Markov transition loop below indexes close[i]/atr[i]
+// with a VARIABLE loop index up to markovLookback (max input 1000), which
+// Pine's auto-detection cannot size from a for-loop bound alone -- without
+// this, the model silently runs out of history sooner on higher timeframes
+// (e.g. 1H) than on lower ones, since the same bar count reaches further
+// back in calendar time, and "Current Markov State" gets stuck at its
+// default (Neutral, 33/33/33) instead of ever computing a real read.
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS — RISK / TRADING CAPACITY
+//──────────────────────────────────────────────────────────────────────────────
+groupRisk = "1. Risk and Trading Capacity"
+
+riskPct = input.float(
+     defval = 1.0,
+     title = "Risk per Trade (% of Strategy Equity)",
+     minval = 0.1,
+     maxval = 10.0,
+     step = 0.1,
+     group = groupRisk
+)
+
+atrLength = input.int(
+     defval = 14,
+     title = "ATR Length",
+     minval = 1,
+     group = groupRisk
+)
+
+atrStopMult = input.float(
+     defval = 2.0,
+     title = "Initial Stop Distance (ATR Multiplier)",
+     minval = 0.1,
+     step = 0.1,
+     group = groupRisk
+)
+
+volumeLength = input.int(
+     defval = 20,
+     title = "Average Volume Length",
+     minval = 1,
+     group = groupRisk
+)
+
+maxParticipationPct = input.float(
+     defval = 5.0,
+     title = "Maximum Volume Participation (%)",
+     minval = 0.1,
+     maxval = 100.0,
+     step = 0.1,
+     group = groupRisk
+)
+
+maxUnits = input.float(
+     defval = 1000000,
+     title = "Absolute Maximum Position Size",
+     minval = 1,
+     step = 1,
+     group = groupRisk
+)
+
+lotIncrement = input.float(
+     defval = 1.0,
+     title = "Order-Size Increment / Lot Size",
+     minval = 0.000001,
+     step = 1,
+     group = groupRisk
+)
+
+bypassCapacityGateInput = input.bool(
+     defval = true,
+     title = "Bypass Capacity Gate (I Manage My Own Risk)",
+     group = groupRisk,
+     tooltip = "The Risk/Liquidity Capacity math above can floor Position Size to 0 (\"TOO SMALL\") and block every entry regardless of what the trigger/trend/Markov gates say. With this on, entries are never blocked by that math -- orders use at least one lot/contract (finalPositionQty = max(Position Size, Order-Size Increment)) even if the calculated capacity rounds to zero. Turn this off to let the Risk % / ATR stop / capacity inputs above actually govern order size again."
+)
+
+useConfidenceSizingInput = input.bool(
+     defval = true,
+     title = "Scale Size by Markov Confidence",
+     group = groupRisk,
+     tooltip = "Every qualifying entry currently uses the same finalPositionQty regardless of whether probabilityBull/probabilityBear barely cleared its threshold or read near certainty -- the entry gate keeps only pass/fail, discarding how confident the model actually was. With this on, size scales linearly from the floor below (at the threshold) up to 100% of finalPositionQty (at 100% probability). This is a risk-SHAPING tool, not an edge-multiplier -- per this repo's quant-research-notes skill (Kuntz 2020, beta dispersion/market timing), the equivalent pattern there reduced volatility with a modest trade-off in average return, not the other way around. Rounds down to whole lots, floored at one lot/contract minimum -- at Position Size 1, this has no visible effect since there's nothing smaller than one lot to scale down to; it only differentiates once finalPositionQty is 2 or more."
+)
+
+confidenceSizingFloorPctInput = input.float(
+     defval = 50.0,
+     title = "Minimum Size At Threshold (%)",
+     minval = 10.0,
+     maxval = 100.0,
+     step = 5.0,
+     group = groupRisk,
+     tooltip = "The fraction of finalPositionQty used when the Markov probability is sitting exactly at its entry threshold (barely qualifying). Scales up linearly to 100% as the probability approaches certainty. 100% here disables any scaling effect (every qualifying signal trades full size, same as before this feature existed)."
+)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS — PREVIOUS-DAY HIGH / LOW
+//──────────────────────────────────────────────────────────────────────────────
+groupPD = "2. Previous-Day High / Low"
+
+showPDH_PDL = input.bool(
+     defval = true,
+     title = "Plot Previous-Day High and Low",
+     group = groupPD
+)
+
+usePDH_PDLFilter = input.bool(
+     defval = true,
+     title = "Require PDH/PDL Directional Filter",
+     group = groupPD,
+     tooltip = "Longs require price above PDL. Shorts require price below PDH. This is a loose sanity check on the ZONE-based entry only (\"don't go long already below yesterday's low\") -- it has never been a breakout signal by itself. For an actual PDH/PDL breakout entry, see \"Enable PDH/PDL Breakout Entries\" below."
+)
+
+usePDBreakoutTrigger = input.bool(
+     defval = true,
+     title = "Enable PDH/PDL Breakout Entries",
+     group = groupPD,
+     tooltip = "A genuine second, independent entry path: close crossing above PDH goes long, close crossing below PDL goes short -- fires on its own, in addition to the zone-based rejection-candle trigger, not instead of it. Still gated by the Trend/Markov/Capacity/Cooldown filters, but NOT by the retracement-zone filter (a breakout is, by definition, not a pullback into a zone)."
+)
+
+showBlockedBreakoutLabelsInput = input.bool(
+     defval = false,
+     title = "Label Blocked PDH/PDL Breakouts (Debug)",
+     group = groupPD,
+     tooltip = "Off by default -- these were a debugging aid (cluttered the chart with a label on every blocked PDH/PDL cross) and are no longer needed now that the Markov threshold that caused most of them is lowered. Turn on again if you need to diagnose why a specific breakout didn't fire: draws a small label directly ON the historical bar naming the gate that blocked it (the dashboard's gate rows only ever reflect the CURRENT bar, not one you've scrolled back to)."
+)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS — SWING LIQUIDITY
+//──────────────────────────────────────────────────────────────────────────────
+groupLiquidity = "3. Swing Liquidity Levels"
+
+pivotLeft = input.int(
+     defval = 5,
+     title = "Pivot Left Bars",
+     minval = 1,
+     group = groupLiquidity
+)
+
+pivotRight = input.int(
+     defval = 5,
+     title = "Pivot Right Bars (Confirmation Delay)",
+     minval = 1,
+     group = groupLiquidity
+)
+
+maxLiquidityLevels = input.int(
+     defval = 12,
+     title = "Maximum Active Liquidity Levels",
+     minval = 1,
+     maxval = 100,
+     group = groupLiquidity
+)
+
+showLiquidityLevels = input.bool(
+     defval = true,
+     title = "Plot Swing Liquidity Levels",
+     group = groupLiquidity
+)
+
+liquidityZoneCapacityMultInput = input.float(
+     defval = 5.0,
+     title = "Zone Volume Capacity (x Avg Volume)",
+     minval = 1.0,
+     group = groupLiquidity,
+     tooltip = "Each liquidity zone's 'health' starts at 100% and decays toward 0% as buy+sell volume trades inside it, based on this multiple of the average bar volume -- a zone that has absorbed a lot of volume without being swept reads as weaker/more contested than a fresh one. Same general concept as LuxAlgo's Liquidity Delta Profiler indicator, reimplemented here using this script's own intrabar buy/sell classification rather than porting that (CC BY-NC-SA licensed) script's code directly."
+)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS — RETRACEMENT ZONES
+//──────────────────────────────────────────────────────────────────────────────
+groupFib = "4. Dynamic Retracement Zones"
+
+showRetracementZone = input.bool(
+     defval = true,
+     title = "Plot 50%–61.8% Retracement Zone",
+     group = groupFib
+)
+
+requireRetracement = input.bool(
+     defval = true,
+     title = "Require Price Within Retracement Zone",
+     group = groupFib,
+     tooltip = "Longs use retracements from a confirmed upward impulse. Shorts use retracements from a confirmed downward impulse."
+)
+
+maxZonesInput = input.int(
+     defval = 5,
+     title = "Maximum Zones Kept On Chart",
+     minval = 1,
+     maxval = 20,
+     group = groupFib,
+     tooltip = "Keeps this many of the most recent supply/demand zones visible at once instead of only the single latest one -- so a larger, still-relevant zone from an earlier impulse doesn't silently disappear the moment a newer, smaller impulse confirms."
+)
+
+touchDecayInput = input.float(
+     defval = 0.7,
+     title = "Probability Decay Per Prior Touch",
+     minval = 0.1,
+     maxval = 1.0,
+     step = 0.05,
+     group = groupFib,
+     tooltip = "Each zone's displayed hold probability is multiplied by this factor for every time price has already touched it -- a first test carries full weight, each retest is discounted, per the \"a level gets less reliable each time it's retested\" finding in this repo's quant-research-notes skill (Person 2004, references/candlestick-patterns-and-pivot-confluence-person.md). 0.7 means each retest keeps 70% of the prior confidence."
+)
+
+minZoneHoldProbabilityInput = input.float(
+     defval = 40.0,
+     title = "Minimum Zone Hold Probability For Entry (%)",
+     minval = 0.0,
+     maxval = 100.0,
+     step = 5.0,
+     group = groupFib,
+     tooltip = "When \"Require Price Within Retracement Zone\" is on, an entry now only counts if price is inside an UNBROKEN zone whose live hold-probability score (the same one shown on its label) is at least this. Replaces the old check, which only tested raw price-in-band math and had no idea whether that specific zone had already failed."
+)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS — DYNAMIC MARKOV MODEL
+//──────────────────────────────────────────────────────────────────────────────
+groupMarkov = "5. Dynamic Markov Regime Model"
+
+markovLookback = input.int(
+     defval = 150,
+     title = "Transition Estimation Lookback",
+     minval = 30,
+     maxval = 1000,
+     group = groupMarkov
+)
+
+stateThresholdATR = input.float(
+     defval = 0.20,
+     title = "State Threshold (ATR Fraction)",
+     minval = 0.01,
+     maxval = 3.0,
+     step = 0.01,
+     group = groupMarkov,
+     tooltip = "A move above ATR × threshold is bullish. A move below -ATR × threshold is bearish."
+)
+
+minimumBullProbability = input.float(
+     defval = 0.38,
+     title = "Minimum Bull Probability for Longs",
+     minval = 0.01,
+     maxval = 0.99,
+     step = 0.01,
+     group = groupMarkov,
+     tooltip = "Lowered from the original 0.45 default -- across live testing this 3-state model's Bull/Bear reads routinely land in the mid-30s to low-40s% (Neutral typically absorbs 20-30% of the distribution), so 45% was rarely clearable and was the single most common gate blocker across both the zone and PDH/PDL breakout paths."
+)
+
+minimumBearProbability = input.float(
+     defval = 0.38,
+     title = "Minimum Bear Probability for Shorts",
+     minval = 0.01,
+     maxval = 0.99,
+     step = 0.01,
+     group = groupMarkov,
+     tooltip = "Lowered from the original 0.45 default -- across live testing this 3-state model's Bull/Bear reads routinely land in the mid-30s to low-40s% (Neutral typically absorbs 20-30% of the distribution), so 45% was rarely clearable and was the single most common gate blocker across both the zone and PDH/PDL breakout paths."
+)
+
+showMarkovTable = input.bool(
+     defval = true,
+     title = "Show Markov / Capacity Table",
+     group = groupMarkov
+)
+
+dashboardPositionInput = input.string(
+     defval = "Top Left",
+     title = "Dashboard Position",
+     options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"],
+     group = groupMarkov,
+     tooltip = "Default moved off the top-right corner, on purpose -- that's where the zone price-scale tags, PDH/PDL labels, and the live price marker all already stack up, which can bury the table behind them. Top Left keeps it clear of that clutter."
+)
+
+dashboardSizeInput = input.string(
+     defval = "Phone",
+     title = "Dashboard Text Size",
+     options = ["Compact", "Phone", "Medium", "Large"],
+     group = groupMarkov,
+     tooltip = "Same size ladder used elsewhere in this repo (Academia_PO3_Professional_v3.pine): Compact/Phone render at the smallest readable text so the 13-row table doesn't dominate a phone screen; Medium/Large are for a full desktop chart."
+)
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS — EXECUTION
+//──────────────────────────────────────────────────────────────────────────────
+groupExecution = "6. Execution"
+
+allowShorts = input.bool(
+     defval = true,
+     title = "Enable Short Trades",
+     group = groupExecution
+)
+
+useTrendFilter = input.bool(
+     defval = true,
+     title = "Use EMA Trend Filter",
+     group = groupExecution
+)
+
+fastEmaLength = input.int(
+     defval = 20,
+     title = "Fast EMA Length",
+     minval = 1,
+     group = groupExecution
+)
+
+slowEmaLength = input.int(
+     defval = 50,
+     title = "Slow EMA Length",
+     minval = 2,
+     group = groupExecution
+)
+
+useZoneBreakExitInput = input.bool(
+     defval = true,
+     title = "Exit on Entry Zone Break",
+     group = groupExecution,
+     tooltip = "Closes the position if the specific supply/demand zone the trade entered from is broken (price closes fully through it), independent of the static ATR stop. Uses the zone captured at entry time, not just whatever is newest in the zone array."
+)
+
+useMarkovFlipExitInput = input.bool(
+     defval = true,
+     title = "Exit on Markov Regime Flip",
+     group = groupExecution,
+     tooltip = "Closes the position if the live Markov transition model's probability for the opposing direction rises to or above this strategy's own entry threshold (Minimum Bull/Bear Probability in the Markov group), i.e. the regime that justified the entry has flipped against it."
+)
+
+// MERGED: same standardized alert convention now used across this repo's
+// alert-wired scripts (Hierarchical_Trading_System_v6_Fakeout_Protected.pine,
+// Sweep_Trend_Continuation_SVP_Merged.pine) -- kept as its own toggle
+// since strategy.entry()/strategy.exit()/strategy.close() fire order
+// events regardless, but the dynamic alert() message body is the only
+// thing that states WHICH of this script's two independent entry paths
+// (zone rejection vs PDH/PDL breakout) actually triggered.
+enableDynamicAlerts = input.bool(
+     defval = true,
+     title = "Enable Dynamic alert() Calls",
+     group = groupExecution,
+     tooltip = "When on, every accepted entry and every exit (ATR stop, Zone Break, Markov Flip) fires a descriptive alert() message -- BULLISH ENTRY / BEARISH ENTRY naming the entry path (Zone vs PDH/PDL Breakout), LONG EXIT / SHORT EXIT naming the exit reason. When off, entries/exits still happen and the alertcondition() rows below still fire, but no alert() message is sent -- which looks identical to a broken alert if you forget this is off."
+)
+
+//──────────────────────────────────────────────────────────────────────────────
+// FUNCTIONS
+//──────────────────────────────────────────────────────────────────────────────
+
+// State definitions:
+// +1 = bullish
+//  0 = neutral
+// -1 = bearish
+f_getState(float priceChange, float threshold) =>
+    int result = 0
+
+    if priceChange > threshold
+        result := 1
+    else if priceChange < -threshold
+        result := -1
+
+    result
+
+// MERGED: standardized alert-message convention used across this repo --
+// every message leads with an ALL-CAPS directional tag (BULLISH ENTRY /
+// BEARISH ENTRY / LONG EXIT / SHORT EXIT), then a label, then
+// ticker/timeframe/price. "Ranger" is this script's alert label from
+// now on, same as Sweep_Trend_Continuation_SVP_Merged.pine.
+f_alertMsg(string kind, string label, float px) =>
+    kind + " | " + label + " | " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(px, format.mintick)
+
+f_price(float value) =>
+    na(value) ? "—" : str.tostring(value, format.mintick)
+
+//──────────────────────────────────────────────────────────────────────────────
+// CORE MARKET CALCULATIONS
+//──────────────────────────────────────────────────────────────────────────────
+float atr = ta.atr(atrLength)
+float averageVolume = ta.sma(volume, volumeLength)
+
+float fastEma = ta.ema(close, fastEmaLength)
+float slowEma = ta.ema(close, slowEmaLength)
+
+bool bullishTrend = fastEma > slowEma
+bool bearishTrend = fastEma < slowEma
+
+// Previous completed daily candle levels.
+// The [1] reference and lookahead_off avoid higher-timeframe lookahead bias.
+float pdh = request.security(
+     syminfo.tickerid,
+     "D",
+     high[1],
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+)
+
+float pdl = request.security(
+     syminfo.tickerid,
+     "D",
+     low[1],
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off
+)
+
+//──────────────────────────────────────────────────────────────────────────────
+// TRADING CAPACITY ENGINE
+//
+// Position Size = min(Risk Capacity, Liquidity Capacity, Absolute Maximum)
+//
+// Risk Capacity = Risk Budget / (ATR Stop Distance × Point Value)
+//──────────────────────────────────────────────────────────────────────────────
+float stopDistance = atr * atrStopMult
+float pointValue = math.max(syminfo.pointvalue, 0.000001)
+
+float riskBudget = strategy.equity * (riskPct / 100.0)
+
+float riskCapacity = stopDistance > 0
+     ? riskBudget / (stopDistance * pointValue)
+     : 0.0
+
+float liquidityCapacity = not na(averageVolume)
+     ? averageVolume * (maxParticipationPct / 100.0)
+     : 0.0
+
+float rawPositionCapacity = math.min(riskCapacity, liquidityCapacity)
+rawPositionCapacity := math.min(rawPositionCapacity, maxUnits)
+
+// Round down to avoid sizing above the calculated risk allowance.
+float positionQty = math.floor(rawPositionCapacity / lotIncrement) * lotIncrement
+
+// The actual size/gate every entry and order below uses. With the bypass
+// off, this is identical to positionQty -- the capacity math still fully
+// governs sizing and can still floor to 0 and block entries, unchanged.
+// With it on, floored-to-zero capacity no longer blocks anything; orders
+// fall back to one lot/contract instead.
+float finalPositionQty = bypassCapacityGateInput ? math.max(positionQty, lotIncrement) : positionQty
+
+//──────────────────────────────────────────────────────────────────────────────
+// FOOTPRINT ORDER-FLOW CONFIRMATION
+//
+// A single footprint-style imbalance is one technique, not confluence on
+// its own (paper #9's own finding: "a 2-trend system improves an already
+// trending market, but barely moves the needle on a noisy one" -- the
+// same caution applies to any single order-flow read). This is wired in
+// as an ADDITIONAL confirmation gate on every existing entry path, not a
+// new trigger of its own, per this repo's quant-research-notes skill
+// (references/intraday-volume-volatility-correlation-graczyk.md and the
+// Volume_Footprint_Math_Geometry_Intro.pine indicator this session).
+//
+// Classification method is the same intrabar-tick approximation already
+// used twice elsewhere in this repo (Regime_Engine_TCO_Gatekeeper.pine's
+// CVD module, Stacked_Buy_Sell_Volume_Columns.pine): pull each bar's own
+// lower-timeframe sub-bars via request.security_lower_tf(), classify each
+// by its own close-vs-open, sum volume per side. Real bid/ask order-flow
+// data is not available to Pine Script at all, on any TradingView plan --
+// this is the closest legitimate proxy, not the real thing.
+//
+// Deliberately lighter than the full per-tick lattice/profile in
+// Volume_Footprint_Math_Geometry_Intro.pine: a confirmation gate only
+// needs "did recent order flow lean hard enough to agree with this
+// trade's direction," not a full price-level table. Porting the specific
+// computation, not the whole indicator, per the plan discussed this
+// session.
+//──────────────────────────────────────────────────────────────────────────────
+groupFootprint = "8. Footprint Confirmation"
+
+useFootprintFilterInput = input.bool(
+     defval = true,
+     title = "Require Order-Flow Imbalance Confirmation",
+     group = groupFootprint,
+     tooltip = "Only allow an entry (either path, either direction) when the trailing footprint window's buy/sell volume leans hard enough in the trade's own direction. An additional confirmation gate, not a new trigger -- it can only block a signal the trigger/trend/Markov gates already approved, never fire one on its own."
+)
+
+footprintLtfInput = input.timeframe(
+     defval = "1",
+     title = "Footprint Sub-Timeframe",
+     group = groupFootprint,
+     tooltip = "Lower timeframe sampled for the buy/sell volume classification. Must be lower than the chart timeframe."
+)
+
+footprintWindowInput = input.int(
+     defval = 5,
+     title = "Footprint Window (Bars)",
+     minval = 2,
+     maxval = 60,
+     group = groupFootprint,
+     tooltip = "How many trailing bars' buy/sell volume are summed for the imbalance read. Matches Volume_Footprint_Math_Geometry_Intro.pine's own default Window Bars."
+)
+
+footprintImbalancePctInput = input.float(
+     defval = 130.0,
+     title = "Imbalance Threshold (%)",
+     minval = 100.0,
+     maxval = 1000.0,
+     step = 10.0,
+     group = groupFootprint,
+     tooltip = "One side's window volume must exceed the opposing side's by this percentage to count as an imbalance. 300%, the classical figure, is Volume_Footprint_Math_Geometry_Intro.pine's own default -- but that threshold is meant for a SINGLE price-level row in a footprint table, a genuinely rare, extreme single-tick event. Applied here to a rolling multi-bar TOTAL volume sum instead, 300% was nearly unclearable in practice (live testing saw a real 1.39:1 buy lean still read as NEUTRAL) and was blocking every entry path regardless of what the trigger/trend/Markov gates said. Lowered to 130% (one side needs ~30% more volume than the other) so it reads real, achievable leans in this window-sum context."
+)
+
+[footprintLtfClose, footprintLtfOpen, footprintLtfVolume] = request.security_lower_tf(
+     syminfo.tickerid,
+     footprintLtfInput,
+     [close, open, volume]
+)
+
+float footprintBarBuyVol = 0.0
+float footprintBarSellVol = 0.0
+
+if array.size(footprintLtfClose) > 0
+    for footprintI = 0 to array.size(footprintLtfClose) - 1
+        float footprintSubClose = array.get(footprintLtfClose, footprintI)
+        float footprintSubOpen = array.get(footprintLtfOpen, footprintI)
+        float footprintSubVolume = array.get(footprintLtfVolume, footprintI)
+
+        if footprintSubClose > footprintSubOpen
+            footprintBarBuyVol += footprintSubVolume
+        else if footprintSubClose < footprintSubOpen
+            footprintBarSellVol += footprintSubVolume
+        else
+            // Sub-bar closed flat -- can't classify direction, so split
+            // the volume evenly rather than assigning it to either side.
+            footprintBarBuyVol += footprintSubVolume * 0.5
+            footprintBarSellVol += footprintSubVolume * 0.5
+
+// Rolling window sums -- math.sum() over the per-bar totals just
+// computed, rather than a manually maintained running accumulator.
+float footprintWindowBuyVol = math.sum(footprintBarBuyVol, footprintWindowInput)
+float footprintWindowSellVol = math.sum(footprintBarSellVol, footprintWindowInput)
+
+float footprintImbalanceRatio = footprintImbalancePctInput / 100.0
+bool footprintBuyImbalance = footprintWindowBuyVol > footprintWindowSellVol * footprintImbalanceRatio
+bool footprintSellImbalance = footprintWindowSellVol > footprintWindowBuyVol * footprintImbalanceRatio
+
+// Footprint POC -- a lightweight reference, not a gate. Which bar in the
+// trailing window carried the most total volume, using that bar's HL2 as
+// its representative price. Display-only (dashboard row below); unlike
+// imbalance, a POC being nearby isn't inherently bullish or bearish, so
+// it isn't wired into any AND-condition.
+float footprintPocPrice = na
+float footprintPocVol = 0.0
+
+for footprintJ = 0 to footprintWindowInput - 1
+    float footprintBarTotal = nz(footprintBarBuyVol[footprintJ]) + nz(footprintBarSellVol[footprintJ])
+    if footprintBarTotal > footprintPocVol
+        footprintPocVol := footprintBarTotal
+        footprintPocPrice := hl2[footprintJ]
+
+//──────────────────────────────────────────────────────────────────────────────
+// CONFIRMED SWING LIQUIDITY ZONES -- WITH VOLUME DELTA
+//
+// Pivot highs = potential buy-side liquidity (resting sell-stops/breakout
+// buys above the old high). Pivot lows = potential sell-side liquidity
+// (mirror, below the old low). Pivots are deliberately confirmation-delayed
+// by pivotRight bars; once plotted, a zone's own top/bottom do not repaint.
+//
+// Same general concept as LuxAlgo's "Liquidity Delta Profiler" (CC
+// BY-NC-SA 4.0) -- a zone around the pivot's wick that tracks buy/sell
+// volume as price revisits it, with a decay "health" reading and
+// sweep-invalidation -- reimplemented here as original code rather than
+// porting that script's licensed implementation. Two differences from
+// the source concept, both intentional:
+//   1. Volume split uses this script's OWN intrabar-tick classification
+//      (footprintBarBuyVol/footprintBarSellVol, computed above) instead
+//      of a single-bar close-position approximation -- the same "many
+//      small directional prints beats one bar's shape" upgrade already
+//      applied to the CVD/footprint modules elsewhere in this repo.
+//   2. One box per zone with a combined health/delta label, not four
+//      per-quadrant sub-boxes -- a lighter, "confirmation gate" scale
+//      matching how the footprint module above was scoped, not the full
+//      per-quadrant visual the source indicator builds.
+//──────────────────────────────────────────────────────────────────────────────
+float confirmedPivotHigh = ta.pivothigh(high, pivotLeft, pivotRight)
+float confirmedPivotLow = ta.pivotlow(low, pivotLeft, pivotRight)
+
+// @type One swing-liquidity zone. isHigh marks a buy-side (pivot-high)
+//       zone; false marks a sell-side (pivot-low) zone. buyVol/sellVol
+//       accumulate as price revisits the zone; capacity sets how much
+//       volume the zone can absorb before health reads 0%.
+type LiquidityZone
+    float top
+    float bottom
+    bool isHigh
+    bool swept
+    box zoneBox
+    label infoLabel
+    float buyVol
+    float sellVol
+    float capacity
+
+var array<LiquidityZone> liquidityZones = array.new<LiquidityZone>()
+
+if showLiquidityLevels and not na(confirmedPivotHigh)
+    int pivotBarIndex = bar_index - pivotRight
+    float zoneTop = confirmedPivotHigh
+    // Zone spans from the pivot high down to the top of that bar's own
+    // body (the wick above the body is where the resting liquidity
+    // actually sits) -- with an ATR-based minimum thickness so a
+    // near-zero-wick pivot bar doesn't produce a zero-height zone.
+    float zoneBottom = math.max(close[pivotRight], open[pivotRight])
+    if zoneTop - zoneBottom < atr * 0.1
+        zoneBottom := zoneTop - atr * 0.1
+
+    box newZoneBox = box.new(
+         left = pivotBarIndex,
+         top = zoneTop,
+         right = bar_index,
+         bottom = zoneBottom,
+         xloc = xloc.bar_index,
+         bgcolor = color.new(color.red, 88),
+         border_color = color.new(color.red, 60),
+         border_width = 1
+    )
+
+    label newInfoLabel = label.new(
+         x = bar_index,
+         y = (zoneTop + zoneBottom) / 2,
+         text = "",
+         xloc = xloc.bar_index,
+         style = label.style_label_left,
+         color = color.new(color.white, 100),
+         textcolor = color.red,
+         size = size.small
+    )
+
+    array.push(liquidityZones, LiquidityZone.new(zoneTop, zoneBottom, true, false, newZoneBox, newInfoLabel, 0.0, 0.0, averageVolume * liquidityZoneCapacityMultInput))
+
+    if array.size(liquidityZones) > maxLiquidityLevels
+        LiquidityZone oldZone = array.shift(liquidityZones)
+        box.delete(oldZone.zoneBox)
+        label.delete(oldZone.infoLabel)
+
+if showLiquidityLevels and not na(confirmedPivotLow)
+    int pivotBarIndex = bar_index - pivotRight
+    float zoneBottom = confirmedPivotLow
+    float zoneTop = math.min(close[pivotRight], open[pivotRight])
+    if zoneTop - zoneBottom < atr * 0.1
+        zoneTop := zoneBottom + atr * 0.1
+
+    box newZoneBox = box.new(
+         left = pivotBarIndex,
+         top = zoneTop,
+         right = bar_index,
+         bottom = zoneBottom,
+         xloc = xloc.bar_index,
+         bgcolor = color.new(color.lime, 88),
+         border_color = color.new(color.lime, 60),
+         border_width = 1
+    )
+
+    label newInfoLabel = label.new(
+         x = bar_index,
+         y = (zoneTop + zoneBottom) / 2,
+         text = "",
+         xloc = xloc.bar_index,
+         style = label.style_label_left,
+         color = color.new(color.white, 100),
+         textcolor = color.lime,
+         size = size.small
+    )
+
+    array.push(liquidityZones, LiquidityZone.new(zoneTop, zoneBottom, false, false, newZoneBox, newInfoLabel, 0.0, 0.0, averageVolume * liquidityZoneCapacityMultInput))
+
+    if array.size(liquidityZones) > maxLiquidityLevels
+        LiquidityZone oldZone = array.shift(liquidityZones)
+        box.delete(oldZone.zoneBox)
+        label.delete(oldZone.infoLabel)
+
+// Per-bar update: extend unswept zones, attribute this bar's buy/sell
+// volume into them (weighted by how much of the bar's range actually
+// overlaps the zone), refresh the health/delta label, and invalidate on
+// a genuine sweep. A buy-side (pivot-high) zone is swept the moment the
+// bar's HIGH trades through it -- a wick through the level already means
+// the resting liquidity was taken, whether or not the close reclaims it;
+// mirror logic for a sell-side zone and the bar's LOW.
+if array.size(liquidityZones) > 0
+    for zi = array.size(liquidityZones) - 1 to 0
+        LiquidityZone lz = array.get(liquidityZones, zi)
+
+        if not lz.swept
+            box.set_right(lz.zoneBox, bar_index)
+            label.set_x(lz.infoLabel, bar_index)
+
+            float overlapTop = math.min(high, lz.top)
+            float overlapBottom = math.max(low, lz.bottom)
+
+            if overlapTop > overlapBottom
+                float barRange = high - low
+                float overlapFrac = barRange > 0 ? (overlapTop - overlapBottom) / barRange : 1.0
+                lz.buyVol += footprintBarBuyVol * overlapFrac
+                lz.sellVol += footprintBarSellVol * overlapFrac
+
+            bool justSwept = lz.isHigh ? high > lz.top : low < lz.bottom
+
+            if justSwept
+                lz.swept := true
+                box.set_bgcolor(lz.zoneBox, color.new(color.gray, 90))
+                box.set_border_color(lz.zoneBox, color.new(color.gray, 70))
+                label.set_text(lz.infoLabel, (lz.isHigh ? "BSL " : "SSL ") + "SWEPT")
+                label.set_textcolor(lz.infoLabel, color.gray)
+            else
+                float zoneTotalVol = lz.buyVol + lz.sellVol
+                float zoneNetDelta = lz.buyVol - lz.sellVol
+                float zoneHealth = math.max(0.0, 100.0 - (zoneTotalVol / lz.capacity * 100.0))
+                color deltaColor = zoneNetDelta > 0 ? color.lime : zoneNetDelta < 0 ? color.red : color.gray
+
+                box.set_bgcolor(lz.zoneBox, color.new(deltaColor, 88))
+                label.set_text(lz.infoLabel, (lz.isHigh ? "BSL " : "SSL ") + str.tostring(zoneHealth, "#") + "% | " + (zoneNetDelta >= 0 ? "+" : "") + str.tostring(zoneNetDelta, format.volume))
+                label.set_textcolor(lz.infoLabel, deltaColor)
+
+//──────────────────────────────────────────────────────────────────────────────
+// DYNAMIC RETRACEMENT ZONES
+//
+// Pivot low → pivot high = confirmed upward impulse.
+// Pivot high → pivot low = confirmed downward impulse.
+//
+// Retracement zone = 50.0% through 61.8% of the most recent impulse.
+//──────────────────────────────────────────────────────────────────────────────
+var float latestPivotHigh = na
+var float latestPivotLow = na
+var int latestPivotType = 0  // +1 = high, -1 = low
+var int latestPivotHighBar = na
+var int latestPivotLowBar = na
+
+var float impulseHigh = na
+var float impulseLow = na
+var int impulseDirection = 0  // +1 = upward, -1 = downward
+var int impulseAnchorBar = na
+var int impulseSetBar = na
+
+if not na(confirmedPivotHigh)
+    if latestPivotType == -1 and not na(latestPivotLow)
+        impulseLow := latestPivotLow
+        impulseHigh := confirmedPivotHigh
+        impulseDirection := 1
+        impulseAnchorBar := latestPivotLowBar
+        impulseSetBar := bar_index
+
+    latestPivotHigh := confirmedPivotHigh
+    latestPivotHighBar := bar_index - pivotRight
+    latestPivotType := 1
+
+if not na(confirmedPivotLow)
+    if latestPivotType == 1 and not na(latestPivotHigh)
+        impulseHigh := latestPivotHigh
+        impulseLow := confirmedPivotLow
+        impulseDirection := -1
+        impulseAnchorBar := latestPivotHighBar
+        impulseSetBar := bar_index
+
+    latestPivotLow := confirmedPivotLow
+    latestPivotLowBar := bar_index - pivotRight
+    latestPivotType := -1
+
+float impulseRange = not na(impulseHigh) and not na(impulseLow)
+     ? math.abs(impulseHigh - impulseLow)
+     : na
+
+// Uptrend retracement: measure downward from impulse high.
+float bullishZoneUpper = impulseDirection == 1
+     ? impulseHigh - impulseRange * 0.500
+     : na
+
+float bullishZoneLower = impulseDirection == 1
+     ? impulseHigh - impulseRange * 0.618
+     : na
+
+// Downtrend retracement: measure upward from impulse low.
+float bearishZoneLower = impulseDirection == -1
+     ? impulseLow + impulseRange * 0.500
+     : na
+
+float bearishZoneUpper = impulseDirection == -1
+     ? impulseLow + impulseRange * 0.618
+     : na
+
+float activeZoneUpper = impulseDirection == 1 ? bullishZoneUpper : bearishZoneUpper
+float activeZoneLower = impulseDirection == 1 ? bullishZoneLower : bearishZoneLower
+
+// NOTE: the raw "is price between these two numbers" check that used to
+// live here (inBullishRetracement/inBearishRetracement) has been removed.
+// It only tested the latest impulse's band arithmetic and had no idea
+// whether that specific zone was already marked BROKEN or had decayed to
+// a low hold-probability from repeated touches -- so an entry could fire
+// inside a zone the dashboard itself had already invalidated. The trade
+// filter now uses inActiveDemandZone/inActiveSupplyZone instead, computed
+// further below from the same zone-array/probability system the display
+// already uses (see "TRADE CONDITIONS" and the zone-scoring loop above it).
+
+//──────────────────────────────────────────────────────────────────────────────
+// RETRACEMENT ZONES -- FRESH-IMPULSE TRIGGER ONLY
+// The actual zone boxes/labels/scoring are built further below, AFTER the
+// Markov model, because each zone's displayed hold-probability uses the
+// live probabilityBull/probabilityBear reading computed there.
+//──────────────────────────────────────────────────────────────────────────────
+bool freshImpulseZone = not na(impulseSetBar) and impulseSetBar == bar_index
+
+//──────────────────────────────────────────────────────────────────────────────
+// DYNAMIC THREE-STATE MARKOV MODEL
+//
+// The model counts state transitions across a rolling sample window:
+//
+// P(next state = j | current state = i) =
+// (Transition Count(i,j) + 1) / (Total Transitions from i + 3)
+//
+// The +1 values are Laplace smoothing, preventing zero-probability states.
+//──────────────────────────────────────────────────────────────────────────────
+int bearToBear = 0
+int bearToNeutral = 0
+int bearToBull = 0
+
+int neutralToBear = 0
+int neutralToNeutral = 0
+int neutralToBull = 0
+
+int bullToBear = 0
+int bullToNeutral = 0
+int bullToBull = 0
+
+int currentState = 0
+
+if bar_index > markovLookback + 2
+    int previousState = f_getState(
+         close[markovLookback] - close[markovLookback + 1],
+         atr[markovLookback] * stateThresholdATR
+    )
+
+    for i = markovLookback - 1 to 0
+        int nextState = f_getState(
+             close[i] - close[i + 1],
+             atr[i] * stateThresholdATR
+        )
+
+        if previousState == -1
+            if nextState == -1
+                bearToBear += 1
+            else if nextState == 0
+                bearToNeutral += 1
+            else
+                bearToBull += 1
+
+        else if previousState == 0
+            if nextState == -1
+                neutralToBear += 1
+            else if nextState == 0
+                neutralToNeutral += 1
+            else
+                neutralToBull += 1
+
+        else
+            if nextState == -1
+                bullToBear += 1
+            else if nextState == 0
+                bullToNeutral += 1
+            else
+                bullToBull += 1
+
+        previousState := nextState
+
+    currentState := previousState
+
+// Default probabilities during the Markov warm-up period.
+float probabilityBear = 1.0 / 3.0
+float probabilityNeutral = 1.0 / 3.0
+float probabilityBull = 1.0 / 3.0
+
+if currentState == -1
+    float bearTotal = bearToBear + bearToNeutral + bearToBull
+    probabilityBear := (bearToBear + 1.0) / (bearTotal + 3.0)
+    probabilityNeutral := (bearToNeutral + 1.0) / (bearTotal + 3.0)
+    probabilityBull := (bearToBull + 1.0) / (bearTotal + 3.0)
+
+else if currentState == 0
+    float neutralTotal = neutralToBear + neutralToNeutral + neutralToBull
+    probabilityBear := (neutralToBear + 1.0) / (neutralTotal + 3.0)
+    probabilityNeutral := (neutralToNeutral + 1.0) / (neutralTotal + 3.0)
+    probabilityBull := (neutralToBull + 1.0) / (neutralTotal + 3.0)
+
+else
+    float bullTotal = bullToBear + bullToNeutral + bullToBull
+    probabilityBear := (bullToBear + 1.0) / (bullTotal + 3.0)
+    probabilityNeutral := (bullToNeutral + 1.0) / (bullTotal + 3.0)
+    probabilityBull := (bullToBull + 1.0) / (bullTotal + 3.0)
+
+//──────────────────────────────────────────────────────────────────────────────
+// RETRACEMENT ZONES DISPLAYED AS SUPPLY / DEMAND ZONES, WITH A LIVE
+// HOLD-PROBABILITY SCORE
+//
+// An upward-impulse retracement (buy the pullback toward the 50-61.8%
+// band) is functionally a DEMAND zone -- where buyers are expected to
+// step back in. A downward-impulse retracement is functionally a SUPPLY
+// zone -- where sellers are expected to step back in.
+//
+// Two upgrades over a single static zone:
+//   1. HISTORY, not just the latest one. Every confirmed impulse pushes
+//      a new zone into a capped array (maxZonesInput) instead of
+//      overwriting the previous one -- so a larger, still-relevant zone
+//      from an earlier impulse stays visible instead of silently
+//      disappearing the moment a newer, smaller impulse confirms.
+//   2. INVALIDATION. A zone is marked broken the first time price closes
+//      fully through it (not just wicks into it), stops extending
+//      rightward, and is redrawn in gray -- rather than extending
+//      forever at a price level price has already moved past.
+//
+// Each ACTIVE (unbroken) zone's label shows a live hold-probability
+// score, not just a name:
+//   score = (Markov P(next state agrees with the zone's own direction))
+//           x (touchDecayInput ^ times already touched)
+// The Markov term uses this script's own live regime-probability engine
+// (an on-chart use of infrastructure already built here, not a bolted-on
+// number). The touch-decay term is the "first test only" pivot-fade
+// finding from this repo's quant-research-notes skill (Person 2004,
+// references/candlestick-patterns-and-pivot-confluence-person.md) --
+// each retest of the same zone is discounted, never boosted.
+//
+// This score is no longer display-only: inActiveDemandZone/
+// inActiveSupplyZone (set inside the loop below) feed directly into
+// longRetracementFilter/shortRetracementFilter in the TRADE CONDITIONS
+// section, so an entry can only fire inside a zone that is both unbroken
+// AND currently scoring at or above "Minimum Zone Hold Probability For
+// Entry" -- not just anywhere the old raw band math happened to overlap.
+//──────────────────────────────────────────────────────────────────────────────
+var array<box>   zoneBoxes      = array.new<box>()
+var array<label> zoneLabels     = array.new<label>()
+var array<float> zoneTopArr     = array.new<float>()
+var array<float> zoneBottomArr  = array.new<float>()
+var array<int>   zoneDirArr     = array.new<int>()
+var array<bool>  zoneBrokenArr  = array.new<bool>()
+var array<int>   zoneTouchArr   = array.new<int>()
+
+bool inActiveDemandZone = false
+bool inActiveSupplyZone = false
+float qualifyingDemandTop = na
+float qualifyingDemandBottom = na
+float qualifyingSupplyTop = na
+float qualifyingSupplyBottom = na
+
+if showRetracementZone and freshImpulseZone and not na(activeZoneUpper) and not na(activeZoneLower)
+    color newZoneColor = impulseDirection == 1 ? color.lime : color.red
+
+    box newZoneBox = box.new(
+         left = na(impulseAnchorBar) ? bar_index : impulseAnchorBar,
+         top = activeZoneUpper,
+         right = bar_index,
+         bottom = activeZoneLower,
+         xloc = xloc.bar_index,
+         bgcolor = color.new(newZoneColor, 85),
+         border_color = color.new(newZoneColor, 40),
+         border_width = 1
+    )
+
+    array.push(zoneBoxes, newZoneBox)
+    array.push(zoneLabels, label.new(x = bar_index, y = (activeZoneUpper + activeZoneLower) / 2, text = "", xloc = xloc.bar_index, style = label.style_label_left, color = color.new(color.white, 100), textcolor = newZoneColor, size = size.small))
+    array.push(zoneTopArr, activeZoneUpper)
+    array.push(zoneBottomArr, activeZoneLower)
+    array.push(zoneDirArr, impulseDirection)
+    array.push(zoneBrokenArr, false)
+    array.push(zoneTouchArr, 0)
+
+    if array.size(zoneBoxes) > maxZonesInput
+        box.delete(array.shift(zoneBoxes))
+        label.delete(array.shift(zoneLabels))
+        array.shift(zoneTopArr)
+        array.shift(zoneBottomArr)
+        array.shift(zoneDirArr)
+        array.shift(zoneBrokenArr)
+        array.shift(zoneTouchArr)
+
+if array.size(zoneBoxes) > 0
+    for zi = 0 to array.size(zoneBoxes) - 1
+        bool zBroken = array.get(zoneBrokenArr, zi)
+        float zTop = array.get(zoneTopArr, zi)
+        float zBottom = array.get(zoneBottomArr, zi)
+        int zDir = array.get(zoneDirArr, zi)
+        box zBox = array.get(zoneBoxes, zi)
+        label zLabel = array.get(zoneLabels, zi)
+
+        bool insideNow = close <= zTop and close >= zBottom
+        bool insidePrev = close[1] <= zTop and close[1] >= zBottom
+
+        if not zBroken and insideNow and not insidePrev
+            array.set(zoneTouchArr, zi, array.get(zoneTouchArr, zi) + 1)
+
+        bool justBroke = not zBroken and ((zDir == 1 and close < zBottom) or (zDir == -1 and close > zTop))
+
+        if justBroke
+            array.set(zoneBrokenArr, zi, true)
+            box.set_bgcolor(zBox, color.new(color.gray, 90))
+            box.set_border_color(zBox, color.new(color.gray, 60))
+            label.set_textcolor(zLabel, color.gray)
+            label.set_text(zLabel, (zDir == 1 ? "DEMAND ZONE " : "SUPPLY ZONE ") + "BROKEN")
+        else if not zBroken
+            box.set_right(zBox, bar_index)
+            label.set_x(zLabel, bar_index)
+
+            float baseRegimeProb = zDir == 1 ? probabilityBull : probabilityBear
+            float touchDecay = math.pow(touchDecayInput, array.get(zoneTouchArr, zi))
+            float holdProbabilityPct = baseRegimeProb * touchDecay * 100
+
+            string zLabelText = (zDir == 1 ? "DEMAND ZONE " : "SUPPLY ZONE ") + str.tostring(holdProbabilityPct, "#") + "%"
+            label.set_text(zLabel, zLabelText)
+
+            // Entry-qualifying: the bar must have WICKED into THIS unbroken
+            // zone (not just closed inside it -- a real rejection candle
+            // routinely closes back through and beyond the zone entirely,
+            // which "insideNow"/close-only would have wrongly excluded),
+            // without confirming a break of it, and its live score must
+            // clear the minimum. Also remember which specific zone
+            // qualified (its own top/bottom, not just a yes/no flag) so an
+            // entry can later track THIS zone's break independent of the
+            // array -- same "freeze the specific level at entry" pattern
+            // already used in Supply_and_Demand_Zones_XL_Strategy.pine,
+            // robust against a newer zone pushing this one out of the
+            // array mid-trade.
+            bool touchedZone = zDir == 1 ? (low <= zTop and close >= zBottom) : (high >= zBottom and close <= zTop)
+
+            if touchedZone and holdProbabilityPct >= minZoneHoldProbabilityInput
+                if zDir == 1
+                    inActiveDemandZone := true
+                    qualifyingDemandTop := zTop
+                    qualifyingDemandBottom := zBottom
+                else
+                    inActiveSupplyZone := true
+                    qualifyingSupplyTop := zTop
+                    qualifyingSupplyBottom := zBottom
+
+//──────────────────────────────────────────────────────────────────────────────
+// COOLDOWN
+//
+// Blocks a fresh entry signal for N bars after the last ACCEPTED signal
+// (the bar the entry order was actually placed, not the bar a trade
+// eventually closes) -- the same "count bars since the last accepted
+// signal" technique used to fix Trend_Following_Strategy_v6_Cooldown.pine
+// and already reused in Kaufman_Trend_System_Swing.pine this session,
+// immune to strategy.closedtrades' fill-timing lag by construction:
+// "cooldown elapsed" is recomputed fresh every bar from lastEntryBar
+// rather than a separately toggled armed/disarmed state.
+//──────────────────────────────────────────────────────────────────────────────
+groupCooldown = "7. Cooldown"
+
+cooldownBars = input.int(
+     defval = 5,
+     title = "Cooldown (Bars After Last Entry Signal)",
+     minval = 0,
+     maxval = 200,
+     group = groupCooldown,
+     tooltip = "Blocks any new entry signal (long or short) for this many bars after the last accepted entry signal, regardless of whether that trade has closed yet. Set to 0 to disable."
+)
+
+var int lastEntryBar = na
+
+bool cooldownElapsed = na(lastEntryBar) or (bar_index - lastEntryBar) >= cooldownBars
+
+//──────────────────────────────────────────────────────────────────────────────
+// TRADE CONDITIONS
+//──────────────────────────────────────────────────────────────────────────────
+bool longPDFilter = not usePDH_PDLFilter or close > pdl
+bool shortPDFilter = not usePDH_PDLFilter or close < pdh
+
+bool longRetracementFilter = not requireRetracement or inActiveDemandZone
+bool shortRetracementFilter = not requireRetracement or inActiveSupplyZone
+
+bool longTrendFilter = not useTrendFilter or bullishTrend
+bool shortTrendFilter = not useTrendFilter or bearishTrend
+
+bool longMarkovFilter = probabilityBull >= minimumBullProbability
+bool shortMarkovFilter = probabilityBear >= minimumBearProbability
+
+bool longFootprintFilter = not useFootprintFilterInput or footprintBuyImbalance
+bool shortFootprintFilter = not useFootprintFilterInput or footprintSellImbalance
+
+// Rejection-candle trigger, replacing the former EMA-crossover trigger.
+// A crossover treated the zone concept as decoration -- the actual
+// signal fired purely on EMA math, with no reference to the zone at all,
+// so a "DEMAND ZONE" label and the entry that supposedly traded off it
+// could be looking at completely different things. This ties the trigger
+// directly to the same zone infrastructure the dashboard and probability
+// score already use: a bullish (bearish) candle closing above (below)
+// its open while price is inside a currently-active, above-threshold
+// demand (supply) zone -- i.e. price entered the zone and was rejected
+// back in the expected direction on this bar, not just "EMA crossed."
+bool longTrigger = inActiveDemandZone and close > open
+bool shortTrigger = inActiveSupplyZone and close < open
+
+bool zoneLongSignal = longTrigger and
+     longPDFilter and
+     longRetracementFilter and
+     longTrendFilter and
+     longMarkovFilter and
+     longFootprintFilter and
+     finalPositionQty > 0 and
+     cooldownElapsed
+
+bool zoneShortSignal = shortTrigger and
+     shortPDFilter and
+     shortRetracementFilter and
+     shortTrendFilter and
+     shortMarkovFilter and
+     shortFootprintFilter and
+     finalPositionQty > 0 and
+     cooldownElapsed
+
+// PDH/PDL BREAKOUT -- a second, independent entry path, not the same
+// as longPDFilter/shortPDFilter above. That filter only checks "is
+// close on the correct side of yesterday's opposite extreme" (close >
+// PDL for longs) and never fires an entry by itself -- it is a loose
+// sanity gate on the zone path. This is an actual breakout: close
+// crossing the extreme in the trade's own direction. Deliberately does
+// NOT include longRetracementFilter/shortRetracementFilter -- a
+// breakout, by definition, is not a pullback into a demand/supply zone,
+// and ANDing that filter in would reproduce the exact same
+// structural-conflict bug already found and fixed on the zone trigger
+// (two conditions that are rarely true on the same bar).
+bool pdhBreakoutTrigger = usePDBreakoutTrigger and ta.crossover(close, pdh)
+bool pdlBreakoutTrigger = usePDBreakoutTrigger and ta.crossunder(close, pdl)
+
+bool longBreakoutSignal = pdhBreakoutTrigger and
+     longTrendFilter and
+     longMarkovFilter and
+     longFootprintFilter and
+     finalPositionQty > 0 and
+     cooldownElapsed
+
+bool shortBreakoutSignal = pdlBreakoutTrigger and
+     shortTrendFilter and
+     shortMarkovFilter and
+     shortFootprintFilter and
+     finalPositionQty > 0 and
+     cooldownElapsed
+
+bool longSignal = zoneLongSignal or longBreakoutSignal
+bool shortSignal = zoneShortSignal or shortBreakoutSignal
+
+// Historical "why didn't this breakout fire" labels. The dashboard table
+// only draws inside `if barstate.islast` (standard practice -- redrawing
+// a table on every historical bar is wasted work), so it only ever shows
+// the LATEST bar's gate state. Scrolling the chart back to an old PDH/PDL
+// cross and reading the live dashboard next to it is comparing two
+// different points in time, which is exactly what looked like "PDH/PDL
+// isn't working" in a scrolled-back screenshot even though the trigger
+// fired correctly and a filter genuinely blocked it. These labels are
+// drawn AT the historical bar itself, wherever a real cross happened but
+// got blocked, naming the first gate responsible.
+f_blockReason(bool trend, bool markov, bool footprint, bool qty, bool cooldown) =>
+    string reason = not trend ? "Trend" : not markov ? "Markov" : not footprint ? "Footprint" : not qty ? "Size" : not cooldown ? "Cooldown" : "?"
+    reason
+
+if showBlockedBreakoutLabelsInput and pdhBreakoutTrigger and not longBreakoutSignal
+    label.new(
+         x = bar_index,
+         y = high,
+         text = "PDH x, blocked: " + f_blockReason(longTrendFilter, longMarkovFilter, longFootprintFilter, finalPositionQty > 0, cooldownElapsed),
+         style = label.style_label_down,
+         color = color.new(color.orange, 80),
+         textcolor = color.orange,
+         size = size.tiny
+    )
+
+if showBlockedBreakoutLabelsInput and pdlBreakoutTrigger and not shortBreakoutSignal
+    label.new(
+         x = bar_index,
+         y = low,
+         text = "PDL x, blocked: " + f_blockReason(shortTrendFilter, shortMarkovFilter, shortFootprintFilter, finalPositionQty > 0, cooldownElapsed),
+         style = label.style_label_up,
+         color = color.new(color.orange, 80),
+         textcolor = color.orange,
+         size = size.tiny
+    )
+
+//──────────────────────────────────────────────────────────────────────────────
+// CONFIDENCE-PROPORTIONAL POSITION SIZING
+//
+// Every qualifying signal has so far used the same finalPositionQty
+// regardless of HOW confident the Markov model was -- the entry gate
+// (longMarkovFilter/shortMarkovFilter) keeps only pass/fail, discarding
+// the actual probabilityBull/probabilityBear reading once it clears the
+// bar. This scales size using that same number the gate already reads,
+// no new signal required.
+//
+// Deliberately NOT paper #16's raw formula (X = 2*(p - 0.5), meant for a
+// reading that straddles 50% both ways) -- here probabilityBull/Bear is
+// only ever acted on once it's ALREADY above minimumBullProbability/
+// minimumBearProbability (0.38 default), so that formula would compute
+// a negative scalar right at the threshold. Rescaled instead: linear
+// from confidenceSizingFloorPctInput at the threshold itself, up to
+// 100% at full (1.0) probability. A signal that barely qualified trades
+// smaller; one the model is highly confident in trades closer to full
+// computed size.
+//──────────────────────────────────────────────────────────────────────────────
+float longConfidenceScalar = 1.0
+float shortConfidenceScalar = 1.0
+
+if useConfidenceSizingInput
+    float confidenceFloor = confidenceSizingFloorPctInput / 100.0
+
+    if minimumBullProbability < 1.0
+        float longConfidenceProgress = math.max(0.0, math.min(1.0, (probabilityBull - minimumBullProbability) / (1.0 - minimumBullProbability)))
+        longConfidenceScalar := confidenceFloor + (1.0 - confidenceFloor) * longConfidenceProgress
+
+    if minimumBearProbability < 1.0
+        float shortConfidenceProgress = math.max(0.0, math.min(1.0, (probabilityBear - minimumBearProbability) / (1.0 - minimumBearProbability)))
+        shortConfidenceScalar := confidenceFloor + (1.0 - confidenceFloor) * shortConfidenceProgress
+
+// Rounded down to whole lots and floored at one lot/contract minimum --
+// a fractional contract isn't a real order, and letting the scalar drop
+// a trade to zero would silently block it rather than just shrink it.
+// At finalPositionQty == lotIncrement (one lot), this floors right back
+// to finalPositionQty every time -- the feature only visibly
+// differentiates once finalPositionQty is two lots or more.
+float longConfidenceQty = math.max(lotIncrement, math.floor((finalPositionQty * longConfidenceScalar) / lotIncrement) * lotIncrement)
+float shortConfidenceQty = math.max(lotIncrement, math.floor((finalPositionQty * shortConfidenceScalar) / lotIncrement) * lotIncrement)
+
+//──────────────────────────────────────────────────────────────────────────────
+// ORDER AND STOP LOGIC
+//──────────────────────────────────────────────────────────────────────────────
+
+// Entry-zone tracking, frozen at the moment the signal fires -- the same
+// "freeze the specific level at entry" pattern already used in
+// Supply_and_Demand_Zones_XL_Strategy.pine. Captured here (on the signal
+// bar, from the qualifying* values the zone-scoring loop already computed
+// this same bar) rather than one bar later on fill detection, so it can't
+// be thrown off by price having moved out of the zone by the time the
+// order actually fills. Feeds the dynamic zone-break exit below.
+var float entryZoneTop = na
+var float entryZoneBottom = na
+var int entryZoneDir = 0
+
+if longSignal
+    strategy.entry(
+         id = "Long",
+         direction = strategy.long,
+         qty = longConfidenceQty
+    )
+
+    lastEntryBar := bar_index
+    entryZoneTop := qualifyingDemandTop
+    entryZoneBottom := qualifyingDemandBottom
+    // A breakout-only entry has no qualifying zone (qualifyingDemandTop
+    // stays na) -- track that honestly as "no zone" rather than labeling
+    // a breakout trade with zone bounds it never actually came from.
+    entryZoneDir := na(qualifyingDemandTop) ? 0 : 1
+
+    // MERGED: dynamic alert -- states WHICH of the two independent long
+    // paths actually fired (zoneLongSignal vs longBreakoutSignal), per
+    // "I want signal triggers type of entry to the alert."
+    string longEntryType = zoneLongSignal ? "Zone Long" : "PDH Breakout Long"
+    if enableDynamicAlerts
+        alert(
+             f_alertMsg("BULLISH ENTRY", "Ranger — " + longEntryType, close) +
+             "\nMarkov: P(Bull) " + str.tostring(probabilityBull * 100.0, "#.#") + "%" +
+             "\nZone: " + (entryZoneDir == 1 ? f_price(entryZoneBottom) + "-" + f_price(entryZoneTop) : "none (breakout)") +
+             "\nPlanned Stop: " + f_price(close - stopDistance) +
+             "\nSize: " + str.tostring(longConfidenceQty, "#.##"),
+             alert.freq_once_per_bar_close)
+
+if shortSignal and allowShorts
+    strategy.entry(
+         id = "Short",
+         direction = strategy.short,
+         qty = shortConfidenceQty
+    )
+
+    lastEntryBar := bar_index
+    entryZoneTop := qualifyingSupplyTop
+    entryZoneBottom := qualifyingSupplyBottom
+    entryZoneDir := na(qualifyingSupplyTop) ? 0 : -1
+
+    // MERGED: dynamic alert -- states WHICH of the two independent short
+    // paths actually fired (zoneShortSignal vs shortBreakoutSignal).
+    string shortEntryType = zoneShortSignal ? "Zone Short" : "PDL Breakout Short"
+    if enableDynamicAlerts
+        alert(
+             f_alertMsg("BEARISH ENTRY", "Ranger — " + shortEntryType, close) +
+             "\nMarkov: P(Bear) " + str.tostring(probabilityBear * 100.0, "#.#") + "%" +
+             "\nZone: " + (entryZoneDir == -1 ? f_price(entryZoneBottom) + "-" + f_price(entryZoneTop) : "none (breakout)") +
+             "\nPlanned Stop: " + f_price(close + stopDistance) +
+             "\nSize: " + str.tostring(shortConfidenceQty, "#.##"),
+             alert.freq_once_per_bar_close)
+
+// Stops lock when a newly opened position is detected.
+// This retains the ATR-based risk assumption used in capacity sizing.
+var float activeLongStop = na
+var float activeShortStop = na
+
+bool newLongPosition = strategy.position_size > 0 and strategy.position_size[1] <= 0
+bool newShortPosition = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if newLongPosition
+    activeLongStop := strategy.position_avg_price - stopDistance
+    activeShortStop := na
+
+if newShortPosition
+    activeShortStop := strategy.position_avg_price + stopDistance
+    activeLongStop := na
+
+if strategy.position_size == 0
+    activeLongStop := na
+    activeShortStop := na
+    entryZoneTop := na
+    entryZoneBottom := na
+    entryZoneDir := 0
+
+strategy.exit(
+     id = "Long ATR Stop",
+     from_entry = "Long",
+     stop = activeLongStop
+)
+
+strategy.exit(
+     id = "Short ATR Stop",
+     from_entry = "Short",
+     stop = activeShortStop
+)
+
+//──────────────────────────────────────────────────────────────────────────────
+// DYNAMIC EXITS -- ZONE BREAK / MARKOV FLIP
+//
+// The static ATR stop above is a backstop for a large, sudden adverse
+// move -- not the primary exit. These two conditions react to the same
+// infrastructure that justified the entry in the first place, closing
+// the trade the moment its own thesis breaks, which is usually well
+// before the ATR stop is ever touched:
+//   1. Zone break: the SPECIFIC zone the trade entered from (frozen at
+//      entry into entryZoneTop/entryZoneBottom, immune to that zone
+//      being pushed out of the live zoneBoxes array by a newer one)
+//      gets closed through.
+//   2. Markov flip: the live regime-transition model's probability for
+//      the OPPOSING direction rises to this strategy's own entry
+//      threshold (Minimum Bull/Bear Probability, "5. Dynamic Markov
+//      Regime Model") -- the same probability math that gated entry now
+//      gates exit, symmetrically.
+//──────────────────────────────────────────────────────────────────────────────
+bool zoneBreakExitLong = useZoneBreakExitInput and strategy.position_size > 0 and not na(entryZoneBottom) and close < entryZoneBottom
+bool zoneBreakExitShort = useZoneBreakExitInput and strategy.position_size < 0 and not na(entryZoneTop) and close > entryZoneTop
+
+bool markovFlipExitLong = useMarkovFlipExitInput and strategy.position_size > 0 and probabilityBear >= minimumBearProbability
+bool markovFlipExitShort = useMarkovFlipExitInput and strategy.position_size < 0 and probabilityBull >= minimumBullProbability
+
+if zoneBreakExitLong or markovFlipExitLong
+    strategy.close(
+         id = "Long",
+         comment = zoneBreakExitLong ? "Zone Break" : "Markov Flip"
+    )
+
+if zoneBreakExitShort or markovFlipExitShort
+    strategy.close(
+         id = "Short",
+         comment = zoneBreakExitShort ? "Zone Break" : "Markov Flip"
+    )
+
+//──────────────────────────────────────────────────────────────────────────────
+// MERGED: EXIT ALERTS -- STANDARDIZED "RANGER" CONVENTION
+//
+// Every exit path above (the ATR stop via strategy.exit(), Zone Break /
+// Markov Flip via strategy.close()) only produces an order-fill event,
+// not an alert() message -- the same gap already found and fixed in
+// Sweep_Trend_Continuation_SVP_Merged.pine this session. Detected
+// generically here (position_size hitting 0 from either side) rather
+// than duplicated per exit path, with strategy.closedtrades.exit_comment()
+// reporting which one actually fired -- its own comment string ("Long
+// ATR Stop"/"Short ATR Stop" from the strategy.exit() ids above, or
+// "Zone Break"/"Markov Flip" from the strategy.close() comments above).
+//──────────────────────────────────────────────────────────────────────────────
+bool longPositionClosed = strategy.position_size == 0 and strategy.position_size[1] > 0
+bool shortPositionClosed = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+string lastExitReason = strategy.closedtrades > 0 ? strategy.closedtrades.exit_comment(strategy.closedtrades - 1) : na
+
+if longPositionClosed and enableDynamicAlerts
+    alert(
+         f_alertMsg("LONG EXIT", "Ranger", close) +
+         "\nReason: " + (na(lastExitReason) or lastExitReason == "" ? "—" : lastExitReason),
+         alert.freq_once_per_bar_close)
+
+if shortPositionClosed and enableDynamicAlerts
+    alert(
+         f_alertMsg("SHORT EXIT", "Ranger", close) +
+         "\nReason: " + (na(lastExitReason) or lastExitReason == "" ? "—" : lastExitReason),
+         alert.freq_once_per_bar_close)
+
+//──────────────────────────────────────────────────────────────────────────────
+// VISUALS
+//──────────────────────────────────────────────────────────────────────────────
+plot(fastEma, title = "Fast EMA", color = color.teal, linewidth = 2)
+plot(slowEma, title = "Slow EMA", color = color.orange, linewidth = 2)
+
+plot(
+     showPDH_PDL ? pdh : na,
+     title = "PDH",
+     color = color.red,
+     style = plot.style_linebr,
+     linewidth = 2
+)
+
+plot(
+     showPDH_PDL ? pdl : na,
+     title = "PDL",
+     color = color.lime,
+     style = plot.style_linebr,
+     linewidth = 2
+)
+
+plot(
+     activeLongStop,
+     title = "Long Initial Stop",
+     color = color.red,
+     style = plot.style_linebr,
+     linewidth = 2
+)
+
+plot(
+     activeShortStop,
+     title = "Short Initial Stop",
+     color = color.red,
+     style = plot.style_linebr,
+     linewidth = 2
+)
+
+// Split by which of the two independent paths actually fired -- a single
+// shared "LONG"/"SHORT" marker couldn't tell you whether a fill came from
+// the zone-rejection trigger or the PDH/PDL breakout trigger, which
+// mattered once both paths could fire on nearby bars (pyramiding = 0
+// caps the position either way, so this is a labeling distinction, not
+// a risk one). Different marker style AND color per path so two firing
+// on the same bar are both still visible rather than fully overlapping.
+plotshape(
+     zoneLongSignal,
+     title = "Long Signal (Zone)",
+     style = shape.triangleup,
+     location = location.belowbar,
+     size = size.small,
+     color = color.lime,
+     text = "LONG-Z"
+)
+
+plotshape(
+     longBreakoutSignal,
+     title = "Long Signal (PDH Breakout)",
+     style = shape.circle,
+     location = location.belowbar,
+     size = size.normal,
+     color = color.aqua,
+     text = "LONG-B"
+)
+
+plotshape(
+     zoneShortSignal and allowShorts,
+     title = "Short Signal (Zone)",
+     style = shape.triangledown,
+     location = location.abovebar,
+     size = size.small,
+     color = color.red,
+     text = "SHORT-Z"
+)
+
+plotshape(
+     shortBreakoutSignal and allowShorts,
+     title = "Short Signal (PDL Breakout)",
+     style = shape.circle,
+     location = location.abovebar,
+     size = size.normal,
+     color = color.orange,
+     text = "SHORT-B"
+)
+
+//──────────────────────────────────────────────────────────────────────────────
+// ALERT CONDITIONS
+//
+// MERGED: renamed to the standardized "Ranger" label and split by which
+// of the two independent entry paths (Zone vs PDH/PDL Breakout) actually
+// fired, plus new Long/Short Exit conditions -- matching the convention
+// applied to Sweep_Trend_Continuation_SVP_Merged.pine this session.
+//──────────────────────────────────────────────────────────────────────────────
+alertcondition(zoneLongSignal, title = "Ranger Zone Long Entry (Bullish)", message = "BULLISH ENTRY | Ranger — Zone Long | {{ticker}} {{interval}}")
+alertcondition(longBreakoutSignal, title = "Ranger PDH Breakout Long Entry (Bullish)", message = "BULLISH ENTRY | Ranger — PDH Breakout Long | {{ticker}} {{interval}}")
+alertcondition(zoneShortSignal and allowShorts, title = "Ranger Zone Short Entry (Bearish)", message = "BEARISH ENTRY | Ranger — Zone Short | {{ticker}} {{interval}}")
+alertcondition(shortBreakoutSignal and allowShorts, title = "Ranger PDL Breakout Short Entry (Bearish)", message = "BEARISH ENTRY | Ranger — PDL Breakout Short | {{ticker}} {{interval}}")
+
+alertcondition(
+     longSignal,
+     title = "Ranger Any Long Entry",
+     message = "BULLISH ENTRY | Ranger | {{ticker}} {{interval}} — see chart/dashboard for entry type"
+)
+
+alertcondition(
+     shortSignal and allowShorts,
+     title = "Ranger Any Short Entry",
+     message = "BEARISH ENTRY | Ranger | {{ticker}} {{interval}} — see chart/dashboard for entry type"
+)
+
+alertcondition(longPositionClosed, title = "Ranger Long Exit", message = "LONG EXIT | Ranger | {{ticker}} {{interval}}")
+alertcondition(shortPositionClosed, title = "Ranger Short Exit", message = "SHORT EXIT | Ranger | {{ticker}} {{interval}}")
+
+//──────────────────────────────────────────────────────────────────────────────
+// MARKOV / CAPACITY TABLE
+//──────────────────────────────────────────────────────────────────────────────
+// MERGED: rows 18 -> 19 to fit the new ALERTS status row.
+// Downsized from 19 rows to 5 -- the individual Markov-probability
+// breakdown, per-gate icon strings (Long/Short Zone Gates, Long/Short
+// Breakout Gates), Active Zone, Impulse Direction, Footprint Flow/POC,
+// Confidence Sizing, and Alerts status all still compute and gate
+// entries exactly as before; they just no longer each get their own
+// dashboard row. What's left is only what actually changes a trade
+// decision at a glance: the model's directional lean, whether Long/
+// Short is clear to fire right now (or which single gate is blocking
+// it, using the same "first blocking gate" logic the alert-diagnostic
+// f_blockReason() helper below already established), and position size.
+var table statsTable = table.new(
+     position.top_left,
+     2,
+     5,
+     border_width = 1
+)
+
+string dashboardPosition = switch dashboardPositionInput
+    "Top Left" => position.top_left
+    "Top Right" => position.top_right
+    "Bottom Left" => position.bottom_left
+    "Bottom Right" => position.bottom_right
+    => position.top_left
+
+// Same size ladder as Academia_PO3_Professional_v3.pine's "Dashboard Size"
+// input -- Compact/Phone map to the two smallest Pine table text sizes so
+// a 13-row table stays legible without swallowing a phone-sized chart.
+string resolvedDashboardSize = switch dashboardSizeInput
+    "Large" => size.normal
+    "Medium" => size.small
+    "Phone" => size.small
+    => size.tiny
+
+// Row helper: every data row shares the same label/value/size/alignment
+// shape, so this collapses 12 rows' worth of near-identical table.cell
+// pairs (and keeps any future row from silently forgetting text_size,
+// the exact bug that would make a new row full-size on an otherwise
+// phone-scaled table).
+f_row(int row, string left, string right, color rightColor) =>
+    table.cell(statsTable, 0, row, left, text_size = resolvedDashboardSize, text_halign = text.align_left)
+    table.cell(statsTable, 1, row, right, text_color = rightColor, text_size = resolvedDashboardSize, text_halign = text.align_right)
+
+if barstate.islast and showMarkovTable
+    table.set_position(statsTable, dashboardPosition)
+    table.cell(statsTable, 0, 0, "RANGER MARKOV", text_color = color.white, bgcolor = color.rgb(20, 50, 90), text_size = resolvedDashboardSize, text_halign = text.align_left)
+    table.cell(statsTable, 1, 0, "LIVE", text_color = color.white, bgcolor = color.rgb(20, 50, 90), text_size = resolvedDashboardSize, text_halign = text.align_right)
+
+    // Bias: the model's own next-state forecast (whichever of Bull/
+    // Neutral/Bear currently reads highest), not the backward-looking
+    // "Current Markov State" -- this is the number longMarkovFilter/
+    // shortMarkovFilter actually gate on.
+    float maxProbability = math.max(probabilityBull, math.max(probabilityNeutral, probabilityBear))
+    string biasText =
+         probabilityBull == maxProbability ? "BULLISH " + str.tostring(probabilityBull * 100.0, "#") + "%" :
+         probabilityBear == maxProbability ? "BEARISH " + str.tostring(probabilityBear * 100.0, "#") + "%" :
+         "NEUTRAL " + str.tostring(probabilityNeutral * 100.0, "#") + "%"
+    color biasColor = probabilityBull == maxProbability ? color.lime : probabilityBear == maxProbability ? color.red : color.gray
+    f_row(1, "Bias", biasText, biasColor)
+
+    // Long/Short: "SIGNAL" if a trade is firing (either the zone or the
+    // breakout path) on this exact bar, "READY" if every persistent gate
+    // (size, cooldown, trend, Markov, footprint, PD filter, zone-hold
+    // probability) already passes and it's purely waiting on a trigger
+    // candle/crossover, or the name of the first gate actually blocking
+    // it right now -- same "first blocking gate" logic already used by
+    // f_blockReason() below for the historical blocked-breakout labels.
+    string longStatus =
+         (zoneLongSignal or longBreakoutSignal) ? "SIGNAL" :
+         not (finalPositionQty > 0) ? "SIZE 0" :
+         not cooldownElapsed ? "COOLDOWN" :
+         not longTrendFilter ? "TREND" :
+         not longMarkovFilter ? "MARKOV" :
+         not longFootprintFilter ? "FOOTPRINT" :
+         not longPDFilter ? "PD FILTER" :
+         not longRetracementFilter ? "ZONE PROB" :
+         "READY"
+    color longStatusColor =
+         longStatus == "SIGNAL" ? color.new(color.lime, 0) :
+         longStatus == "READY" ? color.lime :
+         color.orange
+    f_row(2, "Long", longStatus, longStatusColor)
+
+    string shortStatus =
+         not allowShorts ? "OFF" :
+         (zoneShortSignal or shortBreakoutSignal) ? "SIGNAL" :
+         not (finalPositionQty > 0) ? "SIZE 0" :
+         not cooldownElapsed ? "COOLDOWN" :
+         not shortTrendFilter ? "TREND" :
+         not shortMarkovFilter ? "MARKOV" :
+         not shortFootprintFilter ? "FOOTPRINT" :
+         not shortPDFilter ? "PD FILTER" :
+         not shortRetracementFilter ? "ZONE PROB" :
+         "READY"
+    color shortStatusColor =
+         not allowShorts ? color.gray :
+         shortStatus == "SIGNAL" ? color.new(color.red, 0) :
+         shortStatus == "READY" ? color.lime :
+         color.orange
+    f_row(3, "Short", shortStatus, shortStatusColor)
+
+    bool sizeBypassed = bypassCapacityGateInput and positionQty <= 0
+    string qtyText = finalPositionQty > 0 ? str.tostring(finalPositionQty, "#.##") + (sizeBypassed ? " (bypassed)" : "") : "TOO SMALL"
+    color qtyColor = sizeBypassed ? color.orange : finalPositionQty > 0 ? color.lime : color.red
+    f_row(4, "Size", qtyText, qtyColor)

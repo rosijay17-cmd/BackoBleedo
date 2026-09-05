@@ -1,0 +1,760 @@
+//@version=6
+// =====================================================
+// KAUFMAN TREND SYSTEM -- DAILY SWING
+// Built from Kaufman, "Trend Systems" (Trading Systems and Methods, Ch. 8),
+// logged in this repo's quant-research-notes skill as
+// references/trend-systems-kaufman.md. Every module below traces to a
+// specific named section of that chapter -- see the inline comments and
+// the reference file for the full citation and the empirical evidence
+// each technique is (or isn't) backed by.
+//
+// This is a genuine SWING/POSITION system, not an intraday scalper: the
+// chapter's own tested calculation periods run 40-160+ bars on DAILY data,
+// and it says outright that intraday charts show "mostly noise." Run this
+// on Daily bars. Default parameters (80/20 slow/fast) match the book's
+// own NASDAQ 100 futures example (Fig 8.4/Table 8.4) and its 80-20
+// Eurodollar 2-trend example (Table 8.12) -- both directly relevant
+// precedent for an index-futures instrument like MNQ.
+//
+// Design choices carried over from the chapter, on purpose:
+//   - Win rate will be LOW (the book's own multi-market tests average
+//     ~35%). That is the normal profile of a system built to capture the
+//     "fat tail" of long directional runs, not a sign something is wrong.
+//   - No profit target of any kind. The chapter is explicit that
+//     profit-taking directly reduces a trend system's ability to capture
+//     the fat tail -- exits are trend-signal-driven only, plus an
+//     OPTIONAL, very wide catastrophic stop (off by default) for
+//     risk-of-ruin protection, not profit management.
+// =====================================================
+strategy(
+     title="Kaufman Trend System (Daily Swing)",
+     shorttitle="Kaufman TS",
+     overlay=true,
+     initial_capital=25000,
+     currency=currency.USD,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     pyramiding=0,
+     calc_on_every_tick=false,
+     process_orders_on_close=false,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=8,
+     slippage=2,
+     max_bars_back=500
+)
+
+// =====================================================
+// 1. TREND ENGINE INPUTS
+// "Comparison of Single-Trend Systems": SMA and EMA were close, with EXP
+// (exponential smoothing) consistently the WEAKEST performer of the six
+// systems tested -- included here anyway for completeness, but SMA is the
+// recommended default. Linear Regression slope was the best average
+// performer across futures markets in the book's own test. The 2-Trend
+// Confirmation toggle implements "Techniques Using Two Trendlines," Rule 3
+// (enter only when both trends agree; exit to FLAT -- not reverse -- when
+// they conflict), the highest-quality variant the chapter describes.
+// =====================================================
+string groupTrend = "1. Trend Engine"
+
+string trendMethodInput = input.string(
+     defval="SMA",
+     title="Trend Method",
+     options=["SMA", "EMA", "Linear Regression"],
+     group=groupTrend,
+     tooltip="SMA and EMA performed similarly in the book's own tests; exponential smoothing (EXP) was consistently the weakest of the six systems compared. Linear Regression (the fitted trendline's slope) was the best average performer for futures. Default SMA is the safest, most-tested choice."
+)
+
+int slowLenInput = input.int(
+     defval=80,
+     title="Slow Trend Length (Bars)",
+     minval=5,
+     maxval=300,
+     group=groupTrend,
+     tooltip="The primary, slower trend -- identifies the tradeable direction. Default 80 matches the book's own NASDAQ 100 futures example (Figure 8.4), described as \"typical of longer-term trend-following.\" This is a DAILY-bar system; 80 days is roughly one calendar quarter."
+)
+
+bool use2TrendInput = input.bool(
+     defval=true,
+     title="Use 2-Trend Confirmation",
+     group=groupTrend,
+     tooltip="When on: enter only when the fast AND slow trend agree, exit to flat (not reverse) when they conflict -- the book's own best-tested 2-trend variant (Table 8.12), which substantially helped a strongly trending market (Eurodollar) but barely helped a noisy one (e-mini S&P) in the book's own comparison. When off: a simple always-in-market single-trend reversal system using only the slow trend."
+)
+
+int fastLenInput = input.int(
+     defval=20,
+     title="Fast Trend Length (Bars)",
+     minval=2,
+     maxval=150,
+     group=groupTrend,
+     tooltip="The faster confirming trend. Default 20 is exactly 1/4 of the default slow length (80), matching both the book's own 80-20 Eurodollar example (Table 8.12) and its stated ratio-of-4 heuristic. Ignored when 2-Trend Confirmation is off."
+)
+
+// =====================================================
+// 2. BAND INPUTS
+// "Bands and Channels": a band around the trendline reduces whipsaws at
+// the cost of some lag and total profit. ATR/Volatility is the chapter's
+// general form (Keltner and the volatility-scaled variants are special
+// cases of it). Modified Bollinger is McNicholl's fully-specified fix
+// (cited in the source) for standard Bollinger's known flaw -- bands
+// expand fast after a volatility spike but are slow to narrow again.
+// =====================================================
+string groupBand = "2. Bands"
+
+string bandTypeInput = input.string(
+     defval="ATR / Volatility",
+     title="Band Type",
+     options=["ATR / Volatility", "Modified Bollinger"],
+     group=groupBand,
+     tooltip="ATR/Volatility: band = trendline +/- (s x ATR), the chapter's general form. Modified Bollinger: McNicholl's double-exponentially-smoothed center line and deviation, which corrects standard Bollinger's slow-to-narrow lag after a volatility spike."
+)
+
+int bandAtrLenInput = input.int(
+     defval=20,
+     title="Band ATR Length",
+     minval=2,
+     maxval=100,
+     group=groupBand,
+     tooltip="ATR length used for the ATR/Volatility band type (and for the retracement-timing distance in section 3)."
+)
+
+float bandScaleInput = input.float(
+     defval=1.0,
+     title="Band Scaling Factor (s)",
+     minval=0.1,
+     maxval=5.0,
+     step=0.1,
+     group=groupBand,
+     tooltip="s=1.0 means the full band width is 2xATR, per the book's own worked example. Wider = fewer, later, more reliable signals; narrower = more, earlier, noisier signals -- a direct trade-off the chapter names explicitly, not a bug to tune away."
+)
+
+float mbAlphaInput = input.float(
+     defval=0.15,
+     title="Modified Bollinger Alpha",
+     minval=0.01,
+     maxval=0.5,
+     step=0.01,
+     group=groupBand,
+     tooltip="Smoothing constant for the Modified Bollinger center line. 0.15 approximates a 20-day average, matching the book's own stated value."
+)
+
+float mbWidthMultInput = input.float(
+     defval=2.5,
+     title="Modified Bollinger Width Multiplier (f)",
+     minval=0.5,
+     maxval=5.0,
+     step=0.1,
+     group=groupBand,
+     tooltip="Band-width multiplier for the Modified Bollinger deviation term. The book suggests 2.5, wider than standard Bollinger's 2.0, since this construction is faster to react and would otherwise be tighter."
+)
+
+bool useBandFilterInput = input.bool(
+     defval=true,
+     title="Require Band Clear For Entry",
+     group=groupBand,
+     tooltip="When on, an entry additionally requires price to close beyond the band (not just the trend direction agreeing) -- the reversal-rule pattern from \"Rules for Using Bands.\" When off, bands are still computed and plotted but only the trend direction gates entries."
+)
+
+// =====================================================
+// 3. TIMING INPUTS
+// "Timing the Order" / "Bands Formed by Highs and Lows" retracement idea.
+// Immediate = enter as soon as the trend signal confirms (the book's own
+// baseline). Delay N Bars and ATR Retracement are the book's own listed
+// alternatives, aimed at getting a better entry price at the cost of
+// occasionally missing a fast move entirely -- the book's own tested
+// trade-off ("three out of four returned a better price... offset by the
+// profitable breakouts that were never entered").
+// =====================================================
+string groupTiming = "3. Timing"
+
+string entryStyleInput = input.string(
+     defval="Immediate",
+     title="Entry Timing Style",
+     options=["Immediate", "Delay N Bars", "ATR Retracement or Timeout"],
+     group=groupTiming,
+     tooltip="Immediate: enter as soon as the trend signal confirms (the book's baseline). Delay N Bars: wait N bars, re-checking the signal is still valid, before entering. ATR Retracement or Timeout: try to enter on a pullback of (Retracement x ATR) toward the signal price; if that doesn't fill within the timeout, enter anyway at market."
+)
+
+int delayBarsInput = input.int(
+     defval=2,
+     title="Delay Bars",
+     minval=1,
+     maxval=10,
+     group=groupTiming,
+     tooltip="Used only when Entry Timing Style is \"Delay N Bars.\""
+)
+
+float retraceAtrMultInput = input.float(
+     defval=0.5,
+     title="Retracement (x ATR)",
+     minval=0.1,
+     maxval=2.0,
+     step=0.1,
+     group=groupTiming,
+     tooltip="Used only when Entry Timing Style is \"ATR Retracement or Timeout.\" 0.5 matches the book's own worked hybrid rule (\"buy after prices reverse by 0.50 x ATR, or enter on the next close\")."
+)
+
+int retraceTimeoutInput = input.int(
+     defval=3,
+     title="Retracement Timeout (Bars)",
+     minval=1,
+     maxval=10,
+     group=groupTiming,
+     tooltip="Used only when Entry Timing Style is \"ATR Retracement or Timeout.\" If the retracement hasn't filled within this many bars, enter at market instead of continuing to wait -- the book's own noted risk is that fast breakouts which never retrace get missed entirely if you wait indefinitely."
+)
+
+// =====================================================
+// 4. POSITION SIZING
+// "Donchian's 5- and 20-Day Moving Average System": position size =
+// investment / (ATR x Big Point Value), sizing inversely to current
+// volatility so each trade carries roughly equal dollar risk. Here
+// "investment" is a per-trade RISK BUDGET (riskPctInput% of equity), not
+// the full account, following the book's own intent (equal risk per
+// trade) rather than its literal wording (which assumes a fixed
+// per-trade capital allocation).
+// =====================================================
+string groupSizing = "4. Position Sizing"
+
+float riskPctInput = input.float(
+     defval=1.0,
+     title="Risk % of Equity per Trade",
+     minval=0.1,
+     maxval=10.0,
+     step=0.1,
+     group=groupSizing,
+     tooltip="Dollar risk per trade = this % of current strategy equity, divided by (ATR x Big Point Value) to get contracts. This is the sizing class that should have been used from the start for the zero-qty/margin-rejection bugs root-caused earlier in this repo's Trend Following Strategy v6 scripts -- it sizes down automatically on a high-notional instrument instead of silently rounding to 0."
+)
+
+// =====================================================
+// 5. RISK MANAGEMENT (optional, off by default)
+// The book is explicit that adding stop-losses/profit-taking to a pure
+// trend system trades away fat-tail capture. This is NOT a profit-taking
+// stop -- it's a very wide, off-by-default backstop against a
+// catastrophic single trade, kept deliberately separate from the trend
+// exit logic above.
+// =====================================================
+string groupRisk = "5. Risk Management (Optional)"
+
+bool useCatStopInput = input.bool(
+     defval=false,
+     title="Use Catastrophic Stop",
+     group=groupRisk,
+     tooltip="OFF by default, on purpose -- the book warns that adding stops/profit-taking to a trend system reduces its ability to capture the fat tail that makes trend-following profitable in the first place. If enabled, this is a very wide backstop against ruin, not a trade-management tool."
+)
+
+float catStopAtrMultInput = input.float(
+     defval=8.0,
+     title="Catastrophic Stop (x ATR)",
+     minval=2.0,
+     maxval=20.0,
+     step=0.5,
+     group=groupRisk,
+     tooltip="Distance from entry, in ATR (same ATR used for position sizing). Deliberately wide -- this should almost never be hit by normal trend behavior."
+)
+
+// =====================================================
+// 6. TREND-FAMILY CONFLUENCE
+// "Moving Average Sequences: Signal Progression": the book's own rule of
+// thumb is that a trend change is more trustworthy when a whole FAMILY of
+// calculation periods agrees, not just the one you're trading. This is a
+// genuinely new confirmation axis for this repo -- distinct from trend
+// strength (ADX-style) or participation (CVD/Volume-Trend-style) -- it
+// measures whether the trend read is consistent ACROSS SPEEDS.
+// Display-only: it does not gate entries, so turning it on/off never
+// changes trading behavior, only what the dashboard shows.
+// =====================================================
+string groupConfluence = "6. Trend-Family Confluence"
+
+bool showConfluenceInput = input.bool(
+     defval=true,
+     title="Show MA-Family Confluence",
+     group=groupConfluence,
+     tooltip="Display-only. Counts how many of a fixed family of SMA periods (10/20/40/80/160 -- spanning the book's own commonly-cited week/month/quarter/macrotrend intervals) currently agree with the slow trend's direction. Does not affect entries or exits."
+)
+
+// =====================================================
+// 7. COOLDOWN & TRADING HOURS
+// Cooldown here uses the same "count bars since the last ACCEPTED signal"
+// technique used to fix Trend_Following_Strategy_v6_Cooldown.pine earlier
+// this session, not a persisted armed/disarmed toggle. That earlier bug
+// was specifically a same-bar race between a rearm trigger and a disarm
+// trigger on two separate boolean checks -- this design has no equivalent
+// race to begin with, because "is cooldown elapsed" is recomputed fresh
+// every bar directly from lastEntryBar (bar_index - lastEntryBar >=
+// cooldownBarsInput), rather than toggled and remembered. lastEntryBar is
+// set at the moment a signal is ACCEPTED (armed into pendingLong/
+// pendingShort), the same "signal bar, not fill bar" choice that made the
+// earlier fix immune to strategy.closedtrades' fill-timing lag.
+// =====================================================
+string groupCooldown = "7. Cooldown & Trading Hours"
+
+int cooldownBarsInput = input.int(
+     defval=5,
+     title="Cooldown (Bars After Last Entry Signal)",
+     minval=0,
+     maxval=100,
+     group=groupCooldown,
+     tooltip="Blocks any new entry signal (long or short) for this many bars after the last accepted entry signal, regardless of whether that trade has closed yet. Set to 0 to disable."
+)
+
+bool useSessionFilterInput = input.bool(
+     defval=true,
+     title="Restrict Entries To Trading Hours",
+     group=groupCooldown,
+     tooltip="When on, new entry signals are only accepted for bars whose open time falls inside the session below; existing positions are never held up from exiting by this filter. Matters most if this script is ever run on an intraday timeframe -- on Daily bars (the timeframe this system is designed for) every regular session bar typically falls inside a normal trading-hours window already, so this filter will rarely bind there."
+)
+
+string sessionInput = input.session(
+     defval="0930-1600",
+     title="Trading Hours",
+     group=groupCooldown,
+     tooltip="Default is the regular US equity/index-futures RTH window, in the timezone set below (not the symbol's exchange timezone, which can differ -- e.g. CME futures default to Chicago time)."
+)
+
+string sessionTimezoneInput = input.string(
+     defval="America/New_York",
+     title="Trading Hours Timezone",
+     group=groupCooldown,
+     tooltip="Timezone the Trading Hours session string above is interpreted in."
+)
+
+// =====================================================
+// 9. CROSS-ASSET CONFIRMATION (Xu, Li, Singh & Park 2025)
+// Ported from quant-research-notes paper #12, "Cross-asset time-series
+// momentum strategy: A new perspective" -- their I-XTSM finding that
+// industrial metals' returns lead equity returns by about a month
+// (Jacobsen et al. 2019's diffusion story), used as a cross-asset
+// confirming/vetoing signal alongside the stock's own trend.
+//
+// The paper's regime construction is deliberately ASYMMETRIC, not a
+// mirror "both must agree" gate:
+//   stock +, cross-asset +  -> stay long  (Call)
+//   stock -, cross-asset -  -> stay short (Put)
+//   stock +, cross-asset -  -> stay long  (kept -- a bullish trend with a
+//                                          waning cross-asset undercurrent
+//                                          is still net positive)
+//   stock -, cross-asset +  -> JUMP OUT  (the only disagreement case that
+//                                         overrides -- a bearish stock
+//                                         trend against a bullish
+//                                         industrial-metals undercurrent
+//                                         is read as an unreliable
+//                                         downtrend, per the paper's own
+//                                         momentum-collapse-avoidance
+//                                         result)
+// So this only ever blocks/exits SHORTS, never longs -- faithful to the
+// paper's own asymmetry, not a simplification of it. GSCI-IND itself
+// isn't a chartable TradingView symbol; copper futures are used as the
+// live proxy, since copper was individually one of the paper's own
+// strongest-predicting metals (Table 4/5), not an arbitrary substitute.
+// =====================================================
+string groupCrossAsset = "9. Cross-Asset Confirmation"
+
+bool useCrossAssetInput = input.bool(
+     defval=true,
+     title="Use Cross-Asset Confirmation",
+     group=groupCrossAsset,
+     tooltip="When on: a bearish stock trend gets overridden to flat if the cross-asset (copper) is bullish, per Xu et al. (2025)'s I-XTSM asymmetric regime -- this never blocks or overrides a bullish stock trend, only a bearish one. When off, this module is fully inert."
+)
+
+string crossAssetSymbolInput = input.symbol(
+     defval="COMEX:HG1!",
+     title="Cross-Asset Symbol",
+     group=groupCrossAsset,
+     tooltip="Defaults to COMEX copper futures -- a live proxy for the GSCI Industrial Metals Index used in the paper (GSCI-IND itself isn't a chartable TradingView symbol). Copper was individually one of the paper's own strongest-predicting metals, not an arbitrary stand-in. Requires a market-data subscription covering this symbol/exchange; if it isn't available on your plan, this module reads N/A and never overrides anything (never blocks a long) rather than breaking the script -- switch to a copper-adjacent symbol your plan does cover, or turn the module off."
+)
+
+int crossAssetLookbackDaysInput = input.int(
+     defval=21,
+     title="Cross-Asset Lookback (Bars)",
+     minval=5,
+     maxval=60,
+     group=groupCrossAsset,
+     tooltip="The paper uses a 1-month lookback for the cross-asset signal specifically (shorter than the stock-side K, since industrial-metals information diffuses into equity prices within about a month). Default 21 approximates one trading month on a Daily chart."
+)
+
+// =====================================================
+// 10. DISPLAY
+// =====================================================
+string groupDisplay = "10. Display"
+
+bool showDashboardInput = input.bool(defval=true, title="Show Dashboard", group=groupDisplay)
+bool showBandsPlotInput = input.bool(defval=true, title="Plot Bands", group=groupDisplay)
+bool showAnticipatedFlipInput = input.bool(
+     defval=true,
+     title="Show Anticipated Flip Price (SMA only)",
+     group=groupDisplay,
+     tooltip="\"Anticipating the Trend Signal\": for an SMA, tomorrow's average rises iff tomorrow's close beats the price dropping off the calculation window. That threshold price is knowable in advance and shown here. Only exact for the SMA trend method -- EMA/Linear Regression don't have the same simple closed-form threshold, so this reads N/A for those."
+)
+
+// =====================================================
+// TREND CALCULATIONS
+// =====================================================
+float slowTrend = switch trendMethodInput
+    "SMA" => ta.sma(close, slowLenInput)
+    "EMA" => ta.ema(close, slowLenInput)
+    "Linear Regression" => ta.linreg(close, slowLenInput, 0)
+    => ta.sma(close, slowLenInput)
+
+float fastTrend = switch trendMethodInput
+    "SMA" => ta.sma(close, fastLenInput)
+    "EMA" => ta.ema(close, fastLenInput)
+    "Linear Regression" => ta.linreg(close, fastLenInput, 0)
+    => ta.sma(close, fastLenInput)
+
+bool slowUp = slowTrend > slowTrend[1]
+bool fastUp = fastTrend > fastTrend[1]
+
+bool longCond = use2TrendInput ? (slowUp and fastUp) : slowUp
+bool shortCond = use2TrendInput ? (not slowUp and not fastUp) : not slowUp
+bool flatCond = use2TrendInput and (slowUp != fastUp)
+
+// =====================================================
+// CROSS-ASSET CONFIRMATION (Xu et al. 2025) -- see the "9." input group
+// above for the full reasoning. "Stock signal negative" is read from
+// slowUp (the primary trend), matching the paper's own single-signal
+// (sign of the trailing K-month return) construction, not the compound
+// 2-trend gate.
+// =====================================================
+float crossAssetClose = request.security(crossAssetSymbolInput, timeframe.period, close, lookahead=barmerge.lookahead_off)
+float crossAssetPrior = crossAssetClose[crossAssetLookbackDaysInput]
+float crossAssetReturn = (not na(crossAssetPrior) and crossAssetPrior != 0) ? (crossAssetClose / crossAssetPrior - 1) * 100 : na
+bool crossAssetUp = not na(crossAssetReturn) and crossAssetReturn > 0
+
+bool crossAssetOverrideActive = useCrossAssetInput and not na(crossAssetReturn) and (not slowUp) and crossAssetUp
+
+// =====================================================
+// BANDS
+// =====================================================
+float atrForBand = ta.atr(bandAtrLenInput)
+float atrUpperBand = slowTrend + bandScaleInput * atrForBand
+float atrLowerBand = slowTrend - bandScaleInput * atrForBand
+
+// Modified Bollinger (McNicholl): double-exponentially-smoothed center
+// line D, and the same double-smoothing construction applied to the
+// absolute deviation |C-D|, so the band reacts to a volatility change
+// faster than the standard single-smoothed Bollinger construction.
+var float mbM = na
+var float mbU = na
+var float mbSmDev = na
+var float mbSmDevU = na
+
+mbM := na(mbM[1]) ? close : mbAlphaInput * close + (1 - mbAlphaInput) * mbM[1]
+mbU := na(mbU[1]) ? close : mbAlphaInput * mbM + (1 - mbAlphaInput) * mbU[1]
+float mbD = (1 - mbAlphaInput) != 0 ? ((2 - mbAlphaInput) * mbM - mbU) / (1 - mbAlphaInput) : close
+
+float mbDevNow = math.abs(close - mbD)
+mbSmDev := na(mbSmDev[1]) ? mbDevNow : mbAlphaInput * mbDevNow + (1 - mbAlphaInput) * mbSmDev[1]
+mbSmDevU := na(mbSmDevU[1]) ? mbDevNow : mbAlphaInput * mbSmDev + (1 - mbAlphaInput) * mbSmDevU[1]
+float mbd = (1 - mbAlphaInput) != 0 ? ((2 - mbAlphaInput) * mbSmDev - mbSmDevU) / (1 - mbAlphaInput) : 0.0
+
+float mbUpperBand = mbD + mbWidthMultInput * mbd
+float mbLowerBand = mbD - mbWidthMultInput * mbd
+
+float upperBand = switch bandTypeInput
+    "ATR / Volatility" => atrUpperBand
+    "Modified Bollinger" => mbUpperBand
+    => atrUpperBand
+
+float lowerBand = switch bandTypeInput
+    "ATR / Volatility" => atrLowerBand
+    "Modified Bollinger" => mbLowerBand
+    => atrLowerBand
+
+bool bandClearLong = not useBandFilterInput or close > upperBand
+bool bandClearShort = not useBandFilterInput or close < lowerBand
+
+bool finalLongCond = longCond and bandClearLong
+bool finalShortCond = shortCond and bandClearShort and not crossAssetOverrideActive
+
+// =====================================================
+// ANTICIPATING THE SIGNAL / PROJECTED CROSSOVER (display only)
+// =====================================================
+
+// "Anticipating the Trend Signal": exact for SMA, since only the newest
+// and oldest terms in the window change from one day to the next.
+float anticipatedFlipPrice = trendMethodInput == "SMA" ? close[slowLenInput - 1] : na
+
+// CP2 -- projected two-trend crossover price. Derived independently here
+// from the equal-average condition (solve (Sm+P)/m = (Sn+P)/n for P,
+// where Sm/Sn are the sums of the m-1/n-1 most recent prior prices):
+//   P = (n x Sm - m x Sn) / (m - n)
+// This is verified algebraically from first principles. It is offered as
+// a self-derived, checked projection rather than a literal reproduction
+// of Kaufman's own printed shorthand formula, which the reference file
+// (references/trend-systems-kaufman.md) flags as carrying some
+// transcription-fidelity risk from the source excerpt -- worth a check
+// against the physical text if exact agreement with the book matters.
+float cp2 = na
+if trendMethodInput == "SMA" and use2TrendInput and slowLenInput != fastLenInput
+    float sumSlow1 = math.sum(close[1], math.max(1, slowLenInput - 1))
+    float sumFast1 = math.sum(close[1], math.max(1, fastLenInput - 1))
+    cp2 := (fastLenInput * sumSlow1 - slowLenInput * sumFast1) / (slowLenInput - fastLenInput)
+
+float mdi = na(cp2) or na(cp2[1]) ? na : 100 * (cp2[1] - cp2) / ((close + close[1]) / 2)
+
+// =====================================================
+// MA-FAMILY CONFLUENCE (display only)
+// Five fixed, literal-length SMAs -- spelled out individually rather than
+// looped over a variable length. ta.* built-ins that carry per-call
+// historical state (ta.sma included) are not safe to call with a length
+// that varies by loop iteration in Pine, so each period gets its own
+// named call instead of `for len in array: ta.sma(close, len)`.
+// =====================================================
+float confMa10 = ta.sma(close, 10)
+float confMa20 = ta.sma(close, 20)
+float confMa40 = ta.sma(close, 40)
+float confMa80 = ta.sma(close, 80)
+float confMa160 = ta.sma(close, 160)
+
+bool primaryUp = slowUp
+int confluenceTotal = 5
+int confluenceAgree = 0
+
+confluenceAgree += (confMa10 > confMa10[1]) == primaryUp ? 1 : 0
+confluenceAgree += (confMa20 > confMa20[1]) == primaryUp ? 1 : 0
+confluenceAgree += (confMa40 > confMa40[1]) == primaryUp ? 1 : 0
+confluenceAgree += (confMa80 > confMa80[1]) == primaryUp ? 1 : 0
+confluenceAgree += (confMa160 > confMa160[1]) == primaryUp ? 1 : 0
+
+// =====================================================
+// POSITION SIZING
+// =====================================================
+float atrForSizing = ta.atr(slowLenInput)
+float bigPointValue = syminfo.pointvalue
+float riskDollars = strategy.equity * (riskPctInput / 100.0)
+float rawQty = (atrForSizing > 0 and bigPointValue > 0) ? riskDollars / (atrForSizing * bigPointValue) : 0.0
+int posQty = int(math.floor(rawQty))
+bool qtyTooSmall = posQty < 1
+
+// =====================================================
+// ENTRY TIMING STATE MACHINE
+// Exits (trend conflict) always fire immediately -- only ENTRIES get the
+// timing treatment above, matching the book's own framing that timing
+// rules are about improving entry price, not delaying an exit.
+// =====================================================
+var bool pendingLong = false
+var bool pendingShort = false
+var int pendingLongBar = na
+var int pendingShortBar = na
+var float pendingLongLimit = na
+var float pendingShortLimit = na
+var int lastEntryBar = na
+
+bool inSession = not na(time(timeframe.period, sessionInput, sessionTimezoneInput))
+bool sessionOk = not useSessionFilterInput or inSession
+bool cooldownElapsed = na(lastEntryBar) or (bar_index - lastEntryBar) >= cooldownBarsInput
+
+bool freshLongSignal = finalLongCond and not finalLongCond[1] and strategy.position_size <= 0 and cooldownElapsed and sessionOk
+bool freshShortSignal = finalShortCond and not finalShortCond[1] and strategy.position_size >= 0 and cooldownElapsed and sessionOk
+bool freshFlatSignal = use2TrendInput and flatCond and not flatCond[1] and strategy.position_size != 0
+bool freshCrossAssetJumpOut = crossAssetOverrideActive and not crossAssetOverrideActive[1] and strategy.position_size < 0
+
+if freshFlatSignal
+    strategy.close("Long", comment="Trend Conflict")
+    strategy.close("Short", comment="Trend Conflict")
+
+if freshCrossAssetJumpOut
+    strategy.close("Short", comment="Cross-Asset Jump Out")
+
+if freshLongSignal
+    pendingLong := true
+    pendingLongBar := bar_index
+    pendingLongLimit := close - retraceAtrMultInput * atrForBand
+    pendingShort := false
+    lastEntryBar := bar_index
+
+if freshShortSignal
+    pendingShort := true
+    pendingShortBar := bar_index
+    pendingShortLimit := close + retraceAtrMultInput * atrForBand
+    pendingLong := false
+    lastEntryBar := bar_index
+
+if strategy.position_size > 0
+    pendingLong := false
+
+if strategy.position_size < 0
+    pendingShort := false
+
+if pendingLong and not qtyTooSmall
+    if entryStyleInput == "Immediate"
+        strategy.entry("Long", strategy.long, qty=posQty)
+        pendingLong := false
+    else if entryStyleInput == "Delay N Bars"
+        if not finalLongCond
+            pendingLong := false
+        else if bar_index - pendingLongBar >= delayBarsInput
+            strategy.entry("Long", strategy.long, qty=posQty)
+            pendingLong := false
+    else if entryStyleInput == "ATR Retracement or Timeout"
+        if not finalLongCond
+            strategy.cancel("Long")
+            pendingLong := false
+        else if bar_index - pendingLongBar >= retraceTimeoutInput
+            strategy.cancel("Long")
+            strategy.entry("Long", strategy.long, qty=posQty)
+            pendingLong := false
+        else
+            strategy.entry("Long", strategy.long, qty=posQty, limit=pendingLongLimit)
+
+if pendingShort and not qtyTooSmall
+    if entryStyleInput == "Immediate"
+        strategy.entry("Short", strategy.short, qty=posQty)
+        pendingShort := false
+    else if entryStyleInput == "Delay N Bars"
+        if not finalShortCond
+            pendingShort := false
+        else if bar_index - pendingShortBar >= delayBarsInput
+            strategy.entry("Short", strategy.short, qty=posQty)
+            pendingShort := false
+    else if entryStyleInput == "ATR Retracement or Timeout"
+        if not finalShortCond
+            strategy.cancel("Short")
+            pendingShort := false
+        else if bar_index - pendingShortBar >= retraceTimeoutInput
+            strategy.cancel("Short")
+            strategy.entry("Short", strategy.short, qty=posQty)
+            pendingShort := false
+        else
+            strategy.entry("Short", strategy.short, qty=posQty, limit=pendingShortLimit)
+
+// =====================================================
+// OPTIONAL CATASTROPHIC STOP
+// =====================================================
+if useCatStopInput and strategy.position_size != 0
+    float catStopPrice = strategy.position_size > 0 ? strategy.position_avg_price - catStopAtrMultInput * atrForSizing : strategy.position_avg_price + catStopAtrMultInput * atrForSizing
+    strategy.exit("Cat Stop", from_entry=strategy.position_size > 0 ? "Long" : "Short", stop=catStopPrice)
+
+// =====================================================
+// DASHBOARD
+// =====================================================
+var table dash = table.new(
+     position.top_right,
+     2,
+     18,
+     bgcolor=color.rgb(8, 20, 38),
+     frame_color=color.rgb(35, 125, 255),
+     frame_width=2,
+     border_color=color.rgb(55, 75, 100),
+     border_width=1
+)
+
+f_row(tableId, row, labelText, valueText, valueBg) =>
+    table.cell(
+         table_id=tableId,
+         column=0,
+         row=row,
+         text=labelText,
+         text_color=color.white,
+         bgcolor=color.rgb(8, 20, 38),
+         text_size=size.small,
+         text_halign=text.align_left
+    )
+    table.cell(
+         table_id=tableId,
+         column=1,
+         row=row,
+         text=valueText,
+         text_color=color.white,
+         bgcolor=valueBg,
+         text_size=size.small,
+         text_halign=text.align_right
+    )
+
+if barstate.islast and showDashboardInput
+    table.cell(
+         table_id=dash,
+         column=0,
+         row=0,
+         text="KAUFMAN TREND SYSTEM",
+         text_color=color.white,
+         bgcolor=color.rgb(7, 24, 47),
+         text_size=size.small,
+         text_halign=text.align_left
+    )
+
+    string posText = strategy.position_size > 0 ? "LONG " + str.tostring(strategy.position_size) : strategy.position_size < 0 ? "SHORT " + str.tostring(math.abs(strategy.position_size)) : "FLAT"
+    color posColor = strategy.position_size > 0 ? color.rgb(25, 195, 100) : strategy.position_size < 0 ? color.rgb(245, 55, 80) : color.rgb(88, 105, 132)
+
+    table.cell(
+         table_id=dash,
+         column=1,
+         row=0,
+         text=posText,
+         text_color=color.white,
+         bgcolor=posColor,
+         text_size=size.small,
+         text_halign=text.align_right
+    )
+
+    string slowDirText = slowUp ? "UP" : "DOWN"
+    color slowDirColor = slowUp ? color.rgb(25, 195, 100) : color.rgb(245, 55, 80)
+    f_row(dash, 1, "SLOW TREND (" + trendMethodInput + " " + str.tostring(slowLenInput) + ")", slowDirText, slowDirColor)
+
+    string fastDirText = use2TrendInput ? (fastUp ? "UP" : "DOWN") : "OFF"
+    color fastDirColor = use2TrendInput ? (fastUp ? color.rgb(25, 195, 100) : color.rgb(245, 55, 80)) : color.rgb(88, 105, 132)
+    f_row(dash, 2, "FAST TREND (" + str.tostring(fastLenInput) + ")", fastDirText, fastDirColor)
+
+    string bandText = close > upperBand ? "ABOVE UPPER" : close < lowerBand ? "BELOW LOWER" : "INSIDE"
+    color bandColor = close > upperBand ? color.rgb(25, 195, 100) : close < lowerBand ? color.rgb(245, 55, 80) : color.rgb(88, 105, 132)
+    f_row(dash, 3, "BAND (" + bandTypeInput + ")", bandText, bandColor)
+
+    string qtyText = qtyTooSmall ? "TOO SMALL" : str.tostring(posQty)
+    color qtyColor = qtyTooSmall ? color.rgb(245, 55, 80) : color.rgb(88, 105, 132)
+    f_row(dash, 4, "QTY (RISK " + str.tostring(riskPctInput) + "%)", qtyText, qtyColor)
+
+    string pendingText = pendingLong ? "LONG PENDING (" + str.tostring(bar_index - pendingLongBar) + "b)" : pendingShort ? "SHORT PENDING (" + str.tostring(bar_index - pendingShortBar) + "b)" : "NONE"
+    f_row(dash, 5, "TIMING (" + entryStyleInput + ")", pendingText, color.rgb(88, 105, 132))
+
+    string flipText = na(anticipatedFlipPrice) ? "N/A" : "ABOVE " + str.tostring(anticipatedFlipPrice, format.mintick)
+    f_row(dash, 6, "ANTICIPATED FLIP", showAnticipatedFlipInput ? flipText : "OFF", color.rgb(88, 105, 132))
+
+    string cp2Text = na(cp2) ? "N/A" : str.tostring(cp2, format.mintick)
+    f_row(dash, 7, "CP2 (PROJECTED CROSS)", cp2Text, color.rgb(88, 105, 132))
+
+    string mdiText = na(mdi) ? "N/A" : str.tostring(mdi, "#.00")
+    f_row(dash, 8, "MDI", mdiText, color.rgb(88, 105, 132))
+
+    string confText = str.tostring(confluenceAgree) + "/" + str.tostring(confluenceTotal) + " AGREE"
+    color confColor = confluenceAgree == confluenceTotal ? color.rgb(25, 195, 100) : confluenceAgree == 0 ? color.rgb(245, 55, 80) : color.rgb(88, 105, 132)
+    f_row(dash, 9, "MA FAMILY CONFLUENCE", showConfluenceInput ? confText : "OFF", showConfluenceInput ? confColor : color.rgb(88, 105, 132))
+
+    string catStopText = useCatStopInput ? str.tostring(catStopAtrMultInput) + "x ATR" : "OFF"
+    color catStopColor = useCatStopInput ? color.rgb(245, 160, 20) : color.rgb(88, 105, 132)
+    f_row(dash, 10, "CATASTROPHIC STOP", catStopText, catStopColor)
+
+    f_row(dash, 11, "EQUITY", str.tostring(strategy.equity, "#,###"), color.rgb(88, 105, 132))
+
+    color openPlColor = strategy.openprofit >= 0 ? color.rgb(25, 195, 100) : color.rgb(245, 55, 80)
+    f_row(dash, 12, "OPEN P/L", str.tostring(strategy.openprofit, "#,###"), openPlColor)
+
+    f_row(dash, 13, "CLOSED TRADES", str.tostring(strategy.closedtrades), color.rgb(88, 105, 132))
+
+    string cooldownText = cooldownElapsed ? "READY" : str.tostring(cooldownBarsInput - (bar_index - lastEntryBar)) + " BARS LEFT"
+    color cooldownColor = cooldownElapsed ? color.rgb(88, 105, 132) : color.rgb(245, 160, 20)
+    f_row(dash, 14, "COOLDOWN", cooldownBarsInput <= 0 ? "OFF" : cooldownText, cooldownBarsInput <= 0 ? color.rgb(88, 105, 132) : cooldownColor)
+
+    string sessionText = not useSessionFilterInput ? "OFF" : inSession ? "OPEN" : "CLOSED"
+    color sessionColor = not useSessionFilterInput ? color.rgb(88, 105, 132) : inSession ? color.rgb(25, 195, 100) : color.rgb(245, 55, 80)
+    f_row(dash, 15, "TRADING HOURS (" + sessionInput + ")", sessionText, sessionColor)
+
+    string crossAssetText = not useCrossAssetInput ? "OFF" : na(crossAssetReturn) ? "N/A" : (crossAssetUp ? "UP " : "DOWN ") + str.tostring(crossAssetReturn, "#.00") + "%"
+    color crossAssetColor = not useCrossAssetInput ? color.rgb(88, 105, 132) : crossAssetUp ? color.rgb(25, 195, 100) : color.rgb(245, 55, 80)
+    f_row(dash, 16, "CROSS-ASSET (COPPER)", crossAssetText, crossAssetColor)
+
+    string jumpOutText = not useCrossAssetInput ? "OFF" : crossAssetOverrideActive ? "ACTIVE -- SHORT BLOCKED" : "INACTIVE"
+    color jumpOutColor = not useCrossAssetInput ? color.rgb(88, 105, 132) : crossAssetOverrideActive ? color.rgb(245, 160, 20) : color.rgb(88, 105, 132)
+    f_row(dash, 17, "JUMP OUT OVERRIDE", jumpOutText, jumpOutColor)
+
+// =====================================================
+// PLOTS
+// =====================================================
+plot(slowTrend, title="Slow Trend", color=color.white, linewidth=2)
+plot(use2TrendInput ? fastTrend : na, title="Fast Trend", color=color.aqua, linewidth=1)
+plot(showBandsPlotInput ? upperBand : na, title="Upper Band", color=color.new(color.orange, 30), linewidth=1)
+plot(showBandsPlotInput ? lowerBand : na, title="Lower Band", color=color.new(color.orange, 30), linewidth=1)
+
+plotshape(freshLongSignal, title="Long Signal", style=shape.triangleup, location=location.belowbar, color=color.rgb(25, 195, 100), size=size.small)
+plotshape(freshShortSignal, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.rgb(245, 55, 80), size=size.small)
+
+alertcondition(freshLongSignal, title="Long Signal", message="Kaufman Trend System long signal -- {{ticker}} {{interval}}")
+alertcondition(freshShortSignal, title="Short Signal", message="Kaufman Trend System short signal -- {{ticker}} {{interval}}")

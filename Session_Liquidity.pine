@@ -1,0 +1,276 @@
+// © Infinity_Trading_
+// Last Modified: 12/15/2022
+
+//@version=5
+indicator(title="Session Liquidity", shorttitle="Session Liquidity", overlay=true)
+
+// Description:
+//
+// The “Session Liquidity” TradingView indicator by Infinity Trading creates dynamic horizontal lines at the high and low points of a specified time span within the trading day.
+// This indicator gives the user control of three separate time spans so the user can dynamically see the highs and lows of their favorite daily time spans.
+
+// Purpose:
+//
+// This indicator is similar to my TradingView indicator “Futures Exchange Sessions 3.0”.
+// In that indicator the user gets control of dynamic price boxes. For me, these boxes made it difficult to spot ICT’s Orderblocks.
+// So instead of boxes I made independently controllable lines and now I can spot ICT Orderblocks and easily identify Liquidity Pools.
+
+// Special Notes:
+//
+// If the Line Start Time is within one candle of the Start Day Timezone in the Settings, then the line/box won’t display. So choose the previous timezone
+// Lines only display when the timeframe is <= 30 minute
+
+
+///////////////////////////////////////////////////////////////////////////////// CONSTANTS
+
+c_milliseconds_in_day = 24 * 60 * 60 * 1000
+c_tooltip_1 = "If the user increments/decrements this integer field and nothing happens, that is because the user is moving throught a weekend or holiday. Please continue incrementing/decrementing and after 2-3 clicks the user will see backgrounds/labels appear or disappear. The algorithm for Days Back is counting every 24-hour period which is why this behavior occurs."
+c_tooltip_2 = "To make the lines start over each day the code must know when to start the day. Since the user is entering times, a static start time won't work. Use midnight EST in the three timezone options as the starting point. If the users lines fits in the Asian Session then choose Asia/Shanghai. If the lines are within the London Session then choose Europe/London. And the same goes for the New York Session."
+c_tooltip_3 = "Please specify a start & end time within the same 'day' where the 'day' starts at midnight of the timezone selected by the user in the dropdown Start Day Timezone"
+
+
+///////////////////////////////////////////////////////////////////////////////// INPUTS
+
+
+var string GDTB = "Limit Past Lines"
+i_display_days_back = input.int(defval=15, minval=1, maxval=80, title="Display Only 🔢 Days Back", group=GDTB, tooltip=c_tooltip_1)
+
+
+var string L0 = "First Session Lines"
+i_1st_session_high_line_toggle = input.bool(defval=true, title="High Line On/Off      ", group=L0, inline="high-1")
+i_1st_session_high_label_toggle = input.bool(defval=true, title="High Label On/Off", group=L0, inline="high-1")
+i_1st_session_low_line_toggle = input.bool(defval=true, title="Low Line On/Off      ", group=L0, inline="low-1")
+i_1st_session_low_label_toggle = input.bool(defval=true, title="Low Label On/Off", group=L0, inline="low-1")
+i_1st_session_start_day =       input.string(defval="Asia/Shanghai", title="Line Start Day Timezone", options=["America/New_York", "Europe/London", "Asia/Shanghai"], group=L0, tooltip=c_tooltip_2)
+i_1st_session_time =            input.session(defval='1900-0259', title="Line Start & End Times", group=L0, tooltip=c_tooltip_3)
+i_1st_session_text_char =        input.string(defval="First Session", title="Text Style     ", group=L0, inline="text1")
+i_1st_session_text_color =      input.color(defval=color.new(#131722, 0), title="", group=L0, inline="text1")
+i_1st_session_text_size =       input.string(defval="Normal", title="", options=["Tiny", "Small", "Normal", "Large", "Huge", "Auto"], group=L0, inline="text1")
+i_1st_session_line_high_color = input.color(defval=color.new(#00bcd4, 0), title="Line Style - High  ", group=L0, inline="line-high1")
+i_1st_session_line_high_style = input.string(defval="solid (─)", title="", options=["solid (─)", "dotted (┈)", "dashed (╌)"], group=L0, inline="line-high1")
+i_1st_session_line_high_width = input.int(defval=2, title="", minval=1, maxval=20, group=L0, inline="line-high1")
+i_1st_session_line_low_color =  input.color(defval=color.new(#00bcd4, 0), title="Line Style - Low  ", group=L0, inline="line-low1")
+i_1st_session_line_low_style =  input.string(defval="solid (─)", title="", options=["solid (─)", "dotted (┈)", "dashed (╌)"], group=L0, inline="line-low1")
+i_1st_session_line_low_width =  input.int(defval=2, title="", minval=1, maxval=20, group=L0, inline="line-low1")
+
+
+var string L2 = "Second Session Lines"
+i_2nd_session_high_line_toggle = input.bool(defval=true, title="High Line On/Off      ", group=L2, inline="high-2")
+i_2nd_session_high_label_toggle = input.bool(defval=true, title="High Label On/Off", group=L2, inline="high-2")
+i_2nd_session_low_line_toggle =  input.bool(defval=true, title="Low Line On/Off      ", group=L2, inline="low-2")
+i_2nd_session_low_label_toggle = input.bool(defval=true, title="Low Label On/Off", group=L2, inline="low-2")
+i_2nd_session_start_day =       input.string(defval="Europe/London", title="Line Start Day Timezone", options=["America/New_York", "Europe/London", "Asia/Shanghai"], group=L2, tooltip=c_tooltip_2)
+i_2nd_session_time =            input.session(defval='0300-0929', title="Line Start & End Times", group=L2, tooltip=c_tooltip_3)
+i_2nd_session_text_char =        input.string(defval="Second Session", title="Text Style     ", group=L2, inline="text2")
+i_2nd_session_text_color =      input.color(defval=color.new(#131722, 0), title="", group=L2, inline="text2")
+i_2nd_session_text_size =       input.string(defval="Normal", title="", options=["Tiny", "Small", "Normal", "Large", "Huge", "Auto"], group=L2, inline="text2")
+i_2nd_session_line_high_color = input.color(defval=color.new(#f2a03a, 0), title="Line Style - High  ", group=L2, inline="line-high2")
+i_2nd_session_line_high_style = input.string(defval="solid (─)", title="", options=["solid (─)", "dotted (┈)", "dashed (╌)"], group=L2, inline="line-high2")
+i_2nd_session_line_high_width = input.int(defval=2, title="", minval=1, maxval=20, group=L2, inline="line-high2")
+i_2nd_session_line_low_color =  input.color(defval=color.new(#f2a03a, 0), title="Line Style - Low  ", group=L2, inline="line-low2")
+i_2nd_session_line_low_style =  input.string(defval="solid (─)", title="", options=["solid (─)", "dotted (┈)", "dashed (╌)"], group=L2, inline="line-low2")
+i_2nd_session_line_low_width =  input.int(defval=2, title="", minval=1, maxval=20, group=L2, inline="line-low2")
+
+
+var string L3 = "Third Session Lines"
+i_3rd_session_high_line_toggle = input.bool(defval=false, title="High Line On/Off      ", group=L3, inline="high-3")
+i_3rd_session_high_label_toggle = input.bool(defval=false, title="High Label On/Off", group=L3, inline="high-3")
+i_3rd_session_low_line_toggle =  input.bool(defval=false, title="Low Line On/Off      ", group=L3, inline="low-3")
+i_3rd_session_low_label_toggle = input.bool(defval=false, title="Low Label On/Off", group=L3, inline="low-3")
+i_3rd_session_start_day =       input.string(defval="America/New_York", title="Line Start Day Timezone", options=["America/New_York", "Europe/London", "Asia/Shanghai"], group=L3, tooltip=c_tooltip_2)
+i_3rd_session_time =            input.session(defval='0930-1559', title="Line Start & End Times", group=L3, tooltip=c_tooltip_3)
+i_3rd_session_text_char =        input.string(defval="Third Session", title="Text Style     ", group=L3, inline="text3")
+i_3rd_session_text_color =      input.color(defval=color.new(#131722, 0), title="", group=L3, inline="text3")
+i_3rd_session_text_size =       input.string(defval="Normal", title="", options=["Tiny", "Small", "Normal", "Large", "Huge", "Auto"], group=L3, inline="text3")
+i_3rd_session_line_high_color = input.color(defval=color.new(#467deb, 0), title="Line Style - High  ", group=L3, inline="line-high3")
+i_3rd_session_line_high_style = input.string(defval="solid (─)", title="", options=["solid (─)", "dotted (┈)", "dashed (╌)"], group=L3, inline="line-high3")
+i_3rd_session_line_high_width = input.int(defval=2, title="", minval=1, maxval=20, group=L3, inline="line-high3")
+i_3rd_session_line_low_color =  input.color(defval=color.new(#467deb, 0), title="Line Style - Low  ", group=L3, inline="line-low3")
+i_3rd_session_line_low_style =  input.string(defval="solid (─)", title="", options=["solid (─)", "dotted (┈)", "dashed (╌)"], group=L3, inline="line-low3")
+i_3rd_session_line_low_width =  input.int(defval=2, title="", minval=1, maxval=20, group=L3, inline="line-low3")
+
+
+//------------------------------------
+// VARIABLES
+//------------------------------------
+
+// See if a new calendar day started on the intra-day time frame
+// with variable timezone
+
+newDayFirstStartLine = dayofmonth(time, i_1st_session_start_day) != dayofmonth(time, i_1st_session_start_day)[1] and timeframe.isintraday
+
+newDaySecondStartLine = dayofmonth(time, i_2nd_session_start_day) != dayofmonth(time, i_2nd_session_start_day)[1] and timeframe.isintraday
+
+newDayThirdStartLine = dayofmonth(time, i_3rd_session_start_day) != dayofmonth(time, i_3rd_session_start_day)[1] and timeframe.isintraday
+
+
+///////////////////////////////////////////////////////////////////////////////// DAYS BACK
+
+// Find the last bar on the chart
+lastBarDate = timestamp(year(timenow), month(timenow), dayofmonth(timenow), hour(timenow), minute(timenow), second(timenow))
+// Find the current bar that is being processed
+thisBarDate = timestamp(year, month, dayofmonth, hour, minute, second)
+// Find the number of days between these two bars
+daysLeft = math.floor((lastBarDate - thisBarDate) / c_milliseconds_in_day)
+// Only display the number of days specified in Input Settings
+in_days_back_range = daysLeft < i_display_days_back
+
+
+///////////////////////////////////////////////////////////////////////////////// HELPER FUNCTIONS
+
+
+// Function the converts string inputs to line style code
+line_style_function(input_var) =>
+    switch input_var
+        "dotted (┈)" => line.style_dotted
+        "dashed (╌)" => line.style_dashed
+        => line.style_solid
+
+
+// Function that converts string inputs to text size code
+text_size_function(string_size) =>
+    switch string_size
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        "Huge" => size.huge
+        "Auto" => size.auto
+
+
+
+///////////////////////////////////////////////////////////////////////////////// MAIN FUNCTION
+
+// Creates lines and labels accoriding to settings
+session_liquidity_lines_function(HIGH_LINE_TOGGLE, LOW_LINE_TOGGLE, HIGH_LABEL_TOGGLE, LOW_LABEL_TOGGLE, SESSION_TIME, DAYS_BACK, NEW_DAY, LINE_HIGH_COLOR, LINE_HIGH_STYLE, LINE_HIGH_WIDTH, LINE_LOW_COLOR, LINE_LOW_STYLE, LINE_LOW_WIDTH, TEXT_COLOR, TEXT_CHAR, TEXT_SIZE) =>
+
+    // Time period variables
+    session_est_window = time(timeframe.period, SESSION_TIME, "America/New_York")
+    // Parse start hour and start minutes from session string
+    session_start_hour = str.substring(SESSION_TIME, 0, 2)
+    session_start_minutes = str.substring(SESSION_TIME, 2, 4)
+    // Use time hour and minute to create boolean for time
+    session_start_time = (hour(time, "America/New_York") == str.tonumber(session_start_hour)) and (minute(time) == str.tonumber(session_start_minutes))
+
+    // Line Style functions
+    session_line_high_style = line_style_function(LINE_HIGH_STYLE)
+    session_line_low_style = line_style_function(LINE_LOW_STYLE)
+    // Text size function
+    label_text_size = text_size_function(TEXT_SIZE)
+
+    // Instantiate variables
+    var float session_high = 0.0
+    var float session_low = 0.0
+    var line session_line_low = na
+    var line session_line_high = na
+    var label session_label_low = na
+    var label session_label_high = na
+    var float price_session_line_low = na
+    var float price_session_line_high = na
+
+    standardized_calc = ta.stdev(close, 10) / 2
+
+    // Only display the specified number of days back
+    if DAYS_BACK
+
+        // Toggle NY Session box on/off
+        // Only display when timeframe is 30 minutes or less
+        if timeframe.isminutes and timeframe.multiplier < 60
+
+            // If a new day starts, create initial lines
+            if NEW_DAY
+
+                if HIGH_LINE_TOGGLE
+                    session_line_high := line.new(x1=na, y1=na, x2=na, y2=na, color=LINE_HIGH_COLOR, style=session_line_high_style, width=LINE_HIGH_WIDTH)
+                if LOW_LINE_TOGGLE
+                    session_line_low := line.new(x1=na, y1=na, x2=na, y2=na, color=LINE_LOW_COLOR, style=session_line_low_style, width=LINE_LOW_WIDTH)
+
+                // Dummy variable to trick pine script. Both sides of the conditional must return the same object type
+                pine_script = 5
+
+            // If not new day, then update the highest high and lowest low values and update the lines
+            else
+
+                // When time cross the start time, create the line with updated highs and lows for the first time
+                if session_start_time
+                    session_high := high
+                    session_low := low
+
+                    if HIGH_LINE_TOGGLE
+                        // Update high line with initial x's and y's
+                        line.set_x1(session_line_high, bar_index)
+                        line.set_y1(session_line_high, session_high)
+                        line.set_x2(session_line_high, bar_index + 1)
+                        line.set_y2(session_line_high, session_high)
+
+                    if LOW_LINE_TOGGLE
+                        // Update low line with initial x's and y's
+                        line.set_x1(session_line_low, bar_index)
+                        line.set_y1(session_line_low, session_low)
+                        line.set_x2(session_line_low, bar_index + 1)
+                        line.set_y2(session_line_low, session_low)
+
+                // At every new candle during specified time span, update y1, x2, y2 values to move the lines up or down and to the right
+                if session_est_window
+                    session_high := math.max(session_high, high)
+                    session_low := math.min(session_low, low)
+
+                    if HIGH_LINE_TOGGLE
+                        // Don't need to update x1
+                        line.set_y1(session_line_high, session_high)
+                        line.set_x2(session_line_high, bar_index + 1)
+                        line.set_y2(session_line_high, session_high)
+
+                    if LOW_LINE_TOGGLE
+                        // Don't need to update x1
+                        line.set_y1(session_line_low, session_low)
+                        line.set_x2(session_line_low, bar_index + 1)
+                        line.set_y2(session_line_low, session_low)
+
+                    // Draw label only for most recent line
+                    // Calculation to center label on line
+                    x_middle = (line.get_x2(session_line_low) - line.get_x1(session_line_low)) / 2
+
+                    if HIGH_LABEL_TOGGLE
+                        price_session_line_high := line.get_price(session_line_high, bar_index)
+                        session_label_high := label.new(x=bar_index - x_middle, y=price_session_line_high, text=TEXT_CHAR, xloc=xloc.bar_index, color=color.new(#131722, 100), textcolor=TEXT_COLOR, tooltip=str.tostring(price_session_line_high), size = label_text_size)
+                        // Delete all pasts labels except the most recent one
+                        label.delete(session_label_high[1])
+
+                    if LOW_LABEL_TOGGLE
+                        // Get y value (price) of midnight open line
+                        price_session_line_low := line.get_price(session_line_low, bar_index)
+                        session_label_low := label.new(x=bar_index - x_middle, y=price_session_line_low - standardized_calc, text=TEXT_CHAR, xloc=xloc.bar_index, color=color.new(#131722, 100), textcolor=TEXT_COLOR, tooltip=str.tostring(price_session_line_low), size = label_text_size)
+                        // Delete all pasts labels except the most recent one
+                        label.delete(session_label_low[1])
+
+                // Dummy variable to trick pine script. Both sides of the conditional must return the same object type
+                pine_script = 6
+
+
+
+//------------------------------------
+// 1st SESSION LIQUIDITY
+//------------------------------------
+
+
+session_liquidity_lines_function(i_1st_session_high_line_toggle, i_1st_session_low_line_toggle, i_1st_session_high_label_toggle, i_1st_session_low_label_toggle, i_1st_session_time, in_days_back_range, newDayFirstStartLine, i_1st_session_line_high_color, i_1st_session_line_high_style, i_1st_session_line_high_width, i_1st_session_line_low_color, i_1st_session_line_low_style, i_1st_session_line_low_width, i_1st_session_text_color, i_1st_session_text_char, i_1st_session_text_size)
+
+
+//------------------------------------
+// 2nd SESSION LIQUIDITY
+//------------------------------------
+
+
+session_liquidity_lines_function(i_2nd_session_high_line_toggle, i_2nd_session_low_line_toggle, i_2nd_session_high_label_toggle, i_2nd_session_low_label_toggle, i_2nd_session_time, in_days_back_range, newDaySecondStartLine, i_2nd_session_line_high_color, i_2nd_session_line_high_style, i_2nd_session_line_high_width, i_2nd_session_line_low_color, i_2nd_session_line_low_style, i_2nd_session_line_low_width, i_2nd_session_text_color, i_2nd_session_text_char, i_2nd_session_text_size)
+
+
+//------------------------------------
+// 3rd SESSION LIQUIDITY
+//------------------------------------
+
+
+session_liquidity_lines_function(i_3rd_session_high_line_toggle, i_3rd_session_low_line_toggle, i_3rd_session_high_label_toggle, i_3rd_session_low_label_toggle, i_3rd_session_time, in_days_back_range, newDayThirdStartLine, i_3rd_session_line_high_color, i_3rd_session_line_high_style, i_3rd_session_line_high_width, i_3rd_session_line_low_color, i_3rd_session_line_low_style, i_3rd_session_line_low_width, i_3rd_session_text_color, i_3rd_session_text_char, i_3rd_session_text_size)
+
+
+/////////////////////////////////////////////////////////////////////////////////

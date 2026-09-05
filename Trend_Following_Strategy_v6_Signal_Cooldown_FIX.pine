@@ -1,0 +1,1030 @@
+//@version=6
+// FIX ("the same issue happening"): the cooldown logic itself is sound in
+// this version -- it starts the clock the moment a signal is ACCEPTED
+// (lastAcceptedSignalBar), not tied to strategy.closedtrades at all, so
+// it's immune to the exact bug class that hit the MNQ Regime strategy
+// earlier in this session. But this kept the ORIGINAL strategy.percent_of_
+// equity sizing (10% of a $10,000 account) from the pre-fix version, and
+// if this is being tested on MNQ (as the prior version of this script
+// was), that sizing produces a ZERO-quantity order every time: 10% of
+// $10,000 is $1,000, and MNQ's notional value per contract (price * $2/
+// point) runs roughly $59,000 at the levels seen elsewhere in this
+// session -- $1,000 / $59,000 rounds down to 0 contracts, since futures
+// can't hold a fraction of a contract. A zero-quantity strategy.entry()
+// is effectively a no-op: tradesThisSession and the L/S triangles still
+// fire because they only read this script's own boolean conditions, but
+// no real position ever opens -- same end symptom as the margin-rejection
+// bug in the MNQ Regime strategy (a counted "trade" that never actually
+// existed), just a different mechanism (rounds to zero instead of getting
+// rejected for margin).
+//
+// Switched to a fixed 1-contract size, matching the fix already applied
+// to the MNQ Regime strategy. If this is NOT being run on MNQ, or if 1
+// contract isn't the intended size, this is the number to adjust --
+// nothing else in the cooldown/session logic needs to change for that.
+strategy(
+     title = "Trend Following Strategy v6 - Signal Cooldown FIX",
+     shorttitle = "TF v6 CD FIX",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 10000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.05,
+     slippage = 1
+     )
+
+// =============================================================================
+// 01 — TREND INPUTS
+// =============================================================================
+
+string trendGroup = "01 — Trend"
+
+int entryLengthInput = input.int(
+     55,
+     "Donchian Entry Length",
+     minval = 2,
+     group = trendGroup
+     )
+
+int exitLengthInput = input.int(
+     20,
+     "Donchian Exit Length",
+     minval = 2,
+     group = trendGroup
+     )
+
+int emaLengthInput = input.int(
+     200,
+     "Regime EMA Length",
+     minval = 1,
+     group = trendGroup
+     )
+
+bool requireFreshBreakoutInput = input.bool(
+     true,
+     "Require Fresh Breakout",
+     tooltip = "When enabled, price must newly cross the Donchian breakout level.",
+     group = trendGroup
+     )
+
+// =============================================================================
+// 02 — TREND STRENGTH
+// =============================================================================
+
+string filterGroup = "02 — Trend Strength"
+
+bool useAdxInput = input.bool(
+     true,
+     "Use ADX / DMI Filter",
+     group = filterGroup
+     )
+
+int diLengthInput = input.int(
+     14,
+     "DI Length",
+     minval = 1,
+     group = filterGroup
+     )
+
+int adxSmoothingInput = input.int(
+     14,
+     "ADX Smoothing",
+     minval = 1,
+     group = filterGroup
+     )
+
+float adxMinimumInput = input.float(
+     20.0,
+     "Minimum ADX",
+     minval = 0,
+     step = 0.5,
+     group = filterGroup
+     )
+
+// =============================================================================
+// 03 — RISK MANAGEMENT
+// =============================================================================
+
+string riskGroup = "03 — Risk Management"
+
+int atrLengthInput = input.int(
+     14,
+     "ATR Length",
+     minval = 1,
+     group = riskGroup
+     )
+
+float atrMultiplierInput = input.float(
+     3.0,
+     "ATR Stop Multiplier",
+     minval = 0.1,
+     step = 0.1,
+     group = riskGroup
+     )
+
+// =============================================================================
+// 04 — SESSION TRADE LIMIT
+// =============================================================================
+
+string sessionLimitGroup = "04 — Session Trade Limit"
+
+string sessionInput = input.session(
+     "0000-0000",
+     "Trading Session",
+     tooltip = "0000-0000 = full-day session.",
+     group = sessionLimitGroup
+     )
+
+int maxTradesPerSessionInput = input.int(
+     8,
+     "Max Trades Per Session",
+     minval = 1,
+     tooltip = "Maximum number of accepted entry signals during one session.",
+     group = sessionLimitGroup
+     )
+
+// =============================================================================
+// 05 — COOLDOWN
+// =============================================================================
+
+string cooldownGroup = "05 — Cooldown"
+
+bool useCooldownInput = input.bool(
+     true,
+     "Use Signal Cooldown",
+     tooltip = "Cooldown begins immediately when an entry signal is accepted.",
+     group = cooldownGroup
+     )
+
+int cooldownBarsInput = input.int(
+     5,
+     "Cooldown Bars",
+     minval = 0,
+     maxval = 500,
+     tooltip = "Minimum number of chart bars between accepted entry signals. On a 5-minute chart, 5 bars = 25 minutes.",
+     group = cooldownGroup
+     )
+
+// =============================================================================
+// 06 — TRADE DIRECTION
+// =============================================================================
+
+string directionGroup = "06 — Direction"
+
+string tradeDirectionInput = input.string(
+     "Both",
+     "Trade Direction",
+     options = [
+         "Both",
+         "Long only",
+         "Short only"
+         ],
+     group = directionGroup
+     )
+
+// =============================================================================
+// 07 — VISUALS
+// =============================================================================
+
+string visualGroup = "07 — Visuals"
+
+bool showChannelsInput = input.bool(
+     true,
+     "Show Donchian Channels",
+     group = visualGroup
+     )
+
+bool showStopsInput = input.bool(
+     true,
+     "Show ATR Trailing Stop",
+     group = visualGroup
+     )
+
+bool showBlockedBackgroundInput = input.bool(
+     true,
+     "Highlight Blocked Bars",
+     group = visualGroup
+     )
+
+bool showSignalsInput = input.bool(
+     true,
+     "Show Entry Signals",
+     group = visualGroup
+     )
+
+bool colorBarsInput = input.bool(
+     false,
+     "Color Bars By Trend",
+     group = visualGroup
+     )
+
+bool showDashboardInput = input.bool(
+     true,
+     "Show Dashboard",
+     group = visualGroup
+     )
+
+// =============================================================================
+// TREND CALCULATIONS
+// =============================================================================
+
+float regimeEma = ta.ema(
+     close,
+     emaLengthInput
+     )
+
+// Use previous completed bars for Donchian levels.
+
+float entryHigh = ta.highest(
+     high,
+     entryLengthInput
+     )[1]
+
+float entryLow = ta.lowest(
+     low,
+     entryLengthInput
+     )[1]
+
+float exitHigh = ta.highest(
+     high,
+     exitLengthInput
+     )[1]
+
+float exitLow = ta.lowest(
+     low,
+     exitLengthInput
+     )[1]
+
+// =============================================================================
+// ATR
+// =============================================================================
+
+float atrValue = ta.atr(
+     atrLengthInput
+     )
+
+// =============================================================================
+// DMI / ADX
+// =============================================================================
+
+[plusDi, minusDi, adx] = ta.dmi(
+     diLengthInput,
+     adxSmoothingInput
+     )
+
+// =============================================================================
+// REGIME
+// =============================================================================
+
+bool bullishRegime =
+     close > regimeEma
+
+bool bearishRegime =
+     close < regimeEma
+
+// =============================================================================
+// DIRECTION PERMISSIONS
+// =============================================================================
+
+bool allowLong =
+     tradeDirectionInput != "Short only"
+
+bool allowShort =
+     tradeDirectionInput != "Long only"
+
+// =============================================================================
+// ADX / DMI
+// =============================================================================
+
+bool longStrengthOk =
+     not useAdxInput or
+     (
+         adx >= adxMinimumInput and
+         plusDi > minusDi
+     )
+
+bool shortStrengthOk =
+     not useAdxInput or
+     (
+         adx >= adxMinimumInput and
+         minusDi > plusDi
+     )
+
+// =============================================================================
+// BREAKOUT CONDITIONS
+// =============================================================================
+
+bool longBeyondChannel =
+     not na(entryHigh) and
+     close > entryHigh
+
+bool shortBeyondChannel =
+     not na(entryLow) and
+     close < entryLow
+
+bool freshLongBreakout =
+     not na(entryHigh) and
+     not na(entryHigh[1]) and
+     close > entryHigh and
+     close[1] <= entryHigh[1]
+
+bool freshShortBreakout =
+     not na(entryLow) and
+     not na(entryLow[1]) and
+     close < entryLow and
+     close[1] >= entryLow[1]
+
+bool longBreakout =
+     requireFreshBreakoutInput
+         ? freshLongBreakout
+         : longBeyondChannel
+
+bool shortBreakout =
+     requireFreshBreakoutInput
+         ? freshShortBreakout
+         : shortBeyondChannel
+
+// =============================================================================
+// SESSION DETECTION
+// =============================================================================
+
+int sessionTime =
+     time(
+         timeframe.period,
+         sessionInput + ":1234567"
+         )
+
+bool inSession =
+     not na(sessionTime)
+
+bool newDay =
+     ta.change(time("D")) != 0
+
+bool previousBarInSession =
+     bar_index > 0
+         ? inSession[1]
+         : false
+
+bool newSession =
+     inSession and
+     (
+         newDay or
+         not previousBarInSession
+     )
+
+// =============================================================================
+// SESSION TRADE COUNTER
+// =============================================================================
+
+var int tradesThisSession = 0
+
+if newSession
+    tradesThisSession := 0
+
+bool sessionLimitReached =
+     tradesThisSession >= maxTradesPerSessionInput
+
+bool sessionLimitOK =
+     inSession and
+     not sessionLimitReached
+
+// =============================================================================
+// SIGNAL COOLDOWN
+// =============================================================================
+//
+// IMPORTANT:
+//
+// The old version waited for strategy.closedtrades.
+// That is why the dashboard stayed:
+//
+// BARS LEFT = n/a
+//
+// while entry signals continued.
+//
+// This version starts cooldown immediately when an ENTRY SIGNAL is accepted.
+// =============================================================================
+
+var int lastAcceptedSignalBar = na
+
+int barsSinceLastSignal =
+     na(lastAcceptedSignalBar)
+         ? 1000000
+         : bar_index - lastAcceptedSignalBar
+
+bool cooldownActive =
+     useCooldownInput and
+     cooldownBarsInput > 0 and
+     not na(lastAcceptedSignalBar) and
+     barsSinceLastSignal < cooldownBarsInput
+
+bool cooldownOK =
+     not cooldownActive
+
+int cooldownBarsLeft =
+     not useCooldownInput or
+     cooldownBarsInput == 0 or
+     na(lastAcceptedSignalBar)
+         ? 0
+         : math.max(
+             cooldownBarsInput - barsSinceLastSignal,
+             0
+             )
+
+// =============================================================================
+// MASTER ENTRY PERMISSION
+// =============================================================================
+
+bool flat =
+     strategy.position_size == 0
+
+bool entryPermission =
+     flat and
+     inSession and
+     not sessionLimitReached and
+     cooldownOK
+
+// =============================================================================
+// RAW SETUPS
+// =============================================================================
+//
+// These represent the market conditions BEFORE cooldown/session blocking.
+// Useful for dashboard diagnostics.
+// =============================================================================
+
+bool rawLongSetup =
+     allowLong and
+     bullishRegime and
+     longStrengthOk and
+     longBreakout
+
+bool rawShortSetup =
+     allowShort and
+     bearishRegime and
+     shortStrengthOk and
+     shortBreakout
+
+// =============================================================================
+// FINAL ENTRY SIGNALS
+// =============================================================================
+
+bool longSignal =
+     entryPermission and
+     rawLongSetup
+
+bool shortSignal =
+     entryPermission and
+     rawShortSetup
+
+// =============================================================================
+// STOPS
+// =============================================================================
+
+var float longStop = na
+var float shortStop = na
+
+// =============================================================================
+// LONG ENTRY
+// =============================================================================
+
+if longSignal
+
+    // Start cooldown IMMEDIATELY.
+    lastAcceptedSignalBar := bar_index
+
+    // Count only accepted entry signals.
+    tradesThisSession += 1
+
+    longStop :=
+         close -
+         atrValue * atrMultiplierInput
+
+    shortStop := na
+
+    strategy.entry(
+         id = "Long",
+         direction = strategy.long,
+         comment = "Long Breakout"
+         )
+
+    strategy.exit(
+         id = "Long ATR Exit",
+         from_entry = "Long",
+         stop = longStop,
+         comment = "Long ATR Stop"
+         )
+
+// =============================================================================
+// SHORT ENTRY
+// =============================================================================
+
+if shortSignal
+
+    // Start cooldown IMMEDIATELY.
+    lastAcceptedSignalBar := bar_index
+
+    // Count only accepted entry signals.
+    tradesThisSession += 1
+
+    shortStop :=
+         close +
+         atrValue * atrMultiplierInput
+
+    longStop := na
+
+    strategy.entry(
+         id = "Short",
+         direction = strategy.short,
+         comment = "Short Breakout"
+         )
+
+    strategy.exit(
+         id = "Short ATR Exit",
+         from_entry = "Short",
+         stop = shortStop,
+         comment = "Short ATR Stop"
+         )
+
+// =============================================================================
+// LONG MANAGEMENT
+// =============================================================================
+
+if strategy.position_size > 0
+
+    float longCandidateStop =
+         close -
+         atrValue * atrMultiplierInput
+
+    longStop :=
+         math.max(
+             nz(
+                 longStop,
+                 strategy.position_avg_price -
+                 atrValue * atrMultiplierInput
+                 ),
+             longCandidateStop
+             )
+
+    strategy.exit(
+         id = "Long ATR Exit",
+         from_entry = "Long",
+         stop = longStop,
+         comment = "Long ATR Stop"
+         )
+
+    if not na(exitLow) and close < exitLow
+
+        strategy.close(
+             id = "Long",
+             comment = "Long Channel Exit"
+             )
+
+// =============================================================================
+// SHORT MANAGEMENT
+// =============================================================================
+
+if strategy.position_size < 0
+
+    float shortCandidateStop =
+         close +
+         atrValue * atrMultiplierInput
+
+    shortStop :=
+         math.min(
+             nz(
+                 shortStop,
+                 strategy.position_avg_price +
+                 atrValue * atrMultiplierInput
+                 ),
+             shortCandidateStop
+             )
+
+    strategy.exit(
+         id = "Short ATR Exit",
+         from_entry = "Short",
+         stop = shortStop,
+         comment = "Short ATR Stop"
+         )
+
+    if not na(exitHigh) and close > exitHigh
+
+        strategy.close(
+             id = "Short",
+             comment = "Short Channel Exit"
+             )
+
+// =============================================================================
+// RESET STOPS WHEN FLAT
+// =============================================================================
+
+if strategy.position_size == 0
+
+    if not longSignal
+        longStop := na
+
+    if not shortSignal
+        shortStop := na
+
+// =============================================================================
+// EMA
+// =============================================================================
+
+plot(
+     regimeEma,
+     title = "Regime EMA",
+     color = color.orange,
+     linewidth = 2
+     )
+
+// =============================================================================
+// DONCHIAN ENTRY CHANNEL
+// =============================================================================
+
+plot(
+     showChannelsInput
+         ? entryHigh
+         : na,
+     "Long Entry Channel",
+     color = color.new(color.green, 45)
+     )
+
+plot(
+     showChannelsInput
+         ? entryLow
+         : na,
+     "Short Entry Channel",
+     color = color.new(color.red, 45)
+     )
+
+// =============================================================================
+// DONCHIAN EXIT CHANNEL
+// =============================================================================
+
+plot(
+     showChannelsInput
+         ? exitHigh
+         : na,
+     "Short Exit Channel",
+     color = color.new(color.green, 70)
+     )
+
+plot(
+     showChannelsInput
+         ? exitLow
+         : na,
+     "Long Exit Channel",
+     color = color.new(color.red, 70)
+     )
+
+// =============================================================================
+// ATR STOPS
+// =============================================================================
+
+plot(
+     showStopsInput and strategy.position_size > 0
+         ? longStop
+         : na,
+     "Long ATR Stop",
+     color = color.red,
+     linewidth = 2,
+     style = plot.style_linebr
+     )
+
+plot(
+     showStopsInput and strategy.position_size < 0
+         ? shortStop
+         : na,
+     "Short ATR Stop",
+     color = color.red,
+     linewidth = 2,
+     style = plot.style_linebr
+     )
+
+// =============================================================================
+// BACKGROUND
+// =============================================================================
+//
+// Orange = session limit reached / outside session
+// Blue   = cooldown active
+// =============================================================================
+
+color blockedBackground = na
+
+if showBlockedBackgroundInput and strategy.position_size == 0
+
+    if not inSession or sessionLimitReached
+
+        blockedBackground :=
+             color.new(
+                 color.orange,
+                 85
+                 )
+
+    else if cooldownActive
+
+        blockedBackground :=
+             color.new(
+                 color.blue,
+                 88
+                 )
+
+bgcolor(
+     blockedBackground,
+     title = "Entry Blocked"
+     )
+
+// =============================================================================
+// BAR COLORS
+// =============================================================================
+
+color regimeColor =
+     bullishRegime
+         ? color.new(color.green, 65)
+         : bearishRegime
+             ? color.new(color.red, 65)
+             : na
+
+barcolor(
+     colorBarsInput
+         ? regimeColor
+         : na
+     )
+
+// =============================================================================
+// ACCEPTED ENTRY SIGNALS
+// =============================================================================
+//
+// These triangles ONLY appear when the trade is actually permitted.
+//
+// Therefore cooldown-blocked raw setups DO NOT produce triangles.
+// =============================================================================
+
+plotshape(
+     showSignalsInput and longSignal,
+     title = "Accepted Long Signal",
+     style = shape.triangleup,
+     location = location.belowbar,
+     color = color.lime,
+     size = size.small,
+     text = "L"
+     )
+
+plotshape(
+     showSignalsInput and shortSignal,
+     title = "Accepted Short Signal",
+     style = shape.triangledown,
+     location = location.abovebar,
+     color = color.red,
+     size = size.small,
+     text = "S"
+     )
+
+// =============================================================================
+// DASHBOARD
+// =============================================================================
+
+var table dashboard =
+     table.new(
+         position.top_right,
+         2,
+         9,
+         border_width = 1
+         )
+
+f_cell(_col, _row, _text, _color) =>
+
+    table.cell(
+         dashboard,
+         _col,
+         _row,
+         _text,
+         bgcolor = _color,
+         text_color = color.white,
+         text_size = size.small
+         )
+
+if showDashboardInput and barstate.islast
+
+    // Recalculate cooldown display AFTER any signal on the current bar
+    // because lastAcceptedSignalBar may have just changed.
+
+    int liveBarsSinceSignal =
+         na(lastAcceptedSignalBar)
+             ? 1000000
+             : bar_index - lastAcceptedSignalBar
+
+    int liveCooldownLeft =
+         not useCooldownInput or
+         cooldownBarsInput == 0 or
+         na(lastAcceptedSignalBar)
+             ? 0
+             : math.max(
+                 cooldownBarsInput - liveBarsSinceSignal,
+                 0
+                 )
+
+    bool liveCooldownActive =
+         useCooldownInput and
+         cooldownBarsInput > 0 and
+         not na(lastAcceptedSignalBar) and
+         liveBarsSinceSignal < cooldownBarsInput
+
+    string cooldownText =
+         not useCooldownInput
+             ? "OFF"
+             : na(lastAcceptedSignalBar)
+                 ? "READY"
+                 : str.tostring(liveCooldownLeft)
+
+    // -------------------------------------------------------------------------
+    // SESSION
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         0,
+         "IN SESSION",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         0,
+         inSession ? "YES" : "NO",
+         inSession
+             ? color.new(color.green, 30)
+             : color.new(color.red, 30)
+         )
+
+    // -------------------------------------------------------------------------
+    // TRADES
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         1,
+         "TRADES THIS SESSION",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         1,
+         str.tostring(tradesThisSession),
+         color.gray
+         )
+
+    // -------------------------------------------------------------------------
+    // MAX
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         2,
+         "MAX PER SESSION",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         2,
+         str.tostring(maxTradesPerSessionInput),
+         color.gray
+         )
+
+    // -------------------------------------------------------------------------
+    // LIMIT
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         3,
+         "LIMIT REACHED",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         3,
+         sessionLimitReached ? "YES" : "NO",
+         sessionLimitReached
+             ? color.new(color.red, 25)
+             : color.new(color.green, 30)
+         )
+
+    // -------------------------------------------------------------------------
+    // COOLDOWN
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         4,
+         "COOLDOWN",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         4,
+         useCooldownInput ? "ON" : "OFF",
+         useCooldownInput
+             ? color.new(color.blue, 20)
+             : color.gray
+         )
+
+    // -------------------------------------------------------------------------
+    // BARS LEFT
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         5,
+         "BARS LEFT",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         5,
+         cooldownText,
+         liveCooldownActive
+             ? color.new(color.red, 25)
+             : color.new(color.green, 30)
+         )
+
+    // -------------------------------------------------------------------------
+    // RAW LONG SETUP
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         6,
+         "LONG SETUP",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         6,
+         rawLongSetup ? "YES" : "NO",
+         rawLongSetup
+             ? color.new(color.green, 30)
+             : color.new(color.red, 40)
+         )
+
+    // -------------------------------------------------------------------------
+    // RAW SHORT SETUP
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         7,
+         "SHORT SETUP",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         7,
+         rawShortSetup ? "YES" : "NO",
+         rawShortSetup
+             ? color.new(color.green, 30)
+             : color.new(color.red, 40)
+         )
+
+    // -------------------------------------------------------------------------
+    // ENTRY PERMISSION
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         8,
+         "ENTRY ALLOWED",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         8,
+         entryPermission ? "YES" : "NO",
+         entryPermission
+             ? color.new(color.green, 30)
+             : color.new(color.red, 30)
+         )
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+
+alertcondition(
+     longSignal,
+     "Long Trend Entry",
+     "Trend Following Strategy: LONG breakout"
+     )
+
+alertcondition(
+     shortSignal,
+     "Short Trend Entry",
+     "Trend Following Strategy: SHORT breakout"
+     )

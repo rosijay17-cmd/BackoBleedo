@@ -1,0 +1,108 @@
+//@version=6
+strategy("Pro-Swing system: 200 EMA & SuperTrend 10-5 - Simple Swing System", overlay=true, initial_capital=5000000, default_qty_type=strategy.percent_of_equity, default_qty_value=40, currency=currency.INR)
+
+// ─── Strategy Toggles ────────────────────────────────────────────────────────
+enableLong        = input.bool(true,  "Enable Long Trades?",  group="Strategy Toggles")
+enableShort       = input.bool(false, "Enable Short Trades?", group="Strategy Toggles")
+
+// ─── Partial Exit Settings ───────────────────────────────────────────────────
+enablePartial     = input.bool(true,  "Enable Partial Exit?",         group="Partial Exit")
+partialQtyPct     = input.float(30.0, "Partial Exit Qty %",           group="Partial Exit", minval=1.0, maxval=100.0, step=1.0)
+partialType       = input.string("ATR", "Target Price Method",        group="Partial Exit", options=["ATR", "Fixed Points", "Fixed %"])
+partialAtrMult    = input.float(3,  "ATR Multiplier (ATR mode)",    group="Partial Exit", minval=0.1, step=0.1)
+partialAtrLen     = input.int(50,     "ATR Length (ATR mode)",        group="Partial Exit", minval=1)
+partialFixedPts   = input.float(50.0, "Fixed Points (Points mode)",   group="Partial Exit", minval=0.1, step=0.5)
+partialFixedPct   = input.float(5,  "Fixed % Move (% mode)",       group="Partial Exit", minval=0.01, step=0.1)
+
+// ─── Core Inputs ─────────────────────────────────────────────────────────────
+st_period  = input.int(10,    "SuperTrend Period")
+st_factor  = input.float(5.0, "SuperTrend Multiplier")
+ema_len    = input.int(200,   "EMA Length")
+show_ema   = input.bool(true, "Show 200 EMA?")
+
+// ─── Indicators ──────────────────────────────────────────────────────────────
+[superTrend, direction] = ta.supertrend(st_factor, st_period)
+ema200 = ta.ema(close, ema_len)
+atrVal = ta.atr(partialAtrLen)
+
+// ─── Logic Conditions ────────────────────────────────────────────────────────
+aboveEma = close > ema200
+belowEma = close < ema200
+emaUp    = ema200 > ema200[1]
+emaDown  = ema200 < ema200[1]
+stBuy    = direction < 0
+stSell   = direction > 0
+
+longCondition  = enableLong  and stBuy  and aboveEma and emaUp
+shortCondition = enableShort and stSell and belowEma  and emaDown
+
+// ─── Partial Exit State ───────────────────────────────────────────────────────
+// Tracks entry price and whether the partial has already fired this trade
+var float entryPx        = na
+var bool  partialDone    = false
+
+// Reset state on new entry
+if longCondition and strategy.position_size <= 0
+    entryPx     := close
+    partialDone := false
+
+if shortCondition and strategy.position_size >= 0
+    entryPx     := close
+    partialDone := false
+
+// ─── Compute Partial Target ───────────────────────────────────────────────────
+partialTarget(entryPrice, isLong) =>
+    float offset = switch partialType
+        "ATR"          => atrVal * partialAtrMult
+        "Fixed Points" => partialFixedPts
+        "Fixed %"      => entryPrice * (partialFixedPct / 100.0)
+        => atrVal * partialAtrMult
+    isLong ? entryPrice + offset : entryPrice - offset
+
+// ─── Entries ──────────────────────────────────────────────────────────────────
+if longCondition
+    strategy.entry("Long",  strategy.long,  comment="ST Buy + EMA Up")
+
+if shortCondition
+    strategy.entry("Short", strategy.short, comment="ST Sell + EMA Down")
+
+// ─── Partial Exits ────────────────────────────────────────────────────────────
+if enablePartial and not partialDone
+    if strategy.position_size > 0 and not na(entryPx)
+        longTarget = partialTarget(entryPx, true)
+        if high >= longTarget
+            strategy.close("Long", qty_percent=partialQtyPct, comment="Partial TP")
+            partialDone := true
+
+    if strategy.position_size < 0 and not na(entryPx)
+        shortTarget = partialTarget(entryPx, false)
+        if low <= shortTarget
+            strategy.close("Short", qty_percent=partialQtyPct, comment="Partial TP")
+            partialDone := true
+
+// ─── Full Exit on SuperTrend Flip ─────────────────────────────────────────────
+if strategy.position_size > 0 and stSell
+    strategy.close("Long",  comment="ST Flip")
+    partialDone := false
+
+if strategy.position_size < 0 and stBuy
+    strategy.close("Short", comment="ST Flip")
+    partialDone := false
+
+// ─── Visuals ──────────────────────────────────────────────────────────────────
+plot(superTrend, "SuperTrend", color=direction < 0 ? color.green : color.red, linewidth=2)
+
+emaColor = emaUp ? color.green : emaDown ? color.red : color.gray
+plot(show_ema ? ema200 : na, "200 EMA", color=emaColor, linewidth=3)
+
+bgcolor(longCondition ? color.new(color.green, 90) : shortCondition ? color.new(color.red, 90) : na)
+
+// Partial target line — visible only while in a trade and partial not yet hit
+float displayTarget = na
+if enablePartial and not partialDone and not na(entryPx)
+    if strategy.position_size > 0
+        displayTarget := partialTarget(entryPx, true)
+    else if strategy.position_size < 0
+        displayTarget := partialTarget(entryPx, false)
+
+plot(displayTarget, "Partial TP Target", color=color.new(color.orange, 0), linewidth=1, style=plot.style_linebr)
