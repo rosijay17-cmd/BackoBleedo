@@ -1144,41 +1144,9 @@ bool shortEntry = barstate.isconfirmed and flat and tradeDirectionShortOk and co
 // BLOCKER DIAGNOSTICS
 // ============================================================================
 
-string longBlocker = tradeDirection == "Short Only" ? "LONGS OFF" :
-    not inTradeSession ? "SESSION" :
-    not dailyTradeLimitPass ? "TRADE LIMIT" :
-    not cooldownPass ? "COOLDOWN" :
-    not entrySpacingPass ? "SPACING" :
-    longState == STATE_IDLE ? "WAIT SETUP" :
-    not longPocRecent ? "POC" :
-    not longSweepRecent ? "SWEEP" :
-    not longReclaimRecent ? "RECLAIM" :
-    not longDeltaStateOk ? "DELTA" :
-    not longRvolStateOk ? "RVOL" :
-    not longPocMigrationOk ? "POC SLOPE" :
-    not longTrendOk ? "TREND" :
-    not longMomentumOk ? "MOMENTUM" :
-    not longSizePass ? "SIZE" :
-    strategy.position_size != 0 ? "POSITION" :
-    "CLEAR"
+string longBlocker = tradeDirection == "Short Only" ? "LONGS OFF" : not inTradeSession ? "SESSION" : not dailyTradeLimitPass ? "TRADE LIMIT" : not cooldownPass ? "COOLDOWN" : not entrySpacingPass ? "SPACING" : longState == STATE_IDLE ? "WAIT SETUP" : not longPocRecent ? "POC" : not longSweepRecent ? "SWEEP" : not longReclaimRecent ? "RECLAIM" : not longDeltaStateOk ? "DELTA" : not longRvolStateOk ? "RVOL" : not longPocMigrationOk ? "POC SLOPE" : not longTrendOk ? "TREND" : not longMomentumOk ? "MOMENTUM" : not longSizePass ? "SIZE" : strategy.position_size != 0 ? "POSITION" : "CLEAR"
 
-string shortBlocker = tradeDirection == "Long Only" ? "SHORTS OFF" :
-    not inTradeSession ? "SESSION" :
-    not dailyTradeLimitPass ? "TRADE LIMIT" :
-    not cooldownPass ? "COOLDOWN" :
-    not entrySpacingPass ? "SPACING" :
-    shortState == STATE_IDLE ? "WAIT SETUP" :
-    not shortPocRecent ? "POC" :
-    not shortSweepRecent ? "SWEEP" :
-    not shortReclaimRecent ? "RECLAIM" :
-    not shortDeltaStateOk ? "DELTA" :
-    not shortRvolStateOk ? "RVOL" :
-    not shortPocMigrationOk ? "POC SLOPE" :
-    not shortTrendOk ? "TREND" :
-    not shortMomentumOk ? "MOMENTUM" :
-    not shortSizePass ? "SIZE" :
-    strategy.position_size != 0 ? "POSITION" :
-    "CLEAR"
+string shortBlocker = tradeDirection == "Long Only" ? "SHORTS OFF" : not inTradeSession ? "SESSION" : not dailyTradeLimitPass ? "TRADE LIMIT" : not cooldownPass ? "COOLDOWN" : not entrySpacingPass ? "SPACING" : shortState == STATE_IDLE ? "WAIT SETUP" : not shortPocRecent ? "POC" : not shortSweepRecent ? "SWEEP" : not shortReclaimRecent ? "RECLAIM" : not shortDeltaStateOk ? "DELTA" : not shortRvolStateOk ? "RVOL" : not shortPocMigrationOk ? "POC SLOPE" : not shortTrendOk ? "TREND" : not shortMomentumOk ? "MOMENTUM" : not shortSizePass ? "SIZE" : strategy.position_size != 0 ? "POSITION" : "CLEAR"
 
 // ============================================================================
 // TRADE STATE
@@ -1864,14 +1832,9 @@ else
 // DASHBOARD
 // ============================================================================
 
-resolvedDashboardPosition = dashboardPosition == "Top Left" ? position.top_left :
-    dashboardPosition == "Bottom Right" ? position.bottom_right :
-    dashboardPosition == "Bottom Left" ? position.bottom_left :
-    position.top_right
+resolvedDashboardPosition = dashboardPosition == "Top Left" ? position.top_left : dashboardPosition == "Bottom Right" ? position.bottom_right : dashboardPosition == "Bottom Left" ? position.bottom_left : position.top_right
 
-dashboardTextSize = dashboardFont == "Large" ? size.normal :
-    dashboardFont == "Phone" ? size.small :
-    size.tiny
+dashboardTextSize = dashboardFont == "Large" ? size.normal : dashboardFont == "Phone" ? size.small : size.tiny
 
 var table dashboard = table.new(
     resolvedDashboardPosition,
