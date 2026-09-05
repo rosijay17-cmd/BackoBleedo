@@ -1,5 +1,13 @@
 //@version=6
-strategy(title = "DeltaFlow Volume Profile Strategy", shorttitle = "DeltaFlow VP Strategy", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, initial_capital = input.float(50000.0, "Initial Capital", group = "Strategy"), currency = currency.USD, default_qty_type = strategy.percent_of_equity, default_qty_value = input.float(10.0, "Position Size (% of Equity)", minval = 1.0, maxval = 100.0, group = "Strategy"), commission_type = strategy.commission.percent, commission_value = input.float(0.02, "Commission %", minval = 0.0, group = "Strategy"), process_orders_on_close = true, calc_on_every_tick = false)
+// NOTE: strategy() declaration parameters (initial_capital, default_qty_value,
+// commission_value) require a compile-time "const float" — an input.*() call
+// resolves to "input float", which the compiler rejects here (CE10123). These
+// three are therefore fixed constants below; TradingView's own Properties tab
+// already exposes Initial Capital and Commission for the user to change
+// without touching the script. Position size stays genuinely input-driven —
+// see positionSizePctInput below — by computing an explicit qty at entry
+// time instead of relying on the declaration's default_qty_value.
+strategy(title = "DeltaFlow Volume Profile Strategy", shorttitle = "DeltaFlow VP Strategy", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, initial_capital = 50000.0, currency = currency.USD, default_qty_type = strategy.cash, default_qty_value = 50000.0, commission_type = strategy.commission.percent, commission_value = 0.02, process_orders_on_close = true, calc_on_every_tick = false)
 
 // ============================================================================
 // VOLUME PROFILE INPUTS — preserved verbatim from the DeltaFlow reference
@@ -23,6 +31,7 @@ bearcolor    = input.color(color.rgb(230, 150, 30), "", inline = "vol")
 // STRATEGY INPUTS (Phase 2)
 // ============================================================================
 const string G_STRAT = "Strategy"
+positionSizePctInput = input.float(10.0, "Position Size (% of Equity)", minval = 1.0, maxval = 100.0, group = G_STRAT)
 enableLongInput      = input.bool(true, "Enable Long Trades", group = G_STRAT)
 enableShortInput     = input.bool(true, "Enable Short Trades", group = G_STRAT)
 toleranceTicksInput  = input.int(2, "Level Touch Tolerance (ticks)", minval = 0, group = G_STRAT)
@@ -122,14 +131,16 @@ var float longTargetPrice = na
 var float shortStopPrice = na
 var float shortTargetPrice = na
 
+float orderQty = close > 0 ? strategy.equity * (positionSizePctInput / 100.0) / close : na
+
 if longCondition and strategy.position_size <= 0
-    strategy.entry("Long", strategy.long)
+    strategy.entry("Long", strategy.long, qty = orderQty)
     longStopPrice := sigBot
     float longRisk = close - sigBot
     longTargetPrice := close + longRisk * rMultipleInput
 
 if shortCondition and strategy.position_size >= 0
-    strategy.entry("Short", strategy.short)
+    strategy.entry("Short", strategy.short, qty = orderQty)
     shortStopPrice := sigTop
     float shortRisk = sigTop - close
     shortTargetPrice := close - shortRisk * rMultipleInput
