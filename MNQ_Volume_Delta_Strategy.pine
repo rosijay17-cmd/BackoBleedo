@@ -1,0 +1,604 @@
+//@version=6
+// ============================================================================
+// MNQ VOLUME DELTA STRATEGY
+// Rules-based intraday/scalping strategy for Micro E-mini Nasdaq-100 (MNQ)
+// built around Volume Delta / CVD, with delta momentum, divergence,
+// absorption, exhaustion, market structure, and a configurable scoring
+// system across five selectable entry modes.
+//
+// NOTE on strategy() declaration constants: Pine requires initial_capital,
+// commission_value, and slippage to be compile-time "const" values (an
+// input.*() call there raises CE10123 — confirmed empirically earlier in
+// this project). They are fixed below; adjust them from TradingView's own
+// Properties tab without touching the script. Position size is genuinely
+// input-driven instead, via a risk-per-trade calculation (see Risk
+// Management section) rather than a fixed default_qty_value.
+// ============================================================================
+strategy(title = "MNQ Volume Delta Strategy", shorttitle = "MNQ VolDelta", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, initial_capital = 50000.0, currency = currency.USD, default_qty_type = strategy.cash, default_qty_value = 50000.0, commission_type = strategy.commission.cash_per_contract, commission_value = 0.47, slippage = 2, process_orders_on_close = true, calc_on_every_tick = false)
+
+// ============================================================================
+// STAGE 1 — VOLUME DELTA / CVD INPUTS
+// ============================================================================
+const string G_DELTA = "Volume Delta"
+deltaMethodInput    = input.string("Lower Timeframe (Accurate)", "Delta Calculation Method", options = ["Lower Timeframe (Accurate)", "Bar Polarity (Simple)"], group = G_DELTA)
+ltfResolutionInput  = input.timeframe("1S", "Lower Timeframe Resolution", group = G_DELTA)
+deltaMaLenInput     = input.int(20, "Delta Moving Average Length", minval = 2, group = G_DELTA)
+deltaZLenInput      = input.int(20, "Delta Z-Score Lookback", minval = 2, group = G_DELTA)
+cvdResetDailyInput  = input.bool(true, "Reset CVD Daily", group = G_DELTA)
+cvdTrendLenInput    = input.int(10, "CVD Trend Lookback", minval = 2, group = G_DELTA)
+rollingDeltaBarsInput = input.int(50, "Rolling Cumulative Delta Bars", minval = 2, group = G_DELTA)
+
+// ============================================================================
+// SIGNAL THRESHOLDS / TREND / STRUCTURE INPUTS
+// ============================================================================
+const string G_THRESH = "Signal Thresholds"
+deltaZThresholdInput = input.float(1.5, "Delta Z-Score Threshold", group = G_THRESH)
+volMultiplierInput   = input.float(1.2, "Volume Expansion Multiplier (x avg)", group = G_THRESH)
+rvolLenInput         = input.int(20, "RVOL Average Length", minval = 2, group = G_THRESH)
+closeLocLongInput    = input.float(0.65, "Min Close Location In Range (Long)", minval = 0.5, maxval = 1.0, group = G_THRESH)
+closeLocShortInput   = input.float(0.35, "Max Close Location In Range (Short)", minval = 0.0, maxval = 0.5, group = G_THRESH)
+
+const string G_TREND = "Trend Confirmation"
+fastEmaLenInput  = input.int(9, "Fast EMA Length", minval = 1, group = G_TREND)
+slowEmaLenInput  = input.int(21, "Slow EMA Length", minval = 1, group = G_TREND)
+trendEmaLenInput = input.int(50, "Trend EMA Length", minval = 1, group = G_TREND)
+useVwapFilterInput    = input.bool(true, "Require Price vs VWAP Alignment", group = G_TREND)
+useEmaTrendFilterInput = input.bool(true, "Require Price vs Trend EMA Alignment", group = G_TREND)
+useEmaCrossFilterInput = input.bool(false, "Require Fast/Slow EMA Alignment", group = G_TREND)
+
+const string G_STRUCTURE = "Market Structure"
+structurePivotLenInput = input.int(10, "Structure Pivot Length", minval = 2, group = G_STRUCTURE)
+
+// ============================================================================
+// DIVERGENCE / ABSORPTION / EXHAUSTION INPUTS
+// ============================================================================
+const string G_DIVERGENCE = "Delta Divergence"
+divPivotLenInput          = input.int(5, "Divergence Pivot Length", minval = 2, group = G_DIVERGENCE)
+minDivStrengthInput       = input.float(0.1, "Minimum Divergence Strength (%)", minval = 0.0, group = G_DIVERGENCE)
+maxBarsBetweenPivotsInput = input.int(30, "Max Bars Between Pivots", minval = 2, group = G_DIVERGENCE)
+useCvdForDivergenceInput  = input.bool(true, "Use CVD (Not Raw Delta) For Divergence", group = G_DIVERGENCE)
+
+const string G_ABSORPTION = "Absorption"
+absorptionZThresholdInput   = input.float(1.5, "Absorption Delta Z-Score Threshold", minval = 0.0, group = G_ABSORPTION)
+absorptionCloseRatioInput   = input.float(0.7, "Absorption Close-Reclaim Ratio", minval = 0.5, maxval = 1.0, group = G_ABSORPTION)
+
+const string G_EXHAUSTION = "Exhaustion"
+exhaustionLookbackInput     = input.int(20, "Exhaustion New-Extreme Lookback", minval = 2, group = G_EXHAUSTION)
+exhaustionAvgLenInput       = input.int(10, "Exhaustion Delta Average Length", minval = 2, group = G_EXHAUSTION)
+exhaustionWeaknessMultInput = input.float(0.5, "Exhaustion Weakness Multiplier", minval = 0.1, maxval = 1.0, group = G_EXHAUSTION)
+
+// ============================================================================
+// ENTRY MODE + SCORING WEIGHTS
+// ============================================================================
+const string G_MODE = "Entry Mode"
+entryModeInput = input.string("Composite Score", "Entry Mode", options = ["Delta Momentum", "Delta Divergence", "Absorption Reversal", "Structure + Delta", "Composite Score"], group = G_MODE)
+
+const string G_LONGSCORE = "Long Score Weights"
+wDeltaLong        = input.int(2, "Strong Delta", group = G_LONGSCORE)
+wDeltaRiseLong    = input.int(1, "Delta Rising", group = G_LONGSCORE)
+wCvdTrendLong     = input.int(1, "Positive CVD Trend", group = G_LONGSCORE)
+wCandleLong       = input.int(1, "Bullish Candle Close", group = G_LONGSCORE)
+wCloseLocLong     = input.int(1, "Close Near Candle High", group = G_LONGSCORE)
+wVolumeExpLong    = input.int(1, "Volume Expansion", group = G_LONGSCORE)
+wVwapLong         = input.int(1, "Above VWAP", group = G_LONGSCORE)
+wEmaTrendLong     = input.int(1, "EMA Trend Aligned", group = G_LONGSCORE)
+wStructureLong    = input.int(2, "Structure Break", group = G_LONGSCORE)
+wDivergenceLong   = input.int(2, "Bullish Delta Divergence", group = G_LONGSCORE)
+wAbsorptionLong   = input.int(2, "Bullish Absorption", group = G_LONGSCORE)
+wExhaustionLong   = input.int(2, "Bullish Exhaustion", group = G_LONGSCORE)
+minLongScoreInput    = input.int(4, "Minimum Score To Trigger Long", group = G_LONGSCORE)
+strongLongScoreInput = input.int(7, "Score For STRONG LONG Alert", group = G_LONGSCORE)
+
+const string G_SHORTSCORE = "Short Score Weights"
+wDeltaShort        = input.int(2, "Strong Delta", group = G_SHORTSCORE)
+wDeltaFallShort    = input.int(1, "Delta Falling", group = G_SHORTSCORE)
+wCvdTrendShort     = input.int(1, "Negative CVD Trend", group = G_SHORTSCORE)
+wCandleShort       = input.int(1, "Bearish Candle Close", group = G_SHORTSCORE)
+wCloseLocShort     = input.int(1, "Close Near Candle Low", group = G_SHORTSCORE)
+wVolumeExpShort    = input.int(1, "Volume Expansion", group = G_SHORTSCORE)
+wVwapShort         = input.int(1, "Below VWAP", group = G_SHORTSCORE)
+wEmaTrendShort     = input.int(1, "EMA Trend Aligned", group = G_SHORTSCORE)
+wStructureShort    = input.int(2, "Structure Break", group = G_SHORTSCORE)
+wDivergenceShort   = input.int(2, "Bearish Delta Divergence", group = G_SHORTSCORE)
+wAbsorptionShort   = input.int(2, "Bearish Absorption", group = G_SHORTSCORE)
+wExhaustionShort   = input.int(2, "Bearish Exhaustion", group = G_SHORTSCORE)
+minShortScoreInput    = input.int(4, "Minimum Score To Trigger Short", group = G_SHORTSCORE)
+strongShortScoreInput = input.int(7, "Score For STRONG SHORT Alert", group = G_SHORTSCORE)
+
+// ============================================================================
+// MARKET FILTERS
+// ============================================================================
+const string G_FILTERS = "Market Filters"
+useVolatilityFilterInput = input.bool(false, "Filter By ATR Volatility Band", group = G_FILTERS)
+minAtrInput  = input.float(2.0, "Minimum ATR (Points)", minval = 0.0, group = G_FILTERS)
+maxAtrInput  = input.float(60.0, "Maximum ATR (Points)", minval = 0.0, group = G_FILTERS)
+useRvolFilterInput = input.bool(false, "Filter By Minimum RVOL", group = G_FILTERS)
+minRvolFilterInput = input.float(0.8, "Minimum RVOL", minval = 0.0, group = G_FILTERS)
+useVwapDistanceFilterInput = input.bool(false, "Filter By Max Distance From VWAP", group = G_FILTERS)
+maxVwapDistanceAtrInput    = input.float(3.0, "Max Distance From VWAP (x ATR)", minval = 0.1, group = G_FILTERS)
+usePdhPdlInput = input.bool(false, "Include Prior Day High/Low As Structure Levels", group = G_FILTERS)
+useOrInput     = input.bool(false, "Include Opening Range As Structure Levels", group = G_FILTERS)
+orWindowInput  = input.session("0930-0945", "Opening Range Window (Exchange Time)", group = G_FILTERS)
+
+// ============================================================================
+// SESSION + DAY-OF-WEEK INPUTS
+// ============================================================================
+const string G_SESSION = "MNQ Trading Session"
+sessionInput          = input.session("0930-1600", "Trading Session (Exchange Time)", group = G_SESSION)
+enablePremarketInput   = input.bool(false, "Allow Premarket Trading", group = G_SESSION)
+premarketSessionInput  = input.session("0400-0930", "Premarket Session", group = G_SESSION)
+enableLunchBlockInput  = input.bool(true, "Block Trades During Lunch", group = G_SESSION)
+lunchSessionInput      = input.session("1200-1300", "No-Trade Lunch Period", group = G_SESSION)
+enableClosingBlockInput = input.bool(true, "Block New Entries Near Session Close", group = G_SESSION)
+closingSessionInput    = input.session("1550-1600", "Closing Session Window", group = G_SESSION)
+
+const string G_DAYOFWEEK = "Day Of Week"
+allowMonInput = input.bool(true, "Trade Monday", group = G_DAYOFWEEK)
+allowTueInput = input.bool(true, "Trade Tuesday", group = G_DAYOFWEEK)
+allowWedInput = input.bool(true, "Trade Wednesday", group = G_DAYOFWEEK)
+allowThuInput = input.bool(true, "Trade Thursday", group = G_DAYOFWEEK)
+allowFriInput = input.bool(true, "Trade Friday", group = G_DAYOFWEEK)
+
+// ============================================================================
+// RISK MANAGEMENT INPUTS
+// ============================================================================
+const string G_RISK = "Risk Management"
+riskPerTradeInput   = input.float(200.0, "Risk Per Trade ($, MNQ)", minval = 1.0, group = G_RISK)
+stopTypeInput       = input.string("ATR", "Stop-Loss Method", options = ["Fixed Ticks", "ATR", "Swing High/Low"], group = G_RISK)
+fixedStopTicksInput = input.int(40, "Fixed Stop (Ticks)", minval = 1, group = G_RISK)
+atrLenInput         = input.int(14, "ATR Length", minval = 1, group = G_RISK)
+atrStopMultInput    = input.float(1.5, "ATR Stop Multiplier", minval = 0.1, group = G_RISK)
+swingStopLookbackInput = input.int(10, "Swing Stop Lookback", minval = 2, group = G_RISK)
+targetTypeInput     = input.string("Risk/Reward", "Take-Profit Method", options = ["Fixed Ticks", "Risk/Reward", "ATR"], group = G_RISK)
+fixedTargetTicksInput = input.int(80, "Fixed Target (Ticks)", minval = 1, group = G_RISK)
+riskRewardInput     = input.float(2.0, "Risk/Reward Ratio", minval = 0.1, group = G_RISK)
+atrTargetMultInput  = input.float(3.0, "ATR Target Multiplier", minval = 0.1, group = G_RISK)
+useTrailingStopInput = input.bool(false, "Use Trailing Stop", group = G_RISK)
+trailingTicksInput  = input.int(30, "Trailing Stop Distance (Ticks)", minval = 1, group = G_RISK)
+trailingOffsetTicksInput = input.int(10, "Trailing Stop Offset (Ticks)", minval = 0, group = G_RISK)
+useBreakevenInput   = input.bool(true, "Move Stop To Breakeven", group = G_RISK)
+breakevenTriggerTicksInput = input.int(40, "Breakeven Trigger (Ticks Profit)", minval = 1, group = G_RISK)
+
+// ============================================================================
+// TRADE MANAGEMENT INPUTS
+// ============================================================================
+const string G_TRADEMGMT = "Trade Management"
+tradeDirectionInput = input.string("Long and Short", "Trade Direction", options = ["Long and Short", "Long Only", "Short Only"], group = G_TRADEMGMT)
+maxTradesPerSessionInput = input.int(6, "Max Trades Per Session", minval = 1, group = G_TRADEMGMT)
+minBarsBetweenEntriesInput = input.int(5, "Minimum Bars Between Entries", minval = 0, group = G_TRADEMGMT)
+useConsecutiveLossStopInput = input.bool(true, "Stop After Consecutive Losses", group = G_TRADEMGMT)
+maxConsecutiveLossesInput = input.int(3, "Consecutive Loss Limit", minval = 1, group = G_TRADEMGMT)
+useDailyProfitStopInput = input.bool(false, "Stop After Daily Profit Target", group = G_TRADEMGMT)
+dailyProfitStopInput = input.float(1000.0, "Daily Profit Target ($)", minval = 0.0, group = G_TRADEMGMT)
+useDailyLossStopInput = input.bool(true, "Stop After Daily Loss Limit", group = G_TRADEMGMT)
+dailyLossStopInput = input.float(600.0, "Daily Loss Limit ($)", minval = 0.0, group = G_TRADEMGMT)
+
+// ============================================================================
+// VISUAL INPUTS
+// ============================================================================
+const string G_VISUAL = "Visuals"
+showVwapInput    = input.bool(true, "Show VWAP", group = G_VISUAL)
+showEmaInput     = input.bool(true, "Show Fast/Slow EMA", group = G_VISUAL)
+showSignalsInput = input.bool(true, "Show Entry Signals", group = G_VISUAL)
+showLevelsInput  = input.bool(true, "Show Entry/Stop/Target Lines", group = G_VISUAL)
+showCvdStateInput = input.bool(true, "Show CVD Trend Background", group = G_VISUAL)
+showQualityScoreInput = input.bool(true, "Show Entry Quality Score Label", group = G_VISUAL)
+
+// ============================================================================
+// STAGE 1 — VOLUME DELTA / CVD CALCULATIONS
+// ============================================================================
+[ltfClose, ltfOpen, ltfVol] = request.security_lower_tf(syminfo.tickerid, ltfResolutionInput, [close, open, volume])
+
+float ltfBuyVol = 0.0
+float ltfSellVol = 0.0
+if array.size(ltfClose) > 0
+    for idx = 0 to array.size(ltfClose) - 1
+        float ltfC = array.get(ltfClose, idx)
+        float ltfO = array.get(ltfOpen, idx)
+        float ltfV = array.get(ltfVol, idx)
+        if ltfC >= ltfO
+            ltfBuyVol += ltfV
+        else
+            ltfSellVol += ltfV
+
+bool useLtfDelta = deltaMethodInput == "Lower Timeframe (Accurate)" and array.size(ltfClose) > 0
+float polarityBuyVol = close >= open ? volume : 0.0
+float polaritySellVol = close >= open ? 0.0 : volume
+float buyVolume = useLtfDelta ? ltfBuyVol : polarityBuyVol
+float sellVolume = useLtfDelta ? ltfSellVol : polaritySellVol
+float delta = buyVolume - sellVolume
+float deltaPct = volume > 0 ? delta / volume * 100.0 : 0.0
+
+bool newDay = ta.change(time("D")) != 0
+var float cvd = 0.0
+if cvdResetDailyInput and newDay
+    cvd := 0.0
+cvd += delta
+
+float deltaMa = ta.sma(delta, deltaMaLenInput)
+float deltaZMa = ta.sma(delta, deltaZLenInput)
+float deltaStdev = ta.stdev(delta, deltaZLenInput)
+float deltaZ = deltaStdev > 0 ? (delta - deltaZMa) / deltaStdev : 0.0
+float deltaAccel = delta - nz(delta[1])
+float rollingCumulativeDelta = math.sum(delta, rollingDeltaBarsInput)
+
+var int deltaStreak = 0
+if delta > 0
+    deltaStreak := deltaStreak > 0 ? deltaStreak + 1 : 1
+else if delta < 0
+    deltaStreak := deltaStreak < 0 ? deltaStreak - 1 : -1
+else
+    deltaStreak := 0
+
+bool cvdTrendUp = cvd > cvd[cvdTrendLenInput]
+bool cvdTrendDown = cvd < cvd[cvdTrendLenInput]
+
+// ============================================================================
+// STAGE 2/3 — MOMENTUM, TREND, VOLUME CONFIRMATION
+// ============================================================================
+bool strongPositiveDelta = deltaZ >= deltaZThresholdInput
+bool strongNegativeDelta = deltaZ <= -deltaZThresholdInput
+bool deltaRising = delta > delta[1]
+bool deltaFalling = delta < delta[1]
+
+float vwapValue = ta.vwap(hlc3)
+float fastEma = ta.ema(close, fastEmaLenInput)
+float slowEma = ta.ema(close, slowEmaLenInput)
+float trendEma = ta.ema(close, trendEmaLenInput)
+bool aboveVwap = close > vwapValue
+bool belowVwap = close < vwapValue
+bool aboveTrendEma = close > trendEma
+bool belowTrendEma = close < trendEma
+bool fastAboveSlow = fastEma > slowEma
+bool fastBelowSlow = fastEma < slowEma
+
+float rvolAvgVolume = ta.sma(volume, rvolLenInput)
+float rvol = rvolAvgVolume > 0 ? volume / rvolAvgVolume : 1.0
+bool volumeExpansion = rvol >= volMultiplierInput
+
+float atrValue = ta.atr(atrLenInput)
+float barRange = high - low
+float closeLocation = barRange > 0 ? (close - low) / barRange : 0.5
+bool closeNearHighLong = closeLocation >= closeLocLongInput
+bool closeNearLowShort = closeLocation <= closeLocShortInput
+bool bullishCandle = close > open
+bool bearishCandle = close < open
+
+bool trendOkLong = (not useVwapFilterInput or aboveVwap) and (not useEmaTrendFilterInput or aboveTrendEma) and (not useEmaCrossFilterInput or fastAboveSlow)
+bool trendOkShort = (not useVwapFilterInput or belowVwap) and (not useEmaTrendFilterInput or belowTrendEma) and (not useEmaCrossFilterInput or fastBelowSlow)
+
+// ============================================================================
+// STAGE 4 — MARKET STRUCTURE (confirmed pivots only)
+// ============================================================================
+float pivotHighConfirmed = ta.pivothigh(structurePivotLenInput, structurePivotLenInput)
+float pivotLowConfirmed = ta.pivotlow(structurePivotLenInput, structurePivotLenInput)
+var float lastPivotHigh = na
+var float lastPivotLow = na
+if not na(pivotHighConfirmed)
+    lastPivotHigh := pivotHighConfirmed
+if not na(pivotLowConfirmed)
+    lastPivotLow := pivotLowConfirmed
+
+float pdHigh = request.security(syminfo.tickerid, "1D", high[1], barmerge.gaps_off, barmerge.lookahead_off)
+float pdLow = request.security(syminfo.tickerid, "1D", low[1], barmerge.gaps_off, barmerge.lookahead_off)
+
+bool inOrWindow = not na(time(timeframe.period, orWindowInput))
+var float orHigh = na
+var float orLow = na
+if newDay
+    orHigh := na
+    orLow := na
+if inOrWindow
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+
+bool structureBreakLong = (not na(lastPivotHigh) and ta.crossover(close, lastPivotHigh)) or (usePdhPdlInput and ta.crossover(close, pdHigh)) or (useOrInput and not na(orHigh) and ta.crossover(close, orHigh))
+bool structureBreakShort = (not na(lastPivotLow) and ta.crossunder(close, lastPivotLow)) or (usePdhPdlInput and ta.crossunder(close, pdLow)) or (useOrInput and not na(orLow) and ta.crossunder(close, orLow))
+
+// ============================================================================
+// STAGE 5 — DELTA DIVERGENCE (confirmed pivots, no repaint)
+// ============================================================================
+float divSourceSeries = useCvdForDivergenceInput ? cvd : delta
+bool bullishDivergence = false
+bool bearishDivergence = false
+var float lastDivPivotLowPrice = na
+var float lastDivPivotLowSrc = na
+var int lastDivPivotLowBar = na
+var float lastDivPivotHighPrice = na
+var float lastDivPivotHighSrc = na
+var int lastDivPivotHighBar = na
+
+float pivotLowForDiv = ta.pivotlow(divPivotLenInput, divPivotLenInput)
+if not na(pivotLowForDiv)
+    float curSrcLow = divSourceSeries[divPivotLenInput]
+    int curBarLow = bar_index - divPivotLenInput
+    if not na(lastDivPivotLowPrice)
+        int barsBetweenLow = curBarLow - lastDivPivotLowBar
+        bool priceLL = pivotLowForDiv < lastDivPivotLowPrice
+        bool srcHL = curSrcLow > lastDivPivotLowSrc
+        float denomLow = math.abs(lastDivPivotLowPrice)
+        float strengthLow = denomLow > 0 ? math.abs(pivotLowForDiv - lastDivPivotLowPrice) / denomLow * 100.0 : 0.0
+        if priceLL and srcHL and strengthLow >= minDivStrengthInput and barsBetweenLow > 0 and barsBetweenLow <= maxBarsBetweenPivotsInput
+            bullishDivergence := true
+    lastDivPivotLowPrice := pivotLowForDiv
+    lastDivPivotLowSrc := curSrcLow
+    lastDivPivotLowBar := curBarLow
+
+float pivotHighForDiv = ta.pivothigh(divPivotLenInput, divPivotLenInput)
+if not na(pivotHighForDiv)
+    float curSrcHigh = divSourceSeries[divPivotLenInput]
+    int curBarHigh = bar_index - divPivotLenInput
+    if not na(lastDivPivotHighPrice)
+        int barsBetweenHigh = curBarHigh - lastDivPivotHighBar
+        bool priceHH = pivotHighForDiv > lastDivPivotHighPrice
+        bool srcLH = curSrcHigh < lastDivPivotHighSrc
+        float denomHigh = math.abs(lastDivPivotHighPrice)
+        float strengthHigh = denomHigh > 0 ? math.abs(pivotHighForDiv - lastDivPivotHighPrice) / denomHigh * 100.0 : 0.0
+        if priceHH and srcLH and strengthHigh >= minDivStrengthInput and barsBetweenHigh > 0 and barsBetweenHigh <= maxBarsBetweenPivotsInput
+            bearishDivergence := true
+    lastDivPivotHighPrice := pivotHighForDiv
+    lastDivPivotHighSrc := curSrcHigh
+    lastDivPivotHighBar := curBarHigh
+
+// ============================================================================
+// STAGE 6 — ABSORPTION AND EXHAUSTION
+// ============================================================================
+bool bullishAbsorption = deltaZ <= -absorptionZThresholdInput and barRange > 0 and (close - low) / barRange >= absorptionCloseRatioInput
+bool bearishAbsorption = deltaZ >= absorptionZThresholdInput and barRange > 0 and (high - close) / barRange >= absorptionCloseRatioInput
+
+bool newLowExtreme = low <= ta.lowest(low, exhaustionLookbackInput)
+bool newHighExtreme = high >= ta.highest(high, exhaustionLookbackInput)
+float avgAbsNegDelta = ta.sma(math.abs(math.min(delta, 0.0)), exhaustionAvgLenInput)
+float avgAbsPosDelta = ta.sma(math.abs(math.max(delta, 0.0)), exhaustionAvgLenInput)
+bool bullishExhaustion = newLowExtreme and delta < 0 and math.abs(delta) <= avgAbsNegDelta * exhaustionWeaknessMultInput
+bool bearishExhaustion = newHighExtreme and delta > 0 and delta <= avgAbsPosDelta * exhaustionWeaknessMultInput
+
+// ============================================================================
+// STAGE 7 — COMPOSITE SCORING
+// ============================================================================
+int longScore = (strongPositiveDelta ? wDeltaLong : 0) + (deltaRising ? wDeltaRiseLong : 0) + (cvdTrendUp ? wCvdTrendLong : 0) + (bullishCandle ? wCandleLong : 0) + (closeNearHighLong ? wCloseLocLong : 0) + (volumeExpansion ? wVolumeExpLong : 0) + (aboveVwap ? wVwapLong : 0) + (aboveTrendEma ? wEmaTrendLong : 0) + (structureBreakLong ? wStructureLong : 0) + (bullishDivergence ? wDivergenceLong : 0) + (bullishAbsorption ? wAbsorptionLong : 0) + (bullishExhaustion ? wExhaustionLong : 0)
+int shortScore = (strongNegativeDelta ? wDeltaShort : 0) + (deltaFalling ? wDeltaFallShort : 0) + (cvdTrendDown ? wCvdTrendShort : 0) + (bearishCandle ? wCandleShort : 0) + (closeNearLowShort ? wCloseLocShort : 0) + (volumeExpansion ? wVolumeExpShort : 0) + (belowVwap ? wVwapShort : 0) + (belowTrendEma ? wEmaTrendShort : 0) + (structureBreakShort ? wStructureShort : 0) + (bearishDivergence ? wDivergenceShort : 0) + (bearishAbsorption ? wAbsorptionShort : 0) + (bearishExhaustion ? wExhaustionShort : 0)
+
+bool modeMomentumLong = strongPositiveDelta and deltaRising and bullishCandle and trendOkLong
+bool modeMomentumShort = strongNegativeDelta and deltaFalling and bearishCandle and trendOkShort
+bool modeDivergenceLong = bullishDivergence
+bool modeDivergenceShort = bearishDivergence
+bool modeAbsorptionLong = bullishAbsorption
+bool modeAbsorptionShort = bearishAbsorption
+bool modeStructureLong = structureBreakLong and strongPositiveDelta
+bool modeStructureShort = structureBreakShort and strongNegativeDelta
+bool modeScoreLong = longScore >= minLongScoreInput
+bool modeScoreShort = shortScore >= minShortScoreInput
+
+bool longCondition = switch entryModeInput
+    "Delta Momentum" => modeMomentumLong
+    "Delta Divergence" => modeDivergenceLong
+    "Absorption Reversal" => modeAbsorptionLong
+    "Structure + Delta" => modeStructureLong
+    "Composite Score" => modeScoreLong
+    => false
+bool shortCondition = switch entryModeInput
+    "Delta Momentum" => modeMomentumShort
+    "Delta Divergence" => modeDivergenceShort
+    "Absorption Reversal" => modeAbsorptionShort
+    "Structure + Delta" => modeStructureShort
+    "Composite Score" => modeScoreShort
+    => false
+
+bool strongLongSignal = longCondition and longScore >= strongLongScoreInput
+bool strongShortSignal = shortCondition and shortScore >= strongShortScoreInput
+
+// ============================================================================
+// SIGNAL QUALITY SCORE (0-100, display only)
+// ============================================================================
+f_qualityScore(bool isLong) =>
+    float qDelta = math.min(math.abs(deltaZ) / 3.0, 1.0)
+    float qCvd = (isLong ? cvdTrendUp : cvdTrendDown) ? 1.0 : 0.0
+    float qRvol = math.min(rvol / 2.0, 1.0)
+    float qVwap = (isLong ? aboveVwap : belowVwap) ? 1.0 : 0.0
+    float qEma = (isLong ? fastAboveSlow : fastBelowSlow) ? 1.0 : 0.0
+    float qStructure = (isLong ? structureBreakLong : structureBreakShort) ? 1.0 : 0.0
+    float qDivergence = (isLong ? bullishDivergence : bearishDivergence) ? 1.0 : 0.0
+    float qAbsorption = (isLong ? bullishAbsorption : bearishAbsorption) ? 1.0 : 0.0
+    float qMomentum = (isLong ? deltaRising : deltaFalling) ? 1.0 : 0.0
+    qDelta * 20.0 + qCvd * 10.0 + qRvol * 10.0 + qVwap * 10.0 + qEma * 10.0 + qStructure * 15.0 + qDivergence * 15.0 + qAbsorption * 5.0 + qMomentum * 5.0
+
+// ============================================================================
+// FILTERS — SESSION / DAY / VOLATILITY / RVOL / VWAP DISTANCE / TRADE MGMT
+// ============================================================================
+bool inSession = not na(time(timeframe.period, sessionInput))
+bool inPremarket = not na(time(timeframe.period, premarketSessionInput))
+bool inLunch = not na(time(timeframe.period, lunchSessionInput))
+bool inClosingWindow = not na(time(timeframe.period, closingSessionInput))
+bool sessionOk = inSession or (enablePremarketInput and inPremarket)
+bool lunchOk = not (enableLunchBlockInput and inLunch)
+bool closingOk = not (enableClosingBlockInput and inClosingWindow)
+
+bool dayOk = switch dayofweek
+    dayofweek.monday => allowMonInput
+    dayofweek.tuesday => allowTueInput
+    dayofweek.wednesday => allowWedInput
+    dayofweek.thursday => allowThuInput
+    dayofweek.friday => allowFriInput
+    => false
+
+bool volatilityOk = not useVolatilityFilterInput or (atrValue >= minAtrInput and atrValue <= maxAtrInput)
+bool rvolOk = not useRvolFilterInput or rvol >= minRvolFilterInput
+bool vwapDistOk = not useVwapDistanceFilterInput or math.abs(close - vwapValue) <= maxVwapDistanceAtrInput * atrValue
+
+var int tradesToday = 0
+var int lastEntryBarIndex = na
+var int consecutiveLosses = 0
+var float dayStartNetProfit = na
+var int lastClosedTradesCount = 0
+
+if newDay
+    tradesToday := 0
+    dayStartNetProfit := strategy.netprofit
+
+if strategy.closedtrades > lastClosedTradesCount
+    lastClosedTradesCount := strategy.closedtrades
+    float lastTradeProfit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    consecutiveLosses := lastTradeProfit < 0 ? consecutiveLosses + 1 : 0
+
+float dailyPnl = strategy.netprofit - nz(dayStartNetProfit, strategy.netprofit)
+
+bool tradeCountOk = tradesToday < maxTradesPerSessionInput
+bool spacingOk = na(lastEntryBarIndex) or (bar_index - lastEntryBarIndex) >= minBarsBetweenEntriesInput
+bool lossLimitOk = not useConsecutiveLossStopInput or consecutiveLosses < maxConsecutiveLossesInput
+bool dailyLossOk = not useDailyLossStopInput or dailyPnl > -dailyLossStopInput
+bool dailyProfitOk = not useDailyProfitStopInput or dailyPnl < dailyProfitStopInput
+bool tradeMgmtOk = tradeCountOk and spacingOk and lossLimitOk and dailyLossOk and dailyProfitOk
+
+bool directionLongOk = tradeDirectionInput != "Short Only"
+bool directionShortOk = tradeDirectionInput != "Long Only"
+
+bool filtersOk = sessionOk and lunchOk and closingOk and dayOk and volatilityOk and rvolOk and vwapDistOk and tradeMgmtOk
+
+bool finalLongCondition = longCondition and filtersOk and directionLongOk and strategy.position_size <= 0
+bool finalShortCondition = shortCondition and filtersOk and directionShortOk and strategy.position_size >= 0
+
+// ============================================================================
+// STAGE 8 — RISK MANAGEMENT AND EXITS
+// ============================================================================
+float tickSize = syminfo.mintick
+const float mnqTickValue = 0.5
+
+float longStopCandidate = switch stopTypeInput
+    "Fixed Ticks" => close - fixedStopTicksInput * tickSize
+    "ATR" => close - atrValue * atrStopMultInput
+    "Swing High/Low" => ta.lowest(low, swingStopLookbackInput)
+    => close - atrValue * atrStopMultInput
+float shortStopCandidate = switch stopTypeInput
+    "Fixed Ticks" => close + fixedStopTicksInput * tickSize
+    "ATR" => close + atrValue * atrStopMultInput
+    "Swing High/Low" => ta.highest(high, swingStopLookbackInput)
+    => close + atrValue * atrStopMultInput
+
+float riskLong = close - longStopCandidate
+float riskShort = shortStopCandidate - close
+
+float longTargetCandidate = switch targetTypeInput
+    "Fixed Ticks" => close + fixedTargetTicksInput * tickSize
+    "Risk/Reward" => close + riskLong * riskRewardInput
+    "ATR" => close + atrValue * atrTargetMultInput
+    => close + riskLong * riskRewardInput
+float shortTargetCandidate = switch targetTypeInput
+    "Fixed Ticks" => close - fixedTargetTicksInput * tickSize
+    "Risk/Reward" => close - riskShort * riskRewardInput
+    "ATR" => close - atrValue * atrTargetMultInput
+    => close - riskShort * riskRewardInput
+
+float longStopTicks = riskLong / tickSize
+float shortStopTicks = riskShort / tickSize
+float longQty = longStopTicks > 0 ? math.max(math.round(riskPerTradeInput / (longStopTicks * mnqTickValue)), 1.0) : 1.0
+float shortQty = shortStopTicks > 0 ? math.max(math.round(riskPerTradeInput / (shortStopTicks * mnqTickValue)), 1.0) : 1.0
+
+var float longStopPrice = na
+var float longTargetPrice = na
+var float shortStopPrice = na
+var float shortTargetPrice = na
+var string longEntryType = ""
+var string shortEntryType = ""
+var float longQualityScore = na
+var float shortQualityScore = na
+
+if finalLongCondition
+    strategy.entry("Long", strategy.long, qty = longQty)
+    longStopPrice := longStopCandidate
+    longTargetPrice := longTargetCandidate
+    longEntryType := bullishDivergence ? "Divergence" : bullishAbsorption ? "Absorption" : structureBreakLong ? "Structure" : "Momentum"
+    longQualityScore := f_qualityScore(true)
+    tradesToday += 1
+    lastEntryBarIndex := bar_index
+
+if finalShortCondition
+    strategy.entry("Short", strategy.short, qty = shortQty)
+    shortStopPrice := shortStopCandidate
+    shortTargetPrice := shortTargetCandidate
+    shortEntryType := bearishDivergence ? "Divergence" : bearishAbsorption ? "Absorption" : structureBreakShort ? "Structure" : "Momentum"
+    shortQualityScore := f_qualityScore(false)
+    tradesToday += 1
+    lastEntryBarIndex := bar_index
+
+if useBreakevenInput and strategy.position_size > 0 and (close - strategy.position_avg_price) >= breakevenTriggerTicksInput * tickSize
+    longStopPrice := math.max(longStopPrice, strategy.position_avg_price)
+if useBreakevenInput and strategy.position_size < 0 and (strategy.position_avg_price - close) >= breakevenTriggerTicksInput * tickSize
+    shortStopPrice := math.min(shortStopPrice, strategy.position_avg_price)
+
+if strategy.position_size > 0
+    if useTrailingStopInput
+        strategy.exit("Long Exit", from_entry = "Long", stop = longStopPrice, limit = longTargetPrice, trail_points = trailingTicksInput * tickSize, trail_offset = trailingOffsetTicksInput * tickSize)
+    else
+        strategy.exit("Long Exit", from_entry = "Long", stop = longStopPrice, limit = longTargetPrice)
+if strategy.position_size < 0
+    if useTrailingStopInput
+        strategy.exit("Short Exit", from_entry = "Short", stop = shortStopPrice, limit = shortTargetPrice, trail_points = trailingTicksInput * tickSize, trail_offset = trailingOffsetTicksInput * tickSize)
+    else
+        strategy.exit("Short Exit", from_entry = "Short", stop = shortStopPrice, limit = shortTargetPrice)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+if finalLongCondition
+    alert("LONG ENTRY | " + syminfo.ticker + " | Entry: " + str.tostring(close) + " | Score: " + str.tostring(longScore) + " | Delta: " + str.tostring(delta, "#.##") + " | Z: " + str.tostring(deltaZ, "#.##") + " | Stop: " + str.tostring(longStopPrice, "#.##") + " | Target: " + str.tostring(longTargetPrice, "#.##"), alert.freq_once_per_bar_close)
+if finalShortCondition
+    alert("SHORT ENTRY | " + syminfo.ticker + " | Entry: " + str.tostring(close) + " | Score: " + str.tostring(shortScore) + " | Delta: " + str.tostring(delta, "#.##") + " | Z: " + str.tostring(deltaZ, "#.##") + " | Stop: " + str.tostring(shortStopPrice, "#.##") + " | Target: " + str.tostring(shortTargetPrice, "#.##"), alert.freq_once_per_bar_close)
+if strongLongSignal
+    alert("STRONG LONG | " + syminfo.ticker + " | Score: " + str.tostring(longScore), alert.freq_once_per_bar_close)
+if strongShortSignal
+    alert("STRONG SHORT | " + syminfo.ticker + " | Score: " + str.tostring(shortScore), alert.freq_once_per_bar_close)
+if bullishDivergence
+    alert("BULLISH DELTA DIVERGENCE | " + syminfo.ticker, alert.freq_once_per_bar_close)
+if bearishDivergence
+    alert("BEARISH DELTA DIVERGENCE | " + syminfo.ticker, alert.freq_once_per_bar_close)
+if bullishAbsorption
+    alert("BULLISH ABSORPTION | " + syminfo.ticker, alert.freq_once_per_bar_close)
+if bearishAbsorption
+    alert("BEARISH ABSORPTION | " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+alertcondition(finalLongCondition, title = "LONG ENTRY", message = "LONG ENTRY {{ticker}}")
+alertcondition(finalShortCondition, title = "SHORT ENTRY", message = "SHORT ENTRY {{ticker}}")
+alertcondition(strongLongSignal, title = "STRONG LONG", message = "STRONG LONG {{ticker}}")
+alertcondition(strongShortSignal, title = "STRONG SHORT", message = "STRONG SHORT {{ticker}}")
+alertcondition(bullishDivergence, title = "BULLISH DELTA DIVERGENCE", message = "BULLISH DELTA DIVERGENCE {{ticker}}")
+alertcondition(bearishDivergence, title = "BEARISH DELTA DIVERGENCE", message = "BEARISH DELTA DIVERGENCE {{ticker}}")
+alertcondition(bullishAbsorption, title = "BULLISH ABSORPTION", message = "BULLISH ABSORPTION {{ticker}}")
+alertcondition(bearishAbsorption, title = "BEARISH ABSORPTION", message = "BEARISH ABSORPTION {{ticker}}")
+
+// ============================================================================
+// VISUALS
+// ============================================================================
+plot(showVwapInput ? vwapValue : na, "VWAP", color = color.new(color.yellow, 0), linewidth = 1)
+plot(showEmaInput ? fastEma : na, "Fast EMA", color = color.new(color.aqua, 0), linewidth = 1)
+plot(showEmaInput ? slowEma : na, "Slow EMA", color = color.new(color.orange, 0), linewidth = 1)
+
+bgcolor(showCvdStateInput ? (cvdTrendUp ? color.new(color.teal, 90) : cvdTrendDown ? color.new(color.red, 90) : na) : na, title = "CVD Trend State")
+
+var float activeEntryPrice = na
+var float activeStopPrice = na
+var float activeTargetPrice = na
+if strategy.position_size > 0
+    activeEntryPrice := strategy.position_avg_price
+    activeStopPrice := longStopPrice
+    activeTargetPrice := longTargetPrice
+else if strategy.position_size < 0
+    activeEntryPrice := strategy.position_avg_price
+    activeStopPrice := shortStopPrice
+    activeTargetPrice := shortTargetPrice
+else
+    activeEntryPrice := na
+    activeStopPrice := na
+    activeTargetPrice := na
+
+plot(showLevelsInput ? activeEntryPrice : na, "Entry Price", color = color.new(color.white, 0), style = plot.style_linebr)
+plot(showLevelsInput ? activeStopPrice : na, "Stop Loss", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(showLevelsInput ? activeTargetPrice : na, "Take Profit", color = color.new(color.green, 0), style = plot.style_linebr)
+
+plotshape(showSignalsInput and finalLongCondition ? low : na, "Long Entry", style = shape.triangleup, location = location.belowbar, color = longEntryType == "Divergence" ? color.aqua : longEntryType == "Absorption" ? color.orange : longEntryType == "Structure" ? color.blue : color.lime, size = size.small, text = longEntryType)
+plotshape(showSignalsInput and finalShortCondition ? high : na, "Short Entry", style = shape.triangledown, location = location.abovebar, color = shortEntryType == "Divergence" ? color.aqua : shortEntryType == "Absorption" ? color.orange : shortEntryType == "Structure" ? color.blue : color.red, size = size.small, text = shortEntryType)
+
+if showQualityScoreInput and finalLongCondition
+    label.new(bar_index, low, "Q:" + str.tostring(longQualityScore, "#") , style = label.style_label_up, color = color.new(color.lime, 70), textcolor = color.white, size = size.tiny)
+if showQualityScoreInput and finalShortCondition
+    label.new(bar_index, high, "Q:" + str.tostring(shortQualityScore, "#"), style = label.style_label_down, color = color.new(color.red, 70), textcolor = color.white, size = size.tiny)
