@@ -35,6 +35,7 @@ const string GRP_PROFILE = "11 — Session Volume Profile"
 const string GRP_HTF2    = "12 — Daily HTF Bias"
 const string GRP_MAXVOL  = "13 — Max Volume Price"
 const string GRP_ATRREF  = "14 — ATR(21) Reference"
+const string GRP_SESSVOL = "15 — Session Volume Delta"
 
 // ═══════════════════════════════════════════════════════════════════
 // TREND FILTER
@@ -608,6 +609,75 @@ bool useAtrRefTightenInput = input.bool(
      false,
      "Let ATR(21) Tighten Structural Stop",
      group=GRP_ATRREF)
+
+// ═══════════════════════════════════════════════════════════════════
+// MERGED: SESSION VOLUME DELTA
+//
+// Concept from "Session Volume Moving Average [LuxAlgo]" -- reimplemented
+// here as original code, not ported, per this repo's standing practice
+// with LuxAlgo indicators (their scripts commonly carry CC BY-NC-SA
+// terms, as already flagged and handled this way for their "Liquidity
+// Delta Profiler" earlier this session). Two ideas taken from the
+// source concept, both wired as REAL entry gates ("equal parity" per
+// request), not just chart decoration:
+//   1. Session bull/bear volume delta -- what share of this session's
+//      volume so far traded on up-candles vs down-candles.
+//   2. Volume expansion streak -- consecutive bars of monotonically
+//      rising (or falling) volume, direction-agnostic, filtered to only
+//      count once volume itself is significant vs its own average.
+// Rendering deliberately does NOT reuse the source indicator's
+// box/line/label session-zone drawing (per "I did not like how you
+// render objects on chart") -- the only visual here is a single
+// bgcolor() tint, no per-bar object creation at all.
+// ═══════════════════════════════════════════════════════════════════
+
+bool useSessionDeltaGateInput = input.bool(
+     false,
+     "Require Session Volume Delta Confluence",
+     tooltip="OFF by default for A/B testing. When ON, a long needs this session's bull-volume share at or above the threshold below; a short needs it at or below the mirrored threshold.",
+     group=GRP_SESSVOL)
+
+float sessionDeltaBullMinInput = input.float(
+     55.0,
+     "Minimum Bull Volume % For Longs",
+     minval=50.0,
+     maxval=100.0,
+     step=1.0,
+     group=GRP_SESSVOL)
+
+float sessionDeltaBearMaxInput = input.float(
+     45.0,
+     "Maximum Bull Volume % For Shorts",
+     minval=0.0,
+     maxval=50.0,
+     step=1.0,
+     group=GRP_SESSVOL)
+
+bool showSessionDeltaBgInput = input.bool(
+     true,
+     "Tint Chart Background By Session Delta (visual only)",
+     tooltip="A single bgcolor() tint -- no boxes, lines, or labels.",
+     group=GRP_SESSVOL)
+
+bool useVolumeStreakGateInput = input.bool(
+     false,
+     "Require Volume Expansion Streak",
+     tooltip="OFF by default for A/B testing. Requires volume to have been monotonically rising for at least the bar count below, with the current bar's volume also at or above the significance multiplier times its 50-bar average.",
+     group=GRP_SESSVOL)
+
+int volumeStreakMinBarsInput = input.int(
+     4,
+     "Minimum Consecutive Rising-Volume Bars",
+     minval=2,
+     maxval=20,
+     group=GRP_SESSVOL)
+
+float volumeStreakSigMultInput = input.float(
+     1.5,
+     "Significant Volume Multiplier (x 50-Bar Avg)",
+     minval=0.0,
+     step=0.1,
+     group=GRP_SESSVOL)
 
 // ═══════════════════════════════════════════════════════════════════
 // CLEAN COLOR PALETTE
@@ -1779,6 +1849,65 @@ if not showHtfCandleVisualInput and
     htfTag := na
 
 // ═══════════════════════════════════════════════════════════════════
+// MERGED: SESSION VOLUME DELTA BIAS
+//
+// "Session Volume Moving Average [LuxAlgo]" concept, reimplemented as
+// original code (see the input-group comment above for why). Reuses
+// the SAME session window already driving the Session Volume Profile
+// above (profileNewSession/profileInSession) instead of a second,
+// separate session config -- one session boundary definition for this
+// whole file, not two.
+// ═══════════════════════════════════════════════════════════════════
+
+var float sessionDeltaBullVolume = 0.0
+var float sessionDeltaTotalVolume = 0.0
+
+bool sessionDeltaBarBullish = close > open
+
+if profileNewSession
+    sessionDeltaBullVolume := sessionDeltaBarBullish ? volume : 0.0
+    sessionDeltaTotalVolume := volume
+else if profileInSession
+    sessionDeltaBullVolume += sessionDeltaBarBullish ? volume : 0.0
+    sessionDeltaTotalVolume += volume
+
+float sessionDeltaPct = sessionDeltaTotalVolume > 0 ? sessionDeltaBullVolume / sessionDeltaTotalVolume * 100.0 : 50.0
+
+bool longSessionDeltaOk = not useSessionDeltaGateInput or sessionDeltaPct >= sessionDeltaBullMinInput
+bool shortSessionDeltaOk = not useSessionDeltaGateInput or sessionDeltaPct <= sessionDeltaBearMaxInput
+
+color sessionDeltaBgColor = color.from_gradient(sessionDeltaPct, 35.0, 65.0, color.new(C_PURPLE, 90), color.new(C_BLUE, 90))
+bgcolor(showSessionDeltaBgInput ? sessionDeltaBgColor : na, title="Session Volume Delta Bias")
+
+// ═══════════════════════════════════════════════════════════════════
+// MERGED: VOLUME EXPANSION STREAK
+//
+// Same source concept, reimplemented as original code. Tracks
+// consecutive bars of monotonically rising (or falling) volume,
+// direction-agnostic -- a proxy for a move gaining participation as it
+// develops, not a bullish/bearish read by itself. Only counts as
+// "significant" once volume itself clears a multiple of its own
+// trailing average, so a rising streak of small, quiet bars doesn't
+// qualify.
+// ═══════════════════════════════════════════════════════════════════
+
+var int volumeStreak = 0
+
+if volume > nz(volume[1])
+    volumeStreak := volumeStreak > 0 ? volumeStreak + 1 : 1
+else if volume < nz(volume[1])
+    volumeStreak := volumeStreak < 0 ? volumeStreak - 1 : -1
+else
+    volumeStreak := 0
+
+float volumeStreakAvg = ta.sma(volume, 50)
+bool volumeStreakSignificant = volumeStreakAvg > 0 and volume >= volumeStreakAvg * volumeStreakSigMultInput
+bool volumeExpansionActive = volumeStreak >= volumeStreakMinBarsInput and volumeStreakSignificant
+
+bool longVolumeStreakOk = not useVolumeStreakGateInput or volumeExpansionActive
+bool shortVolumeStreakOk = not useVolumeStreakGateInput or volumeExpansionActive
+
+// ═══════════════════════════════════════════════════════════════════
 // PROFILE CONFLUENCE
 // ═══════════════════════════════════════════════════════════════════
 
@@ -1843,12 +1972,16 @@ bool shortDailyBiasOk =
 bool longProfileConfluenceOk =
      longValueAreaOk and
      longMaxVolOk and
-     longDailyBiasOk
+     longDailyBiasOk and
+     longSessionDeltaOk and
+     longVolumeStreakOk
 
 bool shortProfileConfluenceOk =
      shortValueAreaOk and
      shortMaxVolOk and
-     shortDailyBiasOk
+     shortDailyBiasOk and
+     shortSessionDeltaOk and
+     shortVolumeStreakOk
 
 // ═══════════════════════════════════════════════════════════════════
 // FINAL ENTRY SIGNALS
@@ -1899,6 +2032,8 @@ string longBlocker =
      not longValueAreaOk ? "VALUE AREA" :
      not longMaxVolOk ? "MAX VOL" :
      not longDailyBiasOk ? "DAILY BIAS" :
+     not longSessionDeltaOk ? "SESSION DELTA" :
+     not longVolumeStreakOk ? "VOL STREAK" :
      not longSizePass ? "SIZE" :
      strategy.position_size != 0 ? "POSITION OPEN" :
      "CLEAR"
@@ -1915,6 +2050,8 @@ string shortBlocker =
      not shortValueAreaOk ? "VALUE AREA" :
      not shortMaxVolOk ? "MAX VOL" :
      not shortDailyBiasOk ? "DAILY BIAS" :
+     not shortSessionDeltaOk ? "SESSION DELTA" :
+     not shortVolumeStreakOk ? "VOL STREAK" :
      not shortSizePass ? "SIZE" :
      strategy.position_size != 0 ? "POSITION OPEN" :
      "CLEAR"
@@ -3293,11 +3430,13 @@ dashboardTextSize =
      dashFont == "Phone" ? size.small :
      size.tiny
 
+// MERGED: rows 11 -> 12 to fit the new Session Delta / Volume Streak
+// row (Detailed layout row 11; Compact layout row 7).
 var table dashboard =
      table.new(
          position=resolvedDashboardPosition,
          columns=4,
-         rows=11,
+         rows=12,
          bgcolor=color.new(
              C_NAVY,
              8),
@@ -3589,7 +3728,17 @@ string profileGatesText =
      ) +
      (
          useDailyBiasGateInput
-         ? "DB"
+         ? "DB "
+         : ""
+     ) +
+     (
+         useSessionDeltaGateInput
+         ? "SD "
+         : ""
+     ) +
+     (
+         useVolumeStreakGateInput
+         ? "VS"
          : ""
      )
 
@@ -3601,9 +3750,22 @@ profileGatesText :=
 color profileGatesColor =
      useValueAreaConfluenceInput or
      useMaxVolConfluenceInput or
-     useDailyBiasGateInput
+     useDailyBiasGateInput or
+     useSessionDeltaGateInput or
+     useVolumeStreakGateInput
      ? C_ORANGE
      : C_GRAY
+
+// MERGED: dashboard text/color for the new Session Volume Delta /
+// Volume Expansion Streak rows.
+string sessionDeltaText = str.tostring(sessionDeltaPct, "#.0") + "% Bull"
+color sessionDeltaTextColor = sessionDeltaPct >= 55.0 ? C_BLUE : sessionDeltaPct <= 45.0 ? C_PURPLE : C_GRAY
+
+string volumeStreakText =
+     volumeStreak == 0
+     ? "FLAT"
+     : (volumeStreak > 0 ? "+" : "") + str.tostring(volumeStreak) + (volumeStreakSignificant ? " SIG" : "")
+color volumeStreakColor = volumeExpansionActive ? C_ORANGE : C_GRAY
 
 // ───────────────────────────────────────────────────────────────────
 // DASHBOARD RENDER
@@ -3616,7 +3778,7 @@ if barstate.islast
          0,
          0,
          3,
-         10)
+         11)
 
     if showDashboard
 
@@ -3698,6 +3860,15 @@ if barstate.islast
                  dailyTradeLimitPass
                  ? C_CARD
                  : C_RED)
+
+            f_dashboardPair(
+                 7,
+                 "SESS DELTA",
+                 sessionDeltaText,
+                 sessionDeltaTextColor,
+                 "VOL STREAK",
+                 volumeStreakText,
+                 volumeStreakColor)
 
         else
 
@@ -3810,6 +3981,15 @@ if barstate.islast
                  " / " +
                  f_price(tp1Price),
                  managementColor)
+
+            f_dashboardPair(
+                 11,
+                 "SESS DELTA",
+                 sessionDeltaText,
+                 sessionDeltaTextColor,
+                 "VOL STREAK",
+                 volumeStreakText,
+                 volumeStreakColor)
 
 // ═══════════════════════════════════════════════════════════════════
 // ALERT CONDITIONS
