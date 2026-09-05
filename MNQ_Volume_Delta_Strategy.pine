@@ -14,7 +14,7 @@
 // input-driven instead, via a risk-per-trade calculation (see Risk
 // Management section) rather than a fixed default_qty_value.
 // ============================================================================
-strategy(title = "MNQ Volume Delta Strategy", shorttitle = "MNQ VolDelta", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, initial_capital = 50000.0, currency = currency.USD, default_qty_type = strategy.cash, default_qty_value = 50000.0, commission_type = strategy.commission.cash_per_contract, commission_value = 0.47, slippage = 2, process_orders_on_close = true, calc_on_every_tick = false)
+strategy(title = "MNQ Volume Delta Strategy", shorttitle = "MNQ VolD", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, initial_capital = 50000.0, currency = currency.USD, default_qty_type = strategy.cash, default_qty_value = 50000.0, commission_type = strategy.commission.cash_per_contract, commission_value = 0.47, slippage = 2, process_orders_on_close = true, calc_on_every_tick = false)
 
 // ============================================================================
 // STAGE 1 — VOLUME DELTA / CVD INPUTS
@@ -292,8 +292,15 @@ if inOrWindow
     orHigh := na(orHigh) ? high : math.max(orHigh, high)
     orLow := na(orLow) ? low : math.min(orLow, low)
 
-bool structureBreakLong = (not na(lastPivotHigh) and ta.crossover(close, lastPivotHigh)) or (usePdhPdlInput and ta.crossover(close, pdHigh)) or (useOrInput and not na(orHigh) and ta.crossover(close, orHigh))
-bool structureBreakShort = (not na(lastPivotLow) and ta.crossunder(close, lastPivotLow)) or (usePdhPdlInput and ta.crossunder(close, pdLow)) or (useOrInput and not na(orLow) and ta.crossunder(close, orLow))
+bool crossoverPivotHigh = ta.crossover(close, lastPivotHigh)
+bool crossoverPdHigh = ta.crossover(close, pdHigh)
+bool crossoverOrHigh = ta.crossover(close, orHigh)
+bool crossunderPivotLow = ta.crossunder(close, lastPivotLow)
+bool crossunderPdLow = ta.crossunder(close, pdLow)
+bool crossunderOrLow = ta.crossunder(close, orLow)
+
+bool structureBreakLong = (not na(lastPivotHigh) and crossoverPivotHigh) or (usePdhPdlInput and crossoverPdHigh) or (useOrInput and not na(orHigh) and crossoverOrHigh)
+bool structureBreakShort = (not na(lastPivotLow) and crossunderPivotLow) or (usePdhPdlInput and crossunderPdLow) or (useOrInput and not na(orLow) and crossunderOrLow)
 
 // ============================================================================
 // STAGE 5 — DELTA DIVERGENCE (confirmed pivots, no repaint)
@@ -595,10 +602,18 @@ plot(showLevelsInput ? activeEntryPrice : na, "Entry Price", color = color.new(c
 plot(showLevelsInput ? activeStopPrice : na, "Stop Loss", color = color.new(color.red, 0), style = plot.style_linebr)
 plot(showLevelsInput ? activeTargetPrice : na, "Take Profit", color = color.new(color.green, 0), style = plot.style_linebr)
 
-plotshape(showSignalsInput and finalLongCondition ? low : na, "Long Entry", style = shape.triangleup, location = location.belowbar, color = longEntryType == "Divergence" ? color.aqua : longEntryType == "Absorption" ? color.orange : longEntryType == "Structure" ? color.blue : color.lime, size = size.small, text = longEntryType)
-plotshape(showSignalsInput and finalShortCondition ? high : na, "Short Entry", style = shape.triangledown, location = location.abovebar, color = shortEntryType == "Divergence" ? color.aqua : shortEntryType == "Absorption" ? color.orange : shortEntryType == "Structure" ? color.blue : color.red, size = size.small, text = shortEntryType)
+// plotshape()'s text= argument requires a compile-time "const string"; the
+// entry-type tag (longEntryType/shortEntryType) is a per-bar series string,
+// so it cannot go on the shape itself (CE10123) — the marker color alone
+// still distinguishes entry type, and the type name is carried on the
+// label below instead, which does accept a series string.
+plotshape(showSignalsInput and finalLongCondition ? low : na, "Long Entry", style = shape.triangleup, location = location.belowbar, color = longEntryType == "Divergence" ? color.aqua : longEntryType == "Absorption" ? color.orange : longEntryType == "Structure" ? color.blue : color.lime, size = size.small)
+plotshape(showSignalsInput and finalShortCondition ? high : na, "Short Entry", style = shape.triangledown, location = location.abovebar, color = shortEntryType == "Divergence" ? color.aqua : shortEntryType == "Absorption" ? color.orange : shortEntryType == "Structure" ? color.blue : color.red, size = size.small)
 
-if showQualityScoreInput and finalLongCondition
-    label.new(bar_index, low, "Q:" + str.tostring(longQualityScore, "#") , style = label.style_label_up, color = color.new(color.lime, 70), textcolor = color.white, size = size.tiny)
-if showQualityScoreInput and finalShortCondition
-    label.new(bar_index, high, "Q:" + str.tostring(shortQualityScore, "#"), style = label.style_label_down, color = color.new(color.red, 70), textcolor = color.white, size = size.tiny)
+string longLabelText = longEntryType + (showQualityScoreInput ? " Q:" + str.tostring(longQualityScore, "#") : "")
+string shortLabelText = shortEntryType + (showQualityScoreInput ? " Q:" + str.tostring(shortQualityScore, "#") : "")
+
+if showSignalsInput and finalLongCondition
+    label.new(bar_index, low, longLabelText, style = label.style_label_up, color = color.new(color.lime, 70), textcolor = color.white, size = size.tiny)
+if showSignalsInput and finalShortCondition
+    label.new(bar_index, high, shortLabelText, style = label.style_label_down, color = color.new(color.red, 70), textcolor = color.white, size = size.tiny)
