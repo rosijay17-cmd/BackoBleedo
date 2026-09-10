@@ -384,7 +384,7 @@ float rejectionThreshold = input.float(
 )
 
 float scoreDominance = input.float(
-     12.0,
+     24.0,
      "Required Score Dominance",
      minval = 0.0,
      maxval = 40.0,
@@ -411,7 +411,7 @@ bool requireFreshState = input.bool(
 )
 
 int cooldownBars = input.int(
-     5,
+     20,
      "Cooldown After Exit",
      minval = 0,
      maxval = 50,
