@@ -393,7 +393,7 @@ float scoreDominance = input.float(
 )
 
 float signalStabilityMargin = input.float(
-     5.0,
+     0.0,
      "Signal Stability Margin",
      minval = 0.0,
      maxval = 20.0,
