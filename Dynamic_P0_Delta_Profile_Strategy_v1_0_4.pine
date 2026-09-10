@@ -2369,10 +2369,16 @@ architectureTablePosition = (
      position.bottom_right :
      position.top_right)
 
+// table.new()'s own bgcolor is the DEFAULT background for every cell that
+// doesn't set its own (the header row does, via its explicit navy
+// bgcolor on each table.cell() call; every data row never set one at
+// all, leaving it see-through to whatever is behind it on the chart --
+// which is exactly why ACCEPT/REJECT/READ text was washing out).
 var table architectureTable = table.new(
      architectureTablePosition,
      5,
      10,
+     bgcolor = color.new(color.rgb(15, 20, 27), 10),
      border_width = 1
 )
 
