@@ -1696,32 +1696,27 @@ plotchar(
      color = color.orange
 )
 
-// plotshape()'s size= argument requires a compile-time "const string" --
-// stricter than table.cell_set_text_size()'s, which accepts the result of
-// calling f_dashboardSize(). Passing a user-defined function's return
-// value here raises CE10123, so this is computed as a direct top-level
-// ternary off the input instead (stays "input"-qualified, not "series").
-string entryMarkerSize = entryMarkerSizeInput == "Tiny" ? size.tiny : entryMarkerSizeInput == "Small" ? size.small : entryMarkerSizeInput == "Large" ? size.large : entryMarkerSizeInput == "Huge" ? size.huge : size.normal
+// plotshape()'s size= argument requires a true compile-time "const
+// string" -- stricter than table.cell_set_text_size()'s, and stricter
+// than the earlier fix (a direct ternary off the input still only reaches
+// "input string", not "const"). There is no expression that can satisfy
+// this at runtime, so the only way to make marker size configurable is
+// one plotshape() call per size option, each with a literal size=
+// constant, gated by comparing the input's current value.
+bool showLongEntryMarker = showEntryMarkers and actualLongEntry
+bool showShortEntryMarker = showEntryMarkers and actualShortEntry
 
-plotshape(
-     showEntryMarkers and
-     actualLongEntry,
-     title = "Bull Actual Entry",
-     style = shape.triangleup,
-     location = location.belowbar,
-     size = entryMarkerSize,
-     color = entryLongColor
-)
+plotshape(showLongEntryMarker and entryMarkerSizeInput == "Tiny", title = "Bull Actual Entry (Tiny)", style = shape.triangleup, location = location.belowbar, size = size.tiny, color = entryLongColor)
+plotshape(showLongEntryMarker and entryMarkerSizeInput == "Small", title = "Bull Actual Entry (Small)", style = shape.triangleup, location = location.belowbar, size = size.small, color = entryLongColor)
+plotshape(showLongEntryMarker and entryMarkerSizeInput == "Normal", title = "Bull Actual Entry (Normal)", style = shape.triangleup, location = location.belowbar, size = size.normal, color = entryLongColor)
+plotshape(showLongEntryMarker and entryMarkerSizeInput == "Large", title = "Bull Actual Entry (Large)", style = shape.triangleup, location = location.belowbar, size = size.large, color = entryLongColor)
+plotshape(showLongEntryMarker and entryMarkerSizeInput == "Huge", title = "Bull Actual Entry (Huge)", style = shape.triangleup, location = location.belowbar, size = size.huge, color = entryLongColor)
 
-plotshape(
-     showEntryMarkers and
-     actualShortEntry,
-     title = "Bear Actual Entry",
-     style = shape.triangledown,
-     location = location.abovebar,
-     size = entryMarkerSize,
-     color = entryShortColor
-)
+plotshape(showShortEntryMarker and entryMarkerSizeInput == "Tiny", title = "Bear Actual Entry (Tiny)", style = shape.triangledown, location = location.abovebar, size = size.tiny, color = entryShortColor)
+plotshape(showShortEntryMarker and entryMarkerSizeInput == "Small", title = "Bear Actual Entry (Small)", style = shape.triangledown, location = location.abovebar, size = size.small, color = entryShortColor)
+plotshape(showShortEntryMarker and entryMarkerSizeInput == "Normal", title = "Bear Actual Entry (Normal)", style = shape.triangledown, location = location.abovebar, size = size.normal, color = entryShortColor)
+plotshape(showShortEntryMarker and entryMarkerSizeInput == "Large", title = "Bear Actual Entry (Large)", style = shape.triangledown, location = location.abovebar, size = size.large, color = entryShortColor)
+plotshape(showShortEntryMarker and entryMarkerSizeInput == "Huge", title = "Bear Actual Entry (Huge)", style = shape.triangledown, location = location.abovebar, size = size.huge, color = entryShortColor)
 
 
 //=============================================================================
