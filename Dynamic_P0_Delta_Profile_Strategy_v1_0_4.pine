@@ -392,6 +392,16 @@ float scoreDominance = input.float(
      group = G_ENTRY
 )
 
+float signalStabilityMargin = input.float(
+     5.0,
+     "Signal Stability Margin",
+     minval = 0.0,
+     maxval = 20.0,
+     step = 0.5,
+     tooltip = "Extra headroom required above the raw score threshold before a signal counts as qualified. On a continuous/back-adjusted futures symbol (e.g. NQ1!), small historical revisions can nudge a score by a point or two -- a bar sitting right at the bare threshold can flip between qualifying and not on reload. This margin keeps borderline bars from ever counting as signals in the first place, so a small revision has nothing to flip. It does not fix the underlying data revision itself (that requires trading a fixed-expiry contract) -- it only makes the strategy's own output more stable against it.",
+     group = G_ENTRY
+)
+
 bool requireDirectionalCandle = input.bool(
      true,
      "Require Directional Confirmation Candle",
@@ -1200,11 +1210,11 @@ bool meaningfulDisplacement = math.abs(distanceFromP0ATR) >= minimumDistanceATR
 bool coherenceOK = profileCoherence >= minimumCoherence
 
 bool acceptanceDominant = (
-     acceptanceScore >= acceptanceThreshold and
+     acceptanceScore >= acceptanceThreshold + signalStabilityMargin and
      acceptanceScore >= rejectionScore + scoreDominance)
 
 bool rejectionDominant = (
-     rejectionScore >= rejectionThreshold and
+     rejectionScore >= rejectionThreshold + signalStabilityMargin and
      rejectionScore >= acceptanceScore + scoreDominance)
 
 bool bullishAcceptance = (
