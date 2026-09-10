@@ -1,0 +1,2407 @@
+//@version=6
+strategy(
+     title = "Dynamic P0 Delta Profile Strategy v1.0.4 Armed + Entry Markers",
+     shorttitle = "P0 Delta Strategy",
+     overlay = true,
+     initial_capital = 100000,
+     pyramiding = 0,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.50,
+     slippage = 1,
+     process_orders_on_close = true,
+     calc_on_order_fills = true,
+     calc_on_every_tick = true,
+     use_bar_magnifier = false,
+     max_bars_back = 5000,
+     max_boxes_count = 500,
+     max_lines_count = 300,
+     max_labels_count = 300
+)
+
+//=============================================================================
+// MODEL
+//-----------------------------------------------------------------------------
+// STRUCTURAL LAYER
+// • Up to 120 calendar days.
+// • Estimated positive / negative delta distributed across price.
+// • Structural POC, VAH, VAL.
+// • Delta support / resistance.
+// • High-delta liquidity zones.
+// • Right-side price-level delta histogram.
+// • Histogram/Profile Price Bars input supports 20–160 true price bins.
+//
+// DYNAMIC LAYER
+// • Rolling P0 equilibrium. Default = 4 hours.
+// • Dynamic P0 + dynamic value area.
+// • Acceptance / rejection scoring.
+//
+// ACCEPTANCE COMPONENTS
+// • P0 migration.
+// • P0 catch-up.
+// • New-location volume.
+// • Value-area migration.
+// • Delta alignment / persistence.
+// • Dwell outside equilibrium.
+// • Price / delta efficiency.
+//
+// REJECTION COMPONENTS
+// • P0 stall.
+// • Opposing delta.
+// • Absorption.
+// • Return toward P0.
+// • Value non-migration.
+// • Weak new-location volume.
+//
+// ENTRY TYPES
+// BULL | LONG ENTRY | ACCEPTANCE CONTINUATION
+// BEAR | SHORT ENTRY | ACCEPTANCE CONTINUATION
+// BULL | LONG ENTRY | REJECTION TO P0
+// BEAR | SHORT ENTRY | REJECTION TO P0
+//
+// IMPORTANT:
+// Pine does not expose native bid/ask aggressor volume here.
+// Delta is estimated from OHLCV candle pressure.
+//=============================================================================
+
+
+//=============================================================================
+// 01 — STRUCTURAL PROFILE
+//=============================================================================
+
+string G_STRUCT = "01 — Structural Profile"
+
+int structuralDays = input.int(
+     120,
+     "Lookback Days",
+     minval = 1,
+     maxval = 120,
+     group = G_STRUCT
+)
+
+int structuralRows = input.int(
+     80,
+     "Histogram / Profile Price Bars",
+     minval = 20,
+     maxval = 160,
+     step = 10,
+     tooltip = "Controls the number of actual price bins used by the structural delta profile. Higher values draw more histogram bars and provide finer POC, VAH/VAL, delta-node, support/resistance, and liquidity-zone resolution. Higher values also require more processing.",
+     group = G_STRUCT
+)
+
+int maxStoredBars = input.int(
+     25000,
+     "Maximum Stored Chart Bars",
+     minval = 1000,
+     maxval = 50000,
+     step = 1000,
+     group = G_STRUCT
+)
+
+float structuralValueArea = input.float(
+     70.0,
+     "Value Area %",
+     minval = 50.0,
+     maxval = 95.0,
+     step = 1.0,
+     group = G_STRUCT
+)
+
+float minNodeVolume = input.float(
+     25.0,
+     "Minimum Node Volume (% Of POC)",
+     minval = 0.0,
+     maxval = 100.0,
+     step = 5.0,
+     group = G_STRUCT
+)
+
+float minNodeDelta = input.float(
+     10.0,
+     "Minimum Absolute Delta %",
+     minval = 0.0,
+     maxval = 100.0,
+     step = 1.0,
+     group = G_STRUCT
+)
+
+int liquidityNodeCount = input.int(
+     4,
+     "High-Delta Liquidity Zones",
+     minval = 1,
+     maxval = 8,
+     group = G_STRUCT
+)
+
+
+//=============================================================================
+// 02 — DYNAMIC P0
+//=============================================================================
+
+string G_P0 = "02 — Dynamic P0"
+
+int equilibriumMinutes = input.int(
+     240,
+     "Equilibrium Window (Minutes)",
+     minval = 60,
+     maxval = 1440,
+     step = 30,
+     group = G_P0
+)
+
+int equilibriumRows = input.int(
+     32,
+     "Dynamic P0 Price Rows",
+     minval = 16,
+     maxval = 64,
+     group = G_P0
+)
+
+int maximumEquilibriumBars = input.int(
+     500,
+     "Maximum Bars In Dynamic Profile",
+     minval = 50,
+     maxval = 1000,
+     group = G_P0
+)
+
+float dynamicValueAreaPercent = input.float(
+     70.0,
+     "Dynamic Value Area %",
+     minval = 50.0,
+     maxval = 95.0,
+     step = 1.0,
+     group = G_P0
+)
+
+int coherenceRadius = input.int(
+     2,
+     "P0 Coherence Radius (Rows)",
+     minval = 1,
+     maxval = 5,
+     group = G_P0
+)
+
+float equilibriumBandATR = input.float(
+     0.35,
+     "Equilibrium Band (ATR)",
+     minval = 0.10,
+     maxval = 1.0,
+     step = 0.05,
+     group = G_P0
+)
+
+float minimumDistanceATR = input.float(
+     0.80,
+     "Minimum Entry Distance From P0 (ATR)",
+     minval = 0.25,
+     maxval = 3.0,
+     step = 0.05,
+     group = G_P0
+)
+
+
+//=============================================================================
+// 03 — ACCEPTANCE / REJECTION METRICS
+//=============================================================================
+
+string G_METRICS = "03 — Acceptance / Rejection Metrics"
+
+int migrationLookback = input.int(
+     4,
+     "P0 / Value Migration Lookback",
+     minval = 1,
+     maxval = 20,
+     group = G_METRICS
+)
+
+float migrationTargetATR = input.float(
+     0.15,
+     "Strong P0 Migration (ATR)",
+     minval = 0.02,
+     maxval = 1.0,
+     step = 0.01,
+     group = G_METRICS
+)
+
+float catchUpTargetPercent = input.float(
+     40.0,
+     "Strong P0 Catch-Up %",
+     minval = 10.0,
+     maxval = 100.0,
+     step = 5.0,
+     group = G_METRICS
+)
+
+float newLocationBandATR = input.float(
+     0.25,
+     "New-Location Volume Band (ATR)",
+     minval = 0.10,
+     maxval = 1.0,
+     step = 0.05,
+     group = G_METRICS
+)
+
+float newLocationTargetPercent = input.float(
+     35.0,
+     "Strong New-Location Volume %",
+     minval = 10.0,
+     maxval = 80.0,
+     step = 5.0,
+     group = G_METRICS
+)
+
+float valueMigrationTargetATR = input.float(
+     0.10,
+     "Strong Value-Area Migration (ATR)",
+     minval = 0.02,
+     maxval = 1.0,
+     step = 0.01,
+     group = G_METRICS
+)
+
+int deltaWindow = input.int(
+     3,
+     "Delta State Window",
+     minval = 1,
+     maxval = 10,
+     group = G_METRICS
+)
+
+int deltaPersistenceBars = input.int(
+     3,
+     "Delta Persistence Bars",
+     minval = 2,
+     maxval = 8,
+     group = G_METRICS
+)
+
+float alignedDeltaTarget = input.float(
+     20.0,
+     "Strong Aligned Delta %",
+     minval = 5.0,
+     maxval = 80.0,
+     step = 1.0,
+     group = G_METRICS
+)
+
+float opposingDeltaTarget = input.float(
+     20.0,
+     "Strong Opposing Delta %",
+     minval = 5.0,
+     maxval = 80.0,
+     step = 1.0,
+     group = G_METRICS
+)
+
+int efficiencyLookback = input.int(
+     3,
+     "Efficiency Lookback",
+     minval = 1,
+     maxval = 10,
+     group = G_METRICS
+)
+
+float efficiencyTargetATR = input.float(
+     0.30,
+     "Efficient Price Progress (ATR)",
+     minval = 0.05,
+     maxval = 1.50,
+     step = 0.05,
+     group = G_METRICS
+)
+
+float absorptionDeltaTarget = input.float(
+     25.0,
+     "Absorption Delta Magnitude %",
+     minval = 5.0,
+     maxval = 100.0,
+     step = 1.0,
+     group = G_METRICS
+)
+
+float absorptionMaximumProgressATR = input.float(
+     0.12,
+     "Absorption Maximum Price Progress (ATR)",
+     minval = 0.02,
+     maxval = 0.50,
+     step = 0.01,
+     group = G_METRICS
+)
+
+int dwellMeasurementBars = input.int(
+     4,
+     "Dwell Measurement Bars",
+     minval = 2,
+     maxval = 12,
+     group = G_METRICS
+)
+
+float minimumCoherence = input.float(
+     55.0,
+     "Minimum Profile Coherence",
+     minval = 0.0,
+     maxval = 100.0,
+     step = 1.0,
+     group = G_METRICS
+)
+
+
+//=============================================================================
+// 04 — ENTRY ENGINE
+//=============================================================================
+
+string G_ENTRY = "04 — Entry Engine"
+
+string entryMode = input.string(
+     "Both",
+     "Entry Mode",
+     options = [
+          "Both",
+          "Rejection Only",
+          "Acceptance Only"
+     ],
+     group = G_ENTRY
+)
+
+float acceptanceThreshold = input.float(
+     68.0,
+     "Acceptance Score Threshold",
+     minval = 40.0,
+     maxval = 95.0,
+     step = 1.0,
+     group = G_ENTRY
+)
+
+float rejectionThreshold = input.float(
+     68.0,
+     "Rejection Score Threshold",
+     minval = 40.0,
+     maxval = 95.0,
+     step = 1.0,
+     group = G_ENTRY
+)
+
+float scoreDominance = input.float(
+     12.0,
+     "Required Score Dominance",
+     minval = 0.0,
+     maxval = 40.0,
+     step = 1.0,
+     group = G_ENTRY
+)
+
+bool requireDirectionalCandle = input.bool(
+     true,
+     "Require Directional Confirmation Candle",
+     group = G_ENTRY
+)
+
+bool requireReturnTowardP0 = input.bool(
+     true,
+     "Rejection Must Move Back Toward P0",
+     group = G_ENTRY
+)
+
+bool requireFreshState = input.bool(
+     true,
+     "Require Fresh Acceptance / Rejection State",
+     group = G_ENTRY
+)
+
+int cooldownBars = input.int(
+     5,
+     "Cooldown After Exit",
+     minval = 0,
+     maxval = 50,
+     group = G_ENTRY
+)
+
+
+//=============================================================================
+// 05 — RISK
+//=============================================================================
+
+string G_RISK = "05 — Risk"
+
+float contracts = input.float(
+     1.0,
+     "Contracts",
+     minval = 1.0,
+     step = 1.0,
+     group = G_RISK
+)
+
+float stopATR = input.float(
+     1.0,
+     "Initial Stop (ATR)",
+     minval = 0.25,
+     maxval = 5.0,
+     step = 0.05,
+     group = G_RISK
+)
+
+float acceptanceRR = input.float(
+     1.75,
+     "Acceptance Target (R)",
+     minval = 0.50,
+     maxval = 5.0,
+     step = 0.05,
+     group = G_RISK
+)
+
+float rejectionMinimumRR = input.float(
+     0.75,
+     "Minimum Rejection R:R To Frozen P0",
+     minval = 0.25,
+     maxval = 3.0,
+     step = 0.05,
+     group = G_RISK
+)
+
+bool useBreakEven = input.bool(
+     false,
+     "Move Stop To Break-Even",
+     group = G_RISK
+)
+
+float breakEvenAtR = input.float(
+     1.0,
+     "Break-Even Trigger (R)",
+     minval = 0.25,
+     maxval = 3.0,
+     step = 0.25,
+     group = G_RISK
+)
+
+
+//=============================================================================
+// 06 — HISTOGRAM STYLE
+//=============================================================================
+
+string G_HIST = "06 — Structural Histogram"
+
+bool showHistogram = input.bool(
+     true,
+     "Show Right-Side Delta Histogram",
+     group = G_HIST
+)
+
+int histogramOffset = input.int(
+     6,
+     "Histogram Offset",
+     minval = 1,
+     maxval = 40,
+     group = G_HIST
+)
+
+int histogramWidth = input.int(
+     24,
+     "Histogram Width",
+     minval = 8,
+     maxval = 50,
+     group = G_HIST
+)
+
+float histogramVerticalFill = input.float(
+     0.90,
+     "Histogram Bar Vertical Fill",
+     minval = 0.20,
+     maxval = 1.00,
+     step = 0.05,
+     tooltip = "Controls how much of each price bin is filled vertically. Use a lower value to create visible spacing between many histogram bars.",
+     group = G_HIST
+)
+
+string histogramShape = input.string(
+     "Full Row",
+     "Histogram Bar Shape",
+     options = [
+          "Full Row",
+          "Medium",
+          "Thin"
+     ],
+     group = G_HIST
+)
+
+string histogramStyle = input.string(
+     "Soft",
+     "Histogram Bar Style",
+     options = [
+          "Solid",
+          "Soft",
+          "Outline"
+     ],
+     group = G_HIST
+)
+
+color positiveDeltaColor = input.color(
+     color.rgb(18, 181, 166),
+     "Positive Delta",
+     group = G_HIST
+)
+
+color negativeDeltaColor = input.color(
+     color.rgb(230, 150, 30),
+     "Negative Delta",
+     group = G_HIST
+)
+
+bool showNeutralVolume = input.bool(
+     false,
+     "Show Neutral Total-Volume Frame",
+     group = G_HIST
+)
+
+color neutralVolumeColor = input.color(
+     color.gray,
+     "Neutral Volume Frame",
+     group = G_HIST
+)
+
+
+//=============================================================================
+// 07 — P0 / LEVEL STYLE
+//=============================================================================
+
+string G_STYLE = "07 — P0 / Key Levels"
+
+bool showDynamicP0 = input.bool(
+     true,
+     "Show Dynamic P0",
+     group = G_STYLE
+)
+
+color dynamicP0Color = input.color(
+     color.aqua,
+     "Dynamic P0 Color",
+     group = G_STYLE
+)
+
+int dynamicP0Width = input.int(
+     3,
+     "Dynamic P0 Width",
+     minval = 1,
+     maxval = 5,
+     group = G_STYLE
+)
+
+bool showDynamicValueArea = input.bool(
+     true,
+     "Show Dynamic VAH / VAL",
+     group = G_STYLE
+)
+
+color dynamicValueAreaColor = input.color(
+     color.rgb(70, 115, 255),
+     "Dynamic Value Area Color",
+     group = G_STYLE
+)
+
+bool showStructuralPOC = input.bool(
+     true,
+     "Show Structural POC",
+     group = G_STYLE
+)
+
+color structuralPOCColor = input.color(
+     color.rgb(229, 57, 53),
+     "Structural POC Color",
+     group = G_STYLE
+)
+
+bool showStructuralValueArea = input.bool(
+     true,
+     "Show Structural VAH / VAL",
+     group = G_STYLE
+)
+
+color structuralValueAreaColor = input.color(
+     color.rgb(70, 115, 255),
+     "Structural Value Area Color",
+     group = G_STYLE
+)
+
+bool showSupportResistance = input.bool(
+     true,
+     "Show Delta Support / Resistance",
+     group = G_STYLE
+)
+
+color supportColor = input.color(
+     color.rgb(0, 200, 140),
+     "Support Color",
+     group = G_STYLE
+)
+
+color resistanceColor = input.color(
+     color.rgb(245, 75, 85),
+     "Resistance Color",
+     group = G_STYLE
+)
+
+bool showLiquidityZones = input.bool(
+     true,
+     "Show High-Delta Liquidity Zones",
+     group = G_STYLE
+)
+
+int liquidityZoneTransparency = input.int(
+     90,
+     "Liquidity Zone Transparency",
+     minval = 70,
+     maxval = 98,
+     group = G_STYLE
+)
+
+
+//=============================================================================
+// 08 — ARCHITECTURE HISTOGRAM
+//=============================================================================
+
+string G_DASH = "08 — Architecture Histogram"
+
+bool showArchitectureHistogram = input.bool(
+     true,
+     "Show Acceptance / Rejection Histogram",
+     group = G_DASH
+)
+
+string architecturePosition = input.string(
+     "Top Right",
+     "Position",
+     options = [
+          "Top Left",
+          "Top Right",
+          "Bottom Left",
+          "Bottom Right"
+     ],
+     group = G_DASH
+)
+
+string dashboardTextSize = input.string(
+     "Small",
+     "Dashboard Text Size",
+     options = [
+          "Tiny",
+          "Small",
+          "Normal",
+          "Large",
+          "Huge"
+     ],
+     group = G_DASH
+)
+
+color acceptanceColor = input.color(
+     color.rgb(0, 200, 140),
+     "Acceptance Color",
+     group = G_DASH
+)
+
+color rejectionColor = input.color(
+     color.rgb(245, 75, 85),
+     "Rejection Color",
+     group = G_DASH
+)
+
+
+//=============================================================================
+// 09 — ALERTS
+//=============================================================================
+
+string G_ALERT = "09 — Signals / Alerts"
+
+bool showSetupMarkers = input.bool(
+     true,
+     "Show Setup Armed Hollow Triangles",
+     tooltip = "Small hollow triangles show a qualified setup waiting for bar-close confirmation. These are NOT strategy entries.",
+     group = G_ALERT
+)
+
+bool showEntryMarkers = input.bool(
+     true,
+     "Show Actual Entry Solid Triangles",
+     tooltip = "Larger solid triangles plot only when the strategy submits an actual entry.",
+     group = G_ALERT
+)
+
+bool enableDynamicAlerts = input.bool(
+     true,
+     "Enable Dynamic alert() Calls",
+     group = G_ALERT
+)
+
+bool alertEntries = input.bool(
+     true,
+     "Alert On Entries",
+     group = G_ALERT
+)
+
+bool alertExits = input.bool(
+     true,
+     "Alert On Exits",
+     group = G_ALERT
+)
+
+
+//=============================================================================
+// HELPERS
+//=============================================================================
+
+int MS_DAY = 86400000
+
+f_clamp(float value, float lowValue, float highValue) =>
+    math.max(
+         lowValue,
+         math.min(
+              highValue,
+              value
+         )
+    )
+
+f_score(float value, float target) =>
+    target <= 0 ? 0.0 : f_clamp(value / target * 100.0, 0.0, 100.0)
+
+f_price(float value) =>
+    na(value) ? "—" : str.tostring(value, format.mintick)
+
+f_pct(float value) =>
+    na(value) ? "—" : str.tostring(value, "#.0") + "%"
+
+f_bar(float value) =>
+    int filled = int(math.round(f_clamp(value, 0.0, 100.0) / 10.0))
+    string result = ""
+    for i = 1 to 10
+        result += i <= filled ? "█" : "·"
+    result
+
+f_dashboardSize(string sizeName) =>
+    (sizeName == "Tiny" ? size.tiny :
+     sizeName == "Normal" ? size.normal :
+     sizeName == "Large" ? size.large :
+     sizeName == "Huge" ? size.huge :
+     size.small)
+
+f_delta(float o, float h, float l, float c, float v) =>
+    float safeRange = math.max(h - l, syminfo.mintick)
+    float pressure = f_clamp((c - o) / safeRange, -1.0, 1.0)
+    v * pressure
+
+f_entryMessage(
+     string setup,
+     float entry,
+     float stop,
+     float target,
+     float p0Value,
+     float distanceATR,
+     float deltaPercent,
+     float acceptance,
+     float rejection,
+     float coherence
+) =>
+    (setup +
+     " | " + syminfo.ticker + " " + timeframe.period +
+     " @ " + f_price(entry) +
+     "\nP0: " + f_price(p0Value) +
+     "\nDistance: " + str.tostring(distanceATR, "#.##") + " ATR" +
+     "\nDelta: " + f_pct(deltaPercent) +
+     "\nAcceptance: " + str.tostring(acceptance, "#") + "/100" +
+     "\nRejection: " + str.tostring(rejection, "#") + "/100" +
+     "\nCoherence: " + f_pct(coherence) +
+     "\nStop: " + f_price(stop) +
+     "\nTarget: " + f_price(target))
+
+
+//=============================================================================
+// DYNAMIC P0 PROFILE
+//=============================================================================
+
+float atr = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
+float timeframeSeconds = nz(timeframe.in_seconds(timeframe.period), 60.0)
+
+int equilibriumBarsRaw = int(math.ceil(equilibriumMinutes * 60.0 / timeframeSeconds))
+int equilibriumBars = math.max(4, math.min(maximumEquilibriumBars, equilibriumBarsRaw))
+
+float equilibriumHigh = ta.highest(high, equilibriumBars)
+float equilibriumLow = ta.lowest(low, equilibriumBars)
+float equilibriumStep = math.max((equilibriumHigh - equilibriumLow) / equilibriumRows, syminfo.mintick)
+
+array<float> dynamicTotal = array.new_float(equilibriumRows, 0.0)
+array<float> dynamicBuy = array.new_float(equilibriumRows, 0.0)
+array<float> dynamicSell = array.new_float(equilibriumRows, 0.0)
+
+for i = 0 to equilibriumBars - 1
+    if not na(high[i])
+        float barOpen = open[i]
+        float barHigh = high[i]
+        float barLow = low[i]
+        float barClose = close[i]
+        float barVolume = nz(volume[i], 0.0)
+        float barRange = barHigh - barLow
+        float safeRange = math.max(barRange, syminfo.mintick)
+
+        float pressure = f_clamp((barClose - barOpen) / safeRange, -1.0, 1.0)
+        float buyShare = (1.0 + pressure) * 0.5
+        float sellShare = 1.0 - buyShare
+
+        if barRange <= syminfo.mintick
+            int row = int(math.floor((barClose - equilibriumLow) / equilibriumStep))
+            row := math.max(0, math.min(equilibriumRows - 1, row))
+
+            array.set(dynamicTotal, row, array.get(dynamicTotal, row) + barVolume)
+            array.set(dynamicBuy, row, array.get(dynamicBuy, row) + barVolume * buyShare)
+            array.set(dynamicSell, row, array.get(dynamicSell, row) + barVolume * sellShare)
+
+        else
+            int firstRow = int(math.floor((barLow - equilibriumLow) / equilibriumStep))
+            int lastRow = int(math.floor((barHigh - equilibriumLow) / equilibriumStep))
+
+            firstRow := math.max(0, math.min(equilibriumRows - 1, firstRow))
+            lastRow := math.max(0, math.min(equilibriumRows - 1, lastRow))
+
+            for row = firstRow to lastRow
+                float rowLow = equilibriumLow + row * equilibriumStep
+                float rowHigh = rowLow + equilibriumStep
+
+                float overlap = math.max(
+                     0.0,
+                     math.min(barHigh, rowHigh) - math.max(barLow, rowLow)
+                )
+
+                float fraction = overlap / barRange
+
+                if fraction > 0
+                    float rowVolume = barVolume * fraction
+
+                    array.set(dynamicTotal, row, array.get(dynamicTotal, row) + rowVolume)
+                    array.set(dynamicBuy, row, array.get(dynamicBuy, row) + rowVolume * buyShare)
+                    array.set(dynamicSell, row, array.get(dynamicSell, row) + rowVolume * sellShare)
+
+
+//=============================================================================
+// DYNAMIC P0 / VALUE AREA
+//=============================================================================
+
+float totalDynamicVolume = 0.0
+float maximumDynamicVolume = 0.0
+int dynamicP0Index = 0
+
+for row = 0 to equilibriumRows - 1
+    float rowVolume = array.get(dynamicTotal, row)
+    totalDynamicVolume += rowVolume
+
+    if rowVolume > maximumDynamicVolume
+        maximumDynamicVolume := rowVolume
+        dynamicP0Index := row
+
+float dynamicP0 = equilibriumLow + (dynamicP0Index + 0.5) * equilibriumStep
+
+int dynamicVALIndex = dynamicP0Index
+int dynamicVAHIndex = dynamicP0Index
+
+float valueAreaVolume = array.get(dynamicTotal, dynamicP0Index)
+float valueAreaTarget = totalDynamicVolume * dynamicValueAreaPercent / 100.0
+
+while valueAreaVolume < valueAreaTarget and (dynamicVALIndex > 0 or dynamicVAHIndex < equilibriumRows - 1)
+    float leftVolume = dynamicVALIndex > 0 ? array.get(dynamicTotal, dynamicVALIndex - 1) : -1.0
+    float rightVolume = dynamicVAHIndex < equilibriumRows - 1 ? array.get(dynamicTotal, dynamicVAHIndex + 1) : -1.0
+
+    if rightVolume > leftVolume
+        dynamicVAHIndex += 1
+        valueAreaVolume += array.get(dynamicTotal, dynamicVAHIndex)
+    else
+        if dynamicVALIndex > 0
+            dynamicVALIndex -= 1
+            valueAreaVolume += array.get(dynamicTotal, dynamicVALIndex)
+        else if dynamicVAHIndex < equilibriumRows - 1
+            dynamicVAHIndex += 1
+            valueAreaVolume += array.get(dynamicTotal, dynamicVAHIndex)
+
+float dynamicVAL = equilibriumLow + dynamicVALIndex * equilibriumStep
+float dynamicVAH = equilibriumLow + (dynamicVAHIndex + 1.0) * equilibriumStep
+float dynamicValueCenter = (dynamicVAH + dynamicVAL) * 0.5
+
+
+//=============================================================================
+// PROFILE COHERENCE
+//=============================================================================
+
+int coherenceLow = math.max(0, dynamicP0Index - coherenceRadius)
+int coherenceHigh = math.min(equilibriumRows - 1, dynamicP0Index + coherenceRadius)
+
+float coherenceVolume = 0.0
+
+for row = coherenceLow to coherenceHigh
+    coherenceVolume += array.get(dynamicTotal, row)
+
+int coherenceRowCount = coherenceHigh - coherenceLow + 1
+
+float coherenceShare = totalDynamicVolume > 0 ? coherenceVolume / totalDynamicVolume * 100.0 : 0.0
+float uniformShare = 100.0 * coherenceRowCount / equilibriumRows
+
+float profileCoherence = (coherenceShare + uniformShare > 0 ?
+     100.0 * coherenceShare / (coherenceShare + uniformShare) :
+     0.0)
+
+
+//=============================================================================
+// NEW-LOCATION VOLUME
+//=============================================================================
+
+float newLocationBand = atr * newLocationBandATR
+float newLocationVolume = 0.0
+
+for row = 0 to equilibriumRows - 1
+    float rowMid = equilibriumLow + (row + 0.5) * equilibriumStep
+
+    if math.abs(rowMid - close) <= newLocationBand
+        newLocationVolume += array.get(dynamicTotal, row)
+
+float newLocationShare = (totalDynamicVolume > 0 ?
+     newLocationVolume / totalDynamicVolume * 100.0 :
+     0.0)
+
+
+//=============================================================================
+// DELTA STATE
+//=============================================================================
+
+float aggregateDelta = 0.0
+float aggregateVolume = 0.0
+
+for i = 0 to deltaWindow - 1
+    float barVolume = nz(volume[i], 0.0)
+
+    aggregateDelta += f_delta(
+         open[i],
+         high[i],
+         low[i],
+         close[i],
+         barVolume
+    )
+
+    aggregateVolume += barVolume
+
+float deltaPercent = (aggregateVolume > 0 ?
+     aggregateDelta / aggregateVolume * 100.0 :
+     0.0)
+
+float distanceFromP0ATR = (close - dynamicP0) / atr
+
+int displacementDirection = (distanceFromP0ATR > 0 ?
+     1 :
+     distanceFromP0ATR < 0 ?
+     -1 :
+     0)
+
+int alignedDeltaBars = 0
+
+for i = 0 to deltaPersistenceBars - 1
+    float deltaBar = f_delta(
+         open[i],
+         high[i],
+         low[i],
+         close[i],
+         nz(volume[i], 0.0)
+    )
+
+    if displacementDirection > 0 and deltaBar > 0
+        alignedDeltaBars += 1
+
+    if displacementDirection < 0 and deltaBar < 0
+        alignedDeltaBars += 1
+
+float deltaPersistence = 100.0 * alignedDeltaBars / deltaPersistenceBars
+
+
+//=============================================================================
+// P0 MIGRATION / CATCH-UP
+//=============================================================================
+
+float priorP0 = dynamicP0[migrationLookback]
+float priorValueCenter = dynamicValueCenter[migrationLookback]
+
+float p0MigrationATR = (not na(priorP0) ?
+     (dynamicP0 - priorP0) / atr :
+     0.0)
+
+float valueMigrationATR = (not na(priorValueCenter) ?
+     (dynamicValueCenter - priorValueCenter) / atr :
+     0.0)
+
+bool p0MigrationAligned = displacementDirection != 0 and displacementDirection * p0MigrationATR > 0
+
+float catchUpDenominator = (not na(priorP0) ?
+     math.max(math.abs(close - priorP0), syminfo.mintick) :
+     syminfo.mintick)
+
+float p0CatchUpPercent = (p0MigrationAligned and not na(priorP0) ?
+     math.abs(dynamicP0 - priorP0) / catchUpDenominator * 100.0 :
+     0.0)
+
+p0CatchUpPercent := f_clamp(p0CatchUpPercent, 0.0, 150.0)
+
+
+//=============================================================================
+// PRICE / DELTA EFFICIENCY
+//=============================================================================
+
+float priceProgressATR = (not na(close[efficiencyLookback]) ?
+     (close - close[efficiencyLookback]) / atr :
+     0.0)
+
+float alignedPriceProgress = displacementDirection * priceProgressATR
+float alignedDeltaMagnitude = displacementDirection * deltaPercent
+
+float alignedDeltaScore = f_score(alignedDeltaMagnitude, alignedDeltaTarget)
+float opposingDeltaScore = f_score(-alignedDeltaMagnitude, opposingDeltaTarget)
+
+float efficiencyScore = (alignedDeltaMagnitude > 0 ?
+     f_score(math.max(alignedPriceProgress, 0.0), efficiencyTargetATR) :
+     0.0)
+
+float absorptionDeltaScore = f_score(math.abs(deltaPercent), absorptionDeltaTarget)
+
+float absorptionProgressScore = (absorptionMaximumProgressATR > 0 ?
+     f_clamp(
+          (absorptionMaximumProgressATR - math.max(alignedPriceProgress, 0.0)) /
+          absorptionMaximumProgressATR * 100.0,
+          0.0,
+          100.0
+     ) :
+     0.0)
+
+float absorptionScore = absorptionDeltaScore * absorptionProgressScore / 100.0
+
+
+//=============================================================================
+// DWELL / RETURN
+//=============================================================================
+
+int dwellCount = 0
+
+for i = 0 to dwellMeasurementBars - 1
+    if not na(dynamicP0[i])
+        float band = atr[i] * equilibriumBandATR
+
+        if displacementDirection > 0 and close[i] > dynamicP0[i] + band
+            dwellCount += 1
+
+        if displacementDirection < 0 and close[i] < dynamicP0[i] - band
+            dwellCount += 1
+
+float dwellPercent = 100.0 * dwellCount / dwellMeasurementBars
+
+float currentDistance = math.abs(close - dynamicP0)
+
+float previousDistance = (not na(dynamicP0[1]) ?
+     math.abs(close[1] - dynamicP0[1]) :
+     currentDistance)
+
+bool returningTowardP0 = currentDistance < previousDistance
+
+bool candleTowardP0 = (displacementDirection > 0 ?
+     close < open :
+     displacementDirection < 0 ?
+     close > open :
+     false)
+
+float returnTowardP0Score = (returningTowardP0 and candleTowardP0 ?
+     100.0 :
+     returningTowardP0 ?
+     50.0 :
+     0.0)
+
+
+//=============================================================================
+// ACCEPTANCE SCORE
+//=============================================================================
+
+float acceptanceMigration = f_score(displacementDirection * p0MigrationATR, migrationTargetATR)
+float acceptanceCatchUp = f_score(p0CatchUpPercent, catchUpTargetPercent)
+float acceptanceNewLocation = f_score(newLocationShare, newLocationTargetPercent)
+float acceptanceValueMigration = f_score(displacementDirection * valueMigrationATR, valueMigrationTargetATR)
+
+float acceptanceDelta = (alignedDeltaScore + deltaPersistence) * 0.5
+float acceptanceEfficiency = efficiencyScore
+
+float acceptanceRaw = (
+     acceptanceMigration * 0.20 +
+     acceptanceCatchUp * 0.15 +
+     acceptanceNewLocation * 0.20 +
+     acceptanceValueMigration * 0.15 +
+     acceptanceDelta * 0.15 +
+     dwellPercent * 0.10 +
+     acceptanceEfficiency * 0.05)
+
+float coherenceMultiplier = 0.55 + 0.45 * profileCoherence / 100.0
+
+float acceptanceScore = f_clamp(
+     acceptanceRaw * coherenceMultiplier,
+     0.0,
+     100.0
+)
+
+
+//=============================================================================
+// REJECTION SCORE
+//=============================================================================
+
+float rejectionP0Stall = 100.0 - acceptanceMigration
+float rejectionValueNonMigration = 100.0 - acceptanceValueMigration
+float rejectionWeakNewLocation = 100.0 - acceptanceNewLocation
+
+float rejectionRaw = (
+     rejectionP0Stall * 0.20 +
+     opposingDeltaScore * 0.25 +
+     absorptionScore * 0.15 +
+     returnTowardP0Score * 0.15 +
+     rejectionValueNonMigration * 0.10 +
+     rejectionWeakNewLocation * 0.15)
+
+float rejectionScore = f_clamp(
+     rejectionRaw * coherenceMultiplier,
+     0.0,
+     100.0
+)
+
+
+//=============================================================================
+// MARKET STATE
+//=============================================================================
+
+bool meaningfulDisplacement = math.abs(distanceFromP0ATR) >= minimumDistanceATR
+bool coherenceOK = profileCoherence >= minimumCoherence
+
+bool acceptanceDominant = (
+     acceptanceScore >= acceptanceThreshold and
+     acceptanceScore >= rejectionScore + scoreDominance)
+
+bool rejectionDominant = (
+     rejectionScore >= rejectionThreshold and
+     rejectionScore >= acceptanceScore + scoreDominance)
+
+bool bullishAcceptance = (
+     meaningfulDisplacement and
+     coherenceOK and
+     displacementDirection > 0 and
+     acceptanceDominant)
+
+bool bearishAcceptance = (
+     meaningfulDisplacement and
+     coherenceOK and
+     displacementDirection < 0 and
+     acceptanceDominant)
+
+bool bullishRejection = (
+     meaningfulDisplacement and
+     coherenceOK and
+     displacementDirection < 0 and
+     rejectionDominant)
+
+bool bearishRejection = (
+     meaningfulDisplacement and
+     coherenceOK and
+     displacementDirection > 0 and
+     rejectionDominant)
+
+string marketState = "EQUILIBRIUM"
+
+if meaningfulDisplacement
+    marketState := "TRANSITION"
+
+if bullishAcceptance
+    marketState := "BULL ACCEPTANCE"
+
+if bearishAcceptance
+    marketState := "BEAR ACCEPTANCE"
+
+if bullishRejection
+    marketState := "BULL REJECTION"
+
+if bearishRejection
+    marketState := "BEAR REJECTION"
+
+
+//=============================================================================
+// ENTRY ENGINE
+//=============================================================================
+
+var int lastExitBar = -10000
+
+bool cooldownOK = bar_index - lastExitBar >= cooldownBars
+bool flat = strategy.position_size == 0
+
+bool bullishCandleOK = not requireDirectionalCandle or close > open
+bool bearishCandleOK = not requireDirectionalCandle or close < open
+
+bool rejectionReturnOK = not requireReturnTowardP0 or returningTowardP0
+
+bool allowAcceptance = (
+     entryMode == "Both" or
+     entryMode == "Acceptance Only")
+
+bool allowRejection = (
+     entryMode == "Both" or
+     entryMode == "Rejection Only")
+
+bool acceptanceLongRaw = (
+     allowAcceptance and
+     bullishAcceptance and
+     bullishCandleOK)
+
+bool acceptanceShortRaw = (
+     allowAcceptance and
+     bearishAcceptance and
+     bearishCandleOK)
+
+bool rejectionLongRaw = (
+     allowRejection and
+     bullishRejection and
+     bullishCandleOK and
+     rejectionReturnOK and
+     deltaPercent > 0)
+
+bool rejectionShortRaw = (
+     allowRejection and
+     bearishRejection and
+     bearishCandleOK and
+     rejectionReturnOK and
+     deltaPercent < 0)
+
+bool acceptanceLongFresh = (
+     not requireFreshState or
+     not acceptanceLongRaw[1])
+
+bool acceptanceShortFresh = (
+     not requireFreshState or
+     not acceptanceShortRaw[1])
+
+bool rejectionLongFresh = (
+     not requireFreshState or
+     not rejectionLongRaw[1])
+
+bool rejectionShortFresh = (
+     not requireFreshState or
+     not rejectionShortRaw[1])
+
+float rejectionPlannedRisk = atr * stopATR
+float rejectionLongReward = dynamicP0 - close
+float rejectionShortReward = close - dynamicP0
+
+float rejectionLongRR = (rejectionPlannedRisk > 0 ?
+     rejectionLongReward / rejectionPlannedRisk :
+     0.0)
+
+float rejectionShortRR = (rejectionPlannedRisk > 0 ?
+     rejectionShortReward / rejectionPlannedRisk :
+     0.0)
+
+bool acceptanceLongArmed = (
+     flat and
+     cooldownOK and
+     acceptanceLongRaw and
+     acceptanceLongFresh)
+
+bool acceptanceShortArmed = (
+     flat and
+     cooldownOK and
+     acceptanceShortRaw and
+     acceptanceShortFresh)
+
+bool rejectionLongArmed = (
+     flat and
+     cooldownOK and
+     rejectionLongRaw and
+     rejectionLongFresh and
+     dynamicP0 > close and
+     rejectionLongRR >= rejectionMinimumRR)
+
+bool rejectionShortArmed = (
+     flat and
+     cooldownOK and
+     rejectionShortRaw and
+     rejectionShortFresh and
+     dynamicP0 < close and
+     rejectionShortRR >= rejectionMinimumRR)
+
+bool longSetupArmed = (
+     acceptanceLongArmed or
+     rejectionLongArmed)
+
+bool shortSetupArmed = (
+     acceptanceShortArmed or
+     rejectionShortArmed)
+
+bool acceptanceLongSignal = (
+     barstate.isconfirmed and
+     acceptanceLongArmed)
+
+bool acceptanceShortSignal = (
+     barstate.isconfirmed and
+     acceptanceShortArmed)
+
+bool rejectionLongCandidate = (
+     barstate.isconfirmed and
+     rejectionLongArmed)
+
+bool rejectionShortCandidate = (
+     barstate.isconfirmed and
+     rejectionShortArmed)
+
+
+//=============================================================================
+// ORDERS
+//=============================================================================
+
+var float activeEntry = na
+var float activeStop = na
+var float activeTarget = na
+var float activeRisk = na
+var string activeTradeType = ""
+var bool breakEvenActive = false
+
+bool rejectionLongSignal = false
+bool rejectionShortSignal = false
+
+if acceptanceLongSignal
+    activeEntry := close
+    activeRisk := atr * stopATR
+    activeStop := activeEntry - activeRisk
+    activeTarget := activeEntry + activeRisk * acceptanceRR
+    activeTradeType := "ACCEPTANCE LONG"
+    breakEvenActive := false
+
+    string message = f_entryMessage(
+         "BULL | LONG ENTRY | ACCEPTANCE CONTINUATION",
+         activeEntry,
+         activeStop,
+         activeTarget,
+         dynamicP0,
+         distanceFromP0ATR,
+         deltaPercent,
+         acceptanceScore,
+         rejectionScore,
+         profileCoherence
+    )
+
+    strategy.entry(
+         id = "Acceptance Long",
+         direction = strategy.long,
+         qty = contracts,
+         comment = "ACCEPTANCE LONG",
+         alert_message = message
+    )
+
+    if enableDynamicAlerts and alertEntries
+        alert(message, alert.freq_once_per_bar_close)
+
+
+if acceptanceShortSignal
+    activeEntry := close
+    activeRisk := atr * stopATR
+    activeStop := activeEntry + activeRisk
+    activeTarget := activeEntry - activeRisk * acceptanceRR
+    activeTradeType := "ACCEPTANCE SHORT"
+    breakEvenActive := false
+
+    string message = f_entryMessage(
+         "BEAR | SHORT ENTRY | ACCEPTANCE CONTINUATION",
+         activeEntry,
+         activeStop,
+         activeTarget,
+         dynamicP0,
+         distanceFromP0ATR,
+         deltaPercent,
+         acceptanceScore,
+         rejectionScore,
+         profileCoherence
+    )
+
+    strategy.entry(
+         id = "Acceptance Short",
+         direction = strategy.short,
+         qty = contracts,
+         comment = "ACCEPTANCE SHORT",
+         alert_message = message
+    )
+
+    if enableDynamicAlerts and alertEntries
+        alert(message, alert.freq_once_per_bar_close)
+
+
+//=============================================================================
+// REJECTION ENTRIES — TARGET IS FROZEN P0
+//=============================================================================
+
+if rejectionLongCandidate
+    float plannedRisk = rejectionPlannedRisk
+    float plannedStop = close - plannedRisk
+    float plannedTarget = dynamicP0
+
+    rejectionLongSignal := true
+    activeEntry := close
+    activeRisk := plannedRisk
+    activeStop := plannedStop
+    activeTarget := plannedTarget
+    activeTradeType := "REJECTION LONG"
+    breakEvenActive := false
+
+    string message = f_entryMessage(
+         "BULL | LONG ENTRY | REJECTION TO P0",
+         activeEntry,
+         activeStop,
+         activeTarget,
+         dynamicP0,
+         distanceFromP0ATR,
+         deltaPercent,
+         acceptanceScore,
+         rejectionScore,
+         profileCoherence
+    )
+
+    strategy.entry(
+         id = "Rejection Long",
+         direction = strategy.long,
+         qty = contracts,
+         comment = "REJECTION LONG",
+         alert_message = message
+    )
+
+    if enableDynamicAlerts and alertEntries
+        alert(message, alert.freq_once_per_bar_close)
+
+
+if rejectionShortCandidate
+    float plannedRisk = rejectionPlannedRisk
+    float plannedStop = close + plannedRisk
+    float plannedTarget = dynamicP0
+
+    rejectionShortSignal := true
+    activeEntry := close
+    activeRisk := plannedRisk
+    activeStop := plannedStop
+    activeTarget := plannedTarget
+    activeTradeType := "REJECTION SHORT"
+    breakEvenActive := false
+
+    string message = f_entryMessage(
+         "BEAR | SHORT ENTRY | REJECTION TO P0",
+         activeEntry,
+         activeStop,
+         activeTarget,
+         dynamicP0,
+         distanceFromP0ATR,
+         deltaPercent,
+         acceptanceScore,
+         rejectionScore,
+         profileCoherence
+    )
+
+    strategy.entry(
+         id = "Rejection Short",
+         direction = strategy.short,
+         qty = contracts,
+         comment = "REJECTION SHORT",
+         alert_message = message
+    )
+
+    if enableDynamicAlerts and alertEntries
+        alert(message, alert.freq_once_per_bar_close)
+
+
+//=============================================================================
+// POSITION MANAGEMENT
+//=============================================================================
+
+if strategy.position_size > 0
+    if barstate.isconfirmed and useBreakEven and not breakEvenActive and high >= activeEntry + activeRisk * breakEvenAtR
+        activeStop := math.max(activeStop, activeEntry)
+        breakEvenActive := true
+
+    if activeTradeType == "ACCEPTANCE LONG"
+        strategy.exit(
+             id = "Acceptance Long Exit",
+             from_entry = "Acceptance Long",
+             stop = activeStop,
+             limit = activeTarget,
+             alert_message = "LONG EXIT | ACCEPTANCE LONG"
+        )
+
+    if activeTradeType == "REJECTION LONG"
+        strategy.exit(
+             id = "Rejection Long Exit",
+             from_entry = "Rejection Long",
+             stop = activeStop,
+             limit = activeTarget,
+             alert_message = "LONG EXIT | REJECTION LONG"
+        )
+
+
+if strategy.position_size < 0
+    if barstate.isconfirmed and useBreakEven and not breakEvenActive and low <= activeEntry - activeRisk * breakEvenAtR
+        activeStop := math.min(activeStop, activeEntry)
+        breakEvenActive := true
+
+    if activeTradeType == "ACCEPTANCE SHORT"
+        strategy.exit(
+             id = "Acceptance Short Exit",
+             from_entry = "Acceptance Short",
+             stop = activeStop,
+             limit = activeTarget,
+             alert_message = "SHORT EXIT | ACCEPTANCE SHORT"
+        )
+
+    if activeTradeType == "REJECTION SHORT"
+        strategy.exit(
+             id = "Rejection Short Exit",
+             from_entry = "Rejection Short",
+             stop = activeStop,
+             limit = activeTarget,
+             alert_message = "SHORT EXIT | REJECTION SHORT"
+        )
+
+
+//=============================================================================
+// EXIT DETECTION / COOLDOWN
+//=============================================================================
+
+bool longClosed = (
+     strategy.position_size == 0 and
+     strategy.position_size[1] > 0)
+
+bool shortClosed = (
+     strategy.position_size == 0 and
+     strategy.position_size[1] < 0)
+
+if longClosed or shortClosed
+    if enableDynamicAlerts and alertExits
+        string side = longClosed ? "LONG EXIT" : "SHORT EXIT"
+
+        alert(
+             side +
+             " | " +
+             activeTradeType +
+             " | " +
+             syminfo.ticker +
+             " " +
+             timeframe.period +
+             " @ " +
+             f_price(close),
+             alert.freq_once_per_bar_close
+        )
+
+    lastExitBar := bar_index
+
+    activeEntry := na
+    activeStop := na
+    activeTarget := na
+    activeRisk := na
+    activeTradeType := ""
+    breakEvenActive := false
+
+
+//=============================================================================
+// DYNAMIC P0 / VA DISPLAY
+//=============================================================================
+
+dynamicP0Plot = plot(
+     showDynamicP0 ? dynamicP0 : na,
+     title = "Dynamic P0",
+     color = dynamicP0Color,
+     linewidth = dynamicP0Width
+)
+
+dynamicVAHPlot = plot(
+     showDynamicValueArea ? dynamicVAH : na,
+     title = "Dynamic VAH",
+     color = color.new(dynamicValueAreaColor, 25),
+     linewidth = 1
+)
+
+dynamicVALPlot = plot(
+     showDynamicValueArea ? dynamicVAL : na,
+     title = "Dynamic VAL",
+     color = color.new(dynamicValueAreaColor, 25),
+     linewidth = 1
+)
+
+fill(
+     dynamicVAHPlot,
+     dynamicVALPlot,
+     color = (showDynamicValueArea ?
+          color.new(dynamicValueAreaColor, 93) :
+          na,
+     title = "Dynamic Value Area"
+))
+
+
+//=============================================================================
+// SETUP ARMED + ACTUAL ENTRY SIGNALS
+//=============================================================================
+
+bool actualLongEntry = (
+     acceptanceLongSignal or
+     rejectionLongSignal)
+
+bool actualShortEntry = (
+     acceptanceShortSignal or
+     rejectionShortSignal)
+
+plotchar(
+     showSetupMarkers and
+     longSetupArmed and
+     not actualLongEntry,
+     title = "Bull Setup Armed",
+     char = "△",
+     location = location.belowbar,
+     size = size.small,
+     color = color.aqua
+)
+
+plotchar(
+     showSetupMarkers and
+     shortSetupArmed and
+     not actualShortEntry,
+     title = "Bear Setup Armed",
+     char = "▽",
+     location = location.abovebar,
+     size = size.small,
+     color = color.orange
+)
+
+plotshape(
+     showEntryMarkers and
+     actualLongEntry,
+     title = "Bull Actual Entry",
+     style = shape.triangleup,
+     location = location.belowbar,
+     size = size.normal,
+     color = color.aqua
+)
+
+plotshape(
+     showEntryMarkers and
+     actualShortEntry,
+     title = "Bear Actual Entry",
+     style = shape.triangledown,
+     location = location.abovebar,
+     size = size.normal,
+     color = color.orange
+)
+
+
+//=============================================================================
+// STRUCTURAL PROFILE STORAGE — REALTIME SAFE
+//-----------------------------------------------------------------------------
+// With calc_on_every_tick=true, the strategy recalculates on each realtime tick.
+// The current live candle must therefore be UPDATED IN PLACE rather than pushed
+// repeatedly into the structural profile arrays.
+//
+// Historical bars:
+//     one array record per chart bar.
+//
+// Realtime open bar:
+//     the last array record is refreshed on every tick.
+//
+// Result:
+//     • right-side delta histogram updates intrabar;
+//     • structural POC / VAH / VAL update intrabar;
+//     • support / resistance and liquidity zones update intrabar;
+//     • no duplicate live-bar volume is introduced.
+//=============================================================================
+
+varip array<float> storedOpen = array.new_float()
+varip array<float> storedHigh = array.new_float()
+varip array<float> storedLow = array.new_float()
+varip array<float> storedClose = array.new_float()
+varip array<float> storedVolume = array.new_float()
+varip array<int> storedTime = array.new_int()
+
+varip int lastStoredBarTime = na
+
+bool newStorageBar = na(lastStoredBarTime) or time != lastStoredBarTime
+
+if newStorageBar
+    array.push(storedOpen, open)
+    array.push(storedHigh, high)
+    array.push(storedLow, low)
+    array.push(storedClose, close)
+    array.push(storedVolume, nz(volume, 0.0))
+    array.push(storedTime, time)
+
+    lastStoredBarTime := time
+
+else
+    int liveIndex = array.size(storedTime) - 1
+
+    if liveIndex >= 0
+        array.set(storedOpen, liveIndex, open)
+        array.set(storedHigh, liveIndex, high)
+        array.set(storedLow, liveIndex, low)
+        array.set(storedClose, liveIndex, close)
+        array.set(storedVolume, liveIndex, nz(volume, 0.0))
+        array.set(storedTime, liveIndex, time)
+
+int structuralCutoff = time - structuralDays * MS_DAY
+
+while array.size(storedTime) > 0 and array.get(storedTime, 0) < structuralCutoff
+    array.shift(storedOpen)
+    array.shift(storedHigh)
+    array.shift(storedLow)
+    array.shift(storedClose)
+    array.shift(storedVolume)
+    array.shift(storedTime)
+
+while array.size(storedTime) > maxStoredBars
+    array.shift(storedOpen)
+    array.shift(storedHigh)
+    array.shift(storedLow)
+    array.shift(storedClose)
+    array.shift(storedVolume)
+    array.shift(storedTime)
+
+
+//=============================================================================
+// STRUCTURAL PROFILE OBJECTS
+//=============================================================================
+
+var array<box> structuralBoxes = array.new_box()
+var array<line> structuralLines = array.new_line()
+
+var float structuralPOC = na
+var float structuralVAH = na
+var float structuralVAL = na
+var float structuralSupport = na
+var float structuralResistance = na
+
+if barstate.islast
+
+    if array.size(structuralBoxes) > 0
+        for i = 0 to array.size(structuralBoxes) - 1
+            box.delete(array.get(structuralBoxes, i))
+
+    array.clear(structuralBoxes)
+
+    if array.size(structuralLines) > 0
+        for i = 0 to array.size(structuralLines) - 1
+            line.delete(array.get(structuralLines, i))
+
+    array.clear(structuralLines)
+
+    int storedBars = array.size(storedTime)
+
+    if storedBars >= 2
+
+        float profileHigh = -1.0e20
+        float profileLow = 1.0e20
+
+        for i = 0 to storedBars - 1
+            profileHigh := math.max(profileHigh, array.get(storedHigh, i))
+            profileLow := math.min(profileLow, array.get(storedLow, i))
+
+        float profileStep = math.max(
+             (profileHigh - profileLow) / structuralRows,
+             syminfo.mintick
+        )
+
+        array<float> profileTotal = array.new_float(structuralRows, 0.0)
+        array<float> profileBuy = array.new_float(structuralRows, 0.0)
+        array<float> profileSell = array.new_float(structuralRows, 0.0)
+        array<float> profileDelta = array.new_float(structuralRows, 0.0)
+        array<float> profileDeltaPercent = array.new_float(structuralRows, 0.0)
+
+        for i = 0 to storedBars - 1
+
+            float barOpen = array.get(storedOpen, i)
+            float barHigh = array.get(storedHigh, i)
+            float barLow = array.get(storedLow, i)
+            float barClose = array.get(storedClose, i)
+            float barVolume = array.get(storedVolume, i)
+
+            float barRange = barHigh - barLow
+            float safeRange = math.max(barRange, syminfo.mintick)
+
+            float pressure = f_clamp(
+                 (barClose - barOpen) / safeRange,
+                 -1.0,
+                 1.0
+            )
+
+            float buyShare = (1.0 + pressure) * 0.5
+
+            if barRange <= syminfo.mintick
+
+                int row = int(math.floor(
+                     (barClose - profileLow) / profileStep
+                ))
+
+                row := math.max(0, math.min(structuralRows - 1, row))
+
+                array.set(
+                     profileTotal,
+                     row,
+                     array.get(profileTotal, row) + barVolume
+                )
+
+                array.set(
+                     profileBuy,
+                     row,
+                     array.get(profileBuy, row) + barVolume * buyShare
+                )
+
+                array.set(
+                     profileSell,
+                     row,
+                     array.get(profileSell, row) + barVolume * (1.0 - buyShare)
+                )
+
+            else
+
+                int firstRow = int(math.floor(
+                     (barLow - profileLow) / profileStep
+                ))
+
+                int lastRow = int(math.floor(
+                     (barHigh - profileLow) / profileStep
+                ))
+
+                firstRow := math.max(0, math.min(structuralRows - 1, firstRow))
+                lastRow := math.max(0, math.min(structuralRows - 1, lastRow))
+
+                for row = firstRow to lastRow
+
+                    float rowLow = profileLow + row * profileStep
+                    float rowHigh = rowLow + profileStep
+
+                    float overlap = math.max(
+                         0.0,
+                         math.min(barHigh, rowHigh) -
+                         math.max(barLow, rowLow)
+                    )
+
+                    float fraction = overlap / barRange
+
+                    if fraction > 0
+
+                        float rowVolume = barVolume * fraction
+
+                        array.set(
+                             profileTotal,
+                             row,
+                             array.get(profileTotal, row) + rowVolume
+                        )
+
+                        array.set(
+                             profileBuy,
+                             row,
+                             array.get(profileBuy, row) + rowVolume * buyShare
+                        )
+
+                        array.set(
+                             profileSell,
+                             row,
+                             array.get(profileSell, row) + rowVolume * (1.0 - buyShare)
+                        )
+
+        float maximumVolume = 0.0
+        float maximumAbsoluteDelta = 0.0
+        float totalProfileVolume = 0.0
+        int profilePOCIndex = 0
+
+        for row = 0 to structuralRows - 1
+
+            float rowVolume = array.get(profileTotal, row)
+
+            float rowDelta = (
+                 array.get(profileBuy, row) -
+                 array.get(profileSell, row))
+
+            float rowDeltaPercent = (rowVolume > 0 ?
+                 rowDelta / rowVolume * 100.0 :
+                 0.0)
+
+            array.set(profileDelta, row, rowDelta)
+            array.set(profileDeltaPercent, row, rowDeltaPercent)
+
+            totalProfileVolume += rowVolume
+
+            maximumAbsoluteDelta := math.max(
+                 maximumAbsoluteDelta,
+                 math.abs(rowDelta)
+            )
+
+            if rowVolume > maximumVolume
+                maximumVolume := rowVolume
+                profilePOCIndex := row
+
+        structuralPOC = profileLow + (profilePOCIndex + 0.5) * profileStep
+
+        int profileVALIndex = profilePOCIndex
+        int profileVAHIndex = profilePOCIndex
+
+        float profileValueVolume = array.get(profileTotal, profilePOCIndex)
+        float profileValueTarget = totalProfileVolume * structuralValueArea / 100.0
+
+        while profileValueVolume < profileValueTarget and (profileVALIndex > 0 or profileVAHIndex < structuralRows - 1)
+
+            float leftVolume = (profileVALIndex > 0 ?
+                 array.get(profileTotal, profileVALIndex - 1) :
+                 -1.0)
+
+            float rightVolume = (profileVAHIndex < structuralRows - 1 ?
+                 array.get(profileTotal, profileVAHIndex + 1) :
+                 -1.0)
+
+            if rightVolume > leftVolume
+                profileVAHIndex += 1
+                profileValueVolume += array.get(profileTotal, profileVAHIndex)
+
+            else
+                if profileVALIndex > 0
+                    profileVALIndex -= 1
+                    profileValueVolume += array.get(profileTotal, profileVALIndex)
+
+                else if profileVAHIndex < structuralRows - 1
+                    profileVAHIndex += 1
+                    profileValueVolume += array.get(profileTotal, profileVAHIndex)
+
+        structuralVAL = profileLow + profileVALIndex * profileStep
+        structuralVAH = profileLow + (profileVAHIndex + 1.0) * profileStep
+
+        float bestSupportScore = -1.0
+        float bestResistanceScore = -1.0
+
+        structuralSupport := na
+        structuralResistance := na
+
+        for row = 0 to structuralRows - 1
+
+            float rowVolume = array.get(profileTotal, row)
+            float rowDelta = array.get(profileDelta, row)
+            float rowDeltaPercent = array.get(profileDeltaPercent, row)
+
+            float rowMid = profileLow + (row + 0.5) * profileStep
+
+            float volumePercent = (maximumVolume > 0 ?
+                 rowVolume / maximumVolume * 100.0 :
+                 0.0)
+
+            bool quality = (
+                 volumePercent >= minNodeVolume and
+                 math.abs(rowDeltaPercent) >= minNodeDelta)
+
+            if quality and rowMid < close and rowDelta > 0
+
+                float score = (
+                     math.abs(rowDelta) *
+                     (0.5 + 0.5 * volumePercent / 100.0))
+
+                if score > bestSupportScore
+                    bestSupportScore := score
+                    structuralSupport := rowMid
+
+            if quality and rowMid > close and rowDelta < 0
+
+                float score = (
+                     math.abs(rowDelta) *
+                     (0.5 + 0.5 * volumePercent / 100.0))
+
+                if score > bestResistanceScore
+                    bestResistanceScore := score
+                    structuralResistance := rowMid
+
+        int profileStartTime = array.get(storedTime, 0)
+
+        int futureTime = time_close + int(
+             timeframeSeconds *
+             1000.0 *
+             40
+        )
+
+        if showStructuralPOC
+            line pocLine = line.new(
+                 profileStartTime,
+                 structuralPOC,
+                 futureTime,
+                 structuralPOC,
+                 xloc = xloc.bar_time,
+                 color = structuralPOCColor,
+                 width = 2
+            )
+
+            array.push(structuralLines, pocLine)
+
+        if showStructuralValueArea
+            array.push(
+                 structuralLines,
+                 line.new(
+                      profileStartTime,
+                      structuralVAH,
+                      futureTime,
+                      structuralVAH,
+                      xloc = xloc.bar_time,
+                      color = structuralValueAreaColor
+                 )
+            )
+
+            array.push(
+                 structuralLines,
+                 line.new(
+                      profileStartTime,
+                      structuralVAL,
+                      futureTime,
+                      structuralVAL,
+                      xloc = xloc.bar_time,
+                      color = structuralValueAreaColor
+                 )
+            )
+
+        if showSupportResistance and not na(structuralSupport)
+            array.push(
+                 structuralLines,
+                 line.new(
+                      profileStartTime,
+                      structuralSupport,
+                      futureTime,
+                      structuralSupport,
+                      xloc = xloc.bar_time,
+                      color = supportColor,
+                      width = 3
+                 )
+            )
+
+        if showSupportResistance and not na(structuralResistance)
+            array.push(
+                 structuralLines,
+                 line.new(
+                      profileStartTime,
+                      structuralResistance,
+                      futureTime,
+                      structuralResistance,
+                      xloc = xloc.bar_time,
+                      color = resistanceColor,
+                      width = 3
+                 )
+            )
+
+        if showLiquidityZones
+
+            array<bool> usedNodes = array.new_bool(
+                 structuralRows,
+                 false
+            )
+
+            for node = 0 to liquidityNodeCount - 1
+
+                float bestScore = -1.0
+                int bestIndex = -1
+
+                for row = 0 to structuralRows - 1
+
+                    if not array.get(usedNodes, row)
+
+                        float rowVolume = array.get(profileTotal, row)
+                        float rowDelta = array.get(profileDelta, row)
+                        float rowDeltaPercent = array.get(profileDeltaPercent, row)
+
+                        float volumePercent = (maximumVolume > 0 ?
+                             rowVolume / maximumVolume * 100.0 :
+                             0.0)
+
+                        bool quality = (
+                             volumePercent >= minNodeVolume and
+                             math.abs(rowDeltaPercent) >= minNodeDelta)
+
+                        float nodeScore = (
+                             quality and maximumAbsoluteDelta > 0 ?
+                             math.abs(rowDelta) / maximumAbsoluteDelta * 70.0 +
+                             volumePercent * 0.30 :
+                             -1.0)
+
+                        if nodeScore > bestScore
+                            bestScore := nodeScore
+                            bestIndex := row
+
+                if bestIndex >= 0
+
+                    array.set(usedNodes, bestIndex, true)
+
+                    if bestIndex > 0
+                        array.set(usedNodes, bestIndex - 1, true)
+
+                    if bestIndex < structuralRows - 1
+                        array.set(usedNodes, bestIndex + 1, true)
+
+                    float zoneLow = profileLow + bestIndex * profileStep
+                    float zoneHigh = zoneLow + profileStep
+                    float zoneDelta = array.get(profileDelta, bestIndex)
+
+                    color zoneColor = (zoneDelta >= 0 ?
+                         positiveDeltaColor :
+                         negativeDeltaColor)
+
+                    box zone = box.new(
+                         left = profileStartTime,
+                         top = zoneHigh,
+                         right = futureTime,
+                         bottom = zoneLow,
+                         xloc = xloc.bar_time,
+                         border_color = color.new(zoneColor, 70),
+                         bgcolor = color.new(zoneColor, liquidityZoneTransparency)
+                    )
+
+                    array.push(structuralBoxes, zone)
+
+        if showHistogram
+
+            int centerX = (
+                 bar_index +
+                 histogramOffset +
+                 histogramWidth)
+
+            for row = 0 to structuralRows - 1
+
+                float rowLow = profileLow + row * profileStep
+                float rowHigh = rowLow + profileStep
+                float rowMid = (rowHigh + rowLow) * 0.5
+
+                float rowVolume = array.get(profileTotal, row)
+                float rowDelta = array.get(profileDelta, row)
+
+                int deltaWidth = (maximumAbsoluteDelta > 0 ?
+                     int(math.round(
+                          histogramWidth *
+                          math.abs(rowDelta) /
+                          maximumAbsoluteDelta
+                     )) :
+                     0)
+
+                int totalWidth = (maximumVolume > 0 ?
+                     int(math.round(
+                          histogramWidth *
+                          rowVolume /
+                          maximumVolume
+                     )) :
+                     0)
+
+                float shapeFraction = (histogramShape == "Thin" ?
+                     0.35 :
+                     histogramShape == "Medium" ?
+                     0.65 :
+                     1.0)
+
+                float effectiveShapeFraction = shapeFraction * histogramVerticalFill
+                float halfHeight = profileStep * 0.5 * effectiveShapeFraction
+
+                if showNeutralVolume and totalWidth > 0
+
+                    box volumeFrame = box.new(
+                         left = centerX - totalWidth,
+                         top = rowMid + halfHeight,
+                         right = centerX + totalWidth,
+                         bottom = rowMid - halfHeight,
+                         xloc = xloc.bar_index,
+                         bgcolor = color.new(neutralVolumeColor, 100),
+                         border_color = color.new(neutralVolumeColor, 88)
+                    )
+
+                    array.push(structuralBoxes, volumeFrame)
+
+                if deltaWidth > 0
+
+                    color deltaColor = (rowDelta >= 0 ?
+                         positiveDeltaColor :
+                         negativeDeltaColor)
+
+                    int leftX = (rowDelta >= 0 ?
+                         centerX :
+                         centerX - deltaWidth)
+
+                    int rightX = (rowDelta >= 0 ?
+                         centerX + deltaWidth :
+                         centerX)
+
+                    int backgroundTransparency = (histogramStyle == "Solid" ?
+                         10 :
+                         histogramStyle == "Soft" ?
+                         45 :
+                         100)
+
+                    int borderTransparency = (histogramStyle == "Outline" ?
+                         10 :
+                         45)
+
+                    box deltaBar = box.new(
+                         left = leftX,
+                         top = rowMid + halfHeight,
+                         right = rightX,
+                         bottom = rowMid - halfHeight,
+                         xloc = xloc.bar_index,
+                         bgcolor = color.new(deltaColor, backgroundTransparency),
+                         border_color = color.new(deltaColor, borderTransparency)
+                    )
+
+                    array.push(structuralBoxes, deltaBar)
+
+
+//=============================================================================
+// ACCEPTANCE / REJECTION COMPONENT HISTOGRAM
+//=============================================================================
+
+architectureTablePosition = (
+     architecturePosition == "Top Left" ?
+     position.top_left :
+     architecturePosition == "Bottom Left" ?
+     position.bottom_left :
+     architecturePosition == "Bottom Right" ?
+     position.bottom_right :
+     position.top_right)
+
+var table architectureTable = table.new(
+     architectureTablePosition,
+     4,
+     10,
+     border_width = 1
+)
+
+if barstate.islast
+
+    if showArchitectureHistogram
+
+        table.cell(architectureTable, 0, 0, "ARCHITECTURE", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+        table.cell(architectureTable, 1, 0, "ACCEPT", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+        table.cell(architectureTable, 2, 0, "REJECT", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+        table.cell(architectureTable, 3, 0, "LIVE", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+
+        table.cell(architectureTable, 0, 1, "P0 Mig / Stall")
+        table.cell(architectureTable, 1, 1, f_bar(acceptanceMigration), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 1, f_bar(rejectionP0Stall), text_color = rejectionColor)
+        table.cell(architectureTable, 3, 1, str.tostring(p0MigrationATR, "#.##") + "A")
+
+        table.cell(architectureTable, 0, 2, "Catch-Up")
+        table.cell(architectureTable, 1, 2, f_bar(acceptanceCatchUp), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 2, f_bar(100.0 - acceptanceCatchUp), text_color = rejectionColor)
+        table.cell(architectureTable, 3, 2, f_pct(p0CatchUpPercent))
+
+        table.cell(architectureTable, 0, 3, "New Value")
+        table.cell(architectureTable, 1, 3, f_bar(acceptanceNewLocation), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 3, f_bar(rejectionWeakNewLocation), text_color = rejectionColor)
+        table.cell(architectureTable, 3, 3, f_pct(newLocationShare))
+
+        table.cell(architectureTable, 0, 4, "VA Migration")
+        table.cell(architectureTable, 1, 4, f_bar(acceptanceValueMigration), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 4, f_bar(rejectionValueNonMigration), text_color = rejectionColor)
+        table.cell(architectureTable, 3, 4, str.tostring(valueMigrationATR, "#.##") + "A")
+
+        table.cell(architectureTable, 0, 5, "Delta")
+        table.cell(architectureTable, 1, 5, f_bar(acceptanceDelta), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 5, f_bar(opposingDeltaScore), text_color = rejectionColor)
+        table.cell(architectureTable, 3, 5, f_pct(deltaPercent))
+
+        table.cell(architectureTable, 0, 6, "Efficiency")
+        table.cell(architectureTable, 1, 6, f_bar(acceptanceEfficiency), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 6, f_bar(absorptionScore), text_color = rejectionColor)
+        table.cell(architectureTable, 3, 6, str.tostring(priceProgressATR, "#.##") + "A")
+
+        table.cell(architectureTable, 0, 7, "Dwell / Return")
+        table.cell(architectureTable, 1, 7, f_bar(dwellPercent), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 7, f_bar(returnTowardP0Score), text_color = rejectionColor)
+        table.cell(architectureTable, 3, 7, str.tostring(dwellCount) + "/" + str.tostring(dwellMeasurementBars))
+
+        table.cell(architectureTable, 0, 8, "TOTAL")
+        table.cell(architectureTable, 1, 8, f_bar(acceptanceScore) + " " + str.tostring(acceptanceScore, "#"), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 8, f_bar(rejectionScore) + " " + str.tostring(rejectionScore, "#"), text_color = rejectionColor)
+        table.cell(architectureTable, 3, 8, marketState)
+
+        table.cell(architectureTable, 0, 9, "P0 / Dist / Coh")
+        table.cell(architectureTable, 1, 9, f_price(dynamicP0), text_color = dynamicP0Color)
+        table.cell(architectureTable, 2, 9, str.tostring(distanceFromP0ATR, "#.##") + "A")
+        table.cell(architectureTable, 3, 9, f_pct(profileCoherence))
+
+        dashboardSizeValue = f_dashboardSize(dashboardTextSize)
+
+        for dashboardRow = 0 to 9
+            for dashboardCol = 0 to 3
+                table.cell_set_text_size(
+                     architectureTable,
+                     dashboardCol,
+                     dashboardRow,
+                     dashboardSizeValue
+                )
+
+
+//=============================================================================
+// ALERT CONDITIONS
+//=============================================================================
+
+alertcondition(
+     acceptanceLongSignal,
+     title = "Bull Acceptance Long",
+     message = "BULL | LONG ENTRY | ACCEPTANCE CONTINUATION | {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     acceptanceShortSignal,
+     title = "Bear Acceptance Short",
+     message = "BEAR | SHORT ENTRY | ACCEPTANCE CONTINUATION | {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     rejectionLongSignal,
+     title = "Bull Rejection Long",
+     message = "BULL | LONG ENTRY | REJECTION TO P0 | {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     rejectionShortSignal,
+     title = "Bear Rejection Short",
+     message = "BEAR | SHORT ENTRY | REJECTION TO P0 | {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     longClosed,
+     title = "Long Exit",
+     message = "LONG EXIT | DYNAMIC P0 DELTA | {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     shortClosed,
+     title = "Short Exit",
+     message = "SHORT EXIT | DYNAMIC P0 DELTA | {{ticker}} {{interval}} @ {{close}}"
+)
+
+
+//=============================================================================
+// DATA WINDOW
+//=============================================================================
+
+plot(distanceFromP0ATR, title = "Distance From P0 ATR", display = display.data_window)
+plot(p0MigrationATR, title = "P0 Migration ATR", display = display.data_window)
+plot(p0CatchUpPercent, title = "P0 Catch-Up %", display = display.data_window)
+plot(newLocationShare, title = "New-Location Volume %", display = display.data_window)
+plot(valueMigrationATR, title = "Value Area Migration ATR", display = display.data_window)
+plot(deltaPercent, title = "Estimated Delta %", display = display.data_window)
+plot(deltaPersistence, title = "Delta Persistence %", display = display.data_window)
+plot(profileCoherence, title = "Profile Coherence %", display = display.data_window)
+plot(acceptanceScore, title = "Acceptance Score", display = display.data_window)
+plot(rejectionScore, title = "Rejection Score", display = display.data_window)
+plot(longSetupArmed ? 1 : 0, title = "Bull Setup Armed", display = display.data_window)
+plot(shortSetupArmed ? 1 : 0, title = "Bear Setup Armed", display = display.data_window)
+plot(structuralPOC, title = "Structural POC", display = display.data_window)
+plot(structuralVAH, title = "Structural VAH", display = display.data_window)
+plot(structuralVAL, title = "Structural VAL", display = display.data_window)
+plot(structuralSupport, title = "Structural Delta Support", display = display.data_window)
+plot(structuralResistance, title = "Structural Delta Resistance", display = display.data_window)
+
+// REALTIME VISUALS:
+// Dashboard, dynamic P0, value area, structural levels, and the right-side
+// profile histogram refresh on every realtime tick.
+// Strategy ENTRIES remain bar-close confirmed through barstate.isconfirmed.
+//
+// Detailed dynamic alerts:
+// Create Alert -> this strategy -> Any alert() function call
+//
+// Order-fill alerts:
+// {{strategy.order.alert_message}}
