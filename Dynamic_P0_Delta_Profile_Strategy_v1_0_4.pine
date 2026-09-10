@@ -726,6 +726,31 @@ bool showEntryMarkers = input.bool(
      group = G_ALERT
 )
 
+string entryMarkerSizeInput = input.string(
+     "Normal",
+     "Entry Marker Size",
+     options = [
+          "Tiny",
+          "Small",
+          "Normal",
+          "Large",
+          "Huge"
+     ],
+     group = G_ALERT
+)
+
+color entryLongColor = input.color(
+     color.aqua,
+     "Long Entry Marker Color",
+     group = G_ALERT
+)
+
+color entryShortColor = input.color(
+     color.orange,
+     "Short Entry Marker Color",
+     group = G_ALERT
+)
+
 bool enableDynamicAlerts = input.bool(
      true,
      "Enable Dynamic alert() Calls",
@@ -1677,8 +1702,8 @@ plotshape(
      title = "Bull Actual Entry",
      style = shape.triangleup,
      location = location.belowbar,
-     size = size.normal,
-     color = color.aqua
+     size = f_dashboardSize(entryMarkerSizeInput),
+     color = entryLongColor
 )
 
 plotshape(
@@ -1687,8 +1712,8 @@ plotshape(
      title = "Bear Actual Entry",
      style = shape.triangledown,
      location = location.abovebar,
-     size = size.normal,
-     color = color.orange
+     size = f_dashboardSize(entryMarkerSizeInput),
+     color = entryShortColor
 )
 
 
