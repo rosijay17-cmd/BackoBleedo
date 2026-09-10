@@ -1630,11 +1630,11 @@ dynamicVALPlot = plot(
 fill(
      dynamicVAHPlot,
      dynamicVALPlot,
-     color = (showDynamicValueArea ?
+     color = showDynamicValueArea ?
           color.new(dynamicValueAreaColor, 93) :
           na,
      title = "Dynamic Value Area"
-))
+)
 
 
 //=============================================================================
