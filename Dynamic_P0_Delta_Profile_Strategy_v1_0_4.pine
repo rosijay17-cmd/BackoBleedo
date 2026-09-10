@@ -366,7 +366,7 @@ string entryMode = input.string(
 )
 
 float acceptanceThreshold = input.float(
-     68.0,
+     50.0,
      "Acceptance Score Threshold",
      minval = 40.0,
      maxval = 95.0,
@@ -375,7 +375,7 @@ float acceptanceThreshold = input.float(
 )
 
 float rejectionThreshold = input.float(
-     68.0,
+     50.0,
      "Rejection Score Threshold",
      minval = 40.0,
      maxval = 95.0,
