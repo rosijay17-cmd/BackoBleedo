@@ -2453,13 +2453,19 @@ if barstate.islast
             table.cell(architectureTable, 3, 7, str.tostring(dwellCount) + "/" + str.tostring(dwellMeasurementBars))
         table.cell(architectureTable, readCol, 7, readDwell, text_color = readDwell == "HOLDING" ? acceptanceColor : readDwell == "RETURNING" ? rejectionColor : color.gray)
 
-        string readTotal = f_rowVerdict(acceptanceScore, rejectionScore, "BULLISH", "BEARISH", "NEUTRAL")
+        // TOTAL's verdict must account for which side of P0 price is
+        // actually on -- REJECT winning while price is BELOW P0 means a
+        // bounce back UP is expected (bullish), not a bearish signal.
+        // Derived directly from marketState (already direction-aware) so
+        // this can never drift out of sync with it, just shortened to fit
+        // the READ column.
+        string readTotal = marketState == "BULL ACCEPTANCE" ? "BULL BREAK" : marketState == "BEAR ACCEPTANCE" ? "BEAR BREAK" : marketState == "BULL REJECTION" ? "BULL BOUNCE" : marketState == "BEAR REJECTION" ? "BEAR BOUNCE" : marketState
         table.cell(architectureTable, 0, 8, "TOTAL")
         table.cell(architectureTable, 1, 8, f_bar(acceptanceScore) + " " + str.tostring(acceptanceScore, "#"), text_color = acceptanceColor)
         table.cell(architectureTable, 2, 8, f_bar(rejectionScore) + " " + str.tostring(rejectionScore, "#"), text_color = rejectionColor)
         if showLiveColumnInput
             table.cell(architectureTable, 3, 8, marketState)
-        table.cell(architectureTable, readCol, 8, readTotal, text_color = readTotal == "BULLISH" ? acceptanceColor : readTotal == "BEARISH" ? rejectionColor : color.gray)
+        table.cell(architectureTable, readCol, 8, readTotal, text_color = str.contains(readTotal, "BULL") ? acceptanceColor : str.contains(readTotal, "BEAR") ? rejectionColor : color.gray)
 
         table.cell(architectureTable, 0, 9, "P0 / Dist / Coh")
         table.cell(architectureTable, 1, 9, f_price(dynamicP0), text_color = dynamicP0Color)
