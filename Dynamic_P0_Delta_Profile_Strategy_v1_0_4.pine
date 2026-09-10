@@ -597,6 +597,13 @@ bool showDynamicP0 = input.bool(
      group = G_STYLE
 )
 
+bool showDynamicP0LabelInput = input.bool(
+     true,
+     "Label The Dynamic P0 Line",
+     tooltip = "Puts a small 'P0' tag directly on the line at its current price, so it's unambiguous which line is P0 regardless of color or whatever else is on the chart (e.g. the Dynamic Value Area is a different, blue line right next to it).",
+     group = G_STYLE
+)
+
 color dynamicP0Color = input.color(
      color.aqua,
      "Dynamic P0 Color",
@@ -1724,6 +1731,17 @@ dynamicP0Plot = plot(
      color = dynamicP0Color,
      linewidth = dynamicP0Width
 )
+
+// A small "P0" tag on the line itself, updated in place each bar (one
+// label object total, not one per bar), so the line is identifiable at a
+// glance regardless of its color or what else is drawn on the chart.
+var label dynamicP0Label = na
+if showDynamicP0 and showDynamicP0LabelInput
+    if na(dynamicP0Label)
+        dynamicP0Label := label.new(bar_index, dynamicP0, "P0 " + f_price(dynamicP0), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(dynamicP0Color, 0), textcolor = color.black, size = size.small)
+    else
+        label.set_xy(dynamicP0Label, bar_index, dynamicP0)
+        label.set_text(dynamicP0Label, "P0 " + f_price(dynamicP0))
 
 dynamicVAHPlot = plot(
      showDynamicValueArea ? dynamicVAH : na,
