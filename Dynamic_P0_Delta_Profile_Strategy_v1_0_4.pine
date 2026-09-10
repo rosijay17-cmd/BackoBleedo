@@ -402,6 +402,20 @@ float signalStabilityMargin = input.float(
      group = G_ENTRY
 )
 
+bool useStructuralFilterInput = input.bool(
+     true,
+     "Block Entries Through Structural Resistance/Support",
+     tooltip = "Long entries are blocked if price has already closed at or beyond the long-term Structural Resistance level; shorts are blocked at Structural Support. These structural levels only hold a real value from the current/most-recent bar onward (see the note above STRUCTURAL LEVEL STATE), so this filter only affects live, forward-going entries -- it has no effect on historical backtest bars.",
+     group = G_ENTRY
+)
+
+bool useStructuralTargetInput = input.bool(
+     true,
+     "Cap Target At Nearest Structural Level",
+     tooltip = "For Acceptance entries, if Structural Resistance (longs) / Structural Support (shorts) sits between entry and the flat Acceptance Target (R) multiple, take profit AT that structural level instead of pushing the target past a real overhead/underfoot wall. Falls back to the plain R-multiple target when no closer structural level exists. Same live-only caveat as the filter above.",
+     group = G_ENTRY
+)
+
 bool requireDirectionalCandle = input.bool(
      true,
      "Require Directional Confirmation Candle",
@@ -847,6 +861,25 @@ f_entryMessage(
      "\nStop: " + f_price(stop) +
      "\nTarget: " + f_price(target))
 
+
+//=============================================================================
+// STRUCTURAL LEVEL STATE (declared here, computed much further down inside
+// the barstate.islast block -- see STRUCTURAL PROFILE OBJECTS). These need
+// to be declared before the Entry Engine section that reads them. Because
+// the actual computation only runs on barstate.islast (once per historical
+// backtest, then live on every realtime update -- recomputing the full
+// structural profile every single bar would be far too expensive), these
+// stay "na" for essentially all of historical backtesting and only hold a
+// real value from the current/most-recent bar onward. Any entry logic
+// gated on them is therefore a LIVE-forward filter, not something that
+// will retroactively change historical backtest results.
+//=============================================================================
+
+var float structuralPOC = na
+var float structuralVAH = na
+var float structuralVAL = na
+var float structuralSupport = na
+var float structuralResistance = na
 
 //=============================================================================
 // DYNAMIC P0 PROFILE
@@ -1333,17 +1366,22 @@ float rejectionShortRR = (rejectionPlannedRisk > 0 ?
      rejectionShortReward / rejectionPlannedRisk :
      0.0)
 
+bool structuralFilterLongOk = not useStructuralFilterInput or na(structuralResistance) or close < structuralResistance
+bool structuralFilterShortOk = not useStructuralFilterInput or na(structuralSupport) or close > structuralSupport
+
 bool acceptanceLongArmed = (
      flat and
      cooldownOK and
      acceptanceLongRaw and
-     acceptanceLongFresh)
+     acceptanceLongFresh and
+     structuralFilterLongOk)
 
 bool acceptanceShortArmed = (
      flat and
      cooldownOK and
      acceptanceShortRaw and
-     acceptanceShortFresh)
+     acceptanceShortFresh and
+     structuralFilterShortOk)
 
 bool rejectionLongArmed = (
      flat and
@@ -1404,7 +1442,9 @@ if acceptanceLongSignal
     activeEntry := close
     activeRisk := atr * stopATR
     activeStop := activeEntry - activeRisk
-    activeTarget := activeEntry + activeRisk * acceptanceRR
+    float acceptanceLongRMultipleTarget = activeEntry + activeRisk * acceptanceRR
+    bool structuralLongTargetValid = not na(structuralResistance) and structuralResistance > activeEntry and structuralResistance < acceptanceLongRMultipleTarget
+    activeTarget := useStructuralTargetInput and structuralLongTargetValid ? structuralResistance : acceptanceLongRMultipleTarget
     activeTradeType := "ACCEPTANCE LONG"
     breakEvenActive := false
 
@@ -1437,7 +1477,9 @@ if acceptanceShortSignal
     activeEntry := close
     activeRisk := atr * stopATR
     activeStop := activeEntry + activeRisk
-    activeTarget := activeEntry - activeRisk * acceptanceRR
+    float acceptanceShortRMultipleTarget = activeEntry - activeRisk * acceptanceRR
+    bool structuralShortTargetValid = not na(structuralSupport) and structuralSupport < activeEntry and structuralSupport > acceptanceShortRMultipleTarget
+    activeTarget := useStructuralTargetInput and structuralShortTargetValid ? structuralSupport : acceptanceShortRMultipleTarget
     activeTradeType := "ACCEPTANCE SHORT"
     breakEvenActive := false
 
@@ -1806,12 +1848,6 @@ while array.size(storedTime) > maxStoredBars
 
 var array<box> structuralBoxes = array.new_box()
 var array<line> structuralLines = array.new_line()
-
-var float structuralPOC = na
-var float structuralVAH = na
-var float structuralVAL = na
-var float structuralSupport = na
-var float structuralResistance = na
 
 if barstate.islast
 
