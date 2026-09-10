@@ -1696,13 +1696,20 @@ plotchar(
      color = color.orange
 )
 
+// plotshape()'s size= argument requires a compile-time "const string" --
+// stricter than table.cell_set_text_size()'s, which accepts the result of
+// calling f_dashboardSize(). Passing a user-defined function's return
+// value here raises CE10123, so this is computed as a direct top-level
+// ternary off the input instead (stays "input"-qualified, not "series").
+string entryMarkerSize = entryMarkerSizeInput == "Tiny" ? size.tiny : entryMarkerSizeInput == "Small" ? size.small : entryMarkerSizeInput == "Large" ? size.large : entryMarkerSizeInput == "Huge" ? size.huge : size.normal
+
 plotshape(
      showEntryMarkers and
      actualLongEntry,
      title = "Bull Actual Entry",
      style = shape.triangleup,
      location = location.belowbar,
-     size = f_dashboardSize(entryMarkerSizeInput),
+     size = entryMarkerSize,
      color = entryLongColor
 )
 
@@ -1712,7 +1719,7 @@ plotshape(
      title = "Bear Actual Entry",
      style = shape.triangledown,
      location = location.abovebar,
-     size = f_dashboardSize(entryMarkerSizeInput),
+     size = entryMarkerSize,
      color = entryShortColor
 )
 
@@ -1961,7 +1968,7 @@ if barstate.islast
                 maximumVolume := rowVolume
                 profilePOCIndex := row
 
-        structuralPOC = profileLow + (profilePOCIndex + 0.5) * profileStep
+        structuralPOC := profileLow + (profilePOCIndex + 0.5) * profileStep
 
         int profileVALIndex = profilePOCIndex
         int profileVAHIndex = profilePOCIndex
@@ -1992,8 +1999,8 @@ if barstate.islast
                     profileVAHIndex += 1
                     profileValueVolume += array.get(profileTotal, profileVAHIndex)
 
-        structuralVAL = profileLow + profileVALIndex * profileStep
-        structuralVAH = profileLow + (profileVAHIndex + 1.0) * profileStep
+        structuralVAL := profileLow + profileVALIndex * profileStep
+        structuralVAH := profileLow + (profileVAHIndex + 1.0) * profileStep
 
         float bestSupportScore = -1.0
         float bestResistanceScore = -1.0
