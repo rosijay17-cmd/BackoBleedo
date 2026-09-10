@@ -2416,59 +2416,59 @@ if barstate.islast
         table.cell(architectureTable, readCol, 0, "READ", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
 
         string readMigration = f_rowVerdict(acceptanceMigration, rejectionP0Stall, "MIGRATING", "STALLING", "FLAT")
-        table.cell(architectureTable, 0, 1, "P0 Mig / Stall")
+        table.cell(architectureTable, 0, 1, "P0 Mig / Stall", text_color = color.white)
         table.cell(architectureTable, 1, 1, f_bar(acceptanceMigration), text_color = acceptanceColor)
         table.cell(architectureTable, 2, 1, f_bar(rejectionP0Stall), text_color = rejectionColor)
         if showLiveColumnInput
-            table.cell(architectureTable, 3, 1, str.tostring(p0MigrationATR, "#.##") + "A")
+            table.cell(architectureTable, 3, 1, str.tostring(p0MigrationATR, "#.##") + "A", text_color = color.white)
         table.cell(architectureTable, readCol, 1, readMigration, text_color = readMigration == "MIGRATING" ? acceptanceColor : readMigration == "STALLING" ? rejectionColor : color.gray)
 
         string readCatchUp = f_rowVerdict(acceptanceCatchUp, 100.0 - acceptanceCatchUp, "CONVERGING", "LAGGING", "MIXED")
-        table.cell(architectureTable, 0, 2, "Catch-Up")
+        table.cell(architectureTable, 0, 2, "Catch-Up", text_color = color.white)
         table.cell(architectureTable, 1, 2, f_bar(acceptanceCatchUp), text_color = acceptanceColor)
         table.cell(architectureTable, 2, 2, f_bar(100.0 - acceptanceCatchUp), text_color = rejectionColor)
         if showLiveColumnInput
-            table.cell(architectureTable, 3, 2, f_pct(p0CatchUpPercent))
+            table.cell(architectureTable, 3, 2, f_pct(p0CatchUpPercent), text_color = color.white)
         table.cell(architectureTable, readCol, 2, readCatchUp, text_color = readCatchUp == "CONVERGING" ? acceptanceColor : readCatchUp == "LAGGING" ? rejectionColor : color.gray)
 
         string readNewValue = f_rowVerdict(acceptanceNewLocation, rejectionWeakNewLocation, "ACCEPTED", "REJECTED", "MIXED")
-        table.cell(architectureTable, 0, 3, "New Value")
+        table.cell(architectureTable, 0, 3, "New Value", text_color = color.white)
         table.cell(architectureTable, 1, 3, f_bar(acceptanceNewLocation), text_color = acceptanceColor)
         table.cell(architectureTable, 2, 3, f_bar(rejectionWeakNewLocation), text_color = rejectionColor)
         if showLiveColumnInput
-            table.cell(architectureTable, 3, 3, f_pct(newLocationShare))
+            table.cell(architectureTable, 3, 3, f_pct(newLocationShare), text_color = color.white)
         table.cell(architectureTable, readCol, 3, readNewValue, text_color = readNewValue == "ACCEPTED" ? acceptanceColor : readNewValue == "REJECTED" ? rejectionColor : color.gray)
 
         string readVaMigration = f_rowVerdict(acceptanceValueMigration, rejectionValueNonMigration, "SHIFTING", "ANCHORED", "MIXED")
-        table.cell(architectureTable, 0, 4, "VA Migration")
+        table.cell(architectureTable, 0, 4, "VA Migration", text_color = color.white)
         table.cell(architectureTable, 1, 4, f_bar(acceptanceValueMigration), text_color = acceptanceColor)
         table.cell(architectureTable, 2, 4, f_bar(rejectionValueNonMigration), text_color = rejectionColor)
         if showLiveColumnInput
-            table.cell(architectureTable, 3, 4, str.tostring(valueMigrationATR, "#.##") + "A")
+            table.cell(architectureTable, 3, 4, str.tostring(valueMigrationATR, "#.##") + "A", text_color = color.white)
         table.cell(architectureTable, readCol, 4, readVaMigration, text_color = readVaMigration == "SHIFTING" ? acceptanceColor : readVaMigration == "ANCHORED" ? rejectionColor : color.gray)
 
         string readDelta = f_rowVerdict(acceptanceDelta, opposingDeltaScore, "ALIGNED", "OPPOSING", "MIXED")
-        table.cell(architectureTable, 0, 5, "Delta")
+        table.cell(architectureTable, 0, 5, "Delta", text_color = color.white)
         table.cell(architectureTable, 1, 5, f_bar(acceptanceDelta), text_color = acceptanceColor)
         table.cell(architectureTable, 2, 5, f_bar(opposingDeltaScore), text_color = rejectionColor)
         if showLiveColumnInput
-            table.cell(architectureTable, 3, 5, f_pct(deltaPercent))
+            table.cell(architectureTable, 3, 5, f_pct(deltaPercent), text_color = color.white)
         table.cell(architectureTable, readCol, 5, readDelta, text_color = readDelta == "ALIGNED" ? acceptanceColor : readDelta == "OPPOSING" ? rejectionColor : color.gray)
 
         string readEfficiency = f_rowVerdict(acceptanceEfficiency, absorptionScore, "EFFICIENT", "ABSORBED", "MIXED")
-        table.cell(architectureTable, 0, 6, "Efficiency")
+        table.cell(architectureTable, 0, 6, "Efficiency", text_color = color.white)
         table.cell(architectureTable, 1, 6, f_bar(acceptanceEfficiency), text_color = acceptanceColor)
         table.cell(architectureTable, 2, 6, f_bar(absorptionScore), text_color = rejectionColor)
         if showLiveColumnInput
-            table.cell(architectureTable, 3, 6, str.tostring(priceProgressATR, "#.##") + "A")
+            table.cell(architectureTable, 3, 6, str.tostring(priceProgressATR, "#.##") + "A", text_color = color.white)
         table.cell(architectureTable, readCol, 6, readEfficiency, text_color = readEfficiency == "EFFICIENT" ? acceptanceColor : readEfficiency == "ABSORBED" ? rejectionColor : color.gray)
 
         string readDwell = f_rowVerdict(dwellPercent, returnTowardP0Score, "HOLDING", "RETURNING", "MIXED")
-        table.cell(architectureTable, 0, 7, "Dwell / Return")
+        table.cell(architectureTable, 0, 7, "Dwell / Return", text_color = color.white)
         table.cell(architectureTable, 1, 7, f_bar(dwellPercent), text_color = acceptanceColor)
         table.cell(architectureTable, 2, 7, f_bar(returnTowardP0Score), text_color = rejectionColor)
         if showLiveColumnInput
-            table.cell(architectureTable, 3, 7, str.tostring(dwellCount) + "/" + str.tostring(dwellMeasurementBars))
+            table.cell(architectureTable, 3, 7, str.tostring(dwellCount) + "/" + str.tostring(dwellMeasurementBars), text_color = color.white)
         table.cell(architectureTable, readCol, 7, readDwell, text_color = readDwell == "HOLDING" ? acceptanceColor : readDwell == "RETURNING" ? rejectionColor : color.gray)
 
         // TOTAL's verdict must account for which side of P0 price is
@@ -2478,18 +2478,18 @@ if barstate.islast
         // this can never drift out of sync with it, just shortened to fit
         // the READ column.
         string readTotal = marketState == "BULL ACCEPTANCE" ? "BULL BREAK" : marketState == "BEAR ACCEPTANCE" ? "BEAR BREAK" : marketState == "BULL REJECTION" ? "BULL BOUNCE" : marketState == "BEAR REJECTION" ? "BEAR BOUNCE" : marketState
-        table.cell(architectureTable, 0, 8, "TOTAL")
+        table.cell(architectureTable, 0, 8, "TOTAL", text_color = color.white)
         table.cell(architectureTable, 1, 8, f_bar(acceptanceScore) + " " + str.tostring(acceptanceScore, "#"), text_color = acceptanceColor)
         table.cell(architectureTable, 2, 8, f_bar(rejectionScore) + " " + str.tostring(rejectionScore, "#"), text_color = rejectionColor)
         if showLiveColumnInput
-            table.cell(architectureTable, 3, 8, marketState)
+            table.cell(architectureTable, 3, 8, marketState, text_color = color.white)
         table.cell(architectureTable, readCol, 8, readTotal, text_color = str.contains(readTotal, "BULL") ? acceptanceColor : str.contains(readTotal, "BEAR") ? rejectionColor : color.gray)
 
-        table.cell(architectureTable, 0, 9, "P0 / Dist / Coh")
+        table.cell(architectureTable, 0, 9, "P0 / Dist / Coh", text_color = color.white)
         table.cell(architectureTable, 1, 9, f_price(dynamicP0), text_color = dynamicP0Color)
-        table.cell(architectureTable, 2, 9, str.tostring(distanceFromP0ATR, "#.##") + "A")
+        table.cell(architectureTable, 2, 9, str.tostring(distanceFromP0ATR, "#.##") + "A", text_color = color.white)
         if showLiveColumnInput
-            table.cell(architectureTable, 3, 9, f_pct(profileCoherence))
+            table.cell(architectureTable, 3, 9, f_pct(profileCoherence), text_color = color.white)
         table.cell(architectureTable, readCol, 9, profileCoherence >= minimumCoherence ? "STRUCTURED" : "NOISY", text_color = profileCoherence >= minimumCoherence ? acceptanceColor : color.gray)
 
         dashboardSizeValue = f_dashboardSize(dashboardTextSize)
