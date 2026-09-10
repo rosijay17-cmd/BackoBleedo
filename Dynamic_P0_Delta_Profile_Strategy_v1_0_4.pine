@@ -355,7 +355,7 @@ float minimumCoherence = input.float(
 string G_ENTRY = "04 — Entry Engine"
 
 string entryMode = input.string(
-     "Both",
+     "Acceptance Only",
      "Entry Mode",
      options = [
           "Both",
