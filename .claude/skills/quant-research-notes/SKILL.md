@@ -1,6 +1,6 @@
 ---
 name: quant-research-notes
-description: Persistent knowledge base of reusable concepts, formulas, and documented pitfalls from academic papers and reference texts on algorithmic/quantitative trading (signal volatility, Markov-switching regimes, breakout/multi-indicator combination, RL+fuzzy multi-strategy allocation, implied-vs-historical volatility, support/resistance detection, cycle analysis, intraday volume-volatility correlation, beta dispersion/market timing). Load this before designing, revising, or backtesting any Pine Script strategy or indicator in this repo, or before doing quant research for the PANDA/QUANTS/quantor work — check it for an applicable technique or a known failure mode before building new logic from scratch.
+description: Persistent knowledge base of reusable concepts, formulas, and documented pitfalls from academic papers and reference texts on algorithmic/quantitative trading (signal volatility, Markov-switching regimes, breakout/multi-indicator combination, RL+fuzzy multi-strategy allocation, implied-vs-historical volatility, support/resistance detection, cycle analysis, intraday volume-volatility correlation, beta dispersion/market timing, non-parametric change point detection). Load this before designing, revising, or backtesting any Pine Script strategy or indicator in this repo, or before doing quant research for the PANDA/QUANTS/quantor work — check it for an applicable technique or a known failure mode before building new logic from scratch.
 ---
 
 # Quant Research Notes
@@ -46,6 +46,7 @@ are shared:
 | 14 | Breakout signs-of-strength/weakness checklist, measured-move gap targets, dynamic mid-trade position sizing | `references/breakout-price-action-brooks.md` | Brooks (2012), *Trading Price Action Trading Ranges*, Part I |
 | 15 | Intraday volatility-volume correlation profile (hump-shaped not U-shaped, MDH/SIAH), FOMC-window spike | `references/intraday-volume-volatility-correlation-graczyk.md` | Graczyk & Duarte Queirós (2018), *Physica A* |
 | 16 | Beta dispersion as a systemic-risk/market-vulnerability measure, market timing via distributional regression | `references/beta-dispersion-market-timing-kuntz.md` | Kuntz (2020), *J. of Empirical Finance* |
+| 17 | Non-parametric (Mood test) sequential change point detection in VIX/returns for dynamic asset allocation | `references/change-point-detection-vix-nystrup.md` | Nystrup, Hansen, Madsen & Lindström (2016), *J. of Asset Management* |
 
 ## Portability Matrix
 
@@ -108,6 +109,12 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
 | Structured additive distributional regression (joint mean+stdev modeling, penalized likelihood) | ❌ Not feasible | ✅ Required (e.g. `statsmodels`, R `gamlss`) | A genuinely new technique class for this skill — richer than the plain linear predictive regressions in papers #1/#5/#12/#13 |
 | Confidence-proportional position sizing (`X = 2·(p − 0.5)`, capped at ±100%) from any existing 0-1 probability | ✅ Direct | — | Reusable today on `Dynamic_Markov_Capacity_...`'s own `probabilityBull`/`probabilityBear`, which currently only hard-thresholds instead of sizing continuously |
 | Rebalancing-threshold rule (only re-signal when weight drift exceeds a limit) | ✅ Direct | — | Reduces overtrading/cost drag on any continuously-varying position-sizing scheme |
+| Mood test (rank-based scale-change statistic) on a rolling window | ✅ Direct — closed-form rank arithmetic, no estimation or distributional assumption | ✅ | Paper #17's headline capability; a genuinely new, directly-buildable Pine change-point primitive, unlike papers #2/#7's hard-barrier techniques |
+| Rolling `D_max,t = max_k D_k,t` change-point scan | ✅ Direct — `O(window²)` nested loop, same order of magnitude as this session's P0 structural-profile scan | ✅ | Window size trades off compute cost vs. detection sensitivity |
+| ARL-calibrated detection threshold (target expected time between false alarms) | ⚠️ Approximable — hand-tune via backtested false-alarm frequency | ✅ Preferred — proper calibration needs simulation under the null | A `quantor` project could derive the Pine-side threshold once, offline |
+| EWMA volatility re-estimation after a detected change (`λ=0.95`, ~20-day memory) | ✅ Direct — `ta.ema(r*r, len)` is exactly this | — | Trivial; already a pattern used elsewhere in this repo |
+| Volatility-threshold switching / linear allocation function (e.g. 20% vol reference) | ✅ Direct — simple sizing logic | — | Paper #17's own finding: simple binary switching beat the linear allocation function empirically |
+| VIX (or other real index) as a change-point/regime input via `request.security()` | ✅ Direct for NQ/ES/SPX-family instruments (CBOE VIX is a chartable symbol) | — | Not available for arbitrary/unrelated instruments; see paper #17's Cross-Paper note on paper #5 |
 
 ## Cross-Paper Synthesis
 
@@ -343,6 +350,37 @@ What can run natively in Pine Script vs. what needs the Python `quantor` pipelin
   regime-probability engine in `Dynamic_Markov_Capacity_PDH_PDL_Liquidity_Retracements_v6
   .pine`, which currently only hard-thresholds `probabilityBull`/`probabilityBear`
   rather than sizing off its own confidence level continuously.
+- **Paper #17 gives this skill a fourth, methodologically distinct "how does the market
+  have structure" paradigm** — alongside regime-switching (#2, #6), cycle-decomposition
+  (#8), and MDH/SIAH (#15): **non-parametric sequential change-point detection**, which
+  asserts nothing about how many regimes exist, their distributions, or that they
+  repeat. It's also the *most* directly Pine-portable regime-detection paper in this
+  skill so far — the Mood test is closed-form rank arithmetic, not an estimation
+  problem, unlike papers #2's TVTP-MS or #7's attention/clustering pipeline.
+- **Paper #17 independently confirms paper #5's implied-vs-historical-volatility
+  finding, from a completely different method.** Paper #5 established IV-type signals
+  forecast realized volatility better than HV-type signals; paper #17 reaches the same
+  conclusion by a totally different route — change points detected in the (implied-vol)
+  VIX produced a more profitable dynamic-allocation signal than change points detected
+  in the S&P 500's own (realized-return) series, on every metric tested. This also
+  **partially resolves this skill's standing limitation on paper #5** ("a true
+  forward-looking signal Pine has no access to") — Pine *can* chart the real CBOE VIX
+  for NQ/ES/SPX-family instruments specifically, so a VIX-based filter is a genuine,
+  buildable exception to that general limitation, not a workaround-in-name-only.
+- **A third independent instance of "a simple threshold-crossing rule beats a fancier
+  continuous function."** Paper #17's own head-to-head: binary vol-threshold switching
+  beat a linear vol-scaled allocation function on identical data and identical change
+  points (Sharpe 0.68 vs. 0.64). Paper #6 proved a two-threshold switch is the
+  *provably optimal* trend-following policy; paper #9 found exponential smoothing
+  underperforms simple MA/momentum. Three independent sources now say the same thing:
+  don't assume a smoother, more continuous rule is automatically better than a
+  well-placed threshold without testing both.
+- **Paper #17 is a candid, first-party instance of "most of the edge came from one
+  event."** Its own return-based strategy admits its outperformance nearly vanishes if
+  2008 is excluded from the sample — worth applying the same single-best/worst-period
+  removal check to any of this repo's own promising `quantor` backtests before trusting
+  a Sharpe number, the same discipline paper #12's bootstrap test and paper #13's
+  transaction-cost check already established in this skill.
 
 ## Known Gaps / Wishlist
 
@@ -388,8 +426,11 @@ are missing entirely. Ranked by expected value if the user's library can supply 
    grounding beneath paper #5's IV/HV comparison.
 6. *(Lower priority, still useful)* Regime-detection alternatives beyond TVTP
    Markov-switching — Bayesian online changepoint detection (Adams & MacKay) or
-   hidden semi-Markov models — since paper #2 is currently this skill's only
-   regime-detection paradigm.
+   hidden semi-Markov models. **Partially filled by paper #17** (Nystrup et al.'s
+   non-parametric Mood-test change-point detector) — a real, non-Markov-switching
+   regime-detection paradigm, and notably the most Pine-portable one in this skill —
+   but the specific Bayesian online changepoint / hidden semi-Markov alternatives named
+   here are still ungotten if a closer comparison to paper #2's TVTP-MS is ever wanted.
 
 ## Mapping to This Repo's Architecture
 
@@ -623,3 +664,25 @@ can be corrected against the real implementation rather than inference.
   probabilities. The beta-dispersion computation itself joins papers #2 and #7 in
   needing an offline `quantor` pipeline — genuinely cross-sectional, no single-symbol
   Pine equivalent exists. No contradiction with papers #1-14.
+- **2026-09-11** — Ingested paper #17: Nystrup, Hansen, Madsen & Lindström (2016),
+  "Detecting change points in VIX and S&P 500: A new approach to dynamic asset
+  allocation" (*Journal of Asset Management*). A non-parametric, self-starting
+  sequential change-point detector (Ross et al. 2011's framework; the Mood test for
+  scale changes was empirically the best-performing non-parametric test tried) applied
+  live, one-day-at-a-time, with an explicit one-day implementation lag — no fixed
+  regime count, no distributional assumption, no parameter estimation. Change points
+  detected in the VIX gave a more profitable dynamic-allocation signal than change
+  points detected in the S&P 500's own returns; simple binary vol-threshold switching
+  beat a linear vol-scaled allocation function; the best strategy overall (long S&P 500
+  in the low-vol state, cash in the high-vol state) beat both the index and a
+  same-exposure static portfolio on Sharpe and drawdown. This is this skill's fourth
+  distinct market-structure paradigm (alongside regime-switching, cycle-decomposition,
+  MDH/SIAH) and — because the Mood test is closed-form rank arithmetic rather than an
+  estimation problem — the most directly Pine-portable regime-detection paper ingested
+  so far; see the new Portability Matrix rows. Explicitly critiques paper #2's core
+  design choice (fixing the regime count a priori) in its own introduction — logged as
+  a genuine, unresolved methodological disagreement in the "Contradicts / Qualifies"
+  section of the new reference file, not picked a winner on. Independently confirms
+  paper #5's implied-vs-historical-volatility finding via a completely different
+  method, and partially fills Known Gaps item #6. No other contradiction with papers
+  #1-16.
