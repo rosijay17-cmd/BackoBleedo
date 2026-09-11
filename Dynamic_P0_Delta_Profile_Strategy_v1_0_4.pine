@@ -434,9 +434,19 @@ bool requireFreshState = input.bool(
      group = G_ENTRY
 )
 
-int cooldownBars = input.int(
+int cooldownBarsLongInput = input.int(
      20,
-     "Cooldown After Exit",
+     "Cooldown After Long Exit",
+     tooltip = "Bars to wait after a LONG position closes before a new LONG can arm. Tracked independently from the short-side cooldown below -- a long exit never blocks a short entry, and vice versa.",
+     minval = 0,
+     maxval = 50,
+     group = G_ENTRY
+)
+
+int cooldownBarsShortInput = input.int(
+     20,
+     "Cooldown After Short Exit",
+     tooltip = "Bars to wait after a SHORT position closes before a new SHORT can arm. Tracked independently from the long-side cooldown above.",
      minval = 0,
      maxval = 50,
      group = G_ENTRY
@@ -1338,9 +1348,11 @@ if bearishRejection
 // ENTRY ENGINE
 //=============================================================================
 
-var int lastExitBar = -10000
+var int lastLongExitBar = -10000
+var int lastShortExitBar = -10000
 
-bool cooldownOK = bar_index - lastExitBar >= cooldownBars
+bool cooldownOkLong = bar_index - lastLongExitBar >= cooldownBarsLongInput
+bool cooldownOkShort = bar_index - lastShortExitBar >= cooldownBarsShortInput
 bool flat = strategy.position_size == 0
 
 bool bullishCandleOK = not requireDirectionalCandle or close > open
@@ -1413,21 +1425,21 @@ bool structuralFilterShortOk = not useStructuralFilterInput or na(structuralSupp
 
 bool acceptanceLongArmed = (
      flat and
-     cooldownOK and
+     cooldownOkLong and
      acceptanceLongRaw and
      acceptanceLongFresh and
      structuralFilterLongOk)
 
 bool acceptanceShortArmed = (
      flat and
-     cooldownOK and
+     cooldownOkShort and
      acceptanceShortRaw and
      acceptanceShortFresh and
      structuralFilterShortOk)
 
 bool rejectionLongArmed = (
      flat and
-     cooldownOK and
+     cooldownOkLong and
      rejectionLongRaw and
      rejectionLongFresh and
      dynamicP0 > close and
@@ -1435,7 +1447,7 @@ bool rejectionLongArmed = (
 
 bool rejectionShortArmed = (
      flat and
-     cooldownOK and
+     cooldownOkShort and
      rejectionShortRaw and
      rejectionShortFresh and
      dynamicP0 < close and
@@ -1711,7 +1723,10 @@ if longClosed or shortClosed
              alert.freq_once_per_bar_close
         )
 
-    lastExitBar := bar_index
+    if longClosed
+        lastLongExitBar := bar_index
+    if shortClosed
+        lastShortExitBar := bar_index
 
     activeEntry := na
     activeStop := na
