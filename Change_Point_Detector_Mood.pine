@@ -153,7 +153,7 @@ plot(math.sqrt(baselineVol), title = "Baseline Vol (Long-Run EMA)", color = colo
 // INFO TABLE
 // ============================================================================
 if showTableInput and barstate.islast
-    var table infoTable = table.new(position.top_right, 2, 5, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+    var table infoTable = table.new(position.bottom_right, 2, 5, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
     table.cell(infoTable, 0, 0, "D_max", text_color = color.white)
     table.cell(infoTable, 1, 0, na(dMax) ? "N/A" : str.tostring(dMax, "#.##"), text_color = color.white)
     table.cell(infoTable, 0, 1, "Threshold", text_color = color.white)
