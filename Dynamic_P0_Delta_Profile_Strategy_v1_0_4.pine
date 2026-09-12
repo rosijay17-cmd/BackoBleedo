@@ -252,6 +252,15 @@ float newLocationTargetPercent = input.float(
      group = G_METRICS
 )
 
+int newLocationRecentBars = input.int(
+     20,
+     "New-Location Recency Window (Bars)",
+     minval = 3,
+     maxval = 100,
+     tooltip = "New-Location Volume now only counts volume from the most recent N bars, not the entire multi-hour rolling profile. This measures whether volume is NEWLY piling in at the current price right now, rather than whether this price has simply been well-traded at any point over the last several hours -- the latter made a repeatedly-tested support/resistance level score identically to a genuine fresh breakout hold, which is why Acceptance entries were firing on range-edge retests (mean-reversion-looking behavior) instead of only on real continuation.",
+     group = G_METRICS
+)
+
 float valueMigrationTargetATR = input.float(
      0.10,
      "Strong Value-Area Migration (ATR)",
@@ -1067,19 +1076,33 @@ float profileCoherence = (coherenceShare + uniformShare > 0 ?
 
 //=============================================================================
 // NEW-LOCATION VOLUME
+//-----------------------------------------------------------------------------
+// Measures NEWLY ARRIVING volume near the current price over a short recent
+// window (newLocationRecentBars), not lifetime volume-at-price across the
+// entire multi-hour rolling profile. The prior version summed the full
+// equilibriumBars window's dynamicTotal histogram near the current close --
+// which scored a repeatedly-tested support/resistance level (well-trafficked
+// over the whole window, simply because it keeps getting revisited)
+// identically to a genuine fresh breakout hold (also well-trafficked near
+// the current price, but because value is newly settling there). Restricting
+// to a short recent window means the score only rewards volume that has
+// actually arrived SINCE the current move started, not a level's entire
+// multi-hour trading history.
 //=============================================================================
 
 float newLocationBand = atr * newLocationBandATR
-float newLocationVolume = 0.0
+float newLocationRecentVolume = 0.0
+float newLocationRecentTotal = 0.0
 
-for row = 0 to equilibriumRows - 1
-    float rowMid = equilibriumLow + (row + 0.5) * equilibriumStep
+for i = 0 to newLocationRecentBars - 1
+    float barVolume = nz(volume[i], 0.0)
+    newLocationRecentTotal += barVolume
 
-    if math.abs(rowMid - close) <= newLocationBand
-        newLocationVolume += array.get(dynamicTotal, row)
+    if math.abs(close[i] - close) <= newLocationBand
+        newLocationRecentVolume += barVolume
 
-float newLocationShare = (totalDynamicVolume > 0 ?
-     newLocationVolume / totalDynamicVolume * 100.0 :
+float newLocationShare = (newLocationRecentTotal > 0 ?
+     newLocationRecentVolume / newLocationRecentTotal * 100.0 :
      0.0)
 
 
