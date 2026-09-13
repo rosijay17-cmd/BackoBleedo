@@ -354,9 +354,16 @@ f_get15mBreakContext() =>
     float latestTypeCode = ta.valuewhen(eventDirection != 0.0, eventTypeCode, 0)
     float latestEventTime = ta.valuewhen(eventDirection != 0.0, float(time), 0)
 
-    [latestZoneLow[1], latestZoneHigh[1], latestDirection[1], latestTypeCode[1], latestEventTime[1]]
+    // DIAGNOSTIC (temporary, remove once the dead-value question is
+    // resolved): sessionIndexLocal is hand-rolled var state, the exact
+    // category of thing that failed silently in the original Stage 4 pivot
+    // bug. Returning it lets the dashboard show directly whether var
+    // mutation inside a security-pulled function is advancing at all here,
+    // rather than guessing from "Active Zone: --" alone.
+    [latestZoneLow[1], latestZoneHigh[1], latestDirection[1], latestTypeCode[1], latestEventTime[1], float(sessionIndexLocal)[1]]
 
-[breakZoneLow, breakZoneHigh, breakDirectionRaw, breakTypeCodeRaw, breakEventTimeRaw] = request.security(syminfo.tickerid, breakContextTimeframeInput, f_get15mBreakContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[breakZoneLow, breakZoneHigh, breakDirectionRaw, breakTypeCodeRaw, breakEventTimeRaw, breakDiagSessionCountRaw] = request.security(syminfo.tickerid, breakContextTimeframeInput, f_get15mBreakContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+int breakDiagSessionCount = na(breakDiagSessionCountRaw) ? na : int(breakDiagSessionCountRaw)
 
 bool haveBrokenAny = not na(breakDirectionRaw)
 int breakDirection = haveBrokenAny ? int(breakDirectionRaw) : 0
@@ -517,7 +524,7 @@ if barstate.islast
 // ============================================================================
 
 int coreRows = 8
-int diagnosticRows = 5
+int diagnosticRows = 6
 int tableRows = showDiagnosticsInput ? coreRows + diagnosticRows : coreRows
 
 var table statusTable = table.new(position.bottom_right, 2, tableRows, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
@@ -606,15 +613,25 @@ if barstate.islast
         table.cell(statusTable, 0, 10, "Hours Since Break", text_color = color.white, text_size = size.tiny)
         table.cell(statusTable, 1, 10, na(hoursSinceEvent) ? "--" : str.tostring(hoursSinceEvent), text_color = color.white, text_size = size.tiny)
 
-        table.cell(statusTable, 0, 11, "RETEST LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
-        table.cell(statusTable, 1, 11, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        // DIAGNOSTIC (temporary): proves whether var mutation inside the
+        // security-pulled 15m function is advancing at all. If this stays
+        // "0 / na" forever despite plenty of loaded 15m history, that's the
+        // same dead-value signature as the original Stage 4 pivot bug, just
+        // for hand-rolled session-count state instead of pivot state -- and
+        // confirms the whole f_get15mBreakContext() approach needs the same
+        // kind of fix (rely on a stateful built-in, not hand-rolled var).
+        table.cell(statusTable, 0, 11, "15m Session # (diag)", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 11, na(breakDiagSessionCount) ? "-- (dead)" : str.tostring(breakDiagSessionCount), text_color = na(breakDiagSessionCount) or breakDiagSessionCount == 0 ? color.orange : color.lime, text_size = size.tiny)
+
+        table.cell(statusTable, 0, 12, "RETEST LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        table.cell(statusTable, 1, 12, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
         if array.size(retestLog) > 0
-            table.cell(statusTable, 0, 12, array.get(retestLog, 0), text_color = color.white, text_halign = text.align_left, text_size = size.tiny)
-            table.cell(statusTable, 1, 12, "", text_color = color.white, text_size = size.tiny)
+            table.cell(statusTable, 0, 13, array.get(retestLog, 0), text_color = color.white, text_halign = text.align_left, text_size = size.tiny)
+            table.cell(statusTable, 1, 13, "", text_color = color.white, text_size = size.tiny)
         else
-            table.cell(statusTable, 0, 12, "", text_color = color.white, text_size = size.tiny)
-            table.cell(statusTable, 1, 12, "", text_color = color.white, text_size = size.tiny)
+            table.cell(statusTable, 0, 13, "", text_color = color.white, text_size = size.tiny)
+            table.cell(statusTable, 1, 13, "", text_color = color.white, text_size = size.tiny)
 
 // ============================================================================
 // DATA WINDOW
