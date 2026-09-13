@@ -255,23 +255,16 @@ f_get15mBreakContextRaw() =>
     float eventZoneLow = na
     float eventZoneHigh = na
 
-    // FIX (round 2): the barstate.isconfirmed gate (round 1) did NOT solve
-    // this -- confirmed on-device, Active Zone stayed dead even after that
-    // fix. The actual distinguishing factor, isolated by the sanity-check
-    // diagnostic: ta.valuewhen() reliably tracks a signal computed PURELY
-    // from price (close > open; ta.pivothigh() in the proven Stage 4/5
-    // pattern) through this exact [1] + lookahead_on chain, but NOT a
-    // signal whose condition depends on ANOTHER piece of custom persistent
-    // var state (the old "and not pocBroken" guard here). Removed that
-    // guard from the signal itself -- eventDirection is now a pure
-    // close-vs-close[1]-vs-buffered-zone-edge comparison, nothing else.
-    // The *Broken flags below still exist and still get set (harmless
-    // bookkeeping, kept in case a later revision needs them), but no
-    // longer gate whether an event fires. Traded away: a level that gets
-    // crossed back and forth (chop) now re-fires a "break" event on every
-    // fresh crossing instead of only the first -- acceptable for now since
-    // the retest state machine already always adopts the newest event as
-    // the active candidate regardless.
+    // HISTORY: round 2 temporarily removed the "and not pocBroken" guard
+    // (etc.) from these conditions as a hypothesis test -- it wasn't the
+    // actual bug (round 6 found the real one, an unsafe na comparison in
+    // the outer script's event-adoption logic, nothing to do with these
+    // guards at all). Confirmed on [r6] on-device: with the guard removed,
+    // now-working retest detection fired on nearly every bar, since a
+    // level chopping back and forth re-fired a "break" on every fresh
+    // crossing. Restored the *Broken guards below -- a level only counts
+    // as broken once per session, matching Stage 5's original design and
+    // producing meaningful, sparse events instead of chop noise.
     if newSessionLocal
         if bar_index > 0 and barsIntoSessionLocal > 1
             int endedBarsLocal = bar_index - sessionStartBarLocal
@@ -306,7 +299,7 @@ f_get15mBreakContextRaw() =>
     bool deltaOkUp = not requireBreakDeltaConfirmationInput or localBarDelta > 0
     bool deltaOkDown = not requireBreakDeltaConfirmationInput or localBarDelta < 0
 
-    if not na(pocLevel) and not na(halfWidth)
+    if not na(pocLevel) and not pocBroken and not na(halfWidth)
         float zLow = pocLevel - halfWidth
         float zHigh = pocLevel + halfWidth
         bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
@@ -324,7 +317,7 @@ f_get15mBreakContextRaw() =>
             eventZoneLow := zLow
             eventZoneHigh := zHigh
 
-    if not na(exHighLevel) and not na(halfWidth)
+    if not na(exHighLevel) and not exHighBroken and not na(halfWidth)
         float zLow = exHighLevel - halfWidth
         float zHigh = exHighLevel + halfWidth
         bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
@@ -342,7 +335,7 @@ f_get15mBreakContextRaw() =>
             eventZoneLow := zLow
             eventZoneHigh := zHigh
 
-    if not na(exLowLevel) and not na(halfWidth)
+    if not na(exLowLevel) and not exLowBroken and not na(halfWidth)
         float zLow = exLowLevel - halfWidth
         float zHigh = exLowLevel + halfWidth
         bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
@@ -360,7 +353,7 @@ f_get15mBreakContextRaw() =>
             eventZoneLow := zLow
             eventZoneHigh := zHigh
 
-    if not na(flipLevel) and not na(halfWidth)
+    if not na(flipLevel) and not flipBroken and not na(halfWidth)
         float zLow = flipLevel - halfWidth
         float zHigh = flipLevel + halfWidth
         bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
@@ -378,7 +371,7 @@ f_get15mBreakContextRaw() =>
             eventZoneLow := zLow
             eventZoneHigh := zHigh
 
-    if showAbsorptionInput and not na(absLevel) and not na(halfWidth)
+    if showAbsorptionInput and not na(absLevel) and not absBroken and not na(halfWidth)
         float zLow = absLevel - halfWidth
         float zHigh = absLevel + halfWidth
         bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
@@ -688,7 +681,7 @@ if barstate.islast
     // specifically so a screenshot settles "which round is this running"
     // at a glance, without needing the diagnostics toggle on -- this
     // exact question has cost several rounds already.
-    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r6]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r7]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
     table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
     table.cell(statusTable, 0, 1, "Bias", text_color = color.white, text_size = size.small)
