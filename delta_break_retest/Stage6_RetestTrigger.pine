@@ -542,7 +542,20 @@ var int activeEventTime = na
 var string retestState = "NONE"
 var array<string> retestLog = array.new_string()
 
-bool newBreakEvent = breakDirection != 0 and breakEventTime != activeEventTime
+// FIX (round 6): rounds 1-5 all targeted the security-pull layer and all
+// failed -- confirmed on-device through [r5], with 616+ real break events
+// proven firing inside the pulled function the whole time. The actual bug
+// was never there: it was HERE. Comparing a real value against a variable
+// that starts as na using != is a classic Pine footgun -- na comparisons
+// with ==/!= don't reliably behave like normal comparisons; na(x)/not na(x)
+// is the only safe check. activeEventTime starts as na (line above), so on
+// the very first break event ever, "breakEventTime != activeEventTime"
+// most likely evaluated to na (falsy) instead of true -- meaning
+// newBreakEvent never fired on that first event, activeEventTime stayed na
+// forever, and therefore EVERY subsequent event hit the exact same
+// still-na comparison, permanently. This explains why five rounds of
+// fixing the security layer changed nothing: that layer was fine.
+bool newBreakEvent = breakDirection != 0 and (na(activeEventTime) or breakEventTime != activeEventTime)
 
 if newBreakEvent
     activeZoneLow := breakZoneLow
@@ -675,7 +688,7 @@ if barstate.islast
     // specifically so a screenshot settles "which round is this running"
     // at a glance, without needing the diagnostics toggle on -- this
     // exact question has cost several rounds already.
-    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r5]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r6]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
     table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
     table.cell(statusTable, 0, 1, "Bias", text_color = color.white, text_size = size.small)
