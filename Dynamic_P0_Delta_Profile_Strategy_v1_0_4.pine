@@ -823,6 +823,13 @@ bool showEntryMarkers = input.bool(
      group = G_ALERT
 )
 
+bool showCooldownGapLabelsInput = input.bool(
+     true,
+     "Show Bars-Since-Last-Exit Label On Each Entry",
+     tooltip = "Small label on every entry showing the exact bar count since the last exit of that SAME entry type (Acceptance Long, Acceptance Short, Rejection Long, or Rejection Short) -- ground truth for verifying the cooldown is actually being honored, instead of estimating spacing by eye off the chart.",
+     group = G_ALERT
+)
+
 string entryMarkerSizeInput = input.string(
      "Normal",
      "Entry Marker Size",
@@ -1666,6 +1673,10 @@ if acceptanceLongSignal
          alert_message = message
     )
 
+    if showCooldownGapLabelsInput
+        int barsSinceLastAcceptanceLongExit = bar_index - lastAcceptanceLongExitBar
+        label.new(bar_index, high, "Δ" + str.tostring(barsSinceLastAcceptanceLongExit), style = label.style_label_down, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
+
     if enableDynamicAlerts and alertEntries
         alert(message, alert.freq_once_per_bar_close)
 
@@ -1700,6 +1711,10 @@ if acceptanceShortSignal
          comment = "ACCEPTANCE SHORT",
          alert_message = message
     )
+
+    if showCooldownGapLabelsInput
+        int barsSinceLastAcceptanceShortExit = bar_index - lastAcceptanceShortExitBar
+        label.new(bar_index, low, "Δ" + str.tostring(barsSinceLastAcceptanceShortExit), style = label.style_label_up, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
 
     if enableDynamicAlerts and alertEntries
         alert(message, alert.freq_once_per_bar_close)
@@ -1743,6 +1758,10 @@ if rejectionLongCandidate
          alert_message = message
     )
 
+    if showCooldownGapLabelsInput
+        int barsSinceLastRejectionLongExit = bar_index - lastRejectionLongExitBar
+        label.new(bar_index, high, "Δ" + str.tostring(barsSinceLastRejectionLongExit), style = label.style_label_down, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
+
     if enableDynamicAlerts and alertEntries
         alert(message, alert.freq_once_per_bar_close)
 
@@ -1780,6 +1799,10 @@ if rejectionShortCandidate
          comment = "REJECTION SHORT",
          alert_message = message
     )
+
+    if showCooldownGapLabelsInput
+        int barsSinceLastRejectionShortExit = bar_index - lastRejectionShortExitBar
+        label.new(bar_index, low, "Δ" + str.tostring(barsSinceLastRejectionShortExit), style = label.style_label_up, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
 
     if enableDynamicAlerts and alertEntries
         alert(message, alert.freq_once_per_bar_close)
