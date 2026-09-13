@@ -1639,6 +1639,17 @@ var float activeRisk = na
 var string activeTradeType = ""
 var bool breakEvenActive = false
 
+// DIAGNOSTIC: fires (via Pine Logs, not the chart -- no clutter, no
+// max_labels_count eviction) on every single bar where position_size
+// actually changes, whether that's an entry fill or an exit fill.
+// activeTradeType here reflects whatever it held coming INTO this bar,
+// before any of this bar's own entry/exit logic below runs. Traces the
+// exact fill sequence directly to find out whether shortClosed/
+// longClosed genuinely never fires, or whether the earlier exit label
+// was just lost to clutter/eviction on an already crowded chart.
+if strategy.position_size != strategy.position_size[1]
+    log.info("POS CHANGE bar=" + str.tostring(bar_index) + " prev=" + str.tostring(strategy.position_size[1]) + " now=" + str.tostring(strategy.position_size) + " activeTradeType(incoming)='" + activeTradeType + "'")
+
 bool rejectionLongSignal = false
 bool rejectionShortSignal = false
 
