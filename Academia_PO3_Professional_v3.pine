@@ -1,0 +1,896 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+//@version=6
+indicator(
+     title = "Academia PO3 Professional v3",
+     shorttitle = "Academia PO3 v3",
+     overlay = true,
+     max_bars_back = 3000,
+     max_lines_count = 30,
+     max_labels_count = 100)
+
+//====================================================================
+// 01. GROUPS
+//====================================================================
+
+const string G_CORE   = "01 — Core"
+const string G_ACC    = "02 — Accumulation"
+const string G_MANIP  = "03 — Manipulation"
+const string G_EXP    = "04 — Expansion"
+const string G_TREND  = "05 — Trend"
+const string G_EXH    = "06 — Exhaustion"
+const string G_HTF    = "07 — Higher Timeframes"
+const string G_LIQ    = "08 — Liquidity Matrix"
+const string G_STATE  = "09 — State Engine"
+const string G_VIS    = "10 — Visuals"
+const string G_ALERT  = "11 — Alerts"
+const string G_ROUTER = "12 — Strategy Router"
+
+//====================================================================
+// 02. INPUTS
+//====================================================================
+
+// Core
+int atrLen = input.int(14, "ATR Length", minval = 2, group = G_CORE)
+int atrBaseLen = input.int(50, "ATR Baseline", minval = 10, group = G_CORE)
+int efficiencyLen = input.int(12, "Efficiency Length", minval = 3, group = G_CORE)
+int overlapLen = input.int(12, "Overlap Length", minval = 3, group = G_CORE)
+int rvolLen = input.int(20, "RVOL Length", minval = 2, group = G_CORE)
+int flowLen = input.int(20, "Flow Proxy Length", minval = 2, group = G_CORE)
+int persistenceLen = input.int(3, "Persistence Bars", minval = 2, maxval = 10, group = G_CORE)
+
+// Accumulation
+float accEnter = input.float(70.0, "Enter Threshold", minval = 0, maxval = 100, group = G_ACC)
+float accExit = input.float(55.0, "Exit Threshold", minval = 0, maxval = 100, group = G_ACC)
+float accAtrBest = input.float(0.75, "Strong ATR Contraction", minval = 0.1, step = 0.05, group = G_ACC)
+float accAtrWorst = input.float(1.15, "Weak ATR Contraction", minval = 0.2, step = 0.05, group = G_ACC)
+float accEffBest = input.float(0.18, "Low Efficiency", minval = 0, maxval = 1, step = 0.01, group = G_ACC)
+float accEffWorst = input.float(0.60, "High Efficiency", minval = 0, maxval = 1, step = 0.01, group = G_ACC)
+
+// Manipulation
+float manipEnter = input.float(60.0, "Enter Threshold", minval = 0, maxval = 100, group = G_MANIP)
+int sweepLookback = input.int(20, "Local Sweep Lookback", minval = 3, maxval = 300, group = G_MANIP)
+float minSweepAtr = input.float(0.05, "Minimum Penetration ATR", minval = 0, step = 0.01, group = G_MANIP)
+float minWickRatio = input.float(0.40, "Minimum Rejection Wick", minval = 0.05, maxval = 0.95, step = 0.05, group = G_MANIP)
+float manipRvolRef = input.float(1.15, "RVOL Reference", minval = 0.1, step = 0.05, group = G_MANIP)
+int manipMemoryBars = input.int(12, "Manipulation Memory", minval = 1, maxval = 100, group = G_MANIP)
+
+// Expansion
+float expansionEnter = input.float(62.0, "Enter Threshold", minval = 0, maxval = 100, group = G_EXP)
+float expansionExit = input.float(48.0, "Exit Threshold", minval = 0, maxval = 100, group = G_EXP)
+float displacementWeak = input.float(0.20, "Weak Body ATR", minval = 0, step = 0.05, group = G_EXP)
+float displacementStrong = input.float(0.90, "Strong Body ATR", minval = 0.1, step = 0.05, group = G_EXP)
+float expansionRvolRef = input.float(1.25, "RVOL Reference", minval = 0.1, step = 0.05, group = G_EXP)
+float minDirectionalEdge = input.float(12.0, "Minimum Directional Edge", minval = 0, maxval = 100, group = G_EXP)
+
+// Trend
+float trendEnter = input.float(65.0, "Enter Threshold", minval = 0, maxval = 100, group = G_TREND)
+float trendExit = input.float(50.0, "Exit Threshold", minval = 0, maxval = 100, group = G_TREND)
+int emaFastLen = input.int(20, "Fast EMA", minval = 2, group = G_TREND)
+int emaSlowLen = input.int(50, "Slow EMA", minval = 3, group = G_TREND)
+float trendEfficiencyRef = input.float(0.55, "Efficiency Reference", minval = 0, maxval = 1, step = 0.05, group = G_TREND)
+
+// Exhaustion
+float exhaustionEnter = input.float(62.0, "Enter Threshold", minval = 0, maxval = 100, group = G_EXH)
+float exhaustionExit = input.float(45.0, "Exit Threshold", minval = 0, maxval = 100, group = G_EXH)
+float extensionAtrRef = input.float(2.00, "EMA Extension ATR", minval = 0.5, step = 0.1, group = G_EXH)
+float lowRvolRef = input.float(0.75, "Low RVOL Reference", minval = 0.1, step = 0.05, group = G_EXH)
+
+// HTF
+string structureTf = input.timeframe("60", "Structure TF", options = ["15", "30", "60", "120", "240", "D"], group = G_HTF)
+string regimeTf = input.timeframe("240", "Regime TF", options = ["15", "30", "60", "120", "240", "D"], group = G_HTF)
+int htfEmaLen = input.int(50, "HTF EMA Length", minval = 2, group = G_HTF)
+bool requireHtfAlignment = input.bool(false, "Require HTF Alignment", group = G_HTF)
+
+// Liquidity matrix
+bool use15 = input.bool(true, "Use 15m", group = G_LIQ)
+bool use30 = input.bool(true, "Use 30m", group = G_LIQ)
+bool use60 = input.bool(true, "Use 1h", group = G_LIQ)
+bool use120 = input.bool(true, "Use 2h", group = G_LIQ)
+bool use240 = input.bool(true, "Use 4h", group = G_LIQ)
+bool useD = input.bool(true, "Use 1D", group = G_LIQ)
+float maxTargetDistanceAtr = input.float(8.0, "Maximum Target Distance ATR", minval = 0.5, step = 0.25, group = G_LIQ)
+int targetExtensionBars = input.int(40, "Target Extension Bars", minval = 5, maxval = 300, group = G_LIQ)
+bool showSecondTarget = input.bool(false, "Show Secondary Target", group = G_LIQ)
+
+// State engine
+int minStateBars = input.int(2, "Minimum State Duration", minval = 1, maxval = 50, group = G_STATE)
+int sequenceMemory = input.int(40, "Sequence Memory", minval = 5, maxval = 300, group = G_STATE)
+int oppositeCooldown = input.int(3, "Opposite Direction Cooldown", minval = 0, maxval = 50, group = G_STATE)
+bool requireOrderedSequence = input.bool(true, "Require Acc → Manip → Expansion", group = G_STATE)
+
+// Visuals
+bool showDashboard = input.bool(true, "Show Dashboard", group = G_VIS)
+string dashPosition = input.string("Top Right", "Dashboard Position",
+     options = ["Top Right", "Top Left", "Middle Right", "Middle Left", "Bottom Right", "Bottom Left"], group = G_VIS)
+string dashSize = input.string("Phone", "Dashboard Size",
+     options = ["Compact", "Phone", "Medium", "Large"], group = G_VIS)
+string phaseDisplay = input.string("Ribbon", "Phase Display",
+     options = ["None", "Ribbon", "Background", "Ribbon + Background"], group = G_VIS)
+bool colorBars = input.bool(false, "Color Bars By State", group = G_VIS)
+bool showTransitions = input.bool(true, "Show Transition Markers", group = G_VIS)
+bool showEmas = input.bool(true, "Show EMAs", group = G_VIS)
+bool showTargetLabels = input.bool(true, "Show Target Labels", group = G_VIS)
+
+// Alerts
+bool dynamicAlerts = input.bool(true, "Enable Dynamic Alerts", group = G_ALERT)
+
+// Strategy Router
+bool showRouter = input.bool(true, "Show Strategy Router Rows", group = G_ROUTER)
+string labelAccumulation = input.string("Mean-Reversion (EMA+BB Pullback)", "Accumulation → Strategy", group = G_ROUTER)
+string labelManipulation = input.string("Liquidity Sweep Trend Following", "Manipulation → Strategy", group = G_ROUTER)
+string labelExpansion = input.string("ORB Breakout / Break-Return-Cross", "Expansion → Strategy", group = G_ROUTER)
+string labelTrend = input.string("Trend Continuation (V1 / MTF Flip)", "Trend → Strategy", group = G_ROUTER)
+string labelExhaustion = input.string("Stand Aside — Watch For Sweep Reversal", "Exhaustion → Strategy", group = G_ROUTER)
+string labelNeutral = input.string("Stand Aside — No Clear Phase", "Neutral → Strategy", group = G_ROUTER)
+
+//====================================================================
+// 03. COLORS
+//====================================================================
+
+color cNeutral = color.rgb(100, 116, 139)
+color cAccum = color.rgb(75, 120, 180)
+color cManip = color.rgb(245, 158, 11)
+color cBullExp = color.rgb(34, 197, 94)
+color cBearExp = color.rgb(239, 68, 68)
+color cBullTrend = color.rgb(16, 185, 129)
+color cBearTrend = color.rgb(220, 38, 38)
+color cExhaust = color.rgb(168, 85, 247)
+color cDark = color.rgb(8, 15, 27)
+color cCell = color.rgb(20, 31, 49)
+color cCell2 = color.rgb(29, 42, 63)
+color cText = color.rgb(245, 248, 252)
+color cMuted = color.rgb(190, 201, 217)
+
+//====================================================================
+// 04. HELPERS
+//====================================================================
+
+f_clamp(float v, float lo, float hi) =>
+    math.max(lo, math.min(hi, v))
+
+f_high(float v, float worst, float best) =>
+    na(v) ? 0.0 : v <= worst ? 0.0 : v >= best ? 1.0 : (v - worst) / math.max(best - worst, 0.000001)
+
+f_low(float v, float best, float worst) =>
+    na(v) ? 0.0 : v <= best ? 1.0 : v >= worst ? 0.0 : (worst - v) / math.max(worst - best, 0.000001)
+
+f_bool(bool v) =>
+    v ? 1.0 : 0.0
+
+f_num(float v) =>
+    na(v) ? "—" : str.tostring(v, "#.0")
+
+f_price(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+f_stateName(int s) =>
+    s == 1 ? "ACCUMULATION" :
+     s == 2 ? "MANIPULATION" :
+     s == 3 ? "BULL EXPANSION" :
+     s == 4 ? "BEAR EXPANSION" :
+     s == 5 ? "BULL TREND" :
+     s == 6 ? "BEAR TREND" :
+     s == 7 ? "BULL EXHAUST" :
+     s == 8 ? "BEAR EXHAUST" :
+     "NEUTRAL"
+
+f_stateColor(int s) =>
+    s == 1 ? cAccum :
+     s == 2 ? cManip :
+     s == 3 ? cBullExp :
+     s == 4 ? cBearExp :
+     s == 5 ? cBullTrend :
+     s == 6 ? cBearTrend :
+     s == 7 or s == 8 ? cExhaust :
+     cNeutral
+
+f_addTarget(
+     array<float> vals,
+     array<string> names,
+     array<float> tfWeights,
+     bool enabled,
+     float level,
+     string name,
+     float weight) =>
+    if enabled and not na(level)
+        array.push(vals, level)
+        array.push(names, name)
+        array.push(tfWeights, weight)
+
+//====================================================================
+// 05. BASE DATA
+//====================================================================
+
+float atr = ta.atr(atrLen)
+float atrBase = ta.sma(atr, atrBaseLen)
+float atrRatio = not na(atrBase) and atrBase > 0 ? atr / atrBase : na
+
+float barRange = math.max(high - low, syminfo.mintick)
+float body = math.abs(close - open)
+float bodyAtr = atr > 0 ? body / atr : na
+float bodyRatio = body / barRange
+float upperWickRatio = (high - math.max(open, close)) / barRange
+float lowerWickRatio = (math.min(open, close) - low) / barRange
+float closeLocation = (close - low) / barRange
+
+float emaFast = ta.ema(close, emaFastLen)
+float emaSlow = ta.ema(close, emaSlowLen)
+float vwap = ta.vwap(hlc3)
+
+float avgVol = ta.sma(volume, rvolLen)
+float rvol = not na(avgVol) and avgVol > 0 ? volume / avgVol : na
+
+float signedVol = volume * (close - open) / barRange
+float signedVolAvg = ta.sma(signedVol, flowLen)
+float volAvg = ta.sma(volume, flowLen)
+float flow = not na(volAvg) and volAvg > 0 ? f_clamp(signedVolAvg / volAvg, -1.0, 1.0) : 0.0
+
+float avgAbsChange = ta.sma(math.abs(ta.change(close)), efficiencyLen)
+float path = not na(avgAbsChange) ? avgAbsChange * efficiencyLen : na
+float efficiency = not na(path) and path > 0 and bar_index >= efficiencyLen ? math.abs(close - close[efficiencyLen]) / path : 0.0
+
+float overlapRaw = bar_index > 0 ? math.max(0.0, math.min(high, high[1]) - math.max(low, low[1])) : 0.0
+float minRange = bar_index > 0 ? math.max(math.min(barRange, math.max(high[1] - low[1], syminfo.mintick)), syminfo.mintick) : syminfo.mintick
+float overlap = ta.sma(math.min(overlapRaw / minRange, 1.0), overlapLen)
+
+bool rising = ta.rising(close, persistenceLen)
+bool falling = ta.falling(close, persistenceLen)
+
+//====================================================================
+// 06. CONFIRMED HTF DATA
+//====================================================================
+
+float structureClose = request.security(syminfo.tickerid, structureTf, close[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float structureEma = request.security(syminfo.tickerid, structureTf, ta.ema(close, htfEmaLen)[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float regimeClose = request.security(syminfo.tickerid, regimeTf, close[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float regimeEma = request.security(syminfo.tickerid, regimeTf, ta.ema(close, htfEmaLen)[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool htfBull = not na(structureClose) and not na(structureEma) and not na(regimeClose) and not na(regimeEma) and structureClose > structureEma and regimeClose > regimeEma
+bool htfBear = not na(structureClose) and not na(structureEma) and not na(regimeClose) and not na(regimeEma) and structureClose < structureEma and regimeClose < regimeEma
+
+//====================================================================
+// 07. MULTI-TIMEFRAME LIQUIDITY MATRIX
+//====================================================================
+
+float h15 = request.security(syminfo.tickerid, "15", high[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float l15 = request.security(syminfo.tickerid, "15", low[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float h30 = request.security(syminfo.tickerid, "30", high[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float l30 = request.security(syminfo.tickerid, "30", low[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float h60 = request.security(syminfo.tickerid, "60", high[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float l60 = request.security(syminfo.tickerid, "60", low[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float h120 = request.security(syminfo.tickerid, "120", high[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float l120 = request.security(syminfo.tickerid, "120", low[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float h240 = request.security(syminfo.tickerid, "240", high[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float l240 = request.security(syminfo.tickerid, "240", low[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float hD = request.security(syminfo.tickerid, "D", high[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+float lD = request.security(syminfo.tickerid, "D", low[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+array<float> targetVals = array.new<float>()
+array<string> targetNames = array.new<string>()
+array<float> targetTfWeights = array.new<float>()
+
+f_addTarget(targetVals, targetNames, targetTfWeights, use15, h15, "15m HIGH", 0.45)
+f_addTarget(targetVals, targetNames, targetTfWeights, use15, l15, "15m LOW", 0.45)
+f_addTarget(targetVals, targetNames, targetTfWeights, use30, h30, "30m HIGH", 0.55)
+f_addTarget(targetVals, targetNames, targetTfWeights, use30, l30, "30m LOW", 0.55)
+f_addTarget(targetVals, targetNames, targetTfWeights, use60, h60, "1h HIGH", 0.65)
+f_addTarget(targetVals, targetNames, targetTfWeights, use60, l60, "1h LOW", 0.65)
+f_addTarget(targetVals, targetNames, targetTfWeights, use120, h120, "2h HIGH", 0.75)
+f_addTarget(targetVals, targetNames, targetTfWeights, use120, l120, "2h LOW", 0.75)
+f_addTarget(targetVals, targetNames, targetTfWeights, use240, h240, "4h HIGH", 0.88)
+f_addTarget(targetVals, targetNames, targetTfWeights, use240, l240, "4h LOW", 0.88)
+f_addTarget(targetVals, targetNames, targetTfWeights, useD, hD, "1D HIGH", 1.00)
+f_addTarget(targetVals, targetNames, targetTfWeights, useD, lD, "1D LOW", 1.00)
+
+//====================================================================
+// 08. PROBABILITY ENGINES
+//====================================================================
+
+float accScore = 100.0 * (
+     f_low(atrRatio, accAtrBest, accAtrWorst) * 0.25 +
+     f_low(efficiency, accEffBest, accEffWorst) * 0.25 +
+     f_high(overlap, 0.30, 0.75) * 0.20 +
+     f_low(math.abs(close - vwap) / math.max(atr, syminfo.mintick), 0.25, 1.25) * 0.15 +
+     f_low(bodyRatio, 0.25, 0.75) * 0.10 +
+     f_low(math.abs(flow), 0.05, 0.45) * 0.05)
+
+accScore := f_clamp(accScore, 0, 100)
+
+float priorHigh = ta.highest(high[1], sweepLookback)
+float priorLow = ta.lowest(low[1], sweepLookback)
+float sweepPen = atr * minSweepAtr
+
+bool anyHighSweep = not na(priorHigh) and high >= priorHigh + sweepPen and close < priorHigh
+bool anyLowSweep = not na(priorLow) and low <= priorLow - sweepPen and close > priorLow
+
+float upManip = 100.0 * (
+     f_bool(anyHighSweep) * 0.45 +
+     f_high(upperWickRatio, minWickRatio * 0.5, minWickRatio) * 0.20 +
+     f_low(closeLocation, 0.20, 0.65) * 0.15 +
+     f_high(rvol, 0.75, manipRvolRef) * 0.10 +
+     f_bool(close < open) * 0.10)
+
+float downManip = 100.0 * (
+     f_bool(anyLowSweep) * 0.45 +
+     f_high(lowerWickRatio, minWickRatio * 0.5, minWickRatio) * 0.20 +
+     f_high(closeLocation, 0.35, 0.80) * 0.15 +
+     f_high(rvol, 0.75, manipRvolRef) * 0.10 +
+     f_bool(close > open) * 0.10)
+
+upManip := f_clamp(upManip, 0, 100)
+downManip := f_clamp(downManip, 0, 100)
+
+float manipScore = math.max(upManip, downManip)
+int manipDirectionNow = downManip > upManip ? 1 : upManip > downManip ? -1 : 0
+
+float bullExpansion = 100.0 * (
+     f_high(close > open ? bodyAtr : 0.0, displacementWeak, displacementStrong) * 0.28 +
+     f_high(closeLocation, 0.50, 0.90) * 0.12 +
+     f_high(efficiency, 0.25, 0.75) * 0.16 +
+     f_high(atrRatio, 0.90, 1.40) * 0.12 +
+     f_high(rvol, 0.85, expansionRvolRef) * 0.10 +
+     f_high(flow, 0.00, 0.40) * 0.10 +
+     f_bool(rising) * 0.07 +
+     f_bool(close > vwap) * 0.05)
+
+float bearExpansion = 100.0 * (
+     f_high(close < open ? bodyAtr : 0.0, displacementWeak, displacementStrong) * 0.28 +
+     f_low(closeLocation, 0.10, 0.50) * 0.12 +
+     f_high(efficiency, 0.25, 0.75) * 0.16 +
+     f_high(atrRatio, 0.90, 1.40) * 0.12 +
+     f_high(rvol, 0.85, expansionRvolRef) * 0.10 +
+     f_high(-flow, 0.00, 0.40) * 0.10 +
+     f_bool(falling) * 0.07 +
+     f_bool(close < vwap) * 0.05)
+
+bullExpansion := f_clamp(bullExpansion, 0, 100)
+bearExpansion := f_clamp(bearExpansion, 0, 100)
+
+float expansionEdge = bullExpansion - bearExpansion
+
+float bullTrend = 100.0 * (
+     f_bool(emaFast > emaSlow) * 0.20 +
+     f_bool(close > emaFast) * 0.10 +
+     f_bool(close > vwap) * 0.10 +
+     f_high(efficiency, 0.25, trendEfficiencyRef) * 0.20 +
+     f_bool(rising) * 0.15 +
+     f_high(flow, 0.00, 0.35) * 0.10 +
+     f_bool(htfBull) * 0.15)
+
+float bearTrend = 100.0 * (
+     f_bool(emaFast < emaSlow) * 0.20 +
+     f_bool(close < emaFast) * 0.10 +
+     f_bool(close < vwap) * 0.10 +
+     f_high(efficiency, 0.25, trendEfficiencyRef) * 0.20 +
+     f_bool(falling) * 0.15 +
+     f_high(-flow, 0.00, 0.35) * 0.10 +
+     f_bool(htfBear) * 0.15)
+
+bullTrend := f_clamp(bullTrend, 0, 100)
+bearTrend := f_clamp(bearTrend, 0, 100)
+
+float extension = math.abs(close - emaFast) / math.max(atr, syminfo.mintick)
+float lowRvolScore = f_low(rvol, lowRvolRef, 1.10)
+float weakEfficiency = f_low(efficiency, 0.15, 0.50)
+
+float bullExhaustion = 100.0 * (
+     f_high(extension, extensionAtrRef * 0.6, extensionAtrRef) * 0.25 +
+     lowRvolScore * 0.15 +
+     weakEfficiency * 0.15 +
+     f_high(upperWickRatio, 0.25, 0.60) * 0.20 +
+     f_bool(close < open) * 0.10 +
+     f_bool(flow < 0) * 0.10 +
+     f_bool(close < emaFast) * 0.05)
+
+float bearExhaustion = 100.0 * (
+     f_high(extension, extensionAtrRef * 0.6, extensionAtrRef) * 0.25 +
+     lowRvolScore * 0.15 +
+     weakEfficiency * 0.15 +
+     f_high(lowerWickRatio, 0.25, 0.60) * 0.20 +
+     f_bool(close > open) * 0.10 +
+     f_bool(flow > 0) * 0.10 +
+     f_bool(close > emaFast) * 0.05)
+
+bullExhaustion := f_clamp(bullExhaustion, 0, 100)
+bearExhaustion := f_clamp(bearExhaustion, 0, 100)
+
+float reversalRisk = math.max(bullExhaustion, bearExhaustion)
+
+//====================================================================
+// 09. STATE ENGINE
+//====================================================================
+
+// 0 neutral, 1 accumulation, 2 manipulation,
+// 3 bull expansion, 4 bear expansion,
+// 5 bull trend, 6 bear trend,
+// 7 bull exhaustion, 8 bear exhaustion.
+
+var int state = 0
+var int stateStartBar = na
+var int lastAccBar = na
+var int lastManipBar = na
+var int latchedManipDir = 0
+var int lastBullStateBar = na
+var int lastBearStateBar = na
+
+int stateBars = na(stateStartBar) ? 0 : bar_index - stateStartBar
+bool minDurationMet = stateBars >= minStateBars
+bool accMemory = not na(lastAccBar) and bar_index - lastAccBar <= sequenceMemory
+bool manipMemory = not na(lastManipBar) and bar_index - lastManipBar <= manipMemoryBars
+bool bullCooldownPass = na(lastBearStateBar) or bar_index - lastBearStateBar >= oppositeCooldown
+bool bearCooldownPass = na(lastBullStateBar) or bar_index - lastBullStateBar >= oppositeCooldown
+
+bool htfBullPass = not requireHtfAlignment or htfBull
+bool htfBearPass = not requireHtfAlignment or htfBear
+
+bool accEnterCond = accScore >= accEnter
+bool accHoldCond = accScore >= accExit
+bool manipEnterCond = manipScore >= manipEnter and manipDirectionNow != 0
+bool orderedManipPass = not requireOrderedSequence or accMemory or state == 1
+
+bool bullExpEnter = bullExpansion >= expansionEnter and expansionEdge >= minDirectionalEdge and htfBullPass and
+     (not requireOrderedSequence or (manipMemory and latchedManipDir == 1))
+
+bool bearExpEnter = bearExpansion >= expansionEnter and expansionEdge <= -minDirectionalEdge and htfBearPass and
+     (not requireOrderedSequence or (manipMemory and latchedManipDir == -1))
+
+bool bullExpHold = bullExpansion >= expansionExit and expansionEdge > -minDirectionalEdge * 0.5
+bool bearExpHold = bearExpansion >= expansionExit and expansionEdge < minDirectionalEdge * 0.5
+bool bullTrendEnter = bullTrend >= trendEnter and htfBullPass
+bool bearTrendEnter = bearTrend >= trendEnter and htfBearPass
+bool bullTrendHold = bullTrend >= trendExit
+bool bearTrendHold = bearTrend >= trendExit
+bool bullExhaustEnter = bullExhaustion >= exhaustionEnter
+bool bearExhaustEnter = bearExhaustion >= exhaustionEnter
+bool bullExhaustHold = bullExhaustion >= exhaustionExit
+bool bearExhaustHold = bearExhaustion >= exhaustionExit
+
+bool tAcc = false
+bool tManip = false
+bool tBullExp = false
+bool tBearExp = false
+bool tBullTrend = false
+bool tBearTrend = false
+bool tBullExh = false
+bool tBearExh = false
+
+if barstate.isconfirmed
+    tAcc := false
+    tManip := false
+    tBullExp := false
+    tBearExp := false
+    tBullTrend := false
+    tBearTrend := false
+    tBullExh := false
+    tBearExh := false
+
+    if state == 0
+        if accEnterCond
+            state := 1
+            stateStartBar := bar_index
+            lastAccBar := bar_index
+            tAcc := true
+        else if manipEnterCond and not requireOrderedSequence
+            state := 2
+            stateStartBar := bar_index
+            lastManipBar := bar_index
+            latchedManipDir := manipDirectionNow
+            tManip := true
+        else if bullExpEnter and bullCooldownPass
+            state := 3
+            stateStartBar := bar_index
+            lastBullStateBar := bar_index
+            tBullExp := true
+        else if bearExpEnter and bearCooldownPass
+            state := 4
+            stateStartBar := bar_index
+            lastBearStateBar := bar_index
+            tBearExp := true
+
+    else if state == 1
+        if accHoldCond
+            lastAccBar := bar_index
+
+        if minDurationMet and manipEnterCond and orderedManipPass
+            state := 2
+            stateStartBar := bar_index
+            lastManipBar := bar_index
+            latchedManipDir := manipDirectionNow
+            tManip := true
+        else if minDurationMet and not accHoldCond
+            state := 0
+            stateStartBar := bar_index
+
+    else if state == 2
+        if manipEnterCond
+            lastManipBar := bar_index
+            latchedManipDir := manipDirectionNow
+
+        if minDurationMet and bullExpEnter and bullCooldownPass
+            state := 3
+            stateStartBar := bar_index
+            lastBullStateBar := bar_index
+            tBullExp := true
+        else if minDurationMet and bearExpEnter and bearCooldownPass
+            state := 4
+            stateStartBar := bar_index
+            lastBearStateBar := bar_index
+            tBearExp := true
+        else if minDurationMet and not manipMemory
+            state := accEnterCond ? 1 : 0
+            stateStartBar := bar_index
+            if state == 1
+                lastAccBar := bar_index
+                tAcc := true
+
+    else if state == 3
+        lastBullStateBar := bar_index
+
+        if minDurationMet and bullTrendEnter
+            state := 5
+            stateStartBar := bar_index
+            tBullTrend := true
+        else if minDurationMet and bullExhaustEnter
+            state := 7
+            stateStartBar := bar_index
+            tBullExh := true
+        else if minDurationMet and not bullExpHold
+            state := 0
+            stateStartBar := bar_index
+
+    else if state == 4
+        lastBearStateBar := bar_index
+
+        if minDurationMet and bearTrendEnter
+            state := 6
+            stateStartBar := bar_index
+            tBearTrend := true
+        else if minDurationMet and bearExhaustEnter
+            state := 8
+            stateStartBar := bar_index
+            tBearExh := true
+        else if minDurationMet and not bearExpHold
+            state := 0
+            stateStartBar := bar_index
+
+    else if state == 5
+        lastBullStateBar := bar_index
+
+        if minDurationMet and bullExhaustEnter
+            state := 7
+            stateStartBar := bar_index
+            tBullExh := true
+        else if minDurationMet and not bullTrendHold
+            state := 0
+            stateStartBar := bar_index
+
+    else if state == 6
+        lastBearStateBar := bar_index
+
+        if minDurationMet and bearExhaustEnter
+            state := 8
+            stateStartBar := bar_index
+            tBearExh := true
+        else if minDurationMet and not bearTrendHold
+            state := 0
+            stateStartBar := bar_index
+
+    else if state == 7
+        if minDurationMet and not bullExhaustHold
+            state := accEnterCond ? 1 : 0
+            stateStartBar := bar_index
+            if state == 1
+                lastAccBar := bar_index
+                tAcc := true
+
+    else if state == 8
+        if minDurationMet and not bearExhaustHold
+            state := accEnterCond ? 1 : 0
+            stateStartBar := bar_index
+            if state == 1
+                lastAccBar := bar_index
+                tAcc := true
+
+//====================================================================
+// 10. COMPOSITE EDGE + TARGET RANKING
+//====================================================================
+
+float bullComposite = 0.45 * bullExpansion + 0.35 * bullTrend + 0.20 * (100.0 - bullExhaustion)
+float bearComposite = 0.45 * bearExpansion + 0.35 * bearTrend + 0.20 * (100.0 - bearExhaustion)
+float compositeEdge = bullComposite - bearComposite
+
+string bias = compositeEdge >= minDirectionalEdge ? "BULL" : compositeEdge <= -minDirectionalEdge ? "BEAR" : "MIXED"
+
+float expectedMoveAtr = f_clamp(
+     (0.75 + f_high(atrRatio, 0.80, 1.50) * 0.70) *
+     (0.75 + f_high(rvol, 0.70, 1.60) * 0.60) *
+     (0.75 + f_high(efficiency, 0.20, 0.75) * 0.60),
+     0.25,
+     4.00)
+
+int targetCount = array.size(targetVals)
+int bestIdx = -1
+int secondIdx = -1
+float bestScore = -1.0
+float secondScore = -1.0
+float bestDistance = na
+float secondDistance = na
+
+if targetCount > 0
+    for i = 0 to targetCount - 1
+        float level = array.get(targetVals, i)
+        float tfWeight = array.get(targetTfWeights, i)
+        bool above = level > close
+        float distanceAtr = math.abs(level - close) / math.max(atr, syminfo.mintick)
+
+        float directionalSupport = above
+             ? f_clamp(bullComposite / 100.0, 0.0, 1.0)
+             : f_clamp(bearComposite / 100.0, 0.0, 1.0)
+
+        float distanceScore = f_low(distanceAtr, 0.40, maxTargetDistanceAtr)
+        float reachability = expectedMoveAtr > 0 ? f_clamp(expectedMoveAtr / math.max(distanceAtr, 0.10), 0.0, 1.0) : 0.0
+        float score = 100.0 * (directionalSupport * 0.40 + tfWeight * 0.25 + distanceScore * 0.20 + reachability * 0.15)
+
+        if distanceAtr <= maxTargetDistanceAtr
+            if score > bestScore
+                secondIdx := bestIdx
+                secondScore := bestScore
+                secondDistance := bestDistance
+                bestIdx := i
+                bestScore := score
+                bestDistance := distanceAtr
+            else if score > secondScore
+                secondIdx := i
+                secondScore := score
+                secondDistance := distanceAtr
+
+float target1 = bestIdx >= 0 ? array.get(targetVals, bestIdx) : na
+string target1Name = bestIdx >= 0 ? array.get(targetNames, bestIdx) : "NONE"
+float target2 = secondIdx >= 0 ? array.get(targetVals, secondIdx) : na
+string target2Name = secondIdx >= 0 ? array.get(targetNames, secondIdx) : "NONE"
+
+float activeProbability =
+     state == 1 ? accScore :
+     state == 2 ? manipScore :
+     state == 3 ? bullExpansion :
+     state == 4 ? bearExpansion :
+     state == 5 ? bullTrend :
+     state == 6 ? bearTrend :
+     state == 7 ? bullExhaustion :
+     state == 8 ? bearExhaustion :
+     math.max(accScore, math.max(manipScore, math.max(bullExpansion, bearExpansion)))
+
+string nextState =
+     state == 0 ? (accScore >= manipScore ? "ACCUMULATION" : "MANIPULATION") :
+     state == 1 ? (downManip >= upManip ? "DOWN SWEEP" : "UP SWEEP") :
+     state == 2 ? (latchedManipDir == 1 ? "BULL EXPANSION" : latchedManipDir == -1 ? "BEAR EXPANSION" : "WAIT") :
+     state == 3 ? (bullTrend >= bullExhaustion ? "BULL TREND" : "BULL EXHAUST") :
+     state == 4 ? (bearTrend >= bearExhaustion ? "BEAR TREND" : "BEAR EXHAUST") :
+     state == 5 ? "BULL EXHAUST" :
+     state == 6 ? "BEAR EXHAUST" :
+     state == 7 or state == 8 ? "RESET" :
+     "WAIT"
+
+string grade =
+     math.abs(compositeEdge) >= 40 ? "A+" :
+     math.abs(compositeEdge) >= 30 ? "A" :
+     math.abs(compositeEdge) >= 20 ? "B" :
+     math.abs(compositeEdge) >= 12 ? "C" :
+     "WAIT"
+
+//====================================================================
+// 10B. STRATEGY ROUTER
+//====================================================================
+// Maps the state engine's own phase classification onto which strategy in
+// the user's library is best suited to trade the CURRENT market condition.
+// This script cannot see or control other scripts -- Pine has no
+// cross-script API -- so this is advisory only: read the recommendation
+// off the dashboard (rows 18-19) or the enriched dynamic alert below, and
+// act on whichever chart/strategy it names. Edit the six label inputs
+// above (group "12 - Strategy Router") if your strategies are named
+// differently -- no code change needed.
+
+string routedStrategy =
+     state == 1 ? labelAccumulation :
+     state == 2 ? labelManipulation :
+     (state == 3 or state == 4) ? labelExpansion :
+     (state == 5 or state == 6) ? labelTrend :
+     (state == 7 or state == 8) ? labelExhaustion :
+     labelNeutral
+
+// Short, metric-grounded caution/confirmation note for the routed
+// recommendation -- reuses thresholds and readings already computed above
+// rather than introducing new inputs.
+string routerNote =
+     state == 1 ? (atrRatio <= accAtrBest ? "Strong contraction -- high-quality range" : "Mild contraction only") :
+     state == 2 ? (rvol >= manipRvolRef ? "RVOL confirms the sweep" : "Low RVOL -- weak sweep") :
+     (state == 3 or state == 4) ? (rvol >= expansionRvolRef ? "RVOL confirms displacement" : "Low RVOL -- watch for failed break") :
+     state == 5 ? (htfBull ? "HTF aligned" : "HTF disagrees -- reduce size") :
+     state == 6 ? (htfBear ? "HTF aligned" : "HTF disagrees -- reduce size") :
+     (state == 7 or state == 8) ? "Extension " + f_num(extension) + " ATR -- late stage, no fresh entries" :
+     "Awaiting phase definition"
+
+color routerColor = f_stateColor(state)
+
+//====================================================================
+// 11. VISUALS
+//====================================================================
+
+color stateColor = f_stateColor(state)
+bool ribbonOn = phaseDisplay == "Ribbon" or phaseDisplay == "Ribbon + Background"
+bool backgroundOn = phaseDisplay == "Background" or phaseDisplay == "Ribbon + Background"
+
+plotshape(ribbonOn, title = "State Ribbon", style = shape.square, location = location.bottom, color = stateColor, size = size.tiny)
+bgcolor(backgroundOn ? color.new(stateColor, 93) : na, title = "State Background")
+barcolor(colorBars ? color.new(stateColor, 35) : na)
+
+plot(showEmas ? emaFast : na, "EMA Fast", color = color.new(color.blue, 25))
+plot(showEmas ? emaSlow : na, "EMA Slow", color = color.new(color.orange, 25))
+
+plotshape(showTransitions and tAcc, title = "Accumulation", style = shape.circle, location = location.bottom, color = cAccum, size = size.tiny, text = "A", textcolor = color.white)
+plotshape(showTransitions and tManip, title = "Manipulation", style = shape.diamond, location = location.bottom, color = cManip, size = size.tiny, text = "M", textcolor = color.white)
+plotshape(showTransitions and tBullExp, title = "Bull Expansion", style = shape.triangleup, location = location.belowbar, color = cBullExp, size = size.tiny, text = "E", textcolor = color.white)
+plotshape(showTransitions and tBearExp, title = "Bear Expansion", style = shape.triangledown, location = location.abovebar, color = cBearExp, size = size.tiny, text = "E", textcolor = color.white)
+plotshape(showTransitions and tBullTrend, title = "Bull Trend", style = shape.triangleup, location = location.belowbar, color = cBullTrend, size = size.tiny, text = "T", textcolor = color.white)
+plotshape(showTransitions and tBearTrend, title = "Bear Trend", style = shape.triangledown, location = location.abovebar, color = cBearTrend, size = size.tiny, text = "T", textcolor = color.white)
+plotshape(showTransitions and tBullExh, title = "Bull Exhaustion", style = shape.xcross, location = location.abovebar, color = cExhaust, size = size.tiny, text = "X", textcolor = color.white)
+plotshape(showTransitions and tBearExh, title = "Bear Exhaustion", style = shape.xcross, location = location.belowbar, color = cExhaust, size = size.tiny, text = "X", textcolor = color.white)
+
+var line targetLine1 = na
+var line targetLine2 = na
+var label targetLabel1 = na
+var label targetLabel2 = na
+
+if barstate.islast
+    if not na(targetLine1)
+        line.delete(targetLine1)
+    if not na(targetLine2)
+        line.delete(targetLine2)
+    if not na(targetLabel1)
+        label.delete(targetLabel1)
+    if not na(targetLabel2)
+        label.delete(targetLabel2)
+
+    targetLine1 := na
+    targetLine2 := na
+    targetLabel1 := na
+    targetLabel2 := na
+
+    if not na(target1)
+        color tc1 = target1 > close ? cBullExp : cBearExp
+        targetLine1 := line.new(bar_index, target1, bar_index + targetExtensionBars, target1, xloc = xloc.bar_index, color = tc1, width = 2, style = line.style_dashed)
+
+        if showTargetLabels
+            targetLabel1 := label.new(
+                 bar_index + targetExtensionBars,
+                 target1,
+                 "#1 " + target1Name + "\n" + f_price(target1) + "\nQ " + f_num(bestScore) + " | " + f_num(bestDistance) + " ATR",
+                 xloc = xloc.bar_index,
+                 yloc = yloc.price,
+                 color = cDark,
+                 textcolor = color.white,
+                 style = label.style_label_left,
+                 size = size.small)
+
+    if showSecondTarget and not na(target2)
+        color tc2 = target2 > close ? color.new(cBullExp, 35) : color.new(cBearExp, 35)
+        targetLine2 := line.new(bar_index, target2, bar_index + targetExtensionBars, target2, xloc = xloc.bar_index, color = tc2, width = 1, style = line.style_dotted)
+
+        if showTargetLabels
+            targetLabel2 := label.new(
+                 bar_index + targetExtensionBars,
+                 target2,
+                 "#2 " + target2Name + " " + f_num(secondScore),
+                 xloc = xloc.bar_index,
+                 yloc = yloc.price,
+                 color = cDark,
+                 textcolor = color.white,
+                 style = label.style_label_left,
+                 size = size.tiny)
+
+//====================================================================
+// 12. DASHBOARD
+//====================================================================
+
+resolvedPos =
+     dashPosition == "Top Left" ? position.top_left :
+     dashPosition == "Middle Right" ? position.middle_right :
+     dashPosition == "Middle Left" ? position.middle_left :
+     dashPosition == "Bottom Right" ? position.bottom_right :
+     dashPosition == "Bottom Left" ? position.bottom_left :
+     position.top_right
+
+resolvedSize =
+     dashSize == "Large" ? size.normal :
+     dashSize == "Medium" ? size.small :
+     dashSize == "Phone" ? size.small :
+     size.tiny
+
+var table dash = table.new(
+     resolvedPos,
+     2,
+     20,
+     bgcolor = cDark,
+     border_color = color.rgb(65, 80, 105),
+     border_width = 1,
+     frame_color = cAccum,
+     frame_width = 2)
+
+f_row(int row, string left, string right, color bg) =>
+    table.cell(dash, 0, row, left, bgcolor = row % 2 == 0 ? cCell : cCell2, text_color = cMuted, text_size = resolvedSize, text_halign = text.align_left)
+    table.cell(dash, 1, row, right, bgcolor = bg, text_color = cText, text_size = resolvedSize, text_halign = text.align_right)
+
+if showDashboard and barstate.islast
+    table.clear(dash, 0, 0, 1, 19)
+
+    f_row(0, "ACADEMIA PO3 v3", "READY", stateColor)
+    f_row(1, "STATE", f_stateName(state), stateColor)
+    f_row(2, "NEXT", nextState, cExhaust)
+    f_row(3, "ACTIVE PROB", f_num(activeProbability), stateColor)
+    f_row(4, "ACC", f_num(accScore), accScore >= accEnter ? cAccum : cCell2)
+    f_row(5, "MANIP U / D", f_num(upManip) + " / " + f_num(downManip), manipScore >= manipEnter ? cManip : cCell2)
+    f_row(6, "EXP B / S", f_num(bullExpansion) + " / " + f_num(bearExpansion), expansionEdge >= 0 ? cBullExp : cBearExp)
+    f_row(7, "TREND B / S", f_num(bullTrend) + " / " + f_num(bearTrend), bullTrend >= bearTrend ? cBullTrend : cBearTrend)
+    f_row(8, "EXHAUST B / S", f_num(bullExhaustion) + " / " + f_num(bearExhaustion), cExhaust)
+    f_row(9, "REVERSAL RISK", f_num(reversalRisk), reversalRisk >= exhaustionEnter ? cExhaust : cCell2)
+    f_row(10, "BIAS / EDGE", bias + " / " + f_num(compositeEdge), bias == "BULL" ? cBullExp : bias == "BEAR" ? cBearExp : cNeutral)
+    f_row(11, "GRADE", grade, grade == "A+" or grade == "A" ? cBullTrend : grade == "B" ? cAccum : cNeutral)
+    f_row(12, "HTF", htfBull ? "BULL" : htfBear ? "BEAR" : "MIXED", htfBull ? cBullTrend : htfBear ? cBearTrend : cNeutral)
+    f_row(13, "RVOL / FLOW", f_num(rvol) + " / " + f_num(flow), flow >= 0 ? cBullExp : cBearExp)
+    f_row(14, "EXPECTED MOVE", f_num(expectedMoveAtr) + " ATR", expectedMoveAtr >= 1.0 ? cBullTrend : cCell2)
+    f_row(15, "TARGET", target1Name, not na(target1) ? (target1 > close ? cBullExp : cBearExp) : cNeutral)
+    f_row(16, "TARGET Q / DIST", f_num(bestScore) + " / " + f_num(bestDistance), bestScore >= 70 ? cBullTrend : bestScore >= 55 ? cManip : cNeutral)
+    f_row(17, "STATE BARS", str.tostring(stateBars), cCell2)
+
+    if showRouter
+        f_row(18, "STRATEGY FIT", routedStrategy, routerColor)
+        f_row(19, "ROUTER NOTE", routerNote, cCell2)
+
+if not showDashboard and barstate.islast
+    table.clear(dash, 0, 0, 1, 19)
+
+//====================================================================
+// 13. ALERTS
+//====================================================================
+
+alertcondition(tAcc, "Academia PO3 v3 — Accumulation", "Accumulation state confirmed — {{ticker}} {{interval}}")
+alertcondition(tManip, "Academia PO3 v3 — Manipulation", "Manipulation state confirmed — {{ticker}} {{interval}}")
+alertcondition(tBullExp, "Academia PO3 v3 — Bull Expansion", "Bull expansion confirmed — {{ticker}} {{interval}}")
+alertcondition(tBearExp, "Academia PO3 v3 — Bear Expansion", "Bear expansion confirmed — {{ticker}} {{interval}}")
+alertcondition(tBullTrend, "Academia PO3 v3 — Bull Trend", "Bull trend confirmed — {{ticker}} {{interval}}")
+alertcondition(tBearTrend, "Academia PO3 v3 — Bear Trend", "Bear trend confirmed — {{ticker}} {{interval}}")
+alertcondition(tBullExh or tBearExh, "Academia PO3 v3 — Exhaustion", "Exhaustion state confirmed — {{ticker}} {{interval}}")
+
+if dynamicAlerts and (tBullExp or tBearExp or tBullTrend or tBearTrend or tBullExh or tBearExh)
+    alert(
+         "ACADEMIA PO3 v3\n" +
+         syminfo.ticker + " | " + timeframe.period +
+         "\nState: " + f_stateName(state) +
+         "\nProbability: " + f_num(activeProbability) +
+         "\nBias: " + bias +
+         "\nEdge: " + f_num(compositeEdge) +
+         "\nGrade: " + grade +
+         "\nTarget: " + target1Name + " " + f_price(target1) +
+         "\nSuggested Strategy: " + routedStrategy +
+         "\nNote: " + routerNote,
+         alert.freq_once_per_bar_close)
+
+//====================================================================
+// 14. DATA WINDOW
+//====================================================================
+
+plot(accScore, "Accumulation Probability", display = display.data_window)
+plot(upManip, "Upside Manipulation Probability", display = display.data_window)
+plot(downManip, "Downside Manipulation Probability", display = display.data_window)
+plot(bullExpansion, "Bull Expansion Probability", display = display.data_window)
+plot(bearExpansion, "Bear Expansion Probability", display = display.data_window)
+plot(bullTrend, "Bull Trend Probability", display = display.data_window)
+plot(bearTrend, "Bear Trend Probability", display = display.data_window)
+plot(bullExhaustion, "Bull Exhaustion Probability", display = display.data_window)
+plot(bearExhaustion, "Bear Exhaustion Probability", display = display.data_window)
+plot(reversalRisk, "Reversal Risk", display = display.data_window)
+plot(compositeEdge, "Composite Edge", display = display.data_window)
+plot(expectedMoveAtr, "Expected Move ATR", display = display.data_window)
+plot(target1, "Primary Target", display = display.data_window)
+plot(bestScore, "Primary Target Quality", display = display.data_window)
+plot(float(state), "State Encoding", display = display.data_window)

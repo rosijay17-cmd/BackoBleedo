@@ -1,0 +1,91 @@
+//@version=6
+strategy("Trend State Strategy", "TSS_Strat", overlay = true, initial_capital = 1000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100)
+
+// INPUTS
+groupCalc   = "Calculation"
+groupVisual = "Visuals"
+
+src_type    = input.string("Custom", "Source Type", options = ["Close", "HL2", "HLC3", "OHLC4", "OCC3", "HLCC4", "Custom"], group = groupCalc)
+src = switch src_type
+    "Close"  => close
+    "HL2"    => (high + low) / 2
+    "HLC3"   => (high + low + close) / 3
+    "OHLC4"  => (open + high + low + close) / 4
+    "HLCC4"  => (high + low + 2 * close) / 4
+    "OCC3"   => (open + 2 * close) / 3
+    => (open + 2 * high + 2 * low + 2 * close) / 7
+
+length        = input.int(5, "Sensitivity Length", minval = 1, group = groupCalc)
+multiplier    = input.float(2, "Range Multiplier", minval = 0.1, step = 0.025, group = groupCalc)
+offset        = input.float(0.5, "Offset", minval = 0.5, step = 0.025, group = groupCalc)
+sigma         = input.float(1, "Sigma", minval = 1, step = 0.025, group = groupCalc)
+confirmClose  = input.bool(true, "Confirm Signals On Bar Close", group = groupCalc)
+
+bullColor     = input.color(#00FFAA, "Bullish Color", group = groupVisual)
+bearColor     = input.color(#FF0000, "Bearish Color", group = groupVisual)
+showGlow      = input.bool(true, "Show Line Glow", group = groupVisual)
+showRibbon    = input.bool(true, "Show Gradient Ribbon", group = groupVisual)
+showLabels    = input.bool(true, "Show Bullish/Bearish Labels", group = groupVisual)
+labelDist     = input.float(1.0, "Label Vertical Distance", minval = 0, maxval = 5, step = 0.1, group = groupVisual)
+paintCandles  = input.bool(true, "Color Candles", group = groupVisual)
+
+// ADAPTIVE RANGE
+movement      = math.abs(ta.change(src))
+smoothMove    = ta.alma(movement, length, offset, sigma)
+adaptiveRange = smoothMove * multiplier
+
+// STEP FILTER
+var float filter = na
+prevFilter       = nz(filter[1], src)
+
+upper = prevFilter + adaptiveRange
+lower = prevFilter - adaptiveRange
+
+filter := (src > upper ? src - adaptiveRange :
+          src < lower ? src + adaptiveRange :
+          prevFilter)
+
+// TREND STATE
+var int trend = 0
+trend := filter > filter[1] ? 1 :
+         filter < filter[1] ? -1 :
+         nz(trend[1], 0)
+
+bull = trend == 1
+bear = trend == -1
+
+trendColor = bull ? bullColor : bear ? bearColor : color.gray
+
+bullSignal = confirmClose ? (trend[1] == 1 and nz(trend[2]) != 1) : (bull and nz(trend[1]) != 1)
+bearSignal = confirmClose ? (trend[1] == -1 and nz(trend[2]) != -1) : (bear and nz(trend[1]) != -1)
+
+// STRATEGY LOGIC (Wejście Long na BUY, wyjście na SELL)
+if bullSignal
+    strategy.entry("Long", strategy.long)
+
+if bearSignal
+    strategy.close("Long")
+
+// VISUALIZATION
+plot(showGlow ? filter : na, "Trend Line Glow", color.new(trendColor, 82), 7)
+
+filterPlot = plot(filter, "Trend State Line", trendColor, 3)
+pricePlot  = plot(hl2, "Price Midpoint", display = display.none)
+
+ribbonColor = showRibbon ? color.new(trendColor, 20) : na
+
+fill(filterPlot, pricePlot, hl2, filter, na, ribbonColor, title = "Trend State Ribbon")
+
+bullPos = confirmClose ? filter[1] - adaptiveRange[1] * labelDist : filter - adaptiveRange * labelDist
+bearPos = confirmClose ? filter[1] + adaptiveRange[1] * labelDist : filter + adaptiveRange * labelDist
+
+// SIGNAL LABELS
+plotshape(showLabels and bullSignal ? bullPos : na,
+          "Bullish Signal", shape.labelup, location.absolute,
+          bullColor, text = "BUY", textcolor = color.white, size = size.tiny, offset = confirmClose ? -1 : 0)
+
+plotshape(showLabels and bearSignal ? bearPos : na,
+          "Bearish Signal", shape.labeldown, location.absolute,
+          bearColor, text = "SELL", textcolor = color.white, size = size.tiny, offset = confirmClose ? -1 : 0)
+
+barcolor(paintCandles ? trendColor : na, title = "Trend Candles")

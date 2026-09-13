@@ -1,0 +1,2493 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════
+// LDPT Liquidity Destination Map — Enhanced
+// Informational overlay only. No orders. No signals. No strategy.
+//
+// Intended chart timeframe: 5 minutes.
+// ═══════════════════════════════════════════════════════════════════
+
+indicator(
+     title            = "LDPT Liquidity Destination Map — Enhanced",
+     shorttitle       = "LDPT Map+",
+     overlay          = true,
+     max_lines_count  = 50,
+     max_labels_count = 50)
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 1 — INPUTS
+// ─────────────────────────────────────────────────────────────────
+
+const string GROUP_DISPLAY = "Display"
+const string GROUP_CONF    = "Destination Confidence"
+
+int i_extend = input.int(
+     40,
+     "Destination Line Extension",
+     minval = 1,
+     maxval = 200,
+     group  = GROUP_DISPLAY)
+
+bool i_show_sec = input.bool(
+     true,
+     "Show Liquidity Path Ranks 2–3",
+     group = GROUP_DISPLAY)
+
+bool i_show_label = input.bool(
+     false,
+     "Show Large Destination Label",
+     group = GROUP_DISPLAY)
+
+bool i_show_audit = input.bool(
+     false,
+     "Parity Audit Mode",
+     group = GROUP_DISPLAY)
+
+string i_dash_pos = input.string(
+     "Top Right",
+     "Dashboard Position",
+     options = [
+         "Top Right",
+         "Top Left",
+         "Bottom Right",
+         "Bottom Left",
+         "Middle Right",
+         "Middle Left"
+     ],
+     group = GROUP_DISPLAY)
+
+string i_dash_size = input.string(
+     "Phone",
+     "Dashboard Font Size",
+     options = [
+         "Compact",
+         "Phone",
+         "Large"
+     ],
+     group = GROUP_DISPLAY)
+
+float i_high_rvol = input.float(
+     1.00,
+     "Strong Relative Volume",
+     minval = 0.10,
+     step   = 0.05,
+     group  = GROUP_CONF)
+
+float i_good_distance = input.float(
+     1.00,
+     "Preferred Maximum Distance ATR",
+     minval = 0.10,
+     step   = 0.10,
+     group  = GROUP_CONF)
+
+float i_max_distance = input.float(
+     2.50,
+     "Maximum Quality Distance ATR",
+     minval = 0.25,
+     step   = 0.25,
+     group  = GROUP_CONF)
+
+float i_good_margin = input.float(
+     0.05,
+     "Strong Probability Margin",
+     minval = 0.00,
+     maxval = 1.00,
+     step   = 0.01,
+     group  = GROUP_CONF)
+
+int i_max_intervening = input.int(
+     2,
+     "Maximum Preferred Intervening Levels",
+     minval = 0,
+     maxval = 10,
+     group  = GROUP_CONF)
+
+bool i_require_trend = input.bool(
+     false,
+     "Require Trend Alignment For A Grade",
+     group = GROUP_CONF)
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 2 — FROZEN CONSTANTS
+// ─────────────────────────────────────────────────────────────────
+
+int ATR_P      = 14
+int SWING_N    = 3
+int SWING_WIN  = 20
+int OR_BARS_N  = 6
+int EQ_WIN     = 50
+
+float EQ_TOL_ATR = 0.15
+
+int RTH_OPEN   = 570
+int RTH_CLOSE  = 960
+int LON_OPEN   = 180
+int LON_CLOSE  = 510
+int POST_CLOSE = 1080
+
+const string TZ = "America/New_York"
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 3 — FROZEN MODEL PARAMETERS
+// ─────────────────────────────────────────────────────────────────
+
+// Imputation medians.
+float MED_DIST_ATR = 5.38270
+float MED_RANK     = 4.00000
+float MED_N_SAME   = 9.00000
+float MED_DIST_OPP = 0.73516
+float MED_LIQ_ASYM = -0.05882
+float MED_RVOL     = 0.89736
+float MED_BB_W     = 0.002335
+float MED_RET5     = 0.06552
+float MED_RET20    = 0.22340
+float MED_VWAP_D   = 0.31434
+float MED_PRC_E21  = 0.13109
+float MED_EMA_SLP  = 0.01242
+
+// StandardScaler means.
+float MU0  = 49.75819
+float MU1  = 4.90265
+float MU2  = 9.30949
+float MU3  = 1.05660
+float MU4  = -0.05926
+float MU5  = 1.06974
+float MU6  = 0.003293
+float MU7  = 0.04418
+float MU8  = 0.24950
+float MU9  = 0.37080
+float MU10 = 0.11477
+float MU11 = 0.01227
+
+// StandardScaler scales.
+float SC0  = 182.64396
+float SC1  = 3.19510
+float SC2  = 2.98916
+float SC3  = 2.73049
+float SC4  = 0.32367
+float SC5  = 0.79519
+float SC6  = 0.003039
+float SC7  = 1.42410
+float SC8  = 2.84498
+float SC9  = 1.58849
+float SC10 = 1.37753
+float SC11 = 0.12619
+
+// Logistic regression coefficients.
+float C0  = -41.01222704
+float C1  = -0.37953430
+float C2  = 0.00512509
+float C3  = 0.04588369
+float C4  = -0.01560197
+float C5  = 0.13484882
+float C6  = -0.16080274
+float C7  = -0.02547422
+float C8  = 0.01137328
+float C9  = -0.07713399
+float C10 = 0.01349919
+float C11 = 0.04269445
+
+float INTERCEPT = -11.12582194
+float P_OPP_AGG = 0.1120
+
+float TIE_EPSILON = 1e-10
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 4 — HELPER FUNCTIONS
+// ─────────────────────────────────────────────────────────────────
+
+_f_imp(float value, float medianValue) =>
+    na(value) ? medianValue : value
+
+_touch_prob(
+     float da,
+     int rk,
+     int ns,
+     float dopp,
+     float la,
+     float rv,
+     float bw,
+     float r5,
+     float r20,
+     float vd,
+     float pe,
+     float es) =>
+
+    float x0  = _f_imp(da, MED_DIST_ATR)
+    float x1  = _f_imp(float(rk), MED_RANK)
+    float x2  = _f_imp(float(ns), MED_N_SAME)
+    float x3  = _f_imp(dopp, MED_DIST_OPP)
+    float x4  = _f_imp(la, MED_LIQ_ASYM)
+    float x5  = _f_imp(rv, MED_RVOL)
+    float x6  = _f_imp(bw, MED_BB_W)
+    float x7  = _f_imp(r5, MED_RET5)
+    float x8  = _f_imp(r20, MED_RET20)
+    float x9  = _f_imp(vd, MED_VWAP_D)
+    float x10 = _f_imp(pe, MED_PRC_E21)
+    float x11 = _f_imp(es, MED_EMA_SLP)
+
+    float lp =
+         INTERCEPT +
+         C0  * (x0  - MU0)  / SC0 +
+         C1  * (x1  - MU1)  / SC1 +
+         C2  * (x2  - MU2)  / SC2 +
+         C3  * (x3  - MU3)  / SC3 +
+         C4  * (x4  - MU4)  / SC4 +
+         C5  * (x5  - MU5)  / SC5 +
+         C6  * (x6  - MU6)  / SC6 +
+         C7  * (x7  - MU7)  / SC7 +
+         C8  * (x8  - MU8)  / SC8 +
+         C9  * (x9  - MU9)  / SC9 +
+         C10 * (x10 - MU10) / SC10 +
+         C11 * (x11 - MU11) / SC11
+
+    float probability = na
+
+    if lp >= 0.0
+        probability := 1.0 / (1.0 + math.exp(-lp))
+    else
+        float expLp = math.exp(lp)
+        probability := expLp / (1.0 + expLp)
+
+    probability
+
+_path_stats(string levelType) =>
+    float pClean = na
+    float pStop  = na
+    float eta    = na
+
+    if levelType == "sess_high"
+        pClean := 0.3789
+        pStop  := 0.2859
+        eta    := 12.7
+    else if levelType == "sess_low"
+        pClean := 0.3630
+        pStop  := 0.2969
+        eta    := 13.4
+    else if levelType == "prev_sess_high"
+        pClean := 0.3768
+        pStop  := 0.2948
+        eta    := 14.0
+    else if levelType == "prev_sess_low"
+        pClean := 0.3684
+        pStop  := 0.2887
+        eta    := 14.0
+    else if levelType == "overnight_high"
+        pClean := 0.3835
+        pStop  := 0.2816
+        eta    := 12.6
+    else if levelType == "overnight_low"
+        pClean := 0.3640
+        pStop  := 0.2976
+        eta    := 13.4
+    else if levelType == "london_high"
+        pClean := 0.3763
+        pStop  := 0.2865
+        eta    := 13.8
+    else if levelType == "london_low"
+        pClean := 0.2621
+        pStop  := 0.4417
+        eta    := 16.6
+    else if levelType == "or_high"
+        pClean := 0.4636
+        pStop  := 0.1893
+        eta    := 10.9
+    else if levelType == "or_low"
+        pClean := 0.4593
+        pStop  := 0.1815
+        eta    := 10.8
+    else if levelType == "vwap"
+        pClean := 0.4558
+        pStop  := 0.1841
+        eta    := 8.3
+    else if levelType == "prev_day_high"
+        pClean := 0.3824
+        pStop  := 0.2893
+        eta    := 13.3
+    else if levelType == "prev_day_low"
+        pClean := 0.3622
+        pStop  := 0.3081
+        eta    := 14.5
+    else if levelType == "prev_week_high"
+        pClean := 0.3674
+        pStop  := 0.3147
+        eta    := 14.4
+    else if levelType == "prev_week_low"
+        pClean := 0.3592
+        pStop  := 0.2906
+        eta    := 14.6
+    else if levelType == "swing_high_20"
+        pClean := 0.4196
+        pStop  := 0.2555
+        eta    := 9.6
+    else if levelType == "swing_low_20"
+        pClean := 0.4010
+        pStop  := 0.2640
+        eta    := 10.0
+    else if levelType == "eq_high"
+        pClean := 0.4043
+        pStop  := 0.2678
+        eta    := 10.7
+    else if levelType == "eq_low"
+        pClean := 0.3851
+        pStop  := 0.2842
+        eta    := 10.9
+    else if levelType == "fvg_upper"
+        pClean := 0.4252
+        pStop  := 0.2609
+        eta    := 7.9
+    else if levelType == "fvg_lower"
+        pClean := 0.4412
+        pStop  := 0.2324
+        eta    := 8.2
+
+    [pClean, pStop, eta]
+
+_enc_ltype(string levelType) =>
+    int result = -1
+
+    if levelType == "sess_high"
+        result := 0
+    else if levelType == "sess_low"
+        result := 1
+    else if levelType == "prev_sess_high"
+        result := 2
+    else if levelType == "prev_sess_low"
+        result := 3
+    else if levelType == "overnight_high"
+        result := 4
+    else if levelType == "overnight_low"
+        result := 5
+    else if levelType == "london_high"
+        result := 6
+    else if levelType == "london_low"
+        result := 7
+    else if levelType == "or_high"
+        result := 8
+    else if levelType == "or_low"
+        result := 9
+    else if levelType == "vwap"
+        result := 10
+    else if levelType == "prev_day_high"
+        result := 11
+    else if levelType == "prev_day_low"
+        result := 12
+    else if levelType == "prev_week_high"
+        result := 13
+    else if levelType == "prev_week_low"
+        result := 14
+    else if levelType == "swing_high_20"
+        result := 15
+    else if levelType == "swing_low_20"
+        result := 16
+    else if levelType == "eq_high"
+        result := 17
+    else if levelType == "eq_low"
+        result := 18
+    else if levelType == "fvg_upper"
+        result := 19
+    else if levelType == "fvg_lower"
+        result := 20
+
+    result
+
+_better_candidate(
+     float candidateProbability,
+     float candidateDistance,
+     int candidatePriority,
+     float selectedProbability,
+     float selectedDistance,
+     int selectedPriority) =>
+
+    bool higherProbability =
+         candidateProbability > selectedProbability + TIE_EPSILON
+
+    bool probabilityTie =
+         math.abs(candidateProbability - selectedProbability) <=
+         TIE_EPSILON
+
+    bool closerOnTie =
+         probabilityTie and
+         candidateDistance < selectedDistance - TIE_EPSILON
+
+    bool distanceTie =
+         probabilityTie and
+         math.abs(candidateDistance - selectedDistance) <= TIE_EPSILON
+
+    bool betterPriority =
+         distanceTie and
+         candidatePriority < selectedPriority
+
+    higherProbability or closerOnTie or betterPriority
+
+_push_level(
+     array<float> values,
+     array<string> types,
+     array<int> priorities,
+     array<bool> aboveFlags,
+     array<float> distances,
+     float level,
+     string levelType,
+     int timeframePriority,
+     float currentAtr) =>
+
+    bool eligible =
+         not na(level) and
+         not na(currentAtr) and
+         currentAtr > 0.0 and
+         math.abs(level - close) >= syminfo.mintick
+
+    bool duplicate = false
+    int duplicateIndex = -1
+
+    // Consolidate levels that represent essentially the same price.
+    float duplicateTolerance =
+         math.max(syminfo.mintick, currentAtr * 0.02)
+
+    if eligible and array.size(values) > 0
+        for existingIndex = 0 to array.size(values) - 1
+            float existingLevel =
+                 array.get(values, existingIndex)
+
+            if math.abs(existingLevel - level) <= duplicateTolerance
+                duplicate := true
+                duplicateIndex := existingIndex
+                break
+
+    if eligible and not duplicate
+        array.push(values, level)
+        array.push(types, levelType)
+        array.push(priorities, timeframePriority)
+        array.push(aboveFlags, level > close)
+        array.push(
+             distances,
+             math.abs((level - close) / currentAtr)
+        )
+
+    else if eligible and duplicateIndex >= 0
+        int existingPriority =
+             array.get(priorities, duplicateIndex)
+
+        // Keep the representation with the higher timeframe priority.
+        if timeframePriority < existingPriority
+            array.set(values, duplicateIndex, level)
+            array.set(types, duplicateIndex, levelType)
+            array.set(
+                 priorities,
+                 duplicateIndex,
+                 timeframePriority
+            )
+            array.set(
+                 aboveFlags,
+                 duplicateIndex,
+                 level > close
+            )
+            array.set(
+                 distances,
+                 duplicateIndex,
+                 math.abs((level - close) / currentAtr)
+            )
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 5 — SESSION DETECTION
+// ─────────────────────────────────────────────────────────────────
+
+bool valid_tf =
+     timeframe.isminutes and
+     timeframe.multiplier == 5
+
+int hm_et =
+     hour(time, TZ) * 60 +
+     minute(time, TZ)
+
+int dow_et =
+     dayofweek(time, TZ)
+
+bool wkday =
+     dow_et >= dayofweek.monday and
+     dow_et <= dayofweek.friday
+
+bool is_rth =
+     wkday and
+     hm_et >= RTH_OPEN and
+     hm_et < RTH_CLOSE
+
+bool is_london =
+     wkday and
+     hm_et >= LON_OPEN and
+     hm_et < LON_CLOSE
+
+bool is_post =
+     wkday and
+     hm_et >= RTH_CLOSE and
+     hm_et < POST_CLOSE
+
+string session_lbl =
+     is_rth
+         ? "rth"
+         : is_post
+             ? "post"
+             : is_london
+                 ? "london"
+                 : "overnight"
+
+// Shift the calendar boundary so the CME day begins at 18:00 ET.
+int time_shift =
+     time - 64800000
+
+int cme_day_id =
+     year(time_shift, TZ) * 10000 +
+     month(time_shift, TZ) * 100 +
+     dayofmonth(time_shift, TZ)
+
+bool new_cme_day =
+     barstate.isfirst or
+     cme_day_id != cme_day_id[1]
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 6 — INDICATORS
+// ─────────────────────────────────────────────────────────────────
+
+float atr_val =
+     ta.sma(
+          ta.tr(true),
+          ATR_P
+     )
+
+float ema21 =
+     ta.ema(close, 21)
+
+float ema50 =
+     ta.ema(close, 50)
+
+float bb_mid =
+     ta.sma(close, 20)
+
+float bb_std =
+     ta.stdev(close, 20, false)
+
+float bb_w =
+     not na(bb_mid) and
+     bb_mid != 0.0
+         ? 4.0 * bb_std / bb_mid
+         : na
+
+float v_ma20 =
+     ta.sma(volume, 20)
+
+float rvol =
+     not na(v_ma20) and
+     v_ma20 > 0.0
+         ? volume / v_ma20
+         : na
+
+float ret5 =
+     not na(atr_val) and
+     atr_val > 0.0 and
+     bar_index >= 5
+         ? (close - close[5]) / atr_val
+         : na
+
+float ret20 =
+     not na(atr_val) and
+     atr_val > 0.0 and
+     bar_index >= 20
+         ? (close - close[20]) / atr_val
+         : na
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 7 — RTH VWAP
+// ─────────────────────────────────────────────────────────────────
+
+var float vwap_tpv = 0.0
+var float vwap_vol = 0.0
+var bool vwap_in   = false
+
+float vwap_val = na
+
+if is_rth
+    float typicalPrice =
+         (high + low + close) / 3.0
+
+    if not vwap_in
+        vwap_tpv := typicalPrice * volume
+        vwap_vol := volume
+        vwap_in  := true
+    else
+        vwap_tpv += typicalPrice * volume
+        vwap_vol += volume
+
+    vwap_val :=
+         vwap_vol > 0.0
+             ? vwap_tpv / vwap_vol
+             : na
+else
+    vwap_in  := false
+    vwap_tpv := 0.0
+    vwap_vol := 0.0
+
+float vwap_dist =
+     not na(vwap_val) and
+     not na(atr_val) and
+     atr_val > 0.0
+         ? (close - vwap_val) / atr_val
+         : na
+
+float prc_vs_e21 =
+     not na(atr_val) and
+     atr_val > 0.0
+         ? (close - ema21) / atr_val
+         : na
+
+float ema_slope =
+     not na(atr_val) and
+     atr_val > 0.0 and
+     bar_index >= 5
+         ? (ema21 - ema21[5]) / (atr_val * 5.0)
+         : na
+
+bool trend_up =
+     not na(ema21) and
+     not na(ema50) and
+     not na(ema_slope) and
+     ema21 > ema50 and
+     ema_slope > 0.0
+
+bool trend_down =
+     not na(ema21) and
+     not na(ema50) and
+     not na(ema_slope) and
+     ema21 < ema50 and
+     ema_slope < 0.0
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 8 — SESSION LEVELS
+// ─────────────────────────────────────────────────────────────────
+
+var float cur_sh = na
+var float cur_sl = na
+var float prv_sh = na
+var float prv_sl = na
+
+if new_cme_day
+    prv_sh := cur_sh
+    prv_sl := cur_sl
+    cur_sh := high
+    cur_sl := low
+else
+    cur_sh :=
+         na(cur_sh)
+             ? high
+             : math.max(cur_sh, high)
+
+    cur_sl :=
+         na(cur_sl)
+             ? low
+             : math.min(cur_sl, low)
+
+float sess_h_lvl = cur_sh
+float sess_l_lvl = cur_sl
+float prev_s_h   = prv_sh
+float prev_s_l   = prv_sl
+
+// Full pre-RTH/Globex high and low.
+var float on_h = na
+var float on_l = na
+
+if new_cme_day
+    on_h :=
+         not is_rth
+             ? high
+             : na
+
+    on_l :=
+         not is_rth
+             ? low
+             : na
+
+else if not is_rth
+    on_h :=
+         na(on_h)
+             ? high
+             : math.max(on_h, high)
+
+    on_l :=
+         na(on_l)
+             ? low
+             : math.min(on_l, low)
+
+float on_h_lvl = on_h
+float on_l_lvl = on_l
+
+// London high and low.
+var float lon_h  = na
+var float lon_l  = na
+var bool lon_frz = false
+
+if new_cme_day
+    lon_h   := na
+    lon_l   := na
+    lon_frz := false
+
+if is_london and not lon_frz
+    lon_h :=
+         na(lon_h)
+             ? high
+             : math.max(lon_h, high)
+
+    lon_l :=
+         na(lon_l)
+             ? low
+             : math.min(lon_l, low)
+
+else if is_rth
+    lon_frz := true
+
+float lon_h_lvl = lon_h
+float lon_l_lvl = lon_l
+
+// Opening range: first six 5-minute RTH bars = 30 minutes.
+var float or_h = na
+var float or_l = na
+var int or_cnt = 0
+var bool or_dn = false
+
+if new_cme_day
+    or_h   := na
+    or_l   := na
+    or_cnt := 0
+    or_dn  := false
+
+if is_rth and not or_dn
+    or_cnt += 1
+
+    or_h :=
+         na(or_h)
+             ? high
+             : math.max(or_h, high)
+
+    or_l :=
+         na(or_l)
+             ? low
+             : math.min(or_l, low)
+
+    if or_cnt >= OR_BARS_N
+        or_dn := true
+
+float or_h_lvl =
+     or_dn
+         ? or_h
+         : na
+
+float or_l_lvl =
+     or_dn
+         ? or_l
+         : na
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 9 — PRIOR DAY/WEEK LEVELS
+// ─────────────────────────────────────────────────────────────────
+
+float pd_h = request.security(
+     syminfo.tickerid,
+     "1D",
+     high[1],
+     gaps      = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_on)
+
+float pd_l = request.security(
+     syminfo.tickerid,
+     "1D",
+     low[1],
+     gaps      = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_on)
+
+float pw_h = request.security(
+     syminfo.tickerid,
+     "1W",
+     high[1],
+     gaps      = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_on)
+
+float pw_l = request.security(
+     syminfo.tickerid,
+     "1W",
+     low[1],
+     gaps      = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_on)
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 10 — SWINGS
+// ─────────────────────────────────────────────────────────────────
+
+float ph_raw =
+     ta.pivothigh(
+          high,
+          SWING_N,
+          SWING_N
+     )
+
+float pl_raw =
+     ta.pivotlow(
+          low,
+          SWING_N,
+          SWING_N
+     )
+
+var float last_ph = na
+var float last_pl = na
+var int last_ph_bar = na
+var int last_pl_bar = na
+
+if not na(ph_raw)
+    last_ph     := ph_raw
+    last_ph_bar := bar_index - SWING_N
+
+if not na(pl_raw)
+    last_pl     := pl_raw
+    last_pl_bar := bar_index - SWING_N
+
+float sw_h20 =
+     not na(last_ph_bar) and
+     bar_index - last_ph_bar <= SWING_WIN
+         ? last_ph
+         : na
+
+float sw_l20 =
+     not na(last_pl_bar) and
+     bar_index - last_pl_bar <= SWING_WIN
+         ? last_pl
+         : na
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 11 — EQUAL HIGH/LOW CLUSTERS
+// ─────────────────────────────────────────────────────────────────
+
+var array<float> ph_eq_v = array.new<float>()
+var array<int> ph_eq_b   = array.new<int>()
+
+var array<float> pl_eq_v = array.new<float>()
+var array<int> pl_eq_b   = array.new<int>()
+
+if not na(ph_raw)
+    array.push(ph_eq_v, ph_raw)
+    array.push(ph_eq_b, bar_index - SWING_N)
+
+if not na(pl_raw)
+    array.push(pl_eq_v, pl_raw)
+    array.push(pl_eq_b, bar_index - SWING_N)
+
+int eq_jmax =
+     bar_index - SWING_N
+
+int eq_jmin =
+     eq_jmax - EQ_WIN
+
+while array.size(ph_eq_b) > 0 and array.get(ph_eq_b, 0) < eq_jmin
+    array.shift(ph_eq_v)
+    array.shift(ph_eq_b)
+
+while array.size(pl_eq_b) > 0 and array.get(pl_eq_b, 0) < eq_jmin
+    array.shift(pl_eq_v)
+    array.shift(pl_eq_b)
+
+float eq_tol =
+     not na(atr_val)
+         ? atr_val * EQ_TOL_ATR
+         : 0.0
+
+float eq_h_lvl = na
+int nph = array.size(ph_eq_v)
+
+if nph >= 2
+    int best_n_h = 1
+    float best_h = na
+
+    for ii = 0 to nph - 1
+        float pivotValue =
+             array.get(ph_eq_v, ii)
+
+        int count = 0
+        float sumValue = 0.0
+
+        for jj = 0 to nph - 1
+            float comparisonValue =
+                 array.get(ph_eq_v, jj)
+
+            if math.abs(comparisonValue - pivotValue) <= eq_tol
+                count += 1
+                sumValue += comparisonValue
+
+        if count >= 2 and count > best_n_h
+            best_n_h := count
+            best_h   := sumValue / float(count)
+
+    eq_h_lvl := best_h
+
+float eq_l_lvl = na
+int npl = array.size(pl_eq_v)
+
+if npl >= 2
+    int best_n_l = 1
+    float best_l = na
+
+    for ii = 0 to npl - 1
+        float pivotValue =
+             array.get(pl_eq_v, ii)
+
+        int count = 0
+        float sumValue = 0.0
+
+        for jj = 0 to npl - 1
+            float comparisonValue =
+                 array.get(pl_eq_v, jj)
+
+            if math.abs(comparisonValue - pivotValue) <= eq_tol
+                count += 1
+                sumValue += comparisonValue
+
+        if count >= 2 and count > best_n_l
+            best_n_l := count
+            best_l   := sumValue / float(count)
+
+    eq_l_lvl := best_l
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 12 — FAIR VALUE GAPS
+// ─────────────────────────────────────────────────────────────────
+
+var float last_bull = na
+var float last_bear = na
+
+if bar_index >= 2
+    if high[2] < low
+        last_bull := high[2]
+
+    if low[2] > high
+        last_bear := low[2]
+
+    if not na(last_bull) and low <= last_bull
+        last_bull := na
+
+    if not na(last_bear) and high >= last_bear
+        last_bear := na
+
+float fvg_lo_lvl = last_bull
+float fvg_up_lvl = last_bear
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 13 — CANDIDATE ASSEMBLY
+// ─────────────────────────────────────────────────────────────────
+
+array<float> ca_val  = array.new<float>()
+array<string> ca_typ = array.new<string>()
+array<int> ca_tf     = array.new<int>()
+array<bool> ca_abv   = array.new<bool>()
+array<float> ca_dst  = array.new<float>()
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     sess_h_lvl, "sess_high", 0, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     sess_l_lvl, "sess_low", 0, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     prev_s_h, "prev_sess_high", 0, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     prev_s_l, "prev_sess_low", 0, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     on_h_lvl, "overnight_high", 0, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     on_l_lvl, "overnight_low", 0, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     lon_h_lvl, "london_high", 0, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     lon_l_lvl, "london_low", 0, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     or_h_lvl, "or_high", 0, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     or_l_lvl, "or_low", 0, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     vwap_val, "vwap", 0, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     pd_h, "prev_day_high", 1, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     pd_l, "prev_day_low", 1, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     pw_h, "prev_week_high", 2, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     pw_l, "prev_week_low", 2, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     sw_h20, "swing_high_20", 3, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     sw_l20, "swing_low_20", 3, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     eq_h_lvl, "eq_high", 3, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     eq_l_lvl, "eq_low", 3, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     fvg_up_lvl, "fvg_upper", 3, atr_val)
+
+_push_level(
+     ca_val, ca_typ, ca_tf, ca_abv, ca_dst,
+     fvg_lo_lvl, "fvg_lower", 3, atr_val)
+
+int n_cands =
+     array.size(ca_val)
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 14 — CANDIDATE FEATURES
+// ─────────────────────────────────────────────────────────────────
+
+int n_abv = 0
+int n_blw = 0
+
+if n_cands > 0
+    for k = 0 to n_cands - 1
+        if array.get(ca_abv, k)
+            n_abv += 1
+        else
+            n_blw += 1
+
+float liq_asym =
+     n_abv + n_blw > 0
+         ? float(n_abv - n_blw) /
+           float(n_abv + n_blw)
+         : 0.0
+
+float near_abv_d = na
+float near_blw_d = na
+
+if n_cands > 0
+    for k = 0 to n_cands - 1
+        float distanceValue =
+             array.get(ca_dst, k)
+
+        if array.get(ca_abv, k)
+            near_abv_d :=
+                 na(near_abv_d)
+                     ? distanceValue
+                     : math.min(
+                          near_abv_d,
+                          distanceValue
+                     )
+        else
+            near_blw_d :=
+                 na(near_blw_d)
+                     ? distanceValue
+                     : math.min(
+                          near_blw_d,
+                          distanceValue
+                     )
+
+array<int> ca_rnk =
+     array.new<int>(n_cands, 1)
+
+array<int> ca_nsd =
+     array.new<int>(n_cands, 1)
+
+if n_cands > 0
+    for k = 0 to n_cands - 1
+        bool candidateAbove =
+             array.get(ca_abv, k)
+
+        float candidateDistance =
+             array.get(ca_dst, k)
+
+        int candidateRank = 1
+
+        for j = 0 to n_cands - 1
+            bool sameDirection =
+                 array.get(ca_abv, j) ==
+                 candidateAbove
+
+            bool closer =
+                 array.get(ca_dst, j) <
+                 candidateDistance
+
+            if j != k and sameDirection and closer
+                candidateRank += 1
+
+        array.set(
+             ca_rnk,
+             k,
+             candidateRank
+        )
+
+        array.set(
+             ca_nsd,
+             k,
+             candidateAbove
+                 ? n_abv
+                 : n_blw
+        )
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 15 — TOUCH PROBABILITIES
+// ─────────────────────────────────────────────────────────────────
+
+array<float> ca_prb =
+     array.new<float>(n_cands, na)
+
+if n_cands > 0
+    for k = 0 to n_cands - 1
+        float da_k =
+             array.get(ca_dst, k)
+
+        int rk_k =
+             array.get(ca_rnk, k)
+
+        int ns_k =
+             array.get(ca_nsd, k)
+
+        bool abv_k =
+             array.get(ca_abv, k)
+
+        float dopp_k =
+             abv_k
+                 ? near_blw_d
+                 : near_abv_d
+
+        float probability =
+             _touch_prob(
+                  da_k,
+                  rk_k,
+                  ns_k,
+                  dopp_k,
+                  liq_asym,
+                  rvol,
+                  bb_w,
+                  ret5,
+                  ret20,
+                  vwap_dist,
+                  prc_vs_e21,
+                  ema_slope
+             )
+
+        array.set(
+             ca_prb,
+             k,
+             probability
+        )
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 16 — DESTINATION SELECTION
+// Highest probability first.
+// Tie-break 1: nearest ATR distance.
+// Tie-break 2: lower timeframe-priority number.
+// Top 3 unique candidates only.
+// ─────────────────────────────────────────────────────────────────
+
+int sel1 = -1
+int sel2 = -1
+int sel3 = -1
+
+float sp1 = -1.0
+float sp2 = -1.0
+float sp3 = -1.0
+
+float sd1 = 1e18
+float sd2 = 1e18
+float sd3 = 1e18
+
+int st1 = 999
+int st2 = 999
+int st3 = 999
+
+if n_cands > 0
+    for k = 0 to n_cands - 1
+        float probabilityValue =
+             array.get(ca_prb, k)
+
+        float distanceValue =
+             array.get(ca_dst, k)
+
+        int priorityValue =
+             array.get(ca_tf, k)
+
+        if not na(probabilityValue)
+            if _better_candidate(
+                 probabilityValue,
+                 distanceValue,
+                 priorityValue,
+                 sp1,
+                 sd1,
+                 st1)
+
+                sel1 := k
+                sp1  := probabilityValue
+                sd1  := distanceValue
+                st1  := priorityValue
+
+if n_cands > 1
+    for k = 0 to n_cands - 1
+        if k != sel1
+            float probabilityValue =
+                 array.get(ca_prb, k)
+
+            float distanceValue =
+                 array.get(ca_dst, k)
+
+            int priorityValue =
+                 array.get(ca_tf, k)
+
+            if not na(probabilityValue)
+                if _better_candidate(
+                     probabilityValue,
+                     distanceValue,
+                     priorityValue,
+                     sp2,
+                     sd2,
+                     st2)
+
+                    sel2 := k
+                    sp2  := probabilityValue
+                    sd2  := distanceValue
+                    st2  := priorityValue
+
+if n_cands > 2
+    for k = 0 to n_cands - 1
+        if k != sel1 and k != sel2
+            float probabilityValue =
+                 array.get(ca_prb, k)
+
+            float distanceValue =
+                 array.get(ca_dst, k)
+
+            int priorityValue =
+                 array.get(ca_tf, k)
+
+            if not na(probabilityValue)
+                if _better_candidate(
+                     probabilityValue,
+                     distanceValue,
+                     priorityValue,
+                     sp3,
+                     sd3,
+                     st3)
+
+                    sel3 := k
+                    sp3  := probabilityValue
+                    sd3  := distanceValue
+                    st3  := priorityValue
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 17 — DESTINATION ATTRIBUTES
+// ─────────────────────────────────────────────────────────────────
+
+bool rdy =
+     valid_tf and
+     sel1 >= 0 and
+     not na(atr_val) and
+     atr_val > 0.0 and
+     n_cands >= 2
+
+float top_val =
+     rdy
+         ? array.get(ca_val, sel1)
+         : na
+
+string top_typ =
+     rdy
+         ? array.get(ca_typ, sel1)
+         : "N/A"
+
+bool top_abv =
+     rdy
+         ? array.get(ca_abv, sel1)
+         : false
+
+float top_prb =
+     rdy
+         ? array.get(ca_prb, sel1)
+         : na
+
+float top_dst =
+     rdy
+         ? array.get(ca_dst, sel1)
+         : na
+
+float top_pts =
+     rdy
+         ? top_val - close
+         : na
+
+[path_clean_raw, path_stop_raw, path_eta_raw] =
+     _path_stats(top_typ)
+
+float top_pclean =
+     rdy
+         ? path_clean_raw
+         : na
+
+float top_pstop =
+     rdy
+         ? path_stop_raw
+         : na
+
+float top_eta =
+     rdy
+         ? path_eta_raw
+         : na
+
+float top_popp =
+     P_OPP_AGG
+
+float prb2 =
+     sel2 >= 0
+         ? array.get(ca_prb, sel2)
+         : na
+
+float prb3 =
+     sel3 >= 0
+         ? array.get(ca_prb, sel3)
+         : na
+
+float prb_margin =
+     not na(top_prb) and
+     not na(prb2)
+         ? top_prb - prb2
+         : na
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 18 — INTERVENING LEVELS
+// Candidate levels physically between close and the primary
+// destination, excluding the primary destination itself.
+// ─────────────────────────────────────────────────────────────────
+
+int intervening_count = 0
+
+if rdy and n_cands > 0
+    for k = 0 to n_cands - 1
+        if k != sel1
+            float candidateValue =
+                 array.get(ca_val, k)
+
+            bool between =
+                 top_abv
+                     ? candidateValue > close and candidateValue < top_val
+                     : candidateValue < close and candidateValue > top_val
+
+            if between
+                intervening_count += 1
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 19 — TREND / EMA / VWAP ALIGNMENT
+// ─────────────────────────────────────────────────────────────────
+
+bool dest_trend_aligned =
+     rdy and (
+          top_abv
+              ? trend_up
+              : trend_down
+     )
+
+bool dest_ema_aligned =
+     rdy and (
+          top_abv
+              ? close > ema21
+              : close < ema21
+     )
+
+bool dest_vwap_aligned =
+     rdy and
+     not na(vwap_val) and (
+          top_abv
+              ? close > vwap_val
+              : close < vwap_val
+     )
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 20 — CONFIDENCE SCORE
+// Independent of touch probability. 0–100.
+// ─────────────────────────────────────────────────────────────────
+
+int score_prob   = 0
+int score_dist   = 0
+int score_trend  = 0
+int score_vwap   = 0
+int score_rvol   = 0
+int score_path   = 0
+int score_clean  = 0
+int score_margin = 0
+
+if rdy
+    if not na(top_prb)
+        if top_prb >= 0.75
+            score_prob := 25
+        else if top_prb >= 0.65
+            score_prob := 21
+        else if top_prb >= 0.55
+            score_prob := 16
+        else if top_prb >= 0.45
+            score_prob := 10
+        else
+            score_prob := 4
+
+    if not na(top_dst)
+        if top_dst <= 0.50
+            score_dist := 20
+        else if top_dst <= i_good_distance
+            score_dist := 16
+        else if top_dst <= 1.50
+            score_dist := 10
+        else if top_dst <= i_max_distance
+            score_dist := 5
+
+    if dest_trend_aligned
+        score_trend := 15
+    else if dest_ema_aligned
+        score_trend := 8
+
+    if dest_vwap_aligned
+        score_vwap := 10
+
+    if not na(rvol)
+        if rvol >= 1.25
+            score_rvol := 10
+        else if rvol >= i_high_rvol
+            score_rvol := 7
+        else if rvol >= 0.75
+            score_rvol := 3
+
+    if intervening_count == 0
+        score_path := 10
+    else if intervening_count == 1
+        score_path := 7
+    else if intervening_count <= i_max_intervening
+        score_path := 4
+
+    if not na(top_pclean) and not na(top_pstop) and top_pclean > top_pstop
+        score_clean := 5
+
+    if not na(prb_margin)
+        if prb_margin >= 0.10
+            score_margin := 5
+        else if prb_margin >= i_good_margin
+            score_margin := 3
+        else if prb_margin > 0.0
+            score_margin := 1
+
+int confidence_raw =
+     score_prob + score_dist + score_trend + score_vwap +
+     score_rvol + score_path + score_clean + score_margin
+
+float confidence =
+     rdy
+         ? float(math.max(0, math.min(100, confidence_raw)))
+         : na
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 21 — QUALITY GRADE
+// ─────────────────────────────────────────────────────────────────
+
+string quality_grade = "N/A"
+string quality_msg   = "NOT READY"
+
+bool trend_gate_ok =
+     not i_require_trend or dest_trend_aligned
+
+if rdy and not na(confidence)
+    if confidence >= 85 and trend_gate_ok
+        quality_grade := "A+"
+        quality_msg   := "HIGH CONFLUENCE"
+    else if confidence >= 75 and trend_gate_ok
+        quality_grade := "A"
+        quality_msg   := "STRONG DESTINATION"
+    else if confidence >= 62
+        quality_grade := "B"
+        quality_msg   := "MODERATE QUALITY"
+    else if confidence >= 48
+        quality_grade := "C"
+        quality_msg   := "LOW CONVICTION"
+    else
+        quality_grade := "AVOID"
+        quality_msg   := "WEAK DESTINATION"
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 22 — CHART LINES AND LABELS
+// ─────────────────────────────────────────────────────────────────
+
+var line ln1 = na
+var line ln2 = na
+var line ln3 = na
+
+var label lb1 = na
+var label lb2 = na
+var label lb3 = na
+
+if barstate.islast
+    if not na(ln1)
+        line.delete(ln1)
+
+    if not na(ln2)
+        line.delete(ln2)
+
+    if not na(ln3)
+        line.delete(ln3)
+
+    if not na(lb1)
+        label.delete(lb1)
+
+    if not na(lb2)
+        label.delete(lb2)
+
+    if not na(lb3)
+        label.delete(lb3)
+
+    ln1 := na
+    ln2 := na
+    ln3 := na
+
+    lb1 := na
+    lb2 := na
+    lb3 := na
+
+    if rdy
+        int xEnd =
+             bar_index + i_extend
+
+        color primaryColor =
+             top_abv
+                 ? color.new(color.aqua, 15)
+                 : color.new(color.orange, 15)
+
+        ln1 := line.new(
+             x1    = bar_index,
+             y1    = top_val,
+             x2    = xEnd,
+             y2    = top_val,
+             xloc  = xloc.bar_index,
+             color = primaryColor,
+             width = 2,
+             style = line.style_dashed)
+
+        if i_show_label
+            string directionText =
+                 top_abv
+                     ? "▲ ABOVE"
+                     : "▼ BELOW"
+
+            string destinationLabel =
+                 str.upper(top_typ) +
+                 "  " +
+                 str.tostring(top_val, format.mintick) +
+                 "\n" +
+                 directionText +
+                 "\nTOUCH " +
+                 str.format(
+                      "{0,number,#.#}%",
+                      top_prb * 100.0
+                 ) +
+                 "\nETA " +
+                 str.tostring(math.round(top_eta)) +
+                 " BARS / ~" +
+                 str.tostring(math.round(top_eta * 5.0)) +
+                 " MIN" +
+                 "\nCLEAN " +
+                 str.format(
+                      "{0,number,#.#}%",
+                      top_pclean * 100.0
+                 ) +
+                 "\nSTOP " +
+                 str.format(
+                      "{0,number,#.#}%",
+                      top_pstop * 100.0
+                 ) +
+                 "\nOPP " +
+                 str.format(
+                      "{0,number,#.#}%",
+                      top_popp * 100.0
+                 ) +
+                 "\nDIST " +
+                 str.format(
+                      "{0,number,#.##}",
+                      top_dst
+                 ) +
+                 " ATR" +
+                 "\nCONF " +
+                 str.format(
+                      "{0,number,#}",
+                      confidence
+                 ) +
+                 " (" +
+                 quality_grade +
+                 ")"
+
+            lb1 := label.new(
+                 x         = xEnd,
+                 y         = top_val,
+                 text      = destinationLabel,
+                 xloc      = xloc.bar_index,
+                 color     = color.rgb(12, 18, 27),
+                 textcolor = primaryColor,
+                 style     = top_abv
+                     ? label.style_label_down
+                     : label.style_label_up,
+                 size      = size.normal)
+
+        if i_show_sec
+            if sel2 >= 0
+                float value2 =
+                     array.get(ca_val, sel2)
+
+                bool above2 =
+                     array.get(ca_abv, sel2)
+
+                string type2 =
+                     array.get(ca_typ, sel2)
+
+                float prob2 =
+                     array.get(ca_prb, sel2)
+
+                color color2 =
+                     above2
+                         ? color.new(color.aqua, 55)
+                         : color.new(color.orange, 55)
+
+                ln2 := line.new(
+                     x1    = bar_index,
+                     y1    = value2,
+                     x2    = xEnd,
+                     y2    = value2,
+                     xloc  = xloc.bar_index,
+                     color = color2,
+                     width = 1,
+                     style = line.style_dotted)
+
+                lb2 := label.new(
+                     x         = xEnd,
+                     y         = value2,
+                     text      = str.upper(type2) +
+                                 " " +
+                                 str.format(
+                                      "{0,number,#.#}%",
+                                      prob2 * 100.0
+                                 ),
+                     xloc      = xloc.bar_index,
+                     color     = color.rgb(12, 18, 27),
+                     textcolor = color2,
+                     style     = label.style_label_left,
+                     size      = size.small)
+
+            if sel3 >= 0
+                float value3 =
+                     array.get(ca_val, sel3)
+
+                bool above3 =
+                     array.get(ca_abv, sel3)
+
+                string type3 =
+                     array.get(ca_typ, sel3)
+
+                float prob3 =
+                     array.get(ca_prb, sel3)
+
+                color color3 =
+                     above3
+                         ? color.new(color.aqua, 65)
+                         : color.new(color.orange, 65)
+
+                ln3 := line.new(
+                     x1    = bar_index,
+                     y1    = value3,
+                     x2    = xEnd,
+                     y2    = value3,
+                     xloc  = xloc.bar_index,
+                     color = color3,
+                     width = 1,
+                     style = line.style_dotted)
+
+                lb3 := label.new(
+                     x         = xEnd,
+                     y         = value3,
+                     text      = str.upper(type3) +
+                                 " " +
+                                 str.format(
+                                      "{0,number,#.#}%",
+                                      prob3 * 100.0
+                                 ),
+                     xloc      = xloc.bar_index,
+                     color     = color.rgb(12, 18, 27),
+                     textcolor = color3,
+                     style     = label.style_label_left,
+                     size      = size.small)
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 23 — PHONE-FRIENDLY DASHBOARD
+// 2 columns × 15 rows (0–14).
+// ─────────────────────────────────────────────────────────────────
+
+string dash_pos =
+     i_dash_pos == "Top Left"
+         ? position.top_left
+         : i_dash_pos == "Bottom Right"
+             ? position.bottom_right
+             : i_dash_pos == "Bottom Left"
+                 ? position.bottom_left
+                 : i_dash_pos == "Middle Right"
+                     ? position.middle_right
+                     : i_dash_pos == "Middle Left"
+                         ? position.middle_left
+                         : position.top_right
+
+string sz_label =
+     i_dash_size == "Large"
+         ? size.normal
+         : i_dash_size == "Phone"
+             ? size.small
+             : size.tiny
+
+string sz_value =
+     i_dash_size == "Large"
+         ? size.large
+         : i_dash_size == "Phone"
+             ? size.normal
+             : size.small
+
+string sz_main =
+     i_dash_size == "Large"
+         ? size.huge
+         : i_dash_size == "Phone"
+             ? size.large
+             : size.normal
+
+color BG_HEADER = color.rgb(18, 26, 38)
+color BG_CELL   = color.rgb(12, 18, 27)
+color BG_ALT    = color.rgb(16, 24, 34)
+color BG_WARN   = color.rgb(70, 8, 13)
+
+color TXT_LABEL  = color.rgb(205, 214, 226)
+color TXT_VALUE  = color.rgb(250, 252, 255)
+color TXT_BLUE   = color.rgb(45, 190, 255)
+color TXT_GREEN  = color.rgb(35, 230, 115)
+color TXT_RED    = color.rgb(255, 70, 80)
+color TXT_YELLOW = color.rgb(255, 220, 45)
+color TXT_ORANGE = color.rgb(255, 165, 45)
+color TXT_PURPLE = color.rgb(195, 125, 255)
+
+var table dash = table.new(
+     position     = dash_pos,
+     columns      = 2,
+     rows         = 15,
+     bgcolor      = BG_CELL,
+     border_color = color.rgb(75, 88, 105),
+     border_width = 1,
+     frame_color  = TXT_BLUE,
+     frame_width  = 2)
+
+if barstate.islast
+    table.clear(dash, 0, 0, 1, 14)
+
+    // Row 0 — header.
+    table.cell(
+         dash, 0, 0, "LDPT MAP+",
+         bgcolor     = BG_HEADER,
+         text_color  = TXT_BLUE,
+         text_size   = sz_value,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 0, "ENHANCED",
+         bgcolor     = BG_HEADER,
+         text_color  = TXT_YELLOW,
+         text_size   = sz_label,
+         text_halign = text.align_right)
+
+    // Row 1 — destination and price.
+    string dash_dest =
+         not valid_tf
+             ? "USE 5-MIN CHART"
+             : rdy
+                 ? str.upper(top_typ)
+                 : "NOT READY"
+
+    string dash_price =
+         rdy
+             ? str.tostring(top_val, format.mintick)
+             : "—"
+
+    table.cell(
+         dash, 0, 1, dash_dest,
+         bgcolor     = BG_ALT,
+         text_color  = rdy ? TXT_VALUE : TXT_RED,
+         text_size   = sz_value,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 1, dash_price,
+         bgcolor     = BG_ALT,
+         text_color  = TXT_YELLOW,
+         text_size   = sz_value,
+         text_halign = text.align_right)
+
+    // Row 2 — direction and ATR distance.
+    string dash_direction =
+         rdy
+             ? top_abv
+                 ? "▲ ABOVE"
+                 : "▼ BELOW"
+             : "—"
+
+    color dash_direction_color =
+         not rdy
+             ? TXT_LABEL
+             : top_abv
+                 ? TXT_BLUE
+                 : TXT_ORANGE
+
+    string dash_distance =
+         not na(top_dst)
+             ? str.format("{0,number,#.00}", top_dst) + " ATR"
+             : "—"
+
+    table.cell(
+         dash, 0, 2, dash_direction,
+         bgcolor     = BG_CELL,
+         text_color  = dash_direction_color,
+         text_size   = sz_value,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 2, dash_distance,
+         bgcolor     = BG_CELL,
+         text_color  = TXT_VALUE,
+         text_size   = sz_value,
+         text_halign = text.align_right)
+
+    // Row 3 — touch probability.
+    string dash_touch =
+         not na(top_prb)
+             ? str.format("{0,number,#.0}%", top_prb * 100.0)
+             : "—"
+
+    color dash_touch_color =
+         na(top_prb)
+             ? TXT_LABEL
+             : top_prb >= 0.65
+                 ? TXT_GREEN
+                 : top_prb >= 0.40
+                     ? TXT_YELLOW
+                     : TXT_RED
+
+    table.cell(
+         dash, 0, 3, "TOUCH PROB",
+         bgcolor     = BG_ALT,
+         text_color  = TXT_LABEL,
+         text_size   = sz_label,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 3, dash_touch,
+         bgcolor     = BG_ALT,
+         text_color  = dash_touch_color,
+         text_size   = sz_main,
+         text_halign = text.align_right)
+
+    // Row 4 — confidence.
+    string dash_conf =
+         not na(confidence)
+             ? str.format("{0,number,#}", confidence) + "/100"
+             : "—"
+
+    color dash_conf_color =
+         na(confidence)
+             ? TXT_LABEL
+             : confidence >= 75
+                 ? TXT_GREEN
+                 : confidence >= 62
+                     ? TXT_YELLOW
+                     : confidence >= 48
+                         ? TXT_ORANGE
+                         : TXT_RED
+
+    table.cell(
+         dash, 0, 4, "CONFIDENCE",
+         bgcolor     = BG_CELL,
+         text_color  = TXT_LABEL,
+         text_size   = sz_label,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 4, dash_conf,
+         bgcolor     = BG_CELL,
+         text_color  = dash_conf_color,
+         text_size   = sz_main,
+         text_halign = text.align_right)
+
+    // Row 5 — quality grade and message.
+    color dash_grade_color =
+         quality_grade == "A+" or quality_grade == "A"
+             ? TXT_GREEN
+             : quality_grade == "B"
+                 ? TXT_YELLOW
+                 : quality_grade == "C"
+                     ? TXT_ORANGE
+                     : TXT_RED
+
+    table.cell(
+         dash, 0, 5, quality_grade,
+         bgcolor     = BG_ALT,
+         text_color  = dash_grade_color,
+         text_size   = sz_value,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 5, quality_msg,
+         bgcolor     = BG_ALT,
+         text_color  = dash_grade_color,
+         text_size   = sz_label,
+         text_halign = text.align_right)
+
+    // Row 6 — ETA.
+    string dash_eta =
+         not na(top_eta)
+             ? str.tostring(math.round(top_eta)) +
+               " BARS / ~" +
+               str.tostring(math.round(top_eta * 5.0)) +
+               " MIN"
+             : "—"
+
+    table.cell(
+         dash, 0, 6, "ETA",
+         bgcolor     = BG_CELL,
+         text_color  = TXT_LABEL,
+         text_size   = sz_label,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 6, dash_eta,
+         bgcolor     = BG_CELL,
+         text_color  = TXT_YELLOW,
+         text_size   = sz_value,
+         text_halign = text.align_right)
+
+    // Row 7 — clean and stop.
+    string dash_clean =
+         not na(top_pclean)
+             ? "CLEAN " + str.format("{0,number,#.0}%", top_pclean * 100.0)
+             : "CLEAN —"
+
+    string dash_stop =
+         not na(top_pstop)
+             ? "STOP " + str.format("{0,number,#.0}%", top_pstop * 100.0)
+             : "STOP —"
+
+    table.cell(
+         dash, 0, 7, dash_clean,
+         bgcolor     = BG_ALT,
+         text_color  = TXT_GREEN,
+         text_size   = sz_value,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 7, dash_stop,
+         bgcolor     = BG_ALT,
+         text_color  = TXT_RED,
+         text_size   = sz_value,
+         text_halign = text.align_right)
+
+    // Row 8 — path clarity and probability margin.
+    string dash_pathclr =
+         rdy
+             ? intervening_count == 0
+                 ? "CLEAR PATH"
+                 : str.tostring(intervening_count) + " AHEAD"
+             : "—"
+
+    string dash_margin =
+         not na(prb_margin)
+             ? "Δ " + str.format("{0,number,#.00}%", prb_margin * 100.0)
+             : "Δ —"
+
+    table.cell(
+         dash, 0, 8, dash_pathclr,
+         bgcolor     = BG_CELL,
+         text_color  = TXT_PURPLE,
+         text_size   = sz_value,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 8, dash_margin,
+         bgcolor     = BG_CELL,
+         text_color  = TXT_YELLOW,
+         text_size   = sz_value,
+         text_halign = text.align_right)
+
+    // Row 9 — path 1.
+    string dash_p1 =
+         rdy
+             ? str.upper(top_typ) +
+               " " +
+               str.format("{0,number,#.#}%", top_prb * 100.0)
+             : "—"
+
+    table.cell(
+         dash, 0, 9, "PATH 1",
+         bgcolor     = BG_ALT,
+         text_color  = TXT_LABEL,
+         text_size   = sz_label,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 9, dash_p1,
+         bgcolor     = BG_ALT,
+         text_color  = TXT_BLUE,
+         text_size   = sz_label,
+         text_halign = text.align_right)
+
+    // Row 10 — path 2.
+    string dash_p2 =
+         sel2 >= 0
+             ? str.upper(array.get(ca_typ, sel2)) +
+               " " +
+               str.format("{0,number,#.#}%", prb2 * 100.0)
+             : "—"
+
+    table.cell(
+         dash, 0, 10, "PATH 2",
+         bgcolor     = BG_CELL,
+         text_color  = TXT_LABEL,
+         text_size   = sz_label,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 10, dash_p2,
+         bgcolor     = BG_CELL,
+         text_color  = TXT_VALUE,
+         text_size   = sz_label,
+         text_halign = text.align_right)
+
+    // Row 11 — path 3.
+    string dash_p3 =
+         sel3 >= 0
+             ? str.upper(array.get(ca_typ, sel3)) +
+               " " +
+               str.format("{0,number,#.#}%", prb3 * 100.0)
+             : "—"
+
+    table.cell(
+         dash, 0, 11, "PATH 3",
+         bgcolor     = BG_ALT,
+         text_color  = TXT_LABEL,
+         text_size   = sz_label,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 11, dash_p3,
+         bgcolor     = BG_ALT,
+         text_color  = TXT_VALUE,
+         text_size   = sz_label,
+         text_halign = text.align_right)
+
+    // Row 12 — session and RVOL.
+    string dash_rvol =
+         not na(rvol)
+             ? "RVOL " + str.format("{0,number,#.##}", rvol)
+             : "RVOL —"
+
+    table.cell(
+         dash, 0, 12, "SESSION " + str.upper(session_lbl),
+         bgcolor     = BG_CELL,
+         text_color  = TXT_VALUE,
+         text_size   = sz_value,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 12, dash_rvol,
+         bgcolor     = BG_CELL,
+         text_color  = TXT_PURPLE,
+         text_size   = sz_value,
+         text_halign = text.align_right)
+
+    // Row 13 — trend and candidate count.
+    string dash_trend =
+         trend_up
+             ? "TREND ▲"
+             : trend_down
+                 ? "TREND ▼"
+                 : "TREND FLAT"
+
+    color dash_trend_color =
+         trend_up
+             ? TXT_BLUE
+             : trend_down
+                 ? TXT_ORANGE
+                 : TXT_LABEL
+
+    table.cell(
+         dash, 0, 13, dash_trend,
+         bgcolor     = BG_ALT,
+         text_color  = dash_trend_color,
+         text_size   = sz_value,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 13, str.tostring(n_cands) + " LEVELS",
+         bgcolor     = BG_ALT,
+         text_color  = TXT_PURPLE,
+         text_size   = sz_value,
+         text_halign = text.align_right)
+
+    // Row 14 — warning.
+    table.cell(
+         dash, 0, 14, "⚠ NOT AN ENTRY",
+         bgcolor     = BG_WARN,
+         text_color  = TXT_RED,
+         text_size   = sz_value,
+         text_halign = text.align_left)
+
+    table.cell(
+         dash, 1, 14, "INFO ONLY",
+         bgcolor     = BG_WARN,
+         text_color  = TXT_RED,
+         text_size   = sz_value,
+         text_halign = text.align_right)
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 24 — ALERTS
+// Touch detection uses the prior bar's selected destination.
+// ─────────────────────────────────────────────────────────────────
+
+const string SFXL =
+     " | INFORMATIONAL ONLY — NOT AN ENTRY SIGNAL"
+
+bool previous_destination_ready =
+     rdy[1] and
+     not na(top_val[1])
+
+float previous_destination =
+     previous_destination_ready
+         ? top_val[1]
+         : na
+
+bool previous_destination_above =
+     previous_destination_ready and
+     top_abv[1]
+
+bool previous_destination_below =
+     previous_destination_ready and
+     not top_abv[1]
+
+bool touched_previous_above =
+     previous_destination_above and
+     high >= previous_destination and
+     high[1] < previous_destination
+
+bool touched_previous_below =
+     previous_destination_below and
+     low <= previous_destination and
+     low[1] > previous_destination
+
+bool dest_touched =
+     touched_previous_above or
+     touched_previous_below
+
+bool same_destination =
+     rdy and
+     rdy[1] and
+     top_typ == top_typ[1] and
+     math.abs(top_val - top_val[1]) <=
+         syminfo.mintick * 0.5
+
+bool dest_changed =
+     rdy and
+     not dest_touched and (
+          not rdy[1] or
+          top_typ != top_typ[1] or
+          math.abs(top_val - top_val[1]) >
+              syminfo.mintick * 0.5
+     )
+
+bool model_unavailable =
+     valid_tf and
+     not rdy
+
+bool high_prob_cross =
+     rdy and
+     top_prb >= 0.75 and (
+          not rdy[1] or
+          na(top_prb[1]) or
+          top_prb[1] < 0.75
+     )
+
+bool confidence_cross_75 =
+     rdy and
+     not na(confidence) and
+     confidence >= 75.0 and (
+          not rdy[1] or
+          na(confidence[1]) or
+          confidence[1] < 75.0
+     )
+
+bool a_plus_dest =
+     rdy and
+     quality_grade == "A+" and (
+          not rdy[1] or
+          quality_grade[1] != "A+"
+     )
+
+alertcondition(
+     dest_changed,
+     title   = "LDPT: Destination Changed",
+     message = "LDPT destination changed | INFORMATIONAL ONLY — NOT AN ENTRY SIGNAL")
+
+alertcondition(
+     dest_touched,
+     title   = "LDPT: Destination Touched",
+     message = "LDPT destination touched | INFORMATIONAL ONLY — NOT AN ENTRY SIGNAL")
+
+alertcondition(
+     model_unavailable,
+     title   = "LDPT: Model Unavailable",
+     message = "LDPT model data not ready | INFORMATIONAL ONLY — NOT AN ENTRY SIGNAL")
+
+alertcondition(
+     high_prob_cross,
+     title   = "LDPT: Touch Probability Crossed 75%",
+     message = "LDPT destination touch probability reached 75% | INFORMATIONAL ONLY — NOT AN ENTRY SIGNAL")
+
+alertcondition(
+     confidence_cross_75,
+     title   = "LDPT: Confidence Crossed 75",
+     message = "LDPT confidence crossed 75 | INFORMATIONAL ONLY — NOT AN ENTRY SIGNAL")
+
+alertcondition(
+     a_plus_dest,
+     title   = "LDPT: A+ Destination",
+     message = "LDPT A+ destination detected | INFORMATIONAL ONLY — NOT AN ENTRY SIGNAL")
+
+if dest_changed
+    alert(
+         "LDPT destination changed to " +
+         top_typ +
+         " at " +
+         str.tostring(top_val, format.mintick) +
+         SFXL,
+         alert.freq_once_per_bar_close)
+
+if dest_touched
+    alert(
+         "LDPT destination " +
+         top_typ[1] +
+         " touched at " +
+         str.tostring(top_val[1], format.mintick) +
+         SFXL,
+         alert.freq_once_per_bar_close)
+
+if high_prob_cross
+    alert(
+         "LDPT " +
+         top_typ +
+         " touch probability reached " +
+         str.format("{0,number,#.#}%", top_prb * 100.0) +
+         SFXL,
+         alert.freq_once_per_bar_close)
+
+if confidence_cross_75
+    alert(
+         "LDPT confidence reached " +
+         str.format("{0,number,#}", confidence) +
+         " for " +
+         top_typ +
+         SFXL,
+         alert.freq_once_per_bar_close)
+
+if a_plus_dest
+    alert(
+         "LDPT A+ destination: " +
+         top_typ +
+         " at " +
+         str.tostring(top_val, format.mintick) +
+         SFXL,
+         alert.freq_once_per_bar_close)
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 25 — DATA WINDOW EXPORTS
+// ─────────────────────────────────────────────────────────────────
+
+plot(top_val, "Dest Price", display = display.data_window)
+plot(top_prb, "Touch Prob", display = display.data_window)
+plot(confidence, "Confidence", display = display.data_window)
+plot(top_eta, "ETA Bars", display = display.data_window)
+plot(top_pclean, "P(Clean)", display = display.data_window)
+plot(top_pstop, "P(Stop-First)", display = display.data_window)
+plot(top_popp, "P(Opp-First)", display = display.data_window)
+plot(prb2, "Rank2 Prob", display = display.data_window)
+plot(prb3, "Rank3 Prob", display = display.data_window)
+plot(prb_margin, "Prob Margin", display = display.data_window)
+plot(top_dst, "Dist ATR", display = display.data_window)
+plot(float(intervening_count), "Intervening Levels", display = display.data_window)
+plot(float(n_cands), "Cand Count", display = display.data_window)
+plot(rdy ? 1.0 : 0.0, "Model Ready", display = display.data_window)
+plot(dest_trend_aligned ? 1.0 : 0.0, "Trend Aligned", display = display.data_window)
+plot(dest_vwap_aligned ? 1.0 : 0.0, "VWAP Aligned", display = display.data_window)
+
+plot(
+     rdy
+         ? top_abv
+             ? 1.0
+             : -1.0
+         : 0.0,
+     "Direction +1/-1",
+     display = display.data_window)
+
+plot(
+     rdy
+         ? float(_enc_ltype(top_typ))
+         : na,
+     "Dest Type Enc",
+     display = display.data_window)
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 26 — AUDIT CALCULATIONS
+// ─────────────────────────────────────────────────────────────────
+
+float aud_rank =
+     rdy
+         ? float(array.get(ca_rnk, sel1))
+         : na
+
+float aud_nsd =
+     rdy
+         ? float(array.get(ca_nsd, sel1))
+         : na
+
+float aud_dopp =
+     rdy
+         ? top_abv
+             ? near_blw_d
+             : near_abv_d
+         : na
+
+float aud_lp = na
+
+if rdy
+    float da_a =
+         _f_imp(top_dst, MED_DIST_ATR)
+
+    float rk_a =
+         _f_imp(aud_rank, MED_RANK)
+
+    float ns_a =
+         _f_imp(aud_nsd, MED_N_SAME)
+
+    float op_a =
+         _f_imp(aud_dopp, MED_DIST_OPP)
+
+    float la_a =
+         _f_imp(liq_asym, MED_LIQ_ASYM)
+
+    float rv_a =
+         _f_imp(rvol, MED_RVOL)
+
+    float bw_a =
+         _f_imp(bb_w, MED_BB_W)
+
+    float r5_a =
+         _f_imp(ret5, MED_RET5)
+
+    float r20_a =
+         _f_imp(ret20, MED_RET20)
+
+    float vd_a =
+         _f_imp(vwap_dist, MED_VWAP_D)
+
+    float pe_a =
+         _f_imp(prc_vs_e21, MED_PRC_E21)
+
+    float es_a =
+         _f_imp(ema_slope, MED_EMA_SLP)
+
+    aud_lp :=
+         INTERCEPT +
+         C0  * (da_a  - MU0)  / SC0 +
+         C1  * (rk_a  - MU1)  / SC1 +
+         C2  * (ns_a  - MU2)  / SC2 +
+         C3  * (op_a  - MU3)  / SC3 +
+         C4  * (la_a  - MU4)  / SC4 +
+         C5  * (rv_a  - MU5)  / SC5 +
+         C6  * (bw_a  - MU6)  / SC6 +
+         C7  * (r5_a  - MU7)  / SC7 +
+         C8  * (r20_a - MU8)  / SC8 +
+         C9  * (vd_a  - MU9)  / SC9 +
+         C10 * (pe_a  - MU10) / SC10 +
+         C11 * (es_a  - MU11) / SC11
+
+// ─────────────────────────────────────────────────────────────────
+// SECTION 27 — AUDIT PLOTS
+// Limited to the optional audit fields listed in the spec, to stay
+// well under the 64-plot platform limit alongside the 18 required
+// data-window exports above.
+// ─────────────────────────────────────────────────────────────────
+
+plot(i_show_audit ? atr_val : na, "Aud ATR", display = display.data_window)
+plot(i_show_audit ? ema21 : na, "Aud EMA21", display = display.data_window)
+plot(i_show_audit ? ema50 : na, "Aud EMA50", display = display.data_window)
+plot(i_show_audit ? bb_w : na, "Aud BB Width", display = display.data_window)
+plot(i_show_audit ? rvol : na, "Aud RVOL", display = display.data_window)
+plot(i_show_audit ? ret5 : na, "Aud Ret5", display = display.data_window)
+plot(i_show_audit ? ret20 : na, "Aud Ret20", display = display.data_window)
+plot(i_show_audit ? vwap_dist : na, "Aud VWAP Dist", display = display.data_window)
+plot(i_show_audit ? prc_vs_e21 : na, "Aud Price EMA21", display = display.data_window)
+plot(i_show_audit ? ema_slope : na, "Aud EMA Slope", display = display.data_window)
+plot(i_show_audit ? liq_asym : na, "Aud Liq Asym", display = display.data_window)
+plot(i_show_audit ? aud_rank : na, "Aud Sel Rank", display = display.data_window)
+plot(i_show_audit ? aud_nsd : na, "Aud Sel N Same", display = display.data_window)
+plot(i_show_audit ? aud_dopp : na, "Aud Opp Dist", display = display.data_window)
+plot(i_show_audit ? aud_lp : na, "Aud Raw LP", display = display.data_window)
+
+plot(
+     i_show_audit and not na(top_dst)
+         ? (top_dst - MU0) / SC0
+         : na,
+     "Aud Distance Z",
+     display = display.data_window)
+
+plot(
+     i_show_audit and not na(top_dst)
+         ? C0 * (top_dst - MU0) / SC0
+         : na,
+     "Aud Distance LP Contribution",
+     display = display.data_window)
+
+// ═══════════════════════════════════════════════════════════════════
+// END
+// INFORMATIONAL ONLY — NOT AN ENTRY SIGNAL.
+// ═══════════════════════════════════════════════════════════════════

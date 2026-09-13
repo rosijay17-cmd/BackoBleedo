@@ -1,0 +1,2607 @@
+//@version=6
+strategy(
+     title                   = "15M Confirmed Breakout Strategy v2",
+     shorttitle              = "15MBO v2",
+     overlay                 = true,
+     pyramiding              = 0,
+     process_orders_on_close = true,
+     calc_on_order_fills     = true,
+     calc_on_every_tick      = true,
+     initial_capital         = 50000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 2.50,
+     slippage                = 1,
+     max_labels_count        = 500,
+     max_lines_count         = 100
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// INPUT GROUPS
+// ═══════════════════════════════════════════════════════════════════
+
+const string GRP_SESSION  = "01 — Session and Range"
+const string GRP_BREAKOUT = "02 — 15M Breakout Candle"
+const string GRP_VOLUME   = "03 — Relative Volume"
+const string GRP_TREND    = "04 — Trend Filter"
+const string GRP_ENTRY    = "05 — Entry Trigger"
+const string GRP_RISK     = "06 — Risk Management"
+const string GRP_MANAGE   = "07 — Break-Even and Trailing"
+const string GRP_LIMITS   = "08 — Trade Limits"
+const string GRP_DISPLAY  = "09 — Display"
+const string GRP_ALERTS   = "10 — Alerts"
+
+// ═══════════════════════════════════════════════════════════════════
+// SESSION AND RANGE
+// ═══════════════════════════════════════════════════════════════════
+
+string sessionTimezone = input.string(
+     "America/New_York",
+     "Session Timezone",
+     group = GRP_SESSION
+)
+
+string tradingSession = input.session(
+     "0930-1600",
+     "Trading Session",
+     group = GRP_SESSION
+)
+
+string rangeSession = input.session(
+     "0930-1000",
+     "Breakout Range Window",
+     tooltip = "Default builds the initial range from 09:30 to 10:00 ET.",
+     group = GRP_SESSION
+)
+
+bool closeAtSessionEnd = input.bool(
+     true,
+     "Close Position At Session End",
+     group = GRP_SESSION
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// BREAKOUT CANDLE
+// ═══════════════════════════════════════════════════════════════════
+
+string breakoutTf = input.timeframe(
+     "15",
+     "Breakout Candle Timeframe",
+     group = GRP_BREAKOUT
+)
+
+bool requireOpenInsideRange = input.bool(
+     true,
+     "Require Breakout Candle Open Inside Range",
+     group = GRP_BREAKOUT
+)
+
+int breakoutBufferTicks = input.int(
+     2,
+     "Close Beyond Range — Ticks",
+     minval = 0,
+     maxval = 100,
+     group = GRP_BREAKOUT
+)
+
+float minBodyPercent = input.float(
+     55.0,
+     "Minimum Candle Body %",
+     minval = 0.0,
+     maxval = 100.0,
+     step = 5.0,
+     group = GRP_BREAKOUT
+)
+
+float minCloseLocation = input.float(
+     0.75,
+     "Minimum Directional Close Location",
+     minval = 0.50,
+     maxval = 1.00,
+     step = 0.05,
+     group = GRP_BREAKOUT
+)
+
+float minBreakoutAtrRatio = input.float(
+     0.70,
+     "Minimum Candle Range / ATR",
+     minval = 0.10,
+     maxval = 10.0,
+     step = 0.05,
+     group = GRP_BREAKOUT
+)
+
+float maxBreakoutAtrRatio = input.float(
+     2.50,
+     "Maximum Candle Range / ATR",
+     minval = 0.25,
+     maxval = 10.0,
+     step = 0.25,
+     group = GRP_BREAKOUT
+)
+
+bool oneBreakoutPerDay = input.bool(
+     true,
+     "One Qualified Breakout Per Day",
+     group = GRP_BREAKOUT
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// VOLUME
+// ═══════════════════════════════════════════════════════════════════
+
+int breakoutRvolLength = input.int(
+     20,
+     "15M RVOL Baseline Length",
+     minval = 2,
+     maxval = 200,
+     group = GRP_VOLUME
+)
+
+float minBreakoutRvol = input.float(
+     1.20,
+     "Minimum Breakout-Candle RVOL",
+     minval = 0.10,
+     maxval = 10.0,
+     step = 0.05,
+     group = GRP_VOLUME
+)
+
+bool useMaximumBreakoutRvol = input.bool(
+     false,
+     "Use Maximum Breakout RVOL Guard",
+     group = GRP_VOLUME
+)
+
+float maxBreakoutRvol = input.float(
+     4.00,
+     "Maximum Breakout-Candle RVOL",
+     minval = 0.50,
+     maxval = 20.0,
+     step = 0.25,
+     group = GRP_VOLUME
+)
+
+int entryRvolLength = input.int(
+     20,
+     "Entry-Bar RVOL Length",
+     minval = 2,
+     maxval = 200,
+     group = GRP_VOLUME
+)
+
+float minEntryRvol = input.float(
+     0.00,
+     "Minimum Entry-Bar RVOL",
+     minval = 0.00,
+     maxval = 10.0,
+     step = 0.05,
+     group = GRP_VOLUME
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// TREND FILTER
+// ═══════════════════════════════════════════════════════════════════
+
+bool useTrendFilter = input.bool(
+     true,
+     "Require EMA Trend Alignment",
+     group = GRP_TREND
+)
+
+int fastEmaLength = input.int(
+     20,
+     "Fast EMA Length",
+     minval = 2,
+     group = GRP_TREND
+)
+
+int slowEmaLength = input.int(
+     50,
+     "Slow EMA Length",
+     minval = 3,
+     group = GRP_TREND
+)
+
+bool requireFastEmaSlope = input.bool(
+     true,
+     "Require Fast EMA Slope",
+     group = GRP_TREND
+)
+
+int emaSlopeLookback = input.int(
+     5,
+     "Fast EMA Slope Lookback",
+     minval = 1,
+     group = GRP_TREND
+)
+
+bool useAdxFilter = input.bool(
+     false,
+     "Use ADX Filter",
+     group = GRP_TREND
+)
+
+int adxLength = input.int(
+     14,
+     "ADX Length",
+     minval = 2,
+     group = GRP_TREND
+)
+
+float minimumAdx = input.float(
+     20.0,
+     "Minimum ADX",
+     minval = 1.0,
+     step = 0.5,
+     group = GRP_TREND
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// ENTRY TRIGGER
+// ═══════════════════════════════════════════════════════════════════
+
+string triggerReference = input.string(
+     "Breakout Candle High / Low",
+     "Entry Reference",
+     options = [
+          "Breakout Candle High / Low",
+          "Confirmed Local Swing"
+     ],
+     tooltip = "Breakout Candle uses the qualified 15M candle extreme. Confirmed Local Swing uses the latest confirmed pivot formed after/around the setup.",
+     group = GRP_ENTRY
+)
+
+int swingPivotLength = input.int(
+     2,
+     "Local Swing Pivot Length",
+     minval = 1,
+     maxval = 10,
+     tooltip = "Used only with Confirmed Local Swing mode.",
+     group = GRP_ENTRY
+)
+
+string entryTriggerType = input.string(
+     "High / Low Break",
+     "Entry Trigger",
+     options = [
+          "High / Low Break",
+          "Close Beyond High / Low"
+     ],
+     group = GRP_ENTRY
+)
+
+int entryBufferTicks = input.int(
+     1,
+     "Entry Buffer — Ticks",
+     minval = 0,
+     maxval = 100,
+     group = GRP_ENTRY
+)
+
+int entryExpirationBars = input.int(
+     12,
+     "Entry Expiration — Chart Bars",
+     minval = 1,
+     maxval = 200,
+     group = GRP_ENTRY
+)
+
+bool requireEntryBarDirection = input.bool(
+     true,
+     "Require Directional Entry Bar",
+     tooltip = "When enabled, a long trigger must occur on a bullish chart bar and short on a bearish chart bar.",
+     group = GRP_ENTRY
+)
+
+bool requireTrendAtEntry = input.bool(
+     true,
+     "Require Trend Still Valid At Entry",
+     group = GRP_ENTRY
+)
+
+bool cancelOnOppositeBreak = input.bool(
+     true,
+     "Cancel If Opposite Side Breaks",
+     group = GRP_ENTRY
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// RISK
+// ═══════════════════════════════════════════════════════════════════
+
+float orderQuantity = input.float(
+     1.0,
+     "Contracts",
+     minval = 1.0,
+     step = 1.0,
+     group = GRP_RISK
+)
+
+string stopMode = input.string(
+     "Wider of Candle / ATR",
+     "Initial Stop Mode",
+     options = [
+          "Breakout Candle",
+          "ATR",
+          "Wider of Candle / ATR",
+          "Tighter of Candle / ATR"
+     ],
+     group = GRP_RISK
+)
+
+int stopBufferTicks = input.int(
+     2,
+     "Candle Stop Buffer — Ticks",
+     minval = 0,
+     maxval = 100,
+     group = GRP_RISK
+)
+
+float stopAtrMultiple = input.float(
+     1.25,
+     "ATR Stop Multiple",
+     minval = 0.10,
+     maxval = 10.0,
+     step = 0.05,
+     group = GRP_RISK
+)
+
+float rewardRiskMultiple = input.float(
+     2.00,
+     "Profit Target — R",
+     minval = 0.25,
+     maxval = 20.0,
+     step = 0.25,
+     group = GRP_RISK
+)
+
+int minimumRiskTicks = input.int(
+     4,
+     "Minimum Stop Distance — Ticks",
+     minval = 1,
+     maxval = 1000,
+     group = GRP_RISK
+)
+
+float maximumRiskAtr = input.float(
+     3.00,
+     "Maximum Stop Distance — ATR",
+     minval = 0.25,
+     maxval = 20.0,
+     step = 0.25,
+     group = GRP_RISK
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════
+
+bool useBreakEven = input.bool(
+     true,
+     "Use Break-Even",
+     group = GRP_MANAGE
+)
+
+float breakEvenTriggerR = input.float(
+     1.00,
+     "Break-Even Trigger — R",
+     minval = 0.25,
+     maxval = 10.0,
+     step = 0.25,
+     group = GRP_MANAGE
+)
+
+int breakEvenOffsetTicks = input.int(
+     1,
+     "Break-Even Offset — Ticks",
+     minval = 0,
+     maxval = 100,
+     group = GRP_MANAGE
+)
+
+bool useAtrTrail = input.bool(
+     true,
+     "Use ATR Trailing Stop",
+     group = GRP_MANAGE
+)
+
+float trailActivationR = input.float(
+     1.50,
+     "Trail Activation — R",
+     minval = 0.25,
+     maxval = 20.0,
+     step = 0.25,
+     group = GRP_MANAGE
+)
+
+float trailAtrMultiple = input.float(
+     1.50,
+     "Trailing ATR Multiple",
+     minval = 0.10,
+     maxval = 10.0,
+     step = 0.05,
+     group = GRP_MANAGE
+)
+
+bool useTimeExit = input.bool(
+     true,
+     "Use Time Exit",
+     group = GRP_MANAGE
+)
+
+int maximumHoldingBars = input.int(
+     60,
+     "Maximum Holding — Chart Bars",
+     minval = 1,
+     maxval = 1000,
+     group = GRP_MANAGE
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// TRADE LIMITS
+// ═══════════════════════════════════════════════════════════════════
+
+bool allowLongs = input.bool(
+     true,
+     "Allow Long Entries",
+     group = GRP_LIMITS
+)
+
+bool allowShorts = input.bool(
+     true,
+     "Allow Short Entries",
+     group = GRP_LIMITS
+)
+
+int maximumTradesPerDay = input.int(
+     2,
+     "Maximum Trades Per Day",
+     minval = 1,
+     maxval = 20,
+     group = GRP_LIMITS
+)
+
+int cooldownBars = input.int(
+     3,
+     "Cooldown After Exit — Bars",
+     minval = 0,
+     maxval = 200,
+     group = GRP_LIMITS
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// DISPLAY
+// ═══════════════════════════════════════════════════════════════════
+
+bool showRange = input.bool(
+     true,
+     "Show Breakout Range",
+     group = GRP_DISPLAY
+)
+
+bool showBreakoutLevels = input.bool(
+     true,
+     "Show Armed Trigger Levels",
+     group = GRP_DISPLAY
+)
+
+bool showTrendEma = input.bool(
+     true,
+     "Show Trend EMAs",
+     group = GRP_DISPLAY
+)
+
+bool showDashboard = input.bool(
+     true,
+     "Show Persistent Dashboard",
+     group = GRP_DISPLAY
+)
+
+bool showDebugMarkers = input.bool(
+     false,
+     "Show Debug Markers",
+     group = GRP_DISPLAY
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════
+
+bool enableDynamicAlerts = input.bool(
+     true,
+     "Enable Dynamic alert() Calls",
+     group = GRP_ALERTS
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// COLORS
+// ═══════════════════════════════════════════════════════════════════
+
+color COL_BULL    = color.rgb(0, 140, 255)
+color COL_BEAR    = color.rgb(160, 90, 235)
+color COL_READY   = color.rgb(20, 190, 105)
+color COL_WATCH   = color.rgb(245, 155, 25)
+color COL_DANGER  = color.rgb(240, 65, 80)
+color COL_NEUTRAL = color.rgb(100, 115, 135)
+
+// ═══════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+f_safeDiv(float numerator, float denominator, float fallback) =>
+    float result = fallback
+
+    if denominator != 0.0
+        result := numerator / denominator
+
+    result
+
+// ═══════════════════════════════════════════════════════════════════
+// TIMEFRAME VALIDATION
+// ═══════════════════════════════════════════════════════════════════
+
+int chartSeconds = timeframe.in_seconds(timeframe.period)
+int breakoutSeconds = timeframe.in_seconds(breakoutTf)
+
+bool validBreakoutTimeframe = (
+     not na(chartSeconds) and
+     not na(breakoutSeconds) and
+     chartSeconds <= breakoutSeconds
+)
+
+bool chartIsBreakoutTimeframe = (
+     validBreakoutTimeframe and
+     chartSeconds == breakoutSeconds
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// SESSION DETECTION
+// ═══════════════════════════════════════════════════════════════════
+
+bool inTradingSession = not na(
+     time(
+          timeframe.period,
+          tradingSession,
+          sessionTimezone
+     )
+)
+
+bool inRangeSession = not na(
+     time(
+          timeframe.period,
+          rangeSession,
+          sessionTimezone
+     )
+)
+
+bool rangeSessionStart = (
+     inRangeSession and
+     not inRangeSession[1]
+)
+
+bool rangeSessionEnd = (
+     not inRangeSession and
+     inRangeSession[1]
+)
+
+bool tradingSessionEnd = (
+     not inTradingSession and
+     inTradingSession[1]
+)
+
+int nyDayId = (
+     year(time, sessionTimezone) * 10000 +
+     month(time, sessionTimezone) * 100 +
+     dayofmonth(time, sessionTimezone)
+)
+
+bool newNyDay = (
+     barstate.isfirst or
+     nyDayId != nyDayId[1]
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// BUILD RANGE
+// ═══════════════════════════════════════════════════════════════════
+
+var float developingRangeHigh = na
+var float developingRangeLow = na
+
+var float frozenRangeHigh = na
+var float frozenRangeLow = na
+
+var bool rangeReady = false
+
+if newNyDay
+    developingRangeHigh := na
+    developingRangeLow := na
+
+    frozenRangeHigh := na
+    frozenRangeLow := na
+
+    rangeReady := false
+
+if rangeSessionStart
+
+    developingRangeHigh := high
+    developingRangeLow := low
+
+    rangeReady := false
+
+else if inRangeSession
+
+    if na(developingRangeHigh)
+        developingRangeHigh := high
+    else
+        developingRangeHigh := math.max(
+             developingRangeHigh,
+             high
+        )
+
+    if na(developingRangeLow)
+        developingRangeLow := low
+    else
+        developingRangeLow := math.min(
+             developingRangeLow,
+             low
+        )
+
+if rangeSessionEnd
+
+    frozenRangeHigh := developingRangeHigh
+    frozenRangeLow := developingRangeLow
+
+    rangeReady := (
+         not na(frozenRangeHigh) and
+         not na(frozenRangeLow) and
+         frozenRangeHigh > frozenRangeLow
+    )
+
+// ═══════════════════════════════════════════════════════════════════
+// TREND
+// ═══════════════════════════════════════════════════════════════════
+
+float atr = ta.atr(14)
+
+float fastEma = ta.ema(
+     close,
+     fastEmaLength
+)
+
+float slowEma = ta.ema(
+     close,
+     slowEmaLength
+)
+
+float fastEmaSlope = (
+     fastEma -
+     fastEma[emaSlopeLookback]
+)
+
+[plusDI, minusDI, adx] = ta.dmi(
+     adxLength,
+     adxLength
+)
+
+bool longTrendAligned = true
+
+if useTrendFilter
+
+    longTrendAligned := (
+         fastEma > slowEma and
+         close > fastEma
+    )
+
+    if requireFastEmaSlope
+        longTrendAligned := (
+             longTrendAligned and
+             fastEmaSlope > 0
+        )
+
+bool shortTrendAligned = true
+
+if useTrendFilter
+
+    shortTrendAligned := (
+         fastEma < slowEma and
+         close < fastEma
+    )
+
+    if requireFastEmaSlope
+        shortTrendAligned := (
+             shortTrendAligned and
+             fastEmaSlope < 0
+        )
+
+bool longAdxPass = true
+
+if useAdxFilter
+
+    longAdxPass := (
+         adx >= minimumAdx and
+         plusDI > minusDI
+    )
+
+bool shortAdxPass = true
+
+if useAdxFilter
+
+    shortAdxPass := (
+         adx >= minimumAdx and
+         minusDI > plusDI
+    )
+
+// ═══════════════════════════════════════════════════════════════════
+// CONFIRMED 15M DATA
+// ═══════════════════════════════════════════════════════════════════
+
+[htfTime, htfOpen, htfHigh, htfLow, htfClose, htfVolume, htfAtr, htfAvgVolume] =
+     request.security(
+          syminfo.tickerid,
+          breakoutTf,
+          [
+               time[1],
+               open[1],
+               high[1],
+               low[1],
+               close[1],
+               volume[1],
+               ta.atr(14)[1],
+               ta.sma(volume, breakoutRvolLength)[1]
+          ],
+          gaps = barmerge.gaps_off,
+          lookahead = barmerge.lookahead_on
+     )
+
+bool newConfirmedHtfBar = (
+     validBreakoutTimeframe and
+     not chartIsBreakoutTimeframe and
+     not na(htfTime) and
+     htfTime != htfTime[1]
+)
+
+bool breakoutEvaluationEvent = false
+
+if chartIsBreakoutTimeframe
+    breakoutEvaluationEvent := barstate.isconfirmed
+else
+    breakoutEvaluationEvent := newConfirmedHtfBar
+
+float evaluatedOpen = htfOpen
+float evaluatedHigh = htfHigh
+float evaluatedLow = htfLow
+float evaluatedClose = htfClose
+float evaluatedVolume = htfVolume
+float evaluatedAtr = htfAtr
+float evaluatedAverageVolume = htfAvgVolume
+int evaluatedTime = htfTime
+
+if chartIsBreakoutTimeframe
+    evaluatedOpen := open
+    evaluatedHigh := high
+    evaluatedLow := low
+    evaluatedClose := close
+    evaluatedVolume := volume
+    evaluatedAtr := atr
+    evaluatedAverageVolume := ta.sma(
+         volume,
+         breakoutRvolLength
+    )
+    evaluatedTime := time
+
+// ═══════════════════════════════════════════════════════════════════
+// BREAKOUT CANDLE QUALITY
+// ═══════════════════════════════════════════════════════════════════
+
+float evaluatedRange = math.max(
+     evaluatedHigh -
+     evaluatedLow,
+     syminfo.mintick
+)
+
+float evaluatedBody = math.abs(
+     evaluatedClose -
+     evaluatedOpen
+)
+
+float evaluatedBodyPercent = (
+     f_safeDiv(
+          evaluatedBody,
+          evaluatedRange,
+          0.0
+     ) * 100.0
+)
+
+float evaluatedBullCloseLocation = f_safeDiv(
+     evaluatedClose -
+     evaluatedLow,
+     evaluatedRange,
+     0.0
+)
+
+float evaluatedBearCloseLocation = f_safeDiv(
+     evaluatedHigh -
+     evaluatedClose,
+     evaluatedRange,
+     0.0
+)
+
+float evaluatedAtrRatio = na
+
+if (
+     not na(evaluatedAtr) and
+     evaluatedAtr > 0
+)
+    evaluatedAtrRatio := (
+         evaluatedRange /
+         evaluatedAtr
+    )
+
+float evaluatedRvol = na
+
+if (
+     not na(evaluatedAverageVolume) and
+     evaluatedAverageVolume > 0
+)
+    evaluatedRvol := (
+         evaluatedVolume /
+         evaluatedAverageVolume
+    )
+
+float breakoutCloseBuffer = (
+     breakoutBufferTicks *
+     syminfo.mintick
+)
+
+bool breakoutRvolPass = (
+     not na(evaluatedRvol) and
+     evaluatedRvol >= minBreakoutRvol
+)
+
+if useMaximumBreakoutRvol
+    breakoutRvolPass := (
+         breakoutRvolPass and
+         evaluatedRvol <= maxBreakoutRvol
+    )
+
+bool breakoutBodyPass = (
+     evaluatedBodyPercent >=
+     minBodyPercent
+)
+
+bool breakoutAtrPass = (
+     not na(evaluatedAtrRatio) and
+     evaluatedAtrRatio >= minBreakoutAtrRatio and
+     evaluatedAtrRatio <= maxBreakoutAtrRatio
+)
+
+bool breakoutOpenPass = true
+
+if requireOpenInsideRange
+
+    breakoutOpenPass := (
+         evaluatedOpen >= frozenRangeLow and
+         evaluatedOpen <= frozenRangeHigh
+    )
+
+bool bullishBreakoutPrice = (
+     evaluatedClose >=
+     frozenRangeHigh +
+     breakoutCloseBuffer
+)
+
+bool bearishBreakoutPrice = (
+     evaluatedClose <=
+     frozenRangeLow -
+     breakoutCloseBuffer
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// BREAKOUT STATE
+// ═══════════════════════════════════════════════════════════════════
+
+var bool breakoutUsedToday = false
+
+var bool breakoutArmed = false
+var int breakoutDirection = 0
+var int breakoutDetectionBar = na
+
+var float frozenBreakoutOpen = na
+var float frozenBreakoutHigh = na
+var float frozenBreakoutLow = na
+var float frozenBreakoutClose = na
+
+var float frozenBreakoutRvol = na
+var float frozenBreakoutBodyPercent = na
+var float frozenBreakoutCloseLocation = na
+var float frozenBreakoutAtrRatio = na
+
+if newNyDay
+
+    breakoutUsedToday := false
+
+    breakoutArmed := false
+    breakoutDirection := 0
+    breakoutDetectionBar := na
+
+    frozenBreakoutOpen := na
+    frozenBreakoutHigh := na
+    frozenBreakoutLow := na
+    frozenBreakoutClose := na
+
+bool breakoutAvailable = (
+     not oneBreakoutPerDay or
+     not breakoutUsedToday
+)
+
+bool bullishBreakoutEvent = (
+     breakoutEvaluationEvent and
+     validBreakoutTimeframe and
+     rangeReady and
+     inTradingSession and
+     breakoutAvailable and
+     evaluatedClose > evaluatedOpen and
+     bullishBreakoutPrice and
+     breakoutOpenPass and
+     breakoutBodyPass and
+     evaluatedBullCloseLocation >= minCloseLocation and
+     breakoutAtrPass and
+     breakoutRvolPass and
+     longTrendAligned and
+     longAdxPass
+)
+
+bool bearishBreakoutEvent = (
+     breakoutEvaluationEvent and
+     validBreakoutTimeframe and
+     rangeReady and
+     inTradingSession and
+     breakoutAvailable and
+     evaluatedClose < evaluatedOpen and
+     bearishBreakoutPrice and
+     breakoutOpenPass and
+     breakoutBodyPass and
+     evaluatedBearCloseLocation >= minCloseLocation and
+     breakoutAtrPass and
+     breakoutRvolPass and
+     shortTrendAligned and
+     shortAdxPass and
+     not bullishBreakoutEvent
+)
+
+if bullishBreakoutEvent
+
+    breakoutArmed := true
+    breakoutDirection := 1
+    breakoutDetectionBar := bar_index
+
+    frozenBreakoutOpen := evaluatedOpen
+    frozenBreakoutHigh := evaluatedHigh
+    frozenBreakoutLow := evaluatedLow
+    frozenBreakoutClose := evaluatedClose
+
+    frozenBreakoutRvol := evaluatedRvol
+    frozenBreakoutBodyPercent := evaluatedBodyPercent
+    frozenBreakoutCloseLocation := evaluatedBullCloseLocation
+    frozenBreakoutAtrRatio := evaluatedAtrRatio
+
+    breakoutUsedToday := true
+
+if bearishBreakoutEvent
+
+    breakoutArmed := true
+    breakoutDirection := -1
+    breakoutDetectionBar := bar_index
+
+    frozenBreakoutOpen := evaluatedOpen
+    frozenBreakoutHigh := evaluatedHigh
+    frozenBreakoutLow := evaluatedLow
+    frozenBreakoutClose := evaluatedClose
+
+    frozenBreakoutRvol := evaluatedRvol
+    frozenBreakoutBodyPercent := evaluatedBodyPercent
+    frozenBreakoutCloseLocation := evaluatedBearCloseLocation
+    frozenBreakoutAtrRatio := evaluatedAtrRatio
+
+    breakoutUsedToday := true
+
+// ═══════════════════════════════════════════════════════════════════
+// CONFIRMED LOCAL SWINGS
+// ═══════════════════════════════════════════════════════════════════
+
+float pivotHigh = ta.pivothigh(
+     high,
+     swingPivotLength,
+     swingPivotLength
+)
+
+float pivotLow = ta.pivotlow(
+     low,
+     swingPivotLength,
+     swingPivotLength
+)
+
+var float latestConfirmedSwingHigh = na
+var float latestConfirmedSwingLow = na
+
+var int latestSwingHighBar = na
+var int latestSwingLowBar = na
+
+if not na(pivotHigh)
+
+    latestConfirmedSwingHigh := pivotHigh
+
+    latestSwingHighBar := (
+         bar_index -
+         swingPivotLength
+    )
+
+if not na(pivotLow)
+
+    latestConfirmedSwingLow := pivotLow
+
+    latestSwingLowBar := (
+         bar_index -
+         swingPivotLength
+    )
+
+// Freeze useful swing reference for armed setup.
+
+var float armedSwingHigh = na
+var float armedSwingLow = na
+
+if bullishBreakoutEvent
+
+    armedSwingHigh := latestConfirmedSwingHigh
+    armedSwingLow := latestConfirmedSwingLow
+
+if bearishBreakoutEvent
+
+    armedSwingHigh := latestConfirmedSwingHigh
+    armedSwingLow := latestConfirmedSwingLow
+
+// Allow a newly confirmed swing to update while setup remains armed.
+// This makes "nearest confirmed swing" genuinely dynamic before entry.
+
+if breakoutArmed and strategy.position_size == 0
+
+    if not na(pivotHigh)
+
+        if (
+             not na(latestSwingHighBar) and
+             latestSwingHighBar >= breakoutDetectionBar
+        )
+            armedSwingHigh := latestConfirmedSwingHigh
+
+    if not na(pivotLow)
+
+        if (
+             not na(latestSwingLowBar) and
+             latestSwingLowBar >= breakoutDetectionBar
+        )
+            armedSwingLow := latestConfirmedSwingLow
+
+// ═══════════════════════════════════════════════════════════════════
+// ENTRY RVOL
+// ═══════════════════════════════════════════════════════════════════
+
+float entryAverageVolume = ta.sma(
+     volume,
+     entryRvolLength
+)
+
+float entryRvol = na
+
+if (
+     not na(entryAverageVolume) and
+     entryAverageVolume > 0
+)
+
+    entryRvol := (
+         volume /
+         entryAverageVolume
+    )
+
+bool entryRvolPass = (
+     not na(entryRvol) and
+     entryRvol > 0 and
+     entryRvol >= minEntryRvol
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// DAILY LIMIT / COOLDOWN
+// ═══════════════════════════════════════════════════════════════════
+
+var int tradesToday = 0
+var int lastExitBar = na
+var int lastOrderBar = na
+
+if newNyDay
+    tradesToday := 0
+
+int barsSinceExit = 1000000
+
+if not na(lastExitBar)
+
+    barsSinceExit := (
+         bar_index -
+         lastExitBar
+    )
+
+bool cooldownReady = (
+     barsSinceExit >= cooldownBars
+)
+
+bool dailyLimitReady = (
+     tradesToday <
+     maximumTradesPerDay
+)
+
+bool noDuplicateOrderThisBar = true
+
+if not na(lastOrderBar)
+
+    noDuplicateOrderThisBar := (
+         bar_index != lastOrderBar
+    )
+
+// ═══════════════════════════════════════════════════════════════════
+// SETUP AGE
+// ═══════════════════════════════════════════════════════════════════
+
+int setupAge = -1
+
+if (
+     breakoutArmed and
+     not na(breakoutDetectionBar)
+)
+
+    setupAge := (
+         bar_index -
+         breakoutDetectionBar
+    )
+
+bool afterBreakoutBar = (
+     breakoutArmed and
+     not na(breakoutDetectionBar) and
+     bar_index > breakoutDetectionBar
+)
+
+bool setupExpired = (
+     breakoutArmed and
+     setupAge > entryExpirationBars
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// TRIGGER REFERENCES
+// ═══════════════════════════════════════════════════════════════════
+
+float rawLongReference = frozenBreakoutHigh
+float rawShortReference = frozenBreakoutLow
+
+if triggerReference == "Confirmed Local Swing"
+
+    if not na(armedSwingHigh)
+        rawLongReference := armedSwingHigh
+
+    if not na(armedSwingLow)
+        rawShortReference := armedSwingLow
+
+float entryBuffer = (
+     entryBufferTicks *
+     syminfo.mintick
+)
+
+float longTriggerPrice = na
+float shortTriggerPrice = na
+
+if not na(rawLongReference)
+
+    longTriggerPrice := (
+         rawLongReference +
+         entryBuffer
+    )
+
+if not na(rawShortReference)
+
+    shortTriggerPrice := (
+         rawShortReference -
+         entryBuffer
+    )
+
+// ═══════════════════════════════════════════════════════════════════
+// INVALIDATION
+// ═══════════════════════════════════════════════════════════════════
+
+bool bullishSetupInvalidated = false
+bool bearishSetupInvalidated = false
+
+if (
+     breakoutArmed and
+     breakoutDirection == 1 and
+     cancelOnOppositeBreak and
+     not na(frozenBreakoutLow)
+)
+
+    bullishSetupInvalidated := (
+         low <
+         frozenBreakoutLow
+    )
+
+if (
+     breakoutArmed and
+     breakoutDirection == -1 and
+     cancelOnOppositeBreak and
+     not na(frozenBreakoutHigh)
+)
+
+    bearishSetupInvalidated := (
+         high >
+         frozenBreakoutHigh
+    )
+
+bool setupInvalidated = (
+     bullishSetupInvalidated or
+     bearishSetupInvalidated
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// PERSISTENT PRICE TRIGGER
+//
+// IMPORTANT FIX:
+// We DO NOT require high[1] < trigger or low[1] > trigger.
+//
+// While setup remains armed:
+//
+// Long high/low mode:
+//     high >= trigger
+//
+// Short high/low mode:
+//     low <= trigger
+//
+// This means another filter blocking the first touch does not
+// permanently destroy the setup.
+// ═══════════════════════════════════════════════════════════════════
+
+bool longHighBreak = (
+     afterBreakoutBar and
+     not na(longTriggerPrice) and
+     high >= longTriggerPrice
+)
+
+bool shortLowBreak = (
+     afterBreakoutBar and
+     not na(shortTriggerPrice) and
+     low <= shortTriggerPrice
+)
+
+bool longCloseBreak = (
+     afterBreakoutBar and
+     not na(longTriggerPrice) and
+     close > longTriggerPrice
+)
+
+bool shortCloseBreak = (
+     afterBreakoutBar and
+     not na(shortTriggerPrice) and
+     close < shortTriggerPrice
+)
+
+bool longPriceTrigger = false
+bool shortPriceTrigger = false
+
+if entryTriggerType == "High / Low Break"
+
+    longPriceTrigger := longHighBreak
+    shortPriceTrigger := shortLowBreak
+
+else
+
+    longPriceTrigger := longCloseBreak
+    shortPriceTrigger := shortCloseBreak
+
+// ═══════════════════════════════════════════════════════════════════
+// ENTRY BAR DIRECTION
+// ═══════════════════════════════════════════════════════════════════
+
+bool longEntryBarPass = true
+bool shortEntryBarPass = true
+
+if requireEntryBarDirection
+
+    longEntryBarPass := (
+         close > open
+    )
+
+    shortEntryBarPass := (
+         close < open
+    )
+
+// ═══════════════════════════════════════════════════════════════════
+// TREND AT ENTRY
+// ═══════════════════════════════════════════════════════════════════
+
+bool longTrendEntryPass = true
+bool shortTrendEntryPass = true
+
+if requireTrendAtEntry
+
+    longTrendEntryPass := (
+         longTrendAligned and
+         longAdxPass
+    )
+
+    shortTrendEntryPass := (
+         shortTrendAligned and
+         shortAdxPass
+    )
+
+// ═══════════════════════════════════════════════════════════════════
+// CANDIDATE STOPS
+// ═══════════════════════════════════════════════════════════════════
+
+float stopBuffer = (
+     stopBufferTicks *
+     syminfo.mintick
+)
+
+float minimumRiskDistance = (
+     minimumRiskTicks *
+     syminfo.mintick
+)
+
+float longCandleStop = na
+float shortCandleStop = na
+
+if not na(frozenBreakoutLow)
+
+    longCandleStop := (
+         frozenBreakoutLow -
+         stopBuffer
+    )
+
+if not na(frozenBreakoutHigh)
+
+    shortCandleStop := (
+         frozenBreakoutHigh +
+         stopBuffer
+    )
+
+float longAtrStop = (
+     close -
+     atr * stopAtrMultiple
+)
+
+float shortAtrStop = (
+     close +
+     atr * stopAtrMultiple
+)
+
+float candidateLongStop = na
+float candidateShortStop = na
+
+if stopMode == "Breakout Candle"
+
+    candidateLongStop := longCandleStop
+    candidateShortStop := shortCandleStop
+
+else if stopMode == "ATR"
+
+    candidateLongStop := longAtrStop
+    candidateShortStop := shortAtrStop
+
+else if stopMode == "Wider of Candle / ATR"
+
+    if not na(longCandleStop)
+        candidateLongStop := math.min(
+             longCandleStop,
+             longAtrStop
+        )
+    else
+        candidateLongStop := longAtrStop
+
+    if not na(shortCandleStop)
+        candidateShortStop := math.max(
+             shortCandleStop,
+             shortAtrStop
+        )
+    else
+        candidateShortStop := shortAtrStop
+
+else
+
+    if not na(longCandleStop)
+        candidateLongStop := math.max(
+             longCandleStop,
+             longAtrStop
+        )
+    else
+        candidateLongStop := longAtrStop
+
+    if not na(shortCandleStop)
+        candidateShortStop := math.min(
+             shortCandleStop,
+             shortAtrStop
+        )
+    else
+        candidateShortStop := shortAtrStop
+
+if not na(candidateLongStop)
+
+    candidateLongStop := math.min(
+         candidateLongStop,
+         close - minimumRiskDistance
+    )
+
+if not na(candidateShortStop)
+
+    candidateShortStop := math.max(
+         candidateShortStop,
+         close + minimumRiskDistance
+    )
+
+float candidateLongRisk = na
+float candidateShortRisk = na
+
+if not na(candidateLongStop)
+
+    candidateLongRisk := (
+         close -
+         candidateLongStop
+    )
+
+if not na(candidateShortStop)
+
+    candidateShortRisk := (
+         candidateShortStop -
+         close
+    )
+
+bool longRiskValid = (
+     not na(candidateLongRisk) and
+     candidateLongRisk >= minimumRiskDistance and
+     atr > 0 and
+     candidateLongRisk <= atr * maximumRiskAtr
+)
+
+bool shortRiskValid = (
+     not na(candidateShortRisk) and
+     candidateShortRisk >= minimumRiskDistance and
+     atr > 0 and
+     candidateShortRisk <= atr * maximumRiskAtr
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// FINAL ENTRY
+// ═══════════════════════════════════════════════════════════════════
+
+bool flat = (
+     strategy.position_size == 0
+)
+
+bool commonEntryPass = (
+     barstate.isconfirmed and
+     validBreakoutTimeframe and
+     breakoutArmed and
+     not setupExpired and
+     not setupInvalidated and
+     flat and
+     inTradingSession and
+     dailyLimitReady and
+     cooldownReady and
+     entryRvolPass and
+     noDuplicateOrderThisBar
+)
+
+bool longEntry = (
+     commonEntryPass and
+     allowLongs and
+     breakoutDirection == 1 and
+     longPriceTrigger and
+     longEntryBarPass and
+     longTrendEntryPass and
+     longRiskValid
+)
+
+bool shortEntry = (
+     commonEntryPass and
+     allowShorts and
+     breakoutDirection == -1 and
+     shortPriceTrigger and
+     shortEntryBarPass and
+     shortTrendEntryPass and
+     shortRiskValid and
+     not longEntry
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// TRADE STATE
+// ═══════════════════════════════════════════════════════════════════
+
+var float pendingStop = na
+var float pendingAtr = na
+
+var float activeEntry = na
+var float initialRisk = na
+var float activeStop = na
+var float activeTarget = na
+
+var float highestSinceEntry = na
+var float lowestSinceEntry = na
+
+var bool breakEvenMoved = false
+var bool trailActivated = false
+
+var int entryBarIndex = na
+var string lastExitReason = "NONE"
+
+// ═══════════════════════════════════════════════════════════════════
+// ORDER SUBMISSION
+// ═══════════════════════════════════════════════════════════════════
+
+if longEntry
+
+    pendingStop := candidateLongStop
+    pendingAtr := atr
+
+    lastOrderBar := bar_index
+    tradesToday += 1
+
+    breakoutArmed := false
+
+    strategy.entry(
+         "Long",
+         strategy.long,
+         qty = orderQuantity,
+         comment = "15M Long Break"
+    )
+
+    if enableDynamicAlerts
+
+        alert(
+             "🔵 BULLISH — 15M BREAKOUT LONG\n" +
+             "BIAS: BULLISH ▲\n" +
+             syminfo.ticker +
+             " | " +
+             timeframe.period +
+             "\nTrigger: " +
+             str.tostring(
+                  longTriggerPrice,
+                  format.mintick
+             ),
+             alert.freq_once_per_bar_close
+        )
+
+if shortEntry
+
+    pendingStop := candidateShortStop
+    pendingAtr := atr
+
+    lastOrderBar := bar_index
+    tradesToday += 1
+
+    breakoutArmed := false
+
+    strategy.entry(
+         "Short",
+         strategy.short,
+         qty = orderQuantity,
+         comment = "15M Short Break"
+    )
+
+    if enableDynamicAlerts
+
+        alert(
+             "🟣 BEARISH — 15M BREAKOUT SHORT\n" +
+             "BIAS: BEARISH ▼\n" +
+             syminfo.ticker +
+             " | " +
+             timeframe.period +
+             "\nTrigger: " +
+             str.tostring(
+                  shortTriggerPrice,
+                  format.mintick
+             ),
+             alert.freq_once_per_bar_close
+        )
+
+// ═══════════════════════════════════════════════════════════════════
+// FILL DETECTION
+// ═══════════════════════════════════════════════════════════════════
+
+bool longFill = (
+     strategy.position_size > 0 and
+     strategy.position_size[1] <= 0
+)
+
+bool shortFill = (
+     strategy.position_size < 0 and
+     strategy.position_size[1] >= 0
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// LONG FILL
+// ═══════════════════════════════════════════════════════════════════
+
+if longFill
+
+    activeEntry := (
+         strategy.position_avg_price
+    )
+
+    if not na(pendingStop)
+
+        activeStop := pendingStop
+
+    else
+
+        activeStop := (
+             activeEntry -
+             atr * stopAtrMultiple
+        )
+
+    initialRisk := (
+         activeEntry -
+         activeStop
+    )
+
+    bool fillRiskValid = (
+         not na(initialRisk) and
+         initialRisk >= minimumRiskDistance and
+         not na(pendingAtr) and
+         pendingAtr > 0 and
+         initialRisk <= pendingAtr * maximumRiskAtr
+    )
+
+    if not fillRiskValid
+
+        strategy.close(
+             "Long",
+             immediately = true,
+             comment = "Invalid Fill Risk"
+        )
+
+    else
+
+        activeTarget := (
+             activeEntry +
+             initialRisk *
+             rewardRiskMultiple
+        )
+
+        highestSinceEntry := activeEntry
+        lowestSinceEntry := activeEntry
+
+        breakEvenMoved := false
+        trailActivated := false
+
+        entryBarIndex := bar_index
+
+// ═══════════════════════════════════════════════════════════════════
+// SHORT FILL
+// ═══════════════════════════════════════════════════════════════════
+
+if shortFill
+
+    activeEntry := (
+         strategy.position_avg_price
+    )
+
+    if not na(pendingStop)
+
+        activeStop := pendingStop
+
+    else
+
+        activeStop := (
+             activeEntry +
+             atr * stopAtrMultiple
+        )
+
+    initialRisk := (
+         activeStop -
+         activeEntry
+    )
+
+    bool fillRiskValid = (
+         not na(initialRisk) and
+         initialRisk >= minimumRiskDistance and
+         not na(pendingAtr) and
+         pendingAtr > 0 and
+         initialRisk <= pendingAtr * maximumRiskAtr
+    )
+
+    if not fillRiskValid
+
+        strategy.close(
+             "Short",
+             immediately = true,
+             comment = "Invalid Fill Risk"
+        )
+
+    else
+
+        activeTarget := (
+             activeEntry -
+             initialRisk *
+             rewardRiskMultiple
+        )
+
+        highestSinceEntry := activeEntry
+        lowestSinceEntry := activeEntry
+
+        breakEvenMoved := false
+        trailActivated := false
+
+        entryBarIndex := bar_index
+
+// ═══════════════════════════════════════════════════════════════════
+// MANAGEMENT ELIGIBILITY
+//
+// Do not use signal/fill-bar high-low for BE or trailing.
+// ═══════════════════════════════════════════════════════════════════
+
+bool managementEligible = (
+     strategy.position_size != 0 and
+     not na(entryBarIndex) and
+     bar_index > entryBarIndex
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// POSITION EXTREMES
+// ═══════════════════════════════════════════════════════════════════
+
+if (
+     strategy.position_size != 0 and
+     managementEligible
+)
+
+    highestSinceEntry := math.max(
+         nz(
+              highestSinceEntry,
+              high
+         ),
+         high
+    )
+
+    lowestSinceEntry := math.min(
+         nz(
+              lowestSinceEntry,
+              low
+         ),
+         low
+    )
+
+// ═══════════════════════════════════════════════════════════════════
+// BREAK EVEN
+// ═══════════════════════════════════════════════════════════════════
+
+float breakEvenOffset = (
+     breakEvenOffsetTicks *
+     syminfo.mintick
+)
+
+if (
+     strategy.position_size > 0 and
+     managementEligible and
+     useBreakEven and
+     not breakEvenMoved and
+     not na(initialRisk) and
+     high >= activeEntry +
+     initialRisk *
+     breakEvenTriggerR
+)
+
+    activeStop := math.max(
+         activeStop,
+         activeEntry +
+         breakEvenOffset
+    )
+
+    breakEvenMoved := true
+
+if (
+     strategy.position_size < 0 and
+     managementEligible and
+     useBreakEven and
+     not breakEvenMoved and
+     not na(initialRisk) and
+     low <= activeEntry -
+     initialRisk *
+     breakEvenTriggerR
+)
+
+    activeStop := math.min(
+         activeStop,
+         activeEntry -
+         breakEvenOffset
+    )
+
+    breakEvenMoved := true
+
+// ═══════════════════════════════════════════════════════════════════
+// TRAILING
+// ═══════════════════════════════════════════════════════════════════
+
+if (
+     strategy.position_size > 0 and
+     managementEligible and
+     useAtrTrail and
+     not na(initialRisk) and
+     highestSinceEntry >=
+     activeEntry +
+     initialRisk *
+     trailActivationR
+)
+
+    trailActivated := true
+
+if (
+     strategy.position_size < 0 and
+     managementEligible and
+     useAtrTrail and
+     not na(initialRisk) and
+     lowestSinceEntry <=
+     activeEntry -
+     initialRisk *
+     trailActivationR
+)
+
+    trailActivated := true
+
+if (
+     strategy.position_size > 0 and
+     trailActivated
+)
+
+    float proposedLongTrail = (
+         highestSinceEntry -
+         atr *
+         trailAtrMultiple
+    )
+
+    activeStop := math.max(
+         activeStop,
+         proposedLongTrail
+    )
+
+if (
+     strategy.position_size < 0 and
+     trailActivated
+)
+
+    float proposedShortTrail = (
+         lowestSinceEntry +
+         atr *
+         trailAtrMultiple
+    )
+
+    activeStop := math.min(
+         activeStop,
+         proposedShortTrail
+    )
+
+// ═══════════════════════════════════════════════════════════════════
+// PROTECTIVE EXITS
+// ═══════════════════════════════════════════════════════════════════
+
+if (
+     strategy.position_size > 0 and
+     not na(activeStop) and
+     not na(activeTarget)
+)
+
+    strategy.exit(
+         "Long Exit",
+         from_entry = "Long",
+         stop = activeStop,
+         limit = activeTarget
+    )
+
+if (
+     strategy.position_size < 0 and
+     not na(activeStop) and
+     not na(activeTarget)
+)
+
+    strategy.exit(
+         "Short Exit",
+         from_entry = "Short",
+         stop = activeStop,
+         limit = activeTarget
+    )
+
+// ═══════════════════════════════════════════════════════════════════
+// TIME EXIT
+// ═══════════════════════════════════════════════════════════════════
+
+int barsHeld = 0
+
+if (
+     strategy.position_size != 0 and
+     not na(entryBarIndex)
+)
+
+    barsHeld := (
+         bar_index -
+         entryBarIndex
+    )
+
+if (
+     useTimeExit and
+     strategy.position_size != 0 and
+     barsHeld >= maximumHoldingBars
+)
+
+    lastExitReason := "TIME"
+
+    strategy.close_all(
+         comment = "Time Exit",
+         immediately = true
+    )
+
+// ═══════════════════════════════════════════════════════════════════
+// SESSION EXIT
+// ═══════════════════════════════════════════════════════════════════
+
+if (
+     closeAtSessionEnd and
+     tradingSessionEnd and
+     strategy.position_size != 0
+)
+
+    lastExitReason := "SESSION"
+
+    strategy.close_all(
+         comment = "Session Exit",
+         immediately = true
+    )
+
+if (
+     tradingSessionEnd and
+     breakoutArmed
+)
+
+    breakoutArmed := false
+
+// ═══════════════════════════════════════════════════════════════════
+// SETUP CANCELLATION
+// ═══════════════════════════════════════════════════════════════════
+
+if (
+     strategy.position_size == 0 and
+     breakoutArmed and
+     (
+          setupExpired or
+          setupInvalidated
+     )
+)
+
+    breakoutArmed := false
+
+// ═══════════════════════════════════════════════════════════════════
+// POSITION CLOSED
+// ═══════════════════════════════════════════════════════════════════
+
+bool positionJustClosed = (
+     strategy.position_size == 0 and
+     strategy.position_size[1] != 0
+)
+
+if positionJustClosed
+
+    if lastExitReason == "NONE"
+        lastExitReason := "STOP/TARGET"
+
+    lastExitBar := bar_index
+
+    pendingStop := na
+    pendingAtr := na
+
+    activeEntry := na
+    initialRisk := na
+    activeStop := na
+    activeTarget := na
+
+    highestSinceEntry := na
+    lowestSinceEntry := na
+
+    breakEvenMoved := false
+    trailActivated := false
+
+    entryBarIndex := na
+
+if longFill or shortFill
+
+    lastExitReason := "NONE"
+
+// ═══════════════════════════════════════════════════════════════════
+// BLOCKER DIAGNOSTICS
+// ═══════════════════════════════════════════════════════════════════
+
+string longStatus = "CLEAR"
+
+if not validBreakoutTimeframe
+    longStatus := "INVALID TF"
+else if not inTradingSession
+    longStatus := "SESSION CLOSED"
+else if not rangeReady
+    longStatus := "RANGE NOT READY"
+else if strategy.position_size != 0
+    longStatus := "POSITION OPEN"
+else if not dailyLimitReady
+    longStatus := "DAILY LIMIT"
+else if not cooldownReady
+    longStatus := "COOLDOWN"
+else if not breakoutArmed
+    longStatus := "NO SETUP"
+else if breakoutDirection != 1
+    longStatus := "NOT BULL"
+else if setupExpired
+    longStatus := "EXPIRED"
+else if setupInvalidated
+    longStatus := "INVALIDATED"
+else if not entryRvolPass
+    longStatus := "ENTRY RVOL"
+else if not longTrendEntryPass
+    longStatus := "TREND BLOCK"
+else if not longRiskValid
+    longStatus := "RISK BLOCK"
+else if not longPriceTrigger
+    longStatus := "WAIT HIGH"
+else if not longEntryBarPass
+    longStatus := "BAR DIRECTION"
+
+string shortStatus = "CLEAR"
+
+if not validBreakoutTimeframe
+    shortStatus := "INVALID TF"
+else if not inTradingSession
+    shortStatus := "SESSION CLOSED"
+else if not rangeReady
+    shortStatus := "RANGE NOT READY"
+else if strategy.position_size != 0
+    shortStatus := "POSITION OPEN"
+else if not dailyLimitReady
+    shortStatus := "DAILY LIMIT"
+else if not cooldownReady
+    shortStatus := "COOLDOWN"
+else if not breakoutArmed
+    shortStatus := "NO SETUP"
+else if breakoutDirection != -1
+    shortStatus := "NOT BEAR"
+else if setupExpired
+    shortStatus := "EXPIRED"
+else if setupInvalidated
+    shortStatus := "INVALIDATED"
+else if not entryRvolPass
+    shortStatus := "ENTRY RVOL"
+else if not shortTrendEntryPass
+    shortStatus := "TREND BLOCK"
+else if not shortRiskValid
+    shortStatus := "RISK BLOCK"
+else if not shortPriceTrigger
+    shortStatus := "WAIT LOW"
+else if not shortEntryBarPass
+    shortStatus := "BAR DIRECTION"
+
+// ═══════════════════════════════════════════════════════════════════
+// VISUALS
+// ═══════════════════════════════════════════════════════════════════
+
+plot(
+     showRange and rangeReady
+          ? frozenRangeHigh
+          : na,
+     "Range High",
+     color = COL_WATCH,
+     linewidth = 2,
+     style = plot.style_stepline
+)
+
+plot(
+     showRange and rangeReady
+          ? frozenRangeLow
+          : na,
+     "Range Low",
+     color = COL_WATCH,
+     linewidth = 2,
+     style = plot.style_stepline
+)
+
+plot(
+     showBreakoutLevels and
+     breakoutArmed
+          ? longTriggerPrice
+          : na,
+     "Long Trigger",
+     color = COL_BULL,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     showBreakoutLevels and
+     breakoutArmed
+          ? shortTriggerPrice
+          : na,
+     "Short Trigger",
+     color = COL_BEAR,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     showTrendEma
+          ? fastEma
+          : na,
+     "Fast EMA",
+     color = color.new(
+          COL_BULL,
+          35
+     )
+)
+
+plot(
+     showTrendEma
+          ? slowEma
+          : na,
+     "Slow EMA",
+     color = color.new(
+          COL_WATCH,
+          35
+     )
+)
+
+plot(
+     strategy.position_size != 0
+          ? activeEntry
+          : na,
+     "Active Entry",
+     color = color.white,
+     linewidth = 1,
+     style = plot.style_linebr
+)
+
+plot(
+     strategy.position_size != 0
+          ? activeStop
+          : na,
+     "Active Stop",
+     color = COL_DANGER,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     strategy.position_size != 0
+          ? activeTarget
+          : na,
+     "Active Target",
+     color = COL_READY,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plotshape(
+     bullishBreakoutEvent,
+     title = "Bullish 15M Breakout Armed",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = COL_BULL,
+     textcolor = color.white,
+     text = "15M BO",
+     size = size.tiny
+)
+
+plotshape(
+     bearishBreakoutEvent,
+     title = "Bearish 15M Breakout Armed",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = COL_BEAR,
+     textcolor = color.white,
+     text = "15M BO",
+     size = size.tiny
+)
+
+plotshape(
+     longEntry,
+     title = "Long Entry",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = COL_READY,
+     textcolor = color.white,
+     text = "LONG",
+     size = size.small
+)
+
+plotshape(
+     shortEntry,
+     title = "Short Entry",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = COL_DANGER,
+     textcolor = color.white,
+     text = "SHORT",
+     size = size.small
+)
+
+plotshape(
+     showDebugMarkers and
+     longPriceTrigger and
+     breakoutDirection == 1,
+     title = "Long Price Trigger",
+     style = shape.circle,
+     location = location.abovebar,
+     color = COL_BULL,
+     size = size.tiny
+)
+
+plotshape(
+     showDebugMarkers and
+     shortPriceTrigger and
+     breakoutDirection == -1,
+     title = "Short Price Trigger",
+     style = shape.circle,
+     location = location.belowbar,
+     color = COL_BEAR,
+     size = size.tiny
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════════
+
+var table dashboard = table.new(
+     position.top_right,
+     2,
+     13,
+     border_width = 1
+)
+
+// Surfaces the "Enable Dynamic alert() Calls" toggle — if it's off,
+// entry labels can still plot but no alert() message will ever be
+// sent, which looks identical to a broken alert.
+string alertsStatusText =
+     enableDynamicAlerts
+          ? "ON"
+          : "OFF"
+
+color alertsStatusColor =
+     enableDynamicAlerts
+          ? COL_READY
+          : COL_DANGER
+
+if showDashboard and barstate.islast
+
+    string stateText = "WAIT BREAKOUT"
+
+    if strategy.position_size != 0
+        stateText := "IN TRADE"
+    else if breakoutArmed
+        stateText := "ARMED"
+    else if not rangeReady
+        stateText := "BUILD RANGE"
+
+    string sideText = "NONE"
+
+    if breakoutDirection == 1
+        sideText := "BULL"
+    else if breakoutDirection == -1
+        sideText := "BEAR"
+
+    color sideColor =
+         breakoutDirection == 1
+              ? COL_BULL
+              : breakoutDirection == -1
+                   ? COL_BEAR
+                   : COL_NEUTRAL
+
+    string triggerText = "—"
+
+    if breakoutDirection == 1 and not na(longTriggerPrice)
+        triggerText := str.tostring(
+             longTriggerPrice,
+             format.mintick
+        )
+
+    if breakoutDirection == -1 and not na(shortTriggerPrice)
+        triggerText := str.tostring(
+             shortTriggerPrice,
+             format.mintick
+        )
+
+    string ageText = "—"
+
+    if setupAge >= 0
+        ageText := (
+             str.tostring(setupAge) +
+             "/" +
+             str.tostring(entryExpirationBars)
+        )
+
+    table.cell(
+         dashboard,
+         0,
+         0,
+         "15M BREAKOUT",
+         bgcolor = color.black,
+         text_color = color.white
+    )
+
+    table.cell(
+         dashboard,
+         1,
+         0,
+         stateText,
+         bgcolor = color.black,
+         text_color = color.white
+    )
+
+    table.cell(dashboard, 0, 1, "SIDE")
+    table.cell(
+         dashboard,
+         1,
+         1,
+         sideText,
+         bgcolor = sideColor,
+         text_color = color.white
+    )
+
+    table.cell(dashboard, 0, 2, "REFERENCE")
+    table.cell(
+         dashboard,
+         1,
+         2,
+         triggerReference
+    )
+
+    table.cell(dashboard, 0, 3, "TRIGGER")
+    table.cell(
+         dashboard,
+         1,
+         3,
+         triggerText
+    )
+
+    table.cell(dashboard, 0, 4, "SETUP AGE")
+    table.cell(
+         dashboard,
+         1,
+         4,
+         ageText
+    )
+
+    table.cell(dashboard, 0, 5, "LONG")
+    table.cell(
+         dashboard,
+         1,
+         5,
+         longStatus
+    )
+
+    table.cell(dashboard, 0, 6, "SHORT")
+    table.cell(
+         dashboard,
+         1,
+         6,
+         shortStatus
+    )
+
+    table.cell(dashboard, 0, 7, "ENTRY RVOL")
+    table.cell(
+         dashboard,
+         1,
+         7,
+         na(entryRvol)
+              ? "—"
+              : str.tostring(entryRvol, "#.00")
+    )
+
+    table.cell(dashboard, 0, 8, "TRADES")
+    table.cell(
+         dashboard,
+         1,
+         8,
+         str.tostring(tradesToday) +
+         "/" +
+         str.tostring(maximumTradesPerDay)
+    )
+
+    table.cell(dashboard, 0, 9, "ENTRY")
+    table.cell(
+         dashboard,
+         1,
+         9,
+         na(activeEntry)
+              ? "—"
+              : str.tostring(
+                   activeEntry,
+                   format.mintick
+                )
+    )
+
+    table.cell(dashboard, 0, 10, "STOP")
+    table.cell(
+         dashboard,
+         1,
+         10,
+         na(activeStop)
+              ? "—"
+              : str.tostring(
+                   activeStop,
+                   format.mintick
+                )
+    )
+
+    table.cell(dashboard, 0, 11, "TARGET")
+    table.cell(
+         dashboard,
+         1,
+         11,
+         na(activeTarget)
+              ? "—"
+              : str.tostring(
+                   activeTarget,
+                   format.mintick
+                )
+    )
+
+    table.cell(dashboard, 0, 12, "ALERTS")
+    table.cell(
+         dashboard,
+         1,
+         12,
+         alertsStatusText,
+         bgcolor = alertsStatusColor,
+         text_color = color.white
+    )
+
+// ═══════════════════════════════════════════════════════════════════
+// ALERTS
+//
+// IMPORTANT — how to actually receive these notifications:
+// When you create the TradingView alert, set "Condition" to this
+// script, then pick ONE of:
+//   • "Any alert() function call" — fires the dynamic alert() messages
+//     above, which lead with the live bias (BULLISH ▲ / BEARISH ▼)
+//     plus the ticker, timeframe, and trigger price. Recommended if
+//     you want full context per trade.
+//   • One of the named conditions below (e.g. "15M Breakout Long
+//     Entry (Bullish)") — fires a fixed static message tied to that
+//     specific condition only.
+// Picking "Order fills" instead of one of the above will NOT trigger
+// on these entry signals, and alerts never fire retroactively for
+// bars that already closed before the alert was created — only from
+// the moment the alert is created onward. If entry labels/markers are
+// appearing but no notification arrives, check the dashboard's
+// ALERTS row first (OFF means the "Enable Dynamic alert() Calls"
+// input is unchecked) and then re-check the alert's Condition.
+// ═══════════════════════════════════════════════════════════════════
+
+alertcondition(
+     bullishBreakoutEvent,
+     title = "Qualified Bullish 15M Breakout",
+     message = "🔵 BULLISH — Qualified bullish 15M breakout | {{ticker}} | {{interval}}"
+)
+
+alertcondition(
+     bearishBreakoutEvent,
+     title = "Qualified Bearish 15M Breakout",
+     message = "🟣 BEARISH — Qualified bearish 15M breakout | {{ticker}} | {{interval}}"
+)
+
+alertcondition(
+     longEntry,
+     title = "15M Breakout Long Entry (Bullish)",
+     message = "🔵 BULLISH — 15M breakout trigger reached — LONG | {{ticker}} | {{interval}}"
+)
+
+alertcondition(
+     shortEntry,
+     title = "15M Breakout Short Entry (Bearish)",
+     message = "🟣 BEARISH — 15M breakout trigger reached — SHORT | {{ticker}} | {{interval}}"
+)
+
+alertcondition(
+     positionJustClosed,
+     title = "15M Breakout Exit",
+     message = "15M breakout position closed | {{ticker}} | {{interval}}"
+)
+
+// ═══════════════════════════════════════════════════════════════════
+// DATA WINDOW
+// ═══════════════════════════════════════════════════════════════════
+
+plot(
+     evaluatedRvol,
+     "Evaluated 15M RVOL",
+     display = display.data_window
+)
+
+plot(
+     evaluatedBodyPercent,
+     "Evaluated Body %",
+     display = display.data_window
+)
+
+plot(
+     evaluatedAtrRatio,
+     "Evaluated Range / ATR",
+     display = display.data_window
+)
+
+plot(
+     entryRvol,
+     "Entry-Bar RVOL",
+     display = display.data_window
+)
+
+plot(
+     float(setupAge),
+     "Setup Age",
+     display = display.data_window
+)
+
+plot(
+     float(tradesToday),
+     "Trades Today",
+     display = display.data_window
+)
+
+plot(
+     breakoutArmed ? 1.0 : 0.0,
+     "Breakout Armed",
+     display = display.data_window
+)
+
+plot(
+     longPriceTrigger ? 1.0 : 0.0,
+     "Long Price Trigger",
+     display = display.data_window
+)
+
+plot(
+     shortPriceTrigger ? 1.0 : 0.0,
+     "Short Price Trigger",
+     display = display.data_window
+)
+
+plot(
+     longEntryBarPass ? 1.0 : 0.0,
+     "Long Entry Bar Direction Pass",
+     display = display.data_window
+)
+
+plot(
+     shortEntryBarPass ? 1.0 : 0.0,
+     "Short Entry Bar Direction Pass",
+     display = display.data_window
+)
+
+plot(
+     longTrendEntryPass ? 1.0 : 0.0,
+     "Long Trend Entry Pass",
+     display = display.data_window
+)
+
+plot(
+     shortTrendEntryPass ? 1.0 : 0.0,
+     "Short Trend Entry Pass",
+     display = display.data_window
+)
+
+plot(
+     longRiskValid ? 1.0 : 0.0,
+     "Long Risk Valid",
+     display = display.data_window
+)
+
+plot(
+     shortRiskValid ? 1.0 : 0.0,
+     "Short Risk Valid",
+     display = display.data_window
+)

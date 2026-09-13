@@ -1,0 +1,121 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/ MPL-2.0
+//@version=6
+strategy("Sweep and Engulf Strategy", overlay = true, initial_capital = 1000000, default_qty_type = strategy.fixed, default_qty_value = 1, max_boxes_count = 500)
+
+// --- Inputs ---
+// Filters
+bool   invertTrades     = input.bool(true, title = "Invert Strategy (Trade Opposite)", tooltip = "If enabled, takes a Short on a bullish pattern and a Long on a bearish pattern.", group = "Signal Filters")
+string prevCandleFilter = input.string("Any", title = "Previous Candle Direction", options = ["Any", "Same Direction"], tooltip = "If 'Same Direction' is selected, a bullish sweep requires the previous candle to be bullish, and a bearish sweep requires the previous candle to be bearish.", group = "Signal Filters")
+
+// EMA Settings
+bool   useEma           = input.bool(false, title = "Use & Show EMA Trend Filter", tooltip = "If enabled, displays the EMA and filters signals: bullish only appear when price is above the EMA, and bearish only appear when price is below.", group = "EMA Trend Filter")
+int    emaLength        = input.int(200, title = "EMA Length", minval = 1, group = "EMA Trend Filter")
+
+// Risk Management
+string slType           = input.string("ATR", title = "Stop Loss Method", options = ["ATR", "Candle High/Low"], tooltip = "Choose how the Stop Loss is calculated. 'Candle High/Low' places the stop at the extreme of the signal candle.", group = "Risk Management")
+int    atrLength        = input.int(14, title = "ATR Length", group = "Risk Management")
+float  slMult           = input.float(1.5, title = "ATR Multiplier", step = 0.1, group = "Risk Management")
+float  rrRatio          = input.float(2.0, title = "Risk/Reward Ratio", step = 0.1, group = "Risk Management")
+
+// --- State Variables ---
+var bool  inTrade    = false
+var int   tradeDir   = 0
+var float entryPrice = na
+var float slPrice    = na
+var float tpPrice    = na
+var int   entryBar   = na
+var box   boxTp      = na
+var box   boxSl      = na
+
+// --- Logic ---
+// EMA Calculation
+float emaValue = ta.ema(close, emaLength)
+bool  isUptrend = close > emaValue
+bool  isDowntrend = close < emaValue
+
+// Determine previous candle direction
+bool prevBullish = close[1] > open[1]
+bool prevBearish = close[1] < open[1]
+
+// Check if the previous candle matches our filter requirements
+bool reqBullish = prevCandleFilter == "Any" or prevBullish
+bool reqBearish = prevCandleFilter == "Any" or prevBearish
+
+// Trend filter conditions
+bool trendBullish = not useEma or isUptrend
+bool trendBearish = not useEma or isDowntrend
+
+// ATR Calculation
+float atr = ta.atr(atrLength)
+
+// Trade Management (Exit Logic)
+if inTrade and bar_index > entryBar
+    bool hitTP = (tradeDir == 1 and high >= tpPrice) or (tradeDir == -1 and low <= tpPrice)
+    bool hitSL = (tradeDir == 1 and low <= slPrice) or (tradeDir == -1 and high >= slPrice)
+
+    if hitTP or hitSL
+        // Close the trade and lock box to current bar
+        inTrade  := false
+        tradeDir := 0
+        boxTp.set_right(bar_index)
+        boxSl.set_right(bar_index)
+    else
+        // Keep pushing the boxes forward while in trade
+        boxTp.set_right(bar_index + 5)
+        boxSl.set_right(bar_index + 5)
+
+// Sweep & Engulf Conditions
+bool bullishSweep = low < low[1] and close > high[1] and reqBullish and trendBullish and not na(atr)
+bool bearishSweep = high > high[1] and close < low[1] and reqBearish and trendBearish and not na(atr)
+
+// Apply inversion if enabled
+bool rawLong  = invertTrades ? bearishSweep : bullishSweep
+bool rawShort = invertTrades ? bullishSweep : bearishSweep
+
+// Filter signals based on current trade state
+bool longSignal  = rawLong and not inTrade
+bool shortSignal = rawShort and not inTrade
+
+// Trade Entry Logic
+if longSignal
+    inTrade    := true
+    tradeDir   := 1
+    entryBar   := bar_index
+    entryPrice := close
+    slPrice    := slType == "Candle High/Low" ? low : entryPrice - (atr * slMult)
+    float risk = entryPrice - slPrice
+    tpPrice    := entryPrice + (risk * rrRatio)
+
+    // Execute Strategy Orders
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Exit Long", from_entry = "Long", limit = tpPrice, stop = slPrice)
+
+    // Draw TP/SL boxes
+    boxTp := box.new(left = bar_index, top = tpPrice, right = bar_index + 5, bottom = entryPrice, border_color = na, bgcolor = color.new(#089981, 75))
+    boxSl := box.new(left = bar_index, top = entryPrice, right = bar_index + 5, bottom = slPrice, border_color = na, bgcolor = color.new(#f23645, 75))
+
+if shortSignal
+    inTrade    := true
+    tradeDir   := -1
+    entryBar   := bar_index
+    entryPrice := close
+    slPrice    := slType == "Candle High/Low" ? high : entryPrice + (atr * slMult)
+    float risk = slPrice - entryPrice
+    tpPrice    := entryPrice - (risk * rrRatio)
+
+    // Execute Strategy Orders
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Exit Short", from_entry = "Short", limit = tpPrice, stop = slPrice)
+
+    // Draw TP/SL boxes
+    boxTp := box.new(left = bar_index, top = entryPrice, right = bar_index + 5, bottom = tpPrice, border_color = na, bgcolor = color.new(#089981, 75))
+    boxSl := box.new(left = bar_index, top = slPrice, right = bar_index + 5, bottom = entryPrice, border_color = na, bgcolor = color.new(#f23645, 75))
+
+// --- Visuals ---
+// Plot EMA
+color emaColor = close > emaValue ? color.new(#089981, 0) : color.new(#f23645, 0)
+plot(useEma ? emaValue : na, title = "Trend EMA", color = emaColor, linewidth = 2)
+
+// Plot shapes above/below the triggering candle
+plotshape(longSignal, title = "Long Entry", style = shape.triangleup, location = location.belowbar, color = color.new(#089981, 0), size = size.small)
+plotshape(shortSignal, title = "Short Entry", style = shape.triangledown, location = location.abovebar, color = color.new(#f23645, 0), size = size.small)

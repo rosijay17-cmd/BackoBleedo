@@ -1,0 +1,707 @@
+//@version=6
+strategy(
+     title = "Trend Following Strategy v6 - Session Limit",
+     shorttitle = "TF Strategy v6",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 10,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.05,
+     slippage = 1
+     )
+
+// =============================================================================
+// 01 — TREND INPUTS
+// =============================================================================
+
+string trendGroup = "01 — Trend"
+
+int entryLengthInput = input.int(
+     defval = 55,
+     title = "Donchian Entry Length",
+     minval = 2,
+     group = trendGroup
+     )
+
+int exitLengthInput = input.int(
+     defval = 20,
+     title = "Donchian Exit Length",
+     minval = 2,
+     group = trendGroup
+     )
+
+int emaLengthInput = input.int(
+     defval = 200,
+     title = "Regime EMA Length",
+     minval = 1,
+     group = trendGroup
+     )
+
+bool requireFreshBreakoutInput = input.bool(
+     defval = true,
+     title = "Require Fresh Breakout",
+     tooltip = "When enabled, price must newly cross the Donchian breakout level. This helps prevent repeated entries while price remains beyond the breakout level.",
+     group = trendGroup
+     )
+
+// =============================================================================
+// 02 — TREND STRENGTH
+// =============================================================================
+
+string filterGroup = "02 — Trend Strength"
+
+bool useAdxInput = input.bool(
+     defval = true,
+     title = "Use ADX / DMI Filter",
+     group = filterGroup
+     )
+
+int diLengthInput = input.int(
+     defval = 14,
+     title = "DI Length",
+     minval = 1,
+     group = filterGroup
+     )
+
+int adxSmoothingInput = input.int(
+     defval = 14,
+     title = "ADX Smoothing",
+     minval = 1,
+     group = filterGroup
+     )
+
+float adxMinimumInput = input.float(
+     defval = 20.0,
+     title = "Minimum ADX",
+     minval = 0.0,
+     step = 0.5,
+     group = filterGroup
+     )
+
+// =============================================================================
+// 03 — RISK MANAGEMENT
+// =============================================================================
+
+string riskGroup = "03 — Risk Management"
+
+int atrLengthInput = input.int(
+     defval = 14,
+     title = "ATR Length",
+     minval = 1,
+     group = riskGroup
+     )
+
+float atrMultiplierInput = input.float(
+     defval = 3.0,
+     title = "ATR Stop Multiplier",
+     minval = 0.1,
+     step = 0.1,
+     group = riskGroup
+     )
+
+// =============================================================================
+// 04 — SESSION TRADE LIMIT
+// =============================================================================
+
+string sessionLimitGroup = "04 — Session Trade Limit"
+
+// FIX ("zero signals"): "0000-2359" is not a valid Pine all-day session
+// string -- valid hours only run 00-23, so there's no in-format way to
+// spell "through the end of the day" as ...2359. An invalid session string
+// makes time() return na on every bar, which makes inSession permanently
+// false, which makes sessionLimitOK permanently false -- gating shut every
+// single entry regardless of trend/breakout. The correct all-day format is
+// "0000-0000" (a full 24 hours starting at midnight).
+string sessionInput = input.session(
+     defval = "0000-0000",
+     title = "Trading Session",
+     tooltip = "Defines one \"session\" for the trade-count limit below, and resets the counter at its start. Defaults to the full day (acts as a per-day limit); narrow it (e.g. 0930-1600) to also confine entries to that window.",
+     group = sessionLimitGroup
+     )
+
+int maxTradesPerSessionInput = input.int(
+     defval = 3,
+     title = "Max Trades Per Session",
+     minval = 1,
+     tooltip = "Once this many trades have opened within the current session, no further entries are allowed until the next session begins.",
+     group = sessionLimitGroup
+     )
+
+// =============================================================================
+// 05 — TRADE DIRECTION
+// =============================================================================
+
+string directionGroup = "05 — Direction"
+
+string tradeDirectionInput = input.string(
+     defval = "Both",
+     title = "Trade Direction",
+     options = [
+         "Both",
+         "Long only",
+         "Short only"
+         ],
+     group = directionGroup
+     )
+
+// =============================================================================
+// 06 — VISUALS
+// =============================================================================
+
+string visualGroup = "06 — Visuals"
+
+bool showChannelsInput = input.bool(
+     defval = true,
+     title = "Show Donchian Channels",
+     group = visualGroup
+     )
+
+bool showStopsInput = input.bool(
+     defval = true,
+     title = "Show ATR Trailing Stop",
+     group = visualGroup
+     )
+
+bool showSessionLimitInput = input.bool(
+     defval = true,
+     title = "Highlight Session-Limit Bars",
+     group = visualGroup
+     )
+
+bool showSignalsInput = input.bool(
+     defval = true,
+     title = "Show Entry Signals",
+     group = visualGroup
+     )
+
+bool colorBarsInput = input.bool(
+     defval = false,
+     title = "Color Bars By Trend",
+     group = visualGroup
+     )
+
+bool showDashboardInput = input.bool(
+     defval = true,
+     title = "Show Session Dashboard",
+     tooltip = "Small table showing live session trade-count state -- useful for confirming the limit is actually gating entries the way you expect.",
+     group = visualGroup
+     )
+
+// =============================================================================
+// TREND CALCULATIONS
+// =============================================================================
+
+float regimeEma = ta.ema(
+     close,
+     emaLengthInput
+     )
+
+// Previous completed Donchian levels.
+// [1] prevents the current candle from defining its own breakout.
+float entryHigh = ta.highest(
+     high,
+     entryLengthInput
+     )[1]
+
+float entryLow = ta.lowest(
+     low,
+     entryLengthInput
+     )[1]
+
+float exitHigh = ta.highest(
+     high,
+     exitLengthInput
+     )[1]
+
+float exitLow = ta.lowest(
+     low,
+     exitLengthInput
+     )[1]
+
+// =============================================================================
+// ATR
+// =============================================================================
+
+float atrValue = ta.atr(
+     atrLengthInput
+     )
+
+// =============================================================================
+// DMI / ADX
+// =============================================================================
+
+[plusDi, minusDi, adx] = ta.dmi(
+     diLengthInput,
+     adxSmoothingInput
+     )
+
+// =============================================================================
+// MARKET REGIME
+// =============================================================================
+
+bool bullishRegime =
+     close > regimeEma
+
+bool bearishRegime =
+     close < regimeEma
+
+// =============================================================================
+// DIRECTION PERMISSIONS
+// =============================================================================
+
+bool allowLong =
+     tradeDirectionInput != "Short only"
+
+bool allowShort =
+     tradeDirectionInput != "Long only"
+
+// =============================================================================
+// ADX / DMI FILTERS
+// =============================================================================
+
+bool longStrengthOk =
+     not useAdxInput or
+     (
+         adx >= adxMinimumInput and
+         plusDi > minusDi
+     )
+
+bool shortStrengthOk =
+     not useAdxInput or
+     (
+         adx >= adxMinimumInput and
+         minusDi > plusDi
+     )
+
+// =============================================================================
+// BREAKOUT CONDITIONS
+// =============================================================================
+
+// Basic Donchian conditions.
+bool longBeyondChannel =
+     not na(entryHigh) and
+     close > entryHigh
+
+bool shortBeyondChannel =
+     not na(entryLow) and
+     close < entryLow
+
+// Fresh breakout means price has JUST moved through the channel.
+//
+// This prevents:
+// short -> exit -> price still below channel -> immediate short again
+//
+// unless a genuine new breakout occurs.
+bool freshLongBreakout =
+     not na(entryHigh) and
+     not na(entryHigh[1]) and
+     close > entryHigh and
+     close[1] <= entryHigh[1]
+
+bool freshShortBreakout =
+     not na(entryLow) and
+     not na(entryLow[1]) and
+     close < entryLow and
+     close[1] >= entryLow[1]
+
+// User-selected breakout behavior.
+bool longBreakout =
+     requireFreshBreakoutInput
+         ? freshLongBreakout
+         : longBeyondChannel
+
+bool shortBreakout =
+     requireFreshBreakoutInput
+         ? freshShortBreakout
+         : shortBeyondChannel
+
+// =============================================================================
+// SESSION TRADE LIMIT LOGIC
+// =============================================================================
+
+// Standard Pine session-detection idiom: time() returns na on any bar
+// outside the defined window, and a real timestamp on every bar inside it.
+// ":1234567" means the session applies every day of the week.
+int sessionTime = time(timeframe.period, sessionInput + ":1234567")
+bool inSession = not na(sessionTime)
+
+// FIX: with the all-day default "0000-0000" there is no gap for inSession
+// to ever drop to false, so "inSession and not inSession[1]" alone would
+// never detect a new day and the counter would never reset. Falling back
+// to an explicit calendar-day change (ta.change) catches that case, while
+// "not inSession[1]" still catches a narrower session (e.g. 0930-1600)
+// that opens after having genuinely been closed the bar before.
+bool newDay = ta.change(time("D")) != 0
+bool newSession = inSession and (newDay or not inSession[1])
+
+// Counts trades OPENED since the current session began -- reset the instant
+// a new session starts, regardless of what the prior session's count was.
+var int tradesThisSession = 0
+
+if newSession
+    tradesThisSession := 0
+
+bool sessionLimitReached = tradesThisSession >= maxTradesPerSessionInput
+
+// Replaces the old bar-count cooldown entirely: instead of trying to
+// enforce a minimum GAP between trades (which kept letting a still-active
+// breakout re-fire the moment the gap elapsed), this caps the total COUNT
+// of trades allowed within a session. Simpler to reason about and to
+// verify on the dashboard below -- a plain counter against a plain limit,
+// no bar-math or arm/disarm state machine involved.
+bool sessionLimitOK = inSession and not sessionLimitReached
+
+// =============================================================================
+// FINAL ENTRY CONDITIONS
+// =============================================================================
+
+bool longSignal =
+     allowLong and
+     strategy.position_size == 0 and
+     sessionLimitOK and
+     bullishRegime and
+     longStrengthOk and
+     longBreakout
+
+bool shortSignal =
+     allowShort and
+     strategy.position_size == 0 and
+     sessionLimitOK and
+     bearishRegime and
+     shortStrengthOk and
+     shortBreakout
+
+// =============================================================================
+// STOP VARIABLES
+// =============================================================================
+
+var float longStop = na
+var float shortStop = na
+
+// =============================================================================
+// LONG ENTRY
+// =============================================================================
+
+if longSignal
+
+    longStop :=
+         close -
+         atrValue * atrMultiplierInput
+
+    shortStop := na
+
+    tradesThisSession := tradesThisSession + 1
+
+    strategy.entry(
+         id = "Long",
+         direction = strategy.long,
+         comment = "Long Breakout"
+         )
+
+    strategy.exit(
+         id = "Long ATR Exit",
+         from_entry = "Long",
+         stop = longStop,
+         comment = "Long ATR Stop"
+         )
+
+// =============================================================================
+// SHORT ENTRY
+// =============================================================================
+
+if shortSignal
+
+    shortStop :=
+         close +
+         atrValue * atrMultiplierInput
+
+    longStop := na
+
+    tradesThisSession := tradesThisSession + 1
+
+    strategy.entry(
+         id = "Short",
+         direction = strategy.short,
+         comment = "Short Breakout"
+         )
+
+    strategy.exit(
+         id = "Short ATR Exit",
+         from_entry = "Short",
+         stop = shortStop,
+         comment = "Short ATR Stop"
+         )
+
+// =============================================================================
+// LONG TRADE MANAGEMENT
+// =============================================================================
+
+if strategy.position_size > 0
+
+    float longCandidateStop =
+         close -
+         atrValue * atrMultiplierInput
+
+    // Stop can move UP, but never down.
+    longStop :=
+         math.max(
+             nz(
+                 longStop,
+                 strategy.position_avg_price -
+                 atrValue * atrMultiplierInput
+                 ),
+             longCandidateStop
+             )
+
+    strategy.exit(
+         id = "Long ATR Exit",
+         from_entry = "Long",
+         stop = longStop,
+         comment = "Long ATR Stop"
+         )
+
+    // Donchian trend exit.
+    if not na(exitLow) and close < exitLow
+
+        strategy.close(
+             id = "Long",
+             comment = "Long Channel Exit"
+             )
+
+// =============================================================================
+// SHORT TRADE MANAGEMENT
+// =============================================================================
+
+if strategy.position_size < 0
+
+    float shortCandidateStop =
+         close +
+         atrValue * atrMultiplierInput
+
+    // Stop can move DOWN, but never up.
+    shortStop :=
+         math.min(
+             nz(
+                 shortStop,
+                 strategy.position_avg_price +
+                 atrValue * atrMultiplierInput
+                 ),
+             shortCandidateStop
+             )
+
+    strategy.exit(
+         id = "Short ATR Exit",
+         from_entry = "Short",
+         stop = shortStop,
+         comment = "Short ATR Stop"
+         )
+
+    // Donchian trend exit.
+    if not na(exitHigh) and close > exitHigh
+
+        strategy.close(
+             id = "Short",
+             comment = "Short Channel Exit"
+             )
+
+// =============================================================================
+// RESET STOP VALUES AFTER POSITION CLOSES
+// =============================================================================
+
+if strategy.position_size == 0
+
+    if not longSignal
+        longStop := na
+
+    if not shortSignal
+        shortStop := na
+
+// =============================================================================
+// VISUALS — EMA
+// =============================================================================
+
+plot(
+     regimeEma,
+     title = "Regime EMA",
+     color = color.orange,
+     linewidth = 2
+     )
+
+// =============================================================================
+// VISUALS — DONCHIAN ENTRY CHANNEL
+// =============================================================================
+
+plot(
+     showChannelsInput
+         ? entryHigh
+         : na,
+     title = "Long Entry Channel",
+     color = color.new(
+         color.green,
+         45
+         )
+     )
+
+plot(
+     showChannelsInput
+         ? entryLow
+         : na,
+     title = "Short Entry Channel",
+     color = color.new(
+         color.red,
+         45
+         )
+     )
+
+// =============================================================================
+// VISUALS — DONCHIAN EXIT CHANNEL
+// =============================================================================
+
+plot(
+     showChannelsInput
+         ? exitHigh
+         : na,
+     title = "Short Exit Channel",
+     color = color.new(
+         color.green,
+         70
+         )
+     )
+
+plot(
+     showChannelsInput
+         ? exitLow
+         : na,
+     title = "Long Exit Channel",
+     color = color.new(
+         color.red,
+         70
+         )
+     )
+
+// =============================================================================
+// VISUALS — ATR STOPS
+// =============================================================================
+
+plot(
+     showStopsInput and
+     strategy.position_size > 0
+         ? longStop
+         : na,
+     title = "Long ATR Stop",
+     color = color.red,
+     linewidth = 2,
+     style = plot.style_linebr
+     )
+
+plot(
+     showStopsInput and
+     strategy.position_size < 0
+         ? shortStop
+         : na,
+     title = "Short ATR Stop",
+     color = color.red,
+     linewidth = 2,
+     style = plot.style_linebr
+     )
+
+// =============================================================================
+// VISUALS — SESSION LIMIT BACKGROUND
+// =============================================================================
+
+bgcolor(
+     showSessionLimitInput and strategy.position_size == 0 and not sessionLimitOK
+         ? color.new(
+             color.orange,
+             85
+             )
+         : na,
+     title = "Session Trade Limit / Outside Session"
+     )
+
+// =============================================================================
+// VISUALS — BAR COLORS
+// =============================================================================
+
+color regimeColor =
+     bullishRegime
+         ? color.new(
+             color.green,
+             65
+             )
+         : bearishRegime
+             ? color.new(
+                 color.red,
+                 65
+                 )
+             : na
+
+barcolor(
+     colorBarsInput
+         ? regimeColor
+         : na
+     )
+
+// =============================================================================
+// VISUALS — ENTRY SIGNALS
+// =============================================================================
+
+plotshape(
+     showSignalsInput and longSignal,
+     title = "Long Entry Signal",
+     style = shape.triangleup,
+     location = location.belowbar,
+     color = color.lime,
+     size = size.small,
+     text = "L"
+     )
+
+plotshape(
+     showSignalsInput and shortSignal,
+     title = "Short Entry Signal",
+     style = shape.triangledown,
+     location = location.abovebar,
+     color = color.red,
+     size = size.small,
+     text = "S"
+     )
+
+// =============================================================================
+// DASHBOARD
+// =============================================================================
+
+var table sessionTable = table.new(position.top_right, 2, 4, border_width = 1)
+
+f_dashboardCell(_col, _row, _text, _bg) =>
+    table.cell(sessionTable, _col, _row, _text, bgcolor = _bg, text_color = color.white, text_size = size.small)
+
+if showDashboardInput and barstate.islast
+    f_dashboardCell(0, 0, "IN SESSION", color.new(color.gray, 0))
+    f_dashboardCell(1, 0, inSession ? "YES" : "NO", inSession ? color.new(color.green, 30) : color.new(color.red, 30))
+
+    f_dashboardCell(0, 1, "TRADES THIS SESSION", color.new(color.gray, 0))
+    f_dashboardCell(1, 1, str.tostring(tradesThisSession), color.new(color.gray, 0))
+
+    f_dashboardCell(0, 2, "MAX PER SESSION", color.new(color.gray, 0))
+    f_dashboardCell(1, 2, str.tostring(maxTradesPerSessionInput), color.new(color.gray, 0))
+
+    f_dashboardCell(0, 3, "LIMIT REACHED", color.new(color.gray, 0))
+    f_dashboardCell(1, 3, sessionLimitReached ? "YES" : "NO", sessionLimitReached ? color.new(color.red, 30) : color.new(color.green, 30))
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+
+alertcondition(
+     longSignal,
+     title = "Long Trend Entry",
+     message = "Trend Following Strategy: LONG breakout"
+     )
+
+alertcondition(
+     shortSignal,
+     title = "Short Trend Entry",
+     message = "Trend Following Strategy: SHORT breakout"
+     )

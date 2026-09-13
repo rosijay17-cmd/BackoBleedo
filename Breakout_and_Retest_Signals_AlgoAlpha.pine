@@ -1,0 +1,99 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © AlgoAlpha
+//@version=6
+indicator("Breakout and Retest Signals [AlgoAlpha]", "AlgoAlpha - Breakout & Retest", overlay=true, max_boxes_count=100, max_bars_back = 5000)
+import TradingView/ta/9
+
+x = input.int(title="Period", defval=7, minval=1, tooltip="Number of bars to look back for identifying pivot points", group="Pivot Settings")
+x__ = input.int(title="Confirmation Multipler", defval=2, minval=1, maxval = 10, tooltip="Divides the main period by this number, and uses the result as a confirmation length before printing signals, increase to get earlier signals", group="Pivot Settings")
+Y = input.int(title="Swing Points Memory", defval=3, minval=1, tooltip="Number of recent swing points to keep in memory for analysis", group="Pivot Settings")
+atrLength = input.int(title="ATR Length", defval=40, minval=1, tooltip="Length of the Average True Range calculation used for tolerance", group="Pivot Settings")
+atrMultiplier = input.float(title="ATR Multiplier", defval=2.0, minval=0.1, tooltip="Multiplier applied to ATR to determine tolerance level", group="Pivot Settings")
+ltf_ = input.timeframe("5", "Lower Timeframe Value", tooltip = "Determines the lower timeframe used to calculate buying and selling volume")
+
+bullColor = input.color(#00ffbb, "Bullish Color", tooltip="Color used for bullish trends and indicators. This color appears when price action or indicators suggest upward momentum", group="Appearance Settings")
+bearColor = input.color(#ff1100, "Bearish Color", tooltip="Color used for bearish trends and indicators. This color appears when price action or indicators suggest downward momentum", group="Appearance Settings")
+
+atr_val    = ta.atr(atrLength)
+tolerance  = atr_val * atrMultiplier
+x_ = int(x/x__)
+type PivotPoint
+    int idx
+    float price
+
+var PivotPoint[] swingHighs = array.new<PivotPoint>()
+var PivotPoint[] swingLows  = array.new<PivotPoint>()
+
+ph = ta.pivothigh(high, x, x_)
+pl = ta.pivotlow(low, x, x_)
+
+if not na(ph)
+    phBar = bar_index - x_
+    array.unshift(swingHighs, PivotPoint.new(phBar, ph))
+    if array.size(swingHighs) > Y
+        array.pop(swingHighs)
+if not na(pl)
+    plBar = bar_index - x_
+    array.unshift(swingLows, PivotPoint.new(plBar, pl))
+    if array.size(swingLows) > Y
+        array.pop(swingLows)
+
+[upv, downv, deltav] = ta.requestUpAndDownVolume(ltf_)
+
+if not na(ph) and swingLows.size() > 0
+    minIndex = 0
+    minDist = math.abs(swingLows.get(0).price - ph)
+    for i = 0 to swingLows.size() - 1
+        currentDist = math.abs(swingLows.get(i).price - ph)
+        if currentDist < minDist
+            minDist := currentDist
+            minIndex := i
+
+    if minDist < tolerance and low[x_] < swingLows.get(minIndex).price
+        box.new(swingLows.get(minIndex).idx,math.max(ph, swingLows.get(minIndex).price),bar_index-x_,math.min(ph, swingLows.get(minIndex).price), color.new(color.gray, 100), bgcolor = color.new(chart.fg_color, 85))
+
+        ratio = math.abs(upv[x_]/downv[x_])
+        ratio_ = math.abs(downv[x_]/upv[x_])
+
+        midpoint = int(math.avg(swingLows.get(minIndex).idx, bar_index-x_))
+        distance = math.abs(midpoint-swingLows.get(minIndex).idx)
+
+        box.new(swingLows.get(minIndex).idx,math.max(ph, swingLows.get(minIndex).price), ratio > 1 ? midpoint : int(swingLows.get(minIndex).idx + distance*ratio), math.avg(ph, swingLows.get(minIndex).price), color.new(color.gray, 100), bgcolor = color.new(bearColor, 50))
+        box.new(swingLows.get(minIndex).idx,math.avg(ph, swingLows.get(minIndex).price), ratio < 1 ? midpoint : int(swingLows.get(minIndex).idx + distance*ratio_), math.min(ph, swingLows.get(minIndex).price), color.new(color.gray, 100), bgcolor = color.new(bullColor, 50))
+
+        line.new(swingLows.get(minIndex).idx, math.avg(ph, swingLows.get(minIndex).price), bar_index-x_, math.avg(ph, swingLows.get(minIndex).price), color = chart.fg_color, style = line.style_dashed)
+
+        label.new(bar_index-x_, math.max(ph, swingLows.get(minIndex).price), "▼" + "\nDelta: " + str.tostring(deltav[x_], format.volume), xloc.bar_index, yloc.price, color.new(bearColor, 70), label.style_label_down, size = size.tiny)
+
+    swingLows.remove(minIndex)
+
+if not na(pl) and swingHighs.size() > 0
+    minIndex = 0
+    minDist = math.abs(swingHighs.get(0).price - pl)
+    for i = 0 to swingHighs.size() - 1
+        currentDist = math.abs(swingHighs.get(i).price - pl)
+        if currentDist < minDist
+            minDist := currentDist
+            minIndex := i
+
+    if minDist < tolerance and high[x_] > swingHighs.get(minIndex).price
+        box.new(swingHighs.get(minIndex).idx,math.max(pl, swingHighs.get(minIndex).price),bar_index-x_,math.min(pl, swingHighs.get(minIndex).price), color.new(color.gray, 100), bgcolor = color.new(chart.fg_color, 85))
+
+        ratio = math.abs(upv[x_]/downv[x_])
+        ratio_ = math.abs(downv[x_]/upv[x_])
+
+        midpoint = int(math.avg(swingHighs.get(minIndex).idx, bar_index-x_))
+        distance = math.abs(midpoint-swingHighs.get(minIndex).idx)
+
+        box.new(swingHighs.get(minIndex).idx,math.max(pl, swingHighs.get(minIndex).price), ratio > 1 ? midpoint : int(swingHighs.get(minIndex).idx + distance*ratio), math.avg(pl, swingHighs.get(minIndex).price), color.new(color.gray, 100), bgcolor = color.new(bullColor, 50))
+        box.new(swingHighs.get(minIndex).idx,math.avg(pl, swingHighs.get(minIndex).price), ratio < 1 ? midpoint : int(swingHighs.get(minIndex).idx + distance*ratio_), math.min(pl, swingHighs.get(minIndex).price), color.new(color.gray, 100), bgcolor = color.new(bearColor, 50))
+
+        line.new(swingHighs.get(minIndex).idx, math.avg(pl, swingHighs.get(minIndex).price), bar_index-x_, math.avg(pl, swingHighs.get(minIndex).price), color = chart.fg_color, style = line.style_dashed)
+
+        label.new(bar_index-x_, math.min(pl, swingHighs.get(minIndex).price), "▲" + "\nDelta: " + str.tostring(deltav[x_], format.volume), xloc.bar_index, yloc.price, color.new(bullColor, 70), label.style_label_up, size = size.tiny)
+
+    swingHighs.remove(minIndex)
+
+////Alerts
+alertcondition(not na(ph) and swingLows.size() > 0, title="Bearish Breakout and Retest")
+alertcondition(not na(pl) and swingHighs.size() > 0, title="Bullish Breakout and Retest")

@@ -1,0 +1,148 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Trade_Easy_IO
+
+//@version=6
+indicator("Trend Pivot Retracements", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+
+// 𝙐𝙎𝙀𝙍 𝙄𝙉𝙋𝙐𝙏𝙎
+length = input.int(50, "Trend")
+colorTrendUp = input.color(color.teal, "Trend Up")
+colorTrendDn = input.color(color.rgb(174, 7, 96), "Trend Down")
+
+
+
+// 𝙄𝙉𝘿𝙄𝘾𝘼𝙏𝙊𝙍 𝘾𝘼𝙇𝘾𝙐𝙇𝘼𝙏𝙄𝙊𝙉𝙎
+// === Trend detection using 50-bar extremes
+highestHigh = ta.highest(length)
+lowestLow = ta.lowest(length)
+
+var percentChanges = array.new<float>()
+
+// Track whether the current trend is long (uptrend)
+var isLongTrend = bool(na)
+
+
+if high == highestHigh
+    isLongTrend := true
+
+if low == lowestLow
+    isLongTrend := false
+
+
+
+// === Define the retracement type with line and label
+type Retracement
+    line  lineObj = na
+    label labelObj = na
+    line  lineObj1 = na
+
+// === Initialize retracement storage arrays
+var lowerRetracements = array.new<Retracement>()
+var upperRetracements = array.new<Retracement>()
+
+// === Pivot logic
+pivotLow  = ta.pivotlow(10, 1)
+pivotHigh = ta.pivothigh(10, 1)
+
+var int indexLower     = na
+var int indexUpper     = na
+var float lastPivotLow  = na
+var float lastPivotHigh = na
+
+if percentChanges.size() > 25
+    percentChanges.shift()
+
+// === Handle bullish trend retracement
+if isLongTrend and not na(pivotLow)
+    if bar_index - indexLower < 10
+        if lastPivotLow[2] > pivotLow
+            lastLowZone = array.last(lowerRetracements)
+            lastLowZone.lineObj.delete()
+            lastLowZone.labelObj.delete()
+            lastLowZone.lineObj1.delete()
+
+    float maxHigh = high[1]
+    int indexHigh = bar_index
+    for i = 1 to 20
+        if high[i] > maxHigh
+            maxHigh := high[i]
+            indexHigh := bar_index - i
+    lastPivotLow := low[1]
+    pivotIndex = bar_index - 1
+    indexLower := bar_index
+
+    percentChange = (maxHigh - low[1]) / low[1] * 100
+
+    percentChanges.push(percentChange)
+
+    percentColor = color.from_gradient(percentChange, 0, percentChanges.max(), na, colorTrendUp)
+
+    ln1 = line.new(indexHigh, maxHigh, pivotIndex, low[1], color = chart.fg_color, width = 1, style = line.style_dashed)
+
+    ln = line.new(pivotIndex - 2, low[1], pivotIndex + 2, low[1], color = colorTrendUp, width = 3)
+    lbl = label.new(pivotIndex, low[1], "-" + str.tostring(percentChange, format.percent),
+         style = label.style_label_up, color = percentColor)
+
+    lowerRetracements.push(Retracement.new(ln, lbl, ln1))
+
+// === Handle bearish trend retracement
+if not isLongTrend and not na(pivotHigh)
+    if bar_index - indexUpper < 10
+        if lastPivotHigh[2] < pivotHigh
+            lastHighZone = array.last(upperRetracements)
+            lastHighZone.lineObj.delete()
+            lastHighZone.labelObj.delete()
+            lastHighZone.lineObj1.delete()
+
+    float minLow = low[1]
+    int indexLow = bar_index
+    for i = 1 to 20
+        if low[i] < minLow
+            minLow := low[i]
+            indexLow := bar_index - i
+
+    lastPivotHigh := high[1]
+    pivotIndex = bar_index - 1
+    indexUpper := bar_index
+
+    percentChange = (high[1] - minLow) / minLow * 100
+
+    percentChanges.push(percentChange)
+
+    percentColor = color.from_gradient(percentChange, 0, percentChanges.max(), na, colorTrendDn)
+
+    ln1 = line.new(indexLow, minLow, pivotIndex, high[1], color = chart.fg_color, width = 1, style = line.style_dashed)
+
+    ln = line.new(pivotIndex - 2, high[1], pivotIndex + 2, high[1], color = percentColor, width = 3)
+    lbl = label.new(pivotIndex, high[1], str.tostring(percentChange, format.percent),
+         style = label.style_label_down, color = percentColor)
+
+    upperRetracements.push(Retracement.new(ln, lbl, ln1))
+
+
+// 𝙑𝙄𝙎𝙐𝘼𝙇𝙄𝙕𝘼𝙏𝙄𝙊𝙉
+
+// === Plotting trend lines and markers
+Distance1 = close - lowestLow
+Distance2 = highestHigh - close
+
+distanceValue1 = Distance1 / ta.stdev(Distance1, 200)
+distanceValue2 = Distance2 / ta.stdev(Distance2, 200)
+
+colorLower = color.from_gradient(distanceValue1, 0, 5, na, colorTrendUp)
+colorHigher = color.from_gradient(distanceValue2, 0, 5, na, colorTrendDn)
+
+pLow  = plot(isLongTrend ? lowestLow : na, style = plot.style_linebr, color = color.green, linewidth = 1)
+plot(isLongTrend ? lowestLow : na, style = plot.style_linebr, color = colorLower, linewidth = 5)
+
+pHigh = plot(isLongTrend ? na : highestHigh, style = plot.style_linebr, color = colorTrendDn, linewidth = 1)
+plot(isLongTrend ? na : highestHigh, style = plot.style_linebr, color = colorHigher, linewidth = 5)
+
+price = plot(hl2, display = display.none, editable = false)
+
+plotshape(isLongTrend != isLongTrend[1] and isLongTrend ? lowestLow : na, "Up Signal", shape.diamond, location.absolute, color = color.new(colorTrendUp, 50), size = size.small)
+plotshape(isLongTrend != isLongTrend[1] and not isLongTrend ? highestHigh : na, "Down Signal", shape.diamond, location.absolute, color = color.new(colorTrendDn, 50), size = size.small)
+
+fill(price, pLow , color.new(colorTrendUp, isLongTrend ? 95 : 100))
+fill(price, pHigh, color.new(colorTrendDn, isLongTrend ? 100 : 95))

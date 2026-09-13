@@ -1,0 +1,881 @@
+//@version=6
+strategy(
+     title="Sweep Trend Continuation Strategy",
+     shorttitle="SweepTrend",
+     overlay=true,
+     pyramiding=0,
+     process_orders_on_close=true,
+     calc_on_every_tick=true,
+     calc_on_order_fills=true,
+     initial_capital=50000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     commission_type=strategy.commission.percent,
+     commission_value=0.02,
+     slippage=1,
+     max_labels_count=200)
+
+// ═══════════════════════════════════════════════════════════════════
+// ABOUT
+// ═══════════════════════════════════════════════════════════════════
+// A ground-up trend-continuation strategy. Unlike a plain "integrate
+// the sweep into an existing entry" approach, this script has exactly
+// ONE entry mechanism -- the liquidity sweep + reclaim from the
+// "Liquidity Entry Zones [trade_w_samet]" indicator -- gated by two
+// independent, dedicated filters:
+//   1. TREND FILTER  -- local EMA stack + ADX minimum + optional
+//      confirmed higher-timeframe EMA stack agreement.
+//   2. MOMENTUM FILTER -- ROC magnitude + Balance-Of-Power sign
+//      agreement with the trend direction.
+// A sweep can only confirm into a real entry when BOTH filters already
+// agree with its direction, so every trade this strategy takes is, by
+// construction, a trend-continuation pullback -- never a counter-trend
+// reversal. The initial stop is placed beyond the swept structural
+// level itself (not just a flat ATR offset from close), because that
+// level is what the sweep thesis is actually built on.
+// ═══════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════
+// INPUT GROUPS
+// ═══════════════════════════════════════════════════════════════════
+
+const string GRP_TREND   = "01 — Trend Filter"
+const string GRP_MOM     = "02 — Momentum Filter"
+const string GRP_SWEEP   = "03 — Liquidity Sweep Entry"
+const string GRP_FREQ    = "04 — Trade Frequency"
+const string GRP_SESSION = "05 — Trading Session"
+const string GRP_SIZE    = "06 — Position Sizing"
+const string GRP_RISK    = "07 — Risk Management"
+const string GRP_TRAIL   = "08 — Trailing Stop"
+const string GRP_VISUAL  = "09 — Visuals"
+const string GRP_ALERTS  = "10 — Alerts"
+
+// ═══════════════════════════════════════════════════════════════════
+// TREND FILTER INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+int trendFastLen = input.int(20, "Fast EMA Length", minval=2, group=GRP_TREND)
+int trendSlowLen = input.int(50, "Slow EMA Length", minval=3, group=GRP_TREND)
+
+int adxLen = input.int(14, "ADX Length", minval=2, group=GRP_TREND)
+float adxMin = input.float(20.0, "Minimum ADX (Trend Strength)", minval=1.0, step=0.5, group=GRP_TREND)
+
+bool requireDIAlignment = input.bool(true, "Require +DI / -DI Alignment", group=GRP_TREND)
+
+bool useHtfTrendFilter = input.bool(true, "Use Confirmed Higher-Timeframe Filter", group=GRP_TREND)
+string htfTimeframe = input.timeframe("60", "Higher Timeframe", group=GRP_TREND)
+int htfFastLen = input.int(20, "HTF Fast EMA Length", minval=2, group=GRP_TREND)
+int htfSlowLen = input.int(50, "HTF Slow EMA Length", minval=3, group=GRP_TREND)
+
+// ═══════════════════════════════════════════════════════════════════
+// MOMENTUM FILTER INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+bool requireMomentumAgreement = input.bool(
+     true,
+     "Require ROC / BOP Momentum Agreement",
+     tooltip="When on, a sweep can only confirm if Rate Of Change is beyond the minimum threshold AND Balance Of Power agrees with the sweep's direction. This is the second half of the no-counter-trend gate alongside the Trend Filter.",
+     group=GRP_MOM)
+
+int rocLen = input.int(14, "ROC Length", minval=2, group=GRP_MOM)
+float rocMinAbs = input.float(0.10, "Minimum |ROC| To Qualify", minval=0.0, step=0.05, group=GRP_MOM)
+int bopLen = input.int(21, "BOP Smoothing Length", minval=2, group=GRP_MOM)
+
+// ═══════════════════════════════════════════════════════════════════
+// LIQUIDITY SWEEP ENTRY INPUTS
+// ═══════════════════════════════════════════════════════════════════
+// Ported from the "Liquidity Entry Zones [trade_w_samet]" indicator.
+
+int atrLen = input.int(14, "ATR Length", minval=2, group=GRP_SWEEP)
+
+int sweepPivotLength = input.int(5, "Swing Pivot Length", minval=1, group=GRP_SWEEP)
+int sweepStoredLevels = input.int(20, "Stored Liquidity Levels", minval=5, maxval=100, group=GRP_SWEEP)
+float sweepMinDistanceAtr = input.float(0.10, "Minimum Sweep Distance / ATR", minval=0.01, step=0.01, group=GRP_SWEEP)
+
+string sweepReclaimRule = input.string(
+     "Close Back Inside",
+     "Reclaim Rule",
+     options=["Close Back Inside", "Strong Reclaim"],
+     group=GRP_SWEEP)
+
+float sweepMinWickPercent = input.float(0.35, "Minimum Wick %", minval=0.0, maxval=1.0, step=0.01, group=GRP_SWEEP)
+float sweepMaxBodyPercent = input.float(0.65, "Maximum Body %", minval=0.05, maxval=1.0, step=0.01, group=GRP_SWEEP)
+float sweepMinRangeAtr = input.float(0.20, "Minimum Candle Range / ATR", minval=0.01, step=0.01, group=GRP_SWEEP)
+
+bool sweepRequireBullishBody = input.bool(true, "Long Confirmation Must Be Bullish", group=GRP_SWEEP)
+bool sweepRequireBearishBody = input.bool(true, "Short Confirmation Must Be Bearish", group=GRP_SWEEP)
+
+int sweepConfirmationWindow = input.int(2, "Max Bars After Sweep For Confirmation", minval=0, maxval=10, group=GRP_SWEEP)
+bool sweepRequireMidlineBreak = input.bool(true, "Require Sweep Candle Midline Break", group=GRP_SWEEP)
+int sweepSignalSpacingBars = input.int(10, "Minimum Bars Between Sweep Signals", minval=0, group=GRP_SWEEP)
+
+// ═══════════════════════════════════════════════════════════════════
+// TRADE FREQUENCY INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+string tradeDirection = input.string("Both", "Trade Direction", options=["Long Only", "Short Only", "Both"], group=GRP_FREQ)
+int cooldownBars = input.int(15, "Cooldown Bars After Trade Closes", minval=0, maxval=200, group=GRP_FREQ)
+int maxTradesPerDay = input.int(3, "Maximum Trades Per Day", minval=1, maxval=20, group=GRP_FREQ)
+
+// ═══════════════════════════════════════════════════════════════════
+// SESSION INPUTS
+// ═══════════════════════════════════════════════════════════════════
+
+bool useSessionFilter = input.bool(false, "Restrict Entries To Session", group=GRP_SESSION)
+string tradeSession = input.session("0000-2359", "Entry Session", tooltip="Only used when Restrict Entries To Session is on.", group=GRP_SESSION)
+string sessionTimezone = input.string("America/New_York", "Session Timezone", group=GRP_SESSION)
+bool closeAtSessionEnd = input.bool(false, "Close Position At Session End", group=GRP_SESSION)
+
+// ═══════════════════════════════════════════════════════════════════
+// POSITION SIZING
+// ═══════════════════════════════════════════════════════════════════
+
+string sizingMode = input.string("Fixed", "Sizing Mode", options=["Fixed", "Risk %", "Risk $"], group=GRP_SIZE)
+float baseQty = input.float(1.0, "Fixed Contracts", minval=1.0, step=1.0, group=GRP_SIZE)
+float riskPerTradePct = input.float(0.50, "Risk Per Trade %", minval=0.05, maxval=10.0, step=0.05, group=GRP_SIZE)
+float maxRiskDollars = input.float(500.0, "Maximum Risk $", minval=1.0, step=25.0, group=GRP_SIZE)
+
+// ═══════════════════════════════════════════════════════════════════
+// RISK MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════
+
+float stopBufferATR = input.float(
+     0.15,
+     "Stop Buffer Beyond Swept Level — ATR",
+     minval=0.0,
+     step=0.05,
+     tooltip="The initial stop is placed beyond the structural level that was swept (the swing low for longs, the swing high for shorts), plus this ATR buffer -- not a flat offset from close.",
+     group=GRP_RISK)
+
+float maxStopATR = input.float(2.0, "Maximum Stop Distance — ATR", minval=0.25, step=0.25, tooltip="Caps the structural stop so a far-away swept level never produces an oversized risk.", group=GRP_RISK)
+
+float tp1R = input.float(1.0, "TP1 Reward / Risk", minval=0.25, step=0.25, group=GRP_RISK)
+float tp2R = input.float(2.5, "TP2 Reward / Risk", minval=0.5, step=0.25, group=GRP_RISK)
+float tp1Qty = input.float(50.0, "TP1 Quantity %", minval=1.0, maxval=99.0, step=1.0, group=GRP_RISK)
+
+bool useBreakEven = input.bool(true, "Move Stop To Break-Even After TP1", group=GRP_RISK)
+int breakEvenOffsetTicks = input.int(0, "Break-Even Offset — Ticks", minval=0, maxval=100, group=GRP_RISK)
+int maximumHoldingBars = input.int(100, "Maximum Holding Bars", minval=1, maxval=2000, group=GRP_RISK)
+
+// ═══════════════════════════════════════════════════════════════════
+// TRAILING STOP
+// ═══════════════════════════════════════════════════════════════════
+
+bool useTrail = input.bool(true, "Trail Stop After TP1", group=GRP_TRAIL)
+float tightTrailATR = input.float(1.0, "Tight Trail ATR (Momentum Fading)", minval=0.1, step=0.1, group=GRP_TRAIL)
+float looseTrailATR = input.float(2.0, "Loose Trail ATR (Momentum Strong)", minval=0.1, step=0.1, group=GRP_TRAIL)
+
+// ═══════════════════════════════════════════════════════════════════
+// VISUALS
+// ═══════════════════════════════════════════════════════════════════
+
+bool showSignals = input.bool(true, "Show Entry Signals", group=GRP_VISUAL)
+bool showSweepMarkers = input.bool(true, "Show Raw Sweep Markers", group=GRP_VISUAL)
+bool showTradeLevels = input.bool(true, "Show Active Trade Levels", group=GRP_VISUAL)
+bool showDashboard = input.bool(true, "Show Dashboard", group=GRP_VISUAL)
+
+string dashPos = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=GRP_VISUAL)
+string dashFont = input.string("Phone", "Dashboard Font Size", options=["Compact", "Phone", "Large"], group=GRP_VISUAL)
+
+// ═══════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════
+
+bool enableDynamicAlerts = input.bool(true, "Enable Dynamic alert() Calls", group=GRP_ALERTS)
+
+// ═══════════════════════════════════════════════════════════════════
+// COLORS
+// ═══════════════════════════════════════════════════════════════════
+
+color C_NAVY   = color.rgb(8, 16, 31)
+color C_CARD   = color.rgb(20, 32, 53)
+color C_ALT    = color.rgb(27, 41, 65)
+color C_BLUE   = color.rgb(75, 145, 247)
+color C_PURPLE = color.rgb(156, 90, 235)
+color C_GREEN  = color.rgb(34, 197, 94)
+color C_ORANGE = color.rgb(245, 158, 11)
+color C_RED    = color.rgb(239, 68, 68)
+color C_GRAY   = color.rgb(100, 116, 139)
+color C_WHITE  = color.rgb(245, 248, 252)
+
+// ═══════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════
+
+f_price(float value) =>
+    na(value) ? "—" : str.tostring(value, format.mintick)
+
+f_number(float value) =>
+    na(value) ? "—" : str.tostring(value, "#.00")
+
+// ═══════════════════════════════════════════════════════════════════
+// INDICATORS
+// ═══════════════════════════════════════════════════════════════════
+
+float atr = ta.atr(atrLen)
+float emaFast = ta.ema(close, trendFastLen)
+float emaSlow = ta.ema(close, trendSlowLen)
+
+[plusDI, minusDI, adx] = ta.dmi(adxLen, adxLen)
+
+float roc = ta.roc(close, rocLen)
+
+float candleRange = math.max(high - low, syminfo.mintick)
+float bopRaw = (close - open) / candleRange
+float bop = ta.ema(bopRaw, bopLen)
+
+bool dataReady =
+     not na(atr) and
+     not na(emaFast) and
+     not na(emaSlow) and
+     not na(adx) and
+     not na(roc) and
+     not na(bop)
+
+// ═══════════════════════════════════════════════════════════════════
+// CONFIRMED HIGHER-TIMEFRAME TREND
+// ═══════════════════════════════════════════════════════════════════
+// lookahead=barmerge.lookahead_off keeps this reading only data from
+// the last confirmed HTF bar -- no repainting of unclosed HTF bars.
+
+float htfEmaFast = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, htfFastLen), lookahead=barmerge.lookahead_off)
+float htfEmaSlow = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, htfSlowLen), lookahead=barmerge.lookahead_off)
+
+bool htfValid = not na(htfEmaFast) and not na(htfEmaSlow)
+bool htfBullish = htfValid and htfEmaFast > htfEmaSlow
+bool htfBearish = htfValid and htfEmaFast < htfEmaSlow
+
+bool longHtfOk = not useHtfTrendFilter or htfBullish
+bool shortHtfOk = not useHtfTrendFilter or htfBearish
+
+// ═══════════════════════════════════════════════════════════════════
+// TREND FILTER
+// ═══════════════════════════════════════════════════════════════════
+
+bool localBullish = emaFast > emaSlow and close > emaFast
+bool localBearish = emaFast < emaSlow and close < emaFast
+
+bool adxOk = adx >= adxMin
+
+bool diLongOk = not requireDIAlignment or plusDI > minusDI
+bool diShortOk = not requireDIAlignment or minusDI > plusDI
+
+bool longTrendOk = dataReady and localBullish and adxOk and diLongOk and longHtfOk
+bool shortTrendOk = dataReady and localBearish and adxOk and diShortOk and shortHtfOk
+
+// ═══════════════════════════════════════════════════════════════════
+// MOMENTUM FILTER
+// ═══════════════════════════════════════════════════════════════════
+
+bool longMomentumOk = not requireMomentumAgreement or (roc >= rocMinAbs and bop > 0.0)
+bool shortMomentumOk = not requireMomentumAgreement or (roc <= -rocMinAbs and bop < 0.0)
+
+// Combined "no counter-trend" regime -- both filters must already agree
+// with a direction before a sweep in that direction can ever confirm.
+bool longRegimeOk = longTrendOk and longMomentumOk
+bool shortRegimeOk = shortTrendOk and shortMomentumOk
+
+// ═══════════════════════════════════════════════════════════════════
+// SESSION AND DAILY LIMITS
+// ═══════════════════════════════════════════════════════════════════
+
+bool inSessionRaw = not na(time(timeframe.period, tradeSession, sessionTimezone))
+bool inTradeSession = not useSessionFilter or inSessionRaw
+bool sessionEndBar = useSessionFilter and not inSessionRaw and inSessionRaw[1]
+
+int dayIdentifier = year(time, sessionTimezone) * 10000 + month(time, sessionTimezone) * 100 + dayofmonth(time, sessionTimezone)
+bool newTradingDay = barstate.isfirst or dayIdentifier != dayIdentifier[1]
+
+var int tradesToday = 0
+if newTradingDay
+    tradesToday := 0
+
+bool dailyTradeLimitPass = tradesToday < maxTradesPerDay
+
+// ═══════════════════════════════════════════════════════════════════
+// COOLDOWN
+// ═══════════════════════════════════════════════════════════════════
+
+var int lastClosedTradeBar = na
+int barsSinceClosedTrade = na(lastClosedTradeBar) ? 1000000 : bar_index - lastClosedTradeBar
+bool cooldownPass = barsSinceClosedTrade >= cooldownBars
+int cooldownRemaining = cooldownPass ? 0 : math.max(cooldownBars - barsSinceClosedTrade, 0)
+
+bool tradeDirectionLongOk = tradeDirection == "Long Only" or tradeDirection == "Both"
+bool tradeDirectionShortOk = tradeDirection == "Short Only" or tradeDirection == "Both"
+
+bool commonGatePass = inTradeSession and dailyTradeLimitPass and cooldownPass
+
+// ═══════════════════════════════════════════════════════════════════
+// LIQUIDITY SWEEP ENGINE
+// ═══════════════════════════════════════════════════════════════════
+// Ported from "Liquidity Entry Zones [trade_w_samet]". Raw sweep
+// detection (validBuySweep / validSellSweep) stays trend-agnostic,
+// exactly like the source indicator. The trend/momentum "no counter-
+// trend" gate is applied only at confirmation, inside
+// sweepBuyConfirmed / sweepSellConfirmed below.
+
+float sweepCandleRange = high - low
+float sweepCandleBody  = math.abs(close - open)
+float sweepUpperWick   = high - math.max(open, close)
+float sweepLowerWick   = math.min(open, close) - low
+
+float sweepBodyPercent      = sweepCandleRange > 0 ? sweepCandleBody / sweepCandleRange : 0.0
+float sweepUpperWickPercent = sweepCandleRange > 0 ? sweepUpperWick / sweepCandleRange : 0.0
+float sweepLowerWickPercent = sweepCandleRange > 0 ? sweepLowerWick / sweepCandleRange : 0.0
+
+float sweepMinDistancePx = atr > 0.0 ? sweepMinDistanceAtr * atr : na
+float sweepMinRangePx    = atr > 0.0 ? sweepMinRangeAtr * atr : na
+
+float sweepPivotHigh = ta.pivothigh(high, sweepPivotLength, sweepPivotLength)
+float sweepPivotLow  = ta.pivotlow(low, sweepPivotLength, sweepPivotLength)
+
+var float[] sweepStoredHighLevels = array.new_float()
+var int[]   sweepStoredHighBars   = array.new_int()
+var float[] sweepStoredLowLevels  = array.new_float()
+var int[]   sweepStoredLowBars    = array.new_int()
+
+if not na(sweepPivotHigh)
+    array.push(sweepStoredHighLevels, sweepPivotHigh)
+    array.push(sweepStoredHighBars, bar_index - sweepPivotLength)
+    if array.size(sweepStoredHighLevels) > sweepStoredLevels
+        array.shift(sweepStoredHighLevels)
+        array.shift(sweepStoredHighBars)
+
+if not na(sweepPivotLow)
+    array.push(sweepStoredLowLevels, sweepPivotLow)
+    array.push(sweepStoredLowBars, bar_index - sweepPivotLength)
+    if array.size(sweepStoredLowLevels) > sweepStoredLevels
+        array.shift(sweepStoredLowLevels)
+        array.shift(sweepStoredLowBars)
+
+float sweptHighLevel = na
+int   sweptHighBar   = na
+float sweptLowLevel  = na
+int   sweptLowBar    = na
+
+int sweepHighLevelCount = array.size(sweepStoredHighLevels)
+if sweepHighLevelCount > 0
+    for i = sweepHighLevelCount - 1 to 0
+        float highLevel = array.get(sweepStoredHighLevels, i)
+        int   highBar   = array.get(sweepStoredHighBars, i)
+        if highBar < bar_index and high > highLevel and not na(sweepMinDistancePx) and (high - highLevel) >= sweepMinDistancePx
+            sweptHighLevel := highLevel
+            sweptHighBar   := highBar
+            break
+
+int sweepLowLevelCount = array.size(sweepStoredLowLevels)
+if sweepLowLevelCount > 0
+    for i = sweepLowLevelCount - 1 to 0
+        float lowLevel = array.get(sweepStoredLowLevels, i)
+        int   lowBar   = array.get(sweepStoredLowBars, i)
+        if lowBar < bar_index and low < lowLevel and not na(sweepMinDistancePx) and (lowLevel - low) >= sweepMinDistancePx
+            sweptLowLevel := lowLevel
+            sweptLowBar   := lowBar
+            break
+
+bool sweepBearishReclaim =
+     not na(sweptHighLevel) and
+     (
+         sweepReclaimRule == "Close Back Inside" ?
+         close < sweptHighLevel :
+         close < sweptHighLevel and close < (high + low) / 2.0
+     )
+
+bool sweepBullishReclaim =
+     not na(sweptLowLevel) and
+     (
+         sweepReclaimRule == "Close Back Inside" ?
+         close > sweptLowLevel :
+         close > sweptLowLevel and close > (high + low) / 2.0
+     )
+
+bool validSellSweep =
+     not na(sweptHighLevel) and
+     sweepBearishReclaim and
+     sweepUpperWickPercent >= sweepMinWickPercent and
+     sweepBodyPercent <= sweepMaxBodyPercent and
+     not na(sweepMinRangePx) and
+     sweepCandleRange >= sweepMinRangePx
+
+bool validBuySweep =
+     not na(sweptLowLevel) and
+     sweepBullishReclaim and
+     sweepLowerWickPercent >= sweepMinWickPercent and
+     sweepBodyPercent <= sweepMaxBodyPercent and
+     not na(sweepMinRangePx) and
+     sweepCandleRange >= sweepMinRangePx
+
+var int   sweepPendingBullBar = na
+var float sweepPendingBullMid = na
+var float sweepPendingBullLevel = na
+
+var int   sweepPendingBearBar = na
+var float sweepPendingBearMid = na
+var float sweepPendingBearLevel = na
+
+if validBuySweep
+    sweepPendingBullBar := bar_index
+    sweepPendingBullMid := (high + low) / 2.0
+    sweepPendingBullLevel := sweptLowLevel
+
+if validSellSweep
+    sweepPendingBearBar := bar_index
+    sweepPendingBearMid := (high + low) / 2.0
+    sweepPendingBearLevel := sweptHighLevel
+
+bool sweepBullWindowOpen = not na(sweepPendingBullBar) and (bar_index - sweepPendingBullBar <= sweepConfirmationWindow)
+bool sweepBearWindowOpen = not na(sweepPendingBearBar) and (bar_index - sweepPendingBearBar <= sweepConfirmationWindow)
+
+bool sweepBullBodyOk = not sweepRequireBullishBody or close > open
+bool sweepBearBodyOk = not sweepRequireBearishBody or close < open
+bool sweepBullMidOk  = not sweepRequireMidlineBreak or close > sweepPendingBullMid
+bool sweepBearMidOk  = not sweepRequireMidlineBreak or close < sweepPendingBearMid
+
+// "No counter-trend" gate: TREND FILTER + MOMENTUM FILTER combined.
+bool sweepBuyConfirmed =
+     sweepBullWindowOpen and
+     sweepBullBodyOk and
+     sweepBullMidOk and
+     longRegimeOk
+
+bool sweepSellConfirmed =
+     sweepBearWindowOpen and
+     sweepBearBodyOk and
+     sweepBearMidOk and
+     shortRegimeOk
+
+var int sweepLastSignalBar = na
+bool sweepSpacingOK = na(sweepLastSignalBar) or (bar_index - sweepLastSignalBar > sweepSignalSpacingBars)
+
+bool sweepBuySignal  = sweepBuyConfirmed and sweepSpacingOK
+bool sweepSellSignal = sweepSellConfirmed and sweepSpacingOK and not sweepBuySignal
+
+// Captured before the pending state is cleared below -- these are the
+// structural swept levels the initial stop is placed beyond, and are
+// only non-na on the exact bar a signal fires.
+float confirmedLongStructureLevel = sweepBuySignal ? sweepPendingBullLevel : na
+float confirmedShortStructureLevel = sweepSellSignal ? sweepPendingBearLevel : na
+
+if sweepBuySignal or sweepSellSignal
+    sweepLastSignalBar := bar_index
+
+if sweepBuySignal or (not na(sweepPendingBullBar) and bar_index - sweepPendingBullBar > sweepConfirmationWindow)
+    sweepPendingBullBar := na
+    sweepPendingBullMid := na
+    sweepPendingBullLevel := na
+
+if sweepSellSignal or (not na(sweepPendingBearBar) and bar_index - sweepPendingBearBar > sweepConfirmationWindow)
+    sweepPendingBearBar := na
+    sweepPendingBearMid := na
+    sweepPendingBearLevel := na
+
+// ═══════════════════════════════════════════════════════════════════
+// STRUCTURAL STOP AND POSITION SIZE
+// ═══════════════════════════════════════════════════════════════════
+// The initial stop sits beyond the swept swing level itself (plus a
+// small ATR buffer), capped by a maximum ATR distance so a far-away
+// swept level never produces an oversized risk.
+
+float rawLongStop = not na(confirmedLongStructureLevel) ? confirmedLongStructureLevel - atr * stopBufferATR : close - atr * maxStopATR
+float cappedLongStop = close - atr * maxStopATR
+float candidateLongStop = math.max(rawLongStop, cappedLongStop)
+
+float rawShortStop = not na(confirmedShortStructureLevel) ? confirmedShortStructureLevel + atr * stopBufferATR : close + atr * maxStopATR
+float cappedShortStop = close + atr * maxStopATR
+float candidateShortStop = math.min(rawShortStop, cappedShortStop)
+
+float candidateLongRisk = close - candidateLongStop
+float candidateShortRisk = candidateShortStop - close
+
+float pointValue = not na(syminfo.pointvalue) and syminfo.pointvalue > 0.0 ? syminfo.pointvalue : 1.0
+bool useDollarSizing = sizingMode == "Risk %" or sizingMode == "Risk $"
+float riskBudget = sizingMode == "Risk %" ? strategy.equity * riskPerTradePct / 100.0 : maxRiskDollars
+
+float longRiskQty = useDollarSizing and candidateLongRisk > syminfo.mintick ? math.floor(riskBudget / (candidateLongRisk * pointValue)) : baseQty
+float shortRiskQty = useDollarSizing and candidateShortRisk > syminfo.mintick ? math.floor(riskBudget / (candidateShortRisk * pointValue)) : baseQty
+
+bool longSizePass = not useDollarSizing or longRiskQty >= 1.0
+bool shortSizePass = not useDollarSizing or shortRiskQty >= 1.0
+
+float longOrderQty = useDollarSizing ? longRiskQty : baseQty
+float shortOrderQty = useDollarSizing ? shortRiskQty : baseQty
+
+// ═══════════════════════════════════════════════════════════════════
+// FINAL ENTRY SIGNALS
+// ═══════════════════════════════════════════════════════════════════
+
+bool flat = strategy.position_size == 0
+
+bool longSweepReady = sweepBuySignal and tradeDirectionLongOk and commonGatePass
+bool shortSweepReady = sweepSellSignal and tradeDirectionShortOk and commonGatePass and not longSweepReady
+
+bool longEntry = barstate.isconfirmed and flat and longSweepReady and longSizePass
+bool shortEntry = barstate.isconfirmed and flat and shortSweepReady and shortSizePass and not longEntry
+
+// ═══════════════════════════════════════════════════════════════════
+// BLOCKER DIAGNOSTICS
+// ═══════════════════════════════════════════════════════════════════
+
+string longBlocker =
+     tradeDirection == "Short Only" ? "LONGS OFF" :
+     not inTradeSession ? "SESSION" :
+     not dailyTradeLimitPass ? "TRADE LIMIT" :
+     not cooldownPass ? "COOLDOWN" :
+     not dataReady ? "DATA" :
+     not longTrendOk ? "TREND" :
+     not longMomentumOk ? "MOMENTUM" :
+     not sweepBuySignal ? "NO SWEEP" :
+     not longSizePass ? "SIZE" :
+     strategy.position_size != 0 ? "POSITION OPEN" :
+     "CLEAR"
+
+string shortBlocker =
+     tradeDirection == "Long Only" ? "SHORTS OFF" :
+     not inTradeSession ? "SESSION" :
+     not dailyTradeLimitPass ? "TRADE LIMIT" :
+     not cooldownPass ? "COOLDOWN" :
+     not dataReady ? "DATA" :
+     not shortTrendOk ? "TREND" :
+     not shortMomentumOk ? "MOMENTUM" :
+     not sweepSellSignal ? "NO SWEEP" :
+     not shortSizePass ? "SIZE" :
+     strategy.position_size != 0 ? "POSITION OPEN" :
+     "CLEAR"
+
+// ═══════════════════════════════════════════════════════════════════
+// TRADE STATE
+// ═══════════════════════════════════════════════════════════════════
+
+var float pendingStop = na
+var float entryPrice = na
+var float initialRisk = na
+var float longStop = na
+var float shortStop = na
+var float tp1Price = na
+var float tp2Price = na
+var bool tp1Hit = false
+var bool breakEvenActive = false
+var bool trailingActive = false
+var float highestSinceEntry = na
+var float lowestSinceEntry = na
+var int entryBar = na
+
+// ═══════════════════════════════════════════════════════════════════
+// ENTRIES
+// ═══════════════════════════════════════════════════════════════════
+
+if longEntry
+    pendingStop := candidateLongStop
+    tradesToday += 1
+
+    strategy.entry("Long", strategy.long, qty=longOrderQty, comment="Sweep Long", alert_message="SWEEPTREND_LONG")
+
+    if enableDynamicAlerts
+        alert(
+             "🔵 BULLISH SWEEP — LONG ENTRY\n" +
+             syminfo.ticker + " | " + timeframe.period +
+             "\nTrend: EMA " + str.tostring(trendFastLen) + "/" + str.tostring(trendSlowLen) + " bullish, ADX " + str.tostring(adx, "#.0") +
+             "\nMomentum: ROC " + str.tostring(roc, "#.00") + ", BOP " + str.tostring(bop, "#.00") +
+             "\nStop: " + str.tostring(candidateLongStop, format.mintick),
+             alert.freq_once_per_bar_close)
+
+if shortEntry
+    pendingStop := candidateShortStop
+    tradesToday += 1
+
+    strategy.entry("Short", strategy.short, qty=shortOrderQty, comment="Sweep Short", alert_message="SWEEPTREND_SHORT")
+
+    if enableDynamicAlerts
+        alert(
+             "🟣 BEARISH SWEEP — SHORT ENTRY\n" +
+             syminfo.ticker + " | " + timeframe.period +
+             "\nTrend: EMA " + str.tostring(trendFastLen) + "/" + str.tostring(trendSlowLen) + " bearish, ADX " + str.tostring(adx, "#.0") +
+             "\nMomentum: ROC " + str.tostring(roc, "#.00") + ", BOP " + str.tostring(bop, "#.00") +
+             "\nStop: " + str.tostring(candidateShortStop, format.mintick),
+             alert.freq_once_per_bar_close)
+
+// ═══════════════════════════════════════════════════════════════════
+// FILL DETECTION
+// ═══════════════════════════════════════════════════════════════════
+
+bool longFill = strategy.position_size > 0 and strategy.position_size[1] <= 0
+bool shortFill = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if longFill
+    entryPrice := strategy.position_avg_price
+    longStop := not na(pendingStop) ? pendingStop : entryPrice - atr * maxStopATR
+    initialRisk := entryPrice - longStop
+    tp1Price := entryPrice + initialRisk * tp1R
+    tp2Price := entryPrice + initialRisk * tp2R
+    highestSinceEntry := high
+    lowestSinceEntry := low
+    entryBar := bar_index
+    tp1Hit := false
+    breakEvenActive := false
+    trailingActive := false
+
+if shortFill
+    entryPrice := strategy.position_avg_price
+    shortStop := not na(pendingStop) ? pendingStop : entryPrice + atr * maxStopATR
+    initialRisk := shortStop - entryPrice
+    tp1Price := entryPrice - initialRisk * tp1R
+    tp2Price := entryPrice - initialRisk * tp2R
+    highestSinceEntry := high
+    lowestSinceEntry := low
+    entryBar := bar_index
+    tp1Hit := false
+    breakEvenActive := false
+    trailingActive := false
+
+// ═══════════════════════════════════════════════════════════════════
+// TP1 DETECTION
+// ═══════════════════════════════════════════════════════════════════
+
+if strategy.position_size > 0 and not tp1Hit and not na(tp1Price) and high >= tp1Price
+    tp1Hit := true
+
+if strategy.position_size < 0 and not tp1Hit and not na(tp1Price) and low <= tp1Price
+    tp1Hit := true
+
+// ═══════════════════════════════════════════════════════════════════
+// BREAK-EVEN AND MOMENTUM-AWARE TRAILING
+// ═══════════════════════════════════════════════════════════════════
+// Trail multiplier tightens when the momentum filter's own inputs
+// (ROC / BOP) start disagreeing with the open position -- an early
+// warning that the trend-continuation thesis is fading.
+
+float breakEvenOffset = breakEvenOffsetTicks * syminfo.mintick
+
+if strategy.position_size > 0
+    highestSinceEntry := math.max(nz(highestSinceEntry, high), high)
+    lowestSinceEntry := math.min(nz(lowestSinceEntry, low), low)
+
+    if tp1Hit and useBreakEven
+        longStop := math.max(longStop, entryPrice + breakEvenOffset)
+        breakEvenActive := true
+
+    if tp1Hit and useTrail
+        float longTrailMultiplier = (bop <= 0.0 or roc <= 0.0) ? tightTrailATR : looseTrailATR
+        float proposedLongTrail = highestSinceEntry - atr * longTrailMultiplier
+        longStop := math.max(longStop, proposedLongTrail)
+        trailingActive := true
+
+if strategy.position_size < 0
+    highestSinceEntry := math.max(nz(highestSinceEntry, high), high)
+    lowestSinceEntry := math.min(nz(lowestSinceEntry, low), low)
+
+    if tp1Hit and useBreakEven
+        shortStop := math.min(shortStop, entryPrice - breakEvenOffset)
+        breakEvenActive := true
+
+    if tp1Hit and useTrail
+        float shortTrailMultiplier = (bop >= 0.0 or roc >= 0.0) ? tightTrailATR : looseTrailATR
+        float proposedShortTrail = lowestSinceEntry + atr * shortTrailMultiplier
+        shortStop := math.min(shortStop, proposedShortTrail)
+        trailingActive := true
+
+// ═══════════════════════════════════════════════════════════════════
+// EXITS
+// ═══════════════════════════════════════════════════════════════════
+
+if strategy.position_size > 0
+    strategy.exit("L-TP1", from_entry="Long", qty_percent=tp1Qty, stop=longStop, limit=tp1Price)
+    strategy.exit("L-TP2", from_entry="Long", qty_percent=100.0 - tp1Qty, stop=longStop, limit=tp2Price)
+
+if strategy.position_size < 0
+    strategy.exit("S-TP1", from_entry="Short", qty_percent=tp1Qty, stop=shortStop, limit=tp1Price)
+    strategy.exit("S-TP2", from_entry="Short", qty_percent=100.0 - tp1Qty, stop=shortStop, limit=tp2Price)
+
+// ═══════════════════════════════════════════════════════════════════
+// TIME AND SESSION EXITS
+// ═══════════════════════════════════════════════════════════════════
+
+int barsInTrade = strategy.position_size != 0 and not na(entryBar) ? bar_index - entryBar : 0
+
+if strategy.position_size != 0 and barsInTrade >= maximumHoldingBars
+    strategy.close_all(comment="Sweep Time Stop", immediately=true)
+
+if closeAtSessionEnd and sessionEndBar and strategy.position_size != 0
+    strategy.close_all(comment="Sweep Session Close", immediately=true)
+
+// ═══════════════════════════════════════════════════════════════════
+// CLOSED-TRADE RESET
+// ═══════════════════════════════════════════════════════════════════
+
+bool positionJustClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if positionJustClosed
+    lastClosedTradeBar := bar_index
+    pendingStop := na
+    entryPrice := na
+    initialRisk := na
+    longStop := na
+    shortStop := na
+    tp1Price := na
+    tp2Price := na
+    highestSinceEntry := na
+    lowestSinceEntry := na
+    entryBar := na
+    tp1Hit := false
+    breakEvenActive := false
+    trailingActive := false
+
+// ═══════════════════════════════════════════════════════════════════
+// PLOTS
+// ═══════════════════════════════════════════════════════════════════
+
+plot(emaFast, "EMA Fast", color=color.new(C_BLUE, 10), linewidth=2)
+plot(emaSlow, "EMA Slow", color=color.new(C_ORANGE, 10), linewidth=2)
+
+float activeStop = strategy.position_size > 0 ? longStop : strategy.position_size < 0 ? shortStop : na
+
+plot(showTradeLevels and strategy.position_size != 0 ? entryPrice : na, "Active Entry", color=color.white, linewidth=1, style=plot.style_linebr)
+plot(showTradeLevels ? activeStop : na, "Active Stop", color=C_RED, linewidth=2, style=plot.style_linebr)
+plot(showTradeLevels and strategy.position_size != 0 ? tp1Price : na, "TP1", color=color.new(C_GREEN, 35), linewidth=1, style=plot.style_linebr)
+plot(showTradeLevels and strategy.position_size != 0 ? tp2Price : na, "TP2", color=C_GREEN, linewidth=2, style=plot.style_linebr)
+
+plotshape(showSignals and longEntry, title="Long Entry", style=shape.labelup, location=location.belowbar, color=C_BLUE, textcolor=color.white, text="LONG", size=size.small)
+plotshape(showSignals and shortEntry, title="Short Entry", style=shape.labeldown, location=location.abovebar, color=C_PURPLE, textcolor=color.white, text="SHORT", size=size.small)
+
+plotshape(showSweepMarkers and validBuySweep, title="Raw Bull Sweep", style=shape.circle, location=location.belowbar, color=color.new(C_GREEN, 40), size=size.tiny)
+plotshape(showSweepMarkers and validSellSweep, title="Raw Bear Sweep", style=shape.circle, location=location.abovebar, color=color.new(C_RED, 40), size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════════
+
+resolvedDashboardPosition =
+     dashPos == "Top Left" ? position.top_left :
+     dashPos == "Bottom Right" ? position.bottom_right :
+     dashPos == "Bottom Left" ? position.bottom_left :
+     position.top_right
+
+dashboardTextSize =
+     dashFont == "Large" ? size.normal :
+     dashFont == "Phone" ? size.small :
+     size.tiny
+
+var table dashboard = table.new(
+     position=resolvedDashboardPosition,
+     columns=2,
+     rows=14,
+     bgcolor=C_NAVY,
+     border_width=1,
+     border_color=color.rgb(55, 72, 95),
+     frame_width=2,
+     frame_color=C_BLUE)
+
+f_dashboardRow(int row, string labelText, string valueText, color valueBackground) =>
+    table.cell(dashboard, 0, row, labelText, bgcolor=row % 2 == 0 ? C_CARD : C_ALT, text_color=C_WHITE, text_size=dashboardTextSize, text_halign=text.align_left)
+    table.cell(dashboard, 1, row, valueText, bgcolor=valueBackground, text_color=color.white, text_size=dashboardTextSize, text_halign=text.align_right)
+
+string positionText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+color positionColor = strategy.position_size > 0 ? C_BLUE : strategy.position_size < 0 ? C_PURPLE : C_GRAY
+
+string trendText = localBullish ? "BULLISH" : localBearish ? "BEARISH" : "MIXED"
+color trendColor = localBullish ? C_BLUE : localBearish ? C_PURPLE : C_GRAY
+
+string htfText = not useHtfTrendFilter ? "OFF" : htfBullish ? "BULLISH" : htfBearish ? "BEARISH" : "MIXED"
+color htfColor = not useHtfTrendFilter ? C_GRAY : htfBullish ? C_BLUE : htfBearish ? C_PURPLE : C_ORANGE
+
+string momentumText = roc > 0.0 and bop > 0.0 ? "BULLISH" : roc < 0.0 and bop < 0.0 ? "BEARISH" : "MIXED"
+color momentumColor = roc > 0.0 and bop > 0.0 ? C_BLUE : roc < 0.0 and bop < 0.0 ? C_PURPLE : C_GRAY
+
+int biasSign = localBullish ? 1 : localBearish ? -1 : 0
+string activeBlocker = biasSign > 0 ? longBlocker : biasSign < 0 ? shortBlocker : "NO DIRECTION"
+color blockerColor =
+     activeBlocker == "CLEAR" ? C_GREEN :
+     activeBlocker == "NO DIRECTION" or activeBlocker == "NO SWEEP" ? C_GRAY :
+     activeBlocker == "COOLDOWN" ? C_ORANGE :
+     C_RED
+
+string sessionText = inTradeSession ? "OPEN" : "CLOSED"
+color sessionColor = inTradeSession ? C_GREEN : C_RED
+
+string cooldownText = cooldownPass ? "READY" : str.tostring(cooldownRemaining) + " BARS"
+color cooldownColor = cooldownPass ? C_GREEN : C_ORANGE
+
+bool bullPendingActive = not na(sweepPendingBullBar) and (bar_index - sweepPendingBullBar <= sweepConfirmationWindow)
+bool bearPendingActive = not na(sweepPendingBearBar) and (bar_index - sweepPendingBearBar <= sweepConfirmationWindow)
+
+string sweepStateText =
+     bullPendingActive ? "BULL PENDING " + str.tostring(bar_index - sweepPendingBullBar) :
+     bearPendingActive ? "BEAR PENDING " + str.tostring(bar_index - sweepPendingBearBar) :
+     "NONE"
+
+color sweepStateColor = bullPendingActive ? C_BLUE : bearPendingActive ? C_PURPLE : C_GRAY
+
+string activeLevelsText = f_price(activeStop) + " / " + f_price(tp1Price)
+
+string managementText =
+     strategy.position_size == 0 ? "INACTIVE" :
+     trailingActive ? "TRAILING" :
+     breakEvenActive ? "BREAK-EVEN" :
+     tp1Hit ? "TP1 HIT" :
+     "INITIAL RISK"
+
+color managementColor =
+     strategy.position_size == 0 ? C_GRAY :
+     trailingActive ? C_GREEN :
+     breakEvenActive ? C_BLUE :
+     tp1Hit ? C_GREEN :
+     C_ORANGE
+
+// Surfaces the "Enable Dynamic alert() Calls" toggle on the dashboard --
+// if this is off, entry labels can still plot but no alert() message
+// will ever be sent, which looks identical to a broken alert.
+string alertsStatusText = not enableDynamicAlerts ? "OFF" : "ON"
+color alertsStatusColor = not enableDynamicAlerts ? C_RED : C_GREEN
+
+if showDashboard and barstate.islast
+    table.clear(dashboard, 0, 0, 1, 13)
+
+    f_dashboardRow(0, "SWEEPTREND", "LIVE", C_BLUE)
+    f_dashboardRow(1, "POSITION", positionText, positionColor)
+    f_dashboardRow(2, "TREND", trendText, trendColor)
+    f_dashboardRow(3, "HTF TREND", htfText, htfColor)
+    f_dashboardRow(4, "MOMENTUM", momentumText, momentumColor)
+    f_dashboardRow(5, "ADX", str.tostring(adx, "#.0") + " / " + str.tostring(adxMin, "#.0"), adx >= adxMin ? C_GREEN : C_RED)
+    f_dashboardRow(6, "BLOCKER", activeBlocker, blockerColor)
+    f_dashboardRow(7, "SESSION", sessionText, sessionColor)
+    f_dashboardRow(8, "TRADES", str.tostring(tradesToday) + "/" + str.tostring(maxTradesPerDay), dailyTradeLimitPass ? C_CARD : C_RED)
+    f_dashboardRow(9, "COOLDOWN", cooldownText, cooldownColor)
+    f_dashboardRow(10, "SWEEP", sweepStateText, sweepStateColor)
+    f_dashboardRow(11, "STOP / TP1", activeLevelsText, managementColor)
+    f_dashboardRow(12, "MANAGEMENT", managementText, managementColor)
+    f_dashboardRow(13, "ALERTS", alertsStatusText, alertsStatusColor)
+
+if not showDashboard and barstate.islast
+    table.clear(dashboard, 0, 0, 1, 13)
+
+// ═══════════════════════════════════════════════════════════════════
+// ALERT CONDITIONS
+//
+// IMPORTANT — how to actually receive these notifications:
+// When you create the TradingView alert, set "Condition" to this
+// script, then pick ONE of:
+//   • "Any alert() function call" — fires the dynamic alert() messages
+//     above, which state the live trend/momentum context and stop.
+//     Recommended if you want full context per trade.
+//   • One of the named conditions below — fires a fixed static
+//     message tied to that specific condition only.
+// Picking "Order fills" instead of one of the above will NOT trigger
+// on these entry signals, and alerts never fire retroactively for
+// bars that already closed before the alert was created.
+// ═══════════════════════════════════════════════════════════════════
+
+alertcondition(longEntry, title="Sweep Long Entry (Bullish)", message="🔵 BULLISH — Sweep Trend LONG entry — {{ticker}} {{interval}}")
+alertcondition(shortEntry, title="Sweep Short Entry (Bearish)", message="🟣 BEARISH — Sweep Trend SHORT entry — {{ticker}} {{interval}}")
+alertcondition(longEntry or shortEntry, title="Sweep Any Entry (Check Chart For Bias)", message="Sweep Trend entry — {{ticker}} {{interval}} — see chart/dashboard for bias")
+alertcondition(positionJustClosed, title="Sweep Position Closed", message="Sweep Trend position closed — {{ticker}} {{interval}}")
+
+// ═══════════════════════════════════════════════════════════════════
+// DATA WINDOW
+// ═══════════════════════════════════════════════════════════════════
+
+plot(roc, "ROC", display=display.data_window)
+plot(bop, "BOP", display=display.data_window)
+plot(adx, "ADX", display=display.data_window)
+plot(candidateLongStop, "Candidate Long Stop", display=display.data_window)
+plot(candidateShortStop, "Candidate Short Stop", display=display.data_window)

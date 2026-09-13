@@ -1,0 +1,1274 @@
+//@version=6
+//@strategy_alert_message {{strategy.order.alert_message}} | Fill={{strategy.order.price}}
+
+strategy(
+    "Trend Following Strategy - Triangle Entries v1",
+    overlay = true,
+    pyramiding = 0,
+    process_orders_on_close = true,
+    calc_on_order_fills = true,
+    calc_on_every_tick = false,
+    max_labels_count = 500
+)
+
+//=============================================================================
+// INPUT GROUPS
+//=============================================================================
+
+const string GROUP_GENERAL = "01 — General"
+const string GROUP_TREND   = "02 — Trend Engine"
+const string GROUP_ENTRY   = "03 — Entry"
+const string GROUP_RISK    = "04 — Risk Management"
+const string GROUP_SESSION = "05 — Session"
+const string GROUP_ALERT   = "06 — Alerts"
+const string GROUP_VISUAL  = "07 — Visuals"
+
+//=============================================================================
+// GENERAL
+//=============================================================================
+
+bool allowLongInput = input.bool(
+    true,
+    "Enable Longs",
+    group = GROUP_GENERAL
+)
+
+bool allowShortInput = input.bool(
+    true,
+    "Enable Shorts",
+    group = GROUP_GENERAL
+)
+
+float quantityInput = input.float(
+    1.0,
+    "Order Quantity",
+    minval = 0.01,
+    step = 0.01,
+    group = GROUP_GENERAL
+)
+
+int maxTradesPerDayInput = input.int(
+    4,
+    "Maximum Trades Per Day",
+    minval = 1,
+    maxval = 20,
+    group = GROUP_GENERAL
+)
+
+//=============================================================================
+// TREND ENGINE
+//=============================================================================
+
+int fastEmaLengthInput = input.int(
+    20,
+    "Fast EMA",
+    minval = 2,
+    group = GROUP_TREND
+)
+
+int slowEmaLengthInput = input.int(
+    50,
+    "Slow EMA",
+    minval = 3,
+    group = GROUP_TREND
+)
+
+int slopeLookbackInput = input.int(
+    5,
+    "Slow EMA Slope Lookback",
+    minval = 1,
+    group = GROUP_TREND
+)
+
+float minimumSlopeAtrInput = input.float(
+    0.10,
+    "Minimum Trend Slope / ATR",
+    minval = 0.0,
+    step = 0.01,
+    tooltip = "Higher values require a stronger EMA trend.",
+    group = GROUP_TREND
+)
+
+bool useAdxInput = input.bool(
+    true,
+    "Use ADX Trend Strength",
+    group = GROUP_TREND
+)
+
+int diLengthInput = input.int(
+    14,
+    "DI Length",
+    minval = 2,
+    group = GROUP_TREND
+)
+
+int adxSmoothingInput = input.int(
+    14,
+    "ADX Smoothing",
+    minval = 2,
+    group = GROUP_TREND
+)
+
+float minimumAdxInput = input.float(
+    20.0,
+    "Minimum ADX",
+    minval = 1.0,
+    step = 0.5,
+    group = GROUP_TREND
+)
+
+//=============================================================================
+// HIGHER TIMEFRAME TREND
+//=============================================================================
+
+bool useHTFInput = input.bool(
+    true,
+    "Use Higher Timeframe Trend",
+    group = GROUP_TREND
+)
+
+// FIX: default was "60" (1H), which errors out (RE10142) on any chart
+// timeframe of 1H or above. "D" stays valid regardless of which
+// intraday timeframe this gets applied to; still fully overridable.
+string htfInput = input.timeframe(
+    "D",
+    "Higher Timeframe",
+    group = GROUP_TREND
+)
+
+int htfFastLengthInput = input.int(
+    20,
+    "HTF Fast EMA",
+    minval = 2,
+    group = GROUP_TREND
+)
+
+int htfSlowLengthInput = input.int(
+    50,
+    "HTF Slow EMA",
+    minval = 3,
+    group = GROUP_TREND
+)
+
+//=============================================================================
+// ENTRY
+//=============================================================================
+
+string entryModeInput = input.string(
+    "Pullback Continuation",
+    "Entry Mode",
+    options = [
+        "Pullback Continuation",
+        "Breakout"
+    ],
+    group = GROUP_ENTRY
+)
+
+//-----------------------------------------------------------------------------
+// Pullback
+//-----------------------------------------------------------------------------
+
+float pullbackToleranceAtrInput = input.float(
+    0.20,
+    "Pullback EMA Tolerance — ATR",
+    minval = 0.0,
+    step = 0.05,
+    tooltip = "How close price must come to the fast EMA.",
+    group = GROUP_ENTRY
+)
+
+string pullbackConfirmationInput = input.string(
+    "Break Previous Bar",
+    "Pullback Confirmation",
+    options = [
+        "Bull/Bear Candle",
+        "Break Previous Bar"
+    ],
+    group = GROUP_ENTRY
+)
+
+//-----------------------------------------------------------------------------
+// Breakout
+//-----------------------------------------------------------------------------
+
+int breakoutLookbackInput = input.int(
+    10,
+    "Breakout Lookback",
+    minval = 2,
+    group = GROUP_ENTRY
+)
+
+float breakoutBufferAtrInput = input.float(
+    0.05,
+    "Breakout Buffer — ATR",
+    minval = 0.0,
+    step = 0.01,
+    group = GROUP_ENTRY
+)
+
+//-----------------------------------------------------------------------------
+// Extra confirmation
+//-----------------------------------------------------------------------------
+
+bool requireVolumeInput = input.bool(
+    false,
+    "Require Above-Average Volume",
+    group = GROUP_ENTRY
+)
+
+int volumeLengthInput = input.int(
+    20,
+    "Volume Average Length",
+    minval = 2,
+    group = GROUP_ENTRY
+)
+
+float volumeMultiplierInput = input.float(
+    1.0,
+    "Volume Multiplier",
+    minval = 0.1,
+    step = 0.1,
+    group = GROUP_ENTRY
+)
+
+//=============================================================================
+// RISK MANAGEMENT
+//=============================================================================
+
+int atrLengthInput = input.int(
+    14,
+    "ATR Length",
+    minval = 1,
+    group = GROUP_RISK
+)
+
+string stopMethodInput = input.string(
+    "Wider of ATR / Structure",
+    "Stop Method",
+    options = [
+        "ATR",
+        "Structure",
+        "Wider of ATR / Structure"
+    ],
+    group = GROUP_RISK
+)
+
+float stopAtrInput = input.float(
+    1.5,
+    "ATR Stop Multiplier",
+    minval = 0.1,
+    step = 0.1,
+    group = GROUP_RISK
+)
+
+int structureLookbackInput = input.int(
+    7,
+    "Structure Lookback",
+    minval = 2,
+    group = GROUP_RISK
+)
+
+float structureBufferAtrInput = input.float(
+    0.10,
+    "Structure Buffer — ATR",
+    minval = 0.0,
+    step = 0.05,
+    group = GROUP_RISK
+)
+
+float rewardRiskInput = input.float(
+    2.0,
+    "Target — R",
+    minval = 0.25,
+    step = 0.25,
+    group = GROUP_RISK
+)
+
+//-----------------------------------------------------------------------------
+// Break-even
+//-----------------------------------------------------------------------------
+
+bool breakEvenInput = input.bool(
+    true,
+    "Move Stop To Break-Even",
+    group = GROUP_RISK
+)
+
+float breakEvenTriggerInput = input.float(
+    1.0,
+    "Break-Even Trigger — R",
+    minval = 0.25,
+    step = 0.25,
+    group = GROUP_RISK
+)
+
+int breakEvenOffsetTicksInput = input.int(
+    0,
+    "Break-Even Offset — Ticks",
+    minval = 0,
+    group = GROUP_RISK
+)
+
+//-----------------------------------------------------------------------------
+// Trailing
+//-----------------------------------------------------------------------------
+
+bool trailingInput = input.bool(
+    false,
+    "Enable ATR Trailing Stop",
+    group = GROUP_RISK
+)
+
+float trailingStartRInput = input.float(
+    1.5,
+    "Start Trailing At — R",
+    minval = 0.25,
+    step = 0.25,
+    group = GROUP_RISK
+)
+
+float trailingAtrInput = input.float(
+    1.25,
+    "Trailing Distance — ATR",
+    minval = 0.1,
+    step = 0.05,
+    group = GROUP_RISK
+)
+
+//=============================================================================
+// SESSION
+//=============================================================================
+
+bool useSessionInput = input.bool(
+    true,
+    "Use Trading Session",
+    group = GROUP_SESSION
+)
+
+string tradeSessionInput = input.session(
+    "0930-1555",
+    "Trading Session",
+    group = GROUP_SESSION
+)
+
+string flatSessionInput = input.session(
+    "1555-1600",
+    "Force Flat Window",
+    group = GROUP_SESSION
+)
+
+string daysInput = input.string(
+    "23456",
+    "Trading Days",
+    tooltip = "23456 = Monday through Friday.",
+    group = GROUP_SESSION
+)
+
+string timezoneInput = input.string(
+    "America/New_York",
+    "Time Zone",
+    group = GROUP_SESSION
+)
+
+bool forceFlatInput = input.bool(
+    true,
+    "Close At End Of Session",
+    group = GROUP_SESSION
+)
+
+//=============================================================================
+// ALERTS
+//=============================================================================
+
+bool alertExitsInput = input.bool(
+    false,
+    "Send Exit Alerts",
+    tooltip = "OFF = directional entry alerts only.",
+    group = GROUP_ALERT
+)
+
+//=============================================================================
+// VISUALS
+//=============================================================================
+
+bool showTrianglesInput = input.bool(
+    true,
+    "Show Entry Triangles",
+    group = GROUP_VISUAL
+)
+
+string triangleSizeInput = input.string(
+    "Small",
+    "Triangle Size",
+    options = [
+        "Tiny",
+        "Small",
+        "Normal"
+    ],
+    group = GROUP_VISUAL
+)
+
+bool showEmaInput = input.bool(
+    true,
+    "Show EMAs",
+    group = GROUP_VISUAL
+)
+
+bool showTrendBackgroundInput = input.bool(
+    false,
+    "Trend Background",
+    group = GROUP_VISUAL
+)
+
+bool showTradeLevelsInput = input.bool(
+    true,
+    "Show Entry / Stop / Target",
+    group = GROUP_VISUAL
+)
+
+bool showDashboardInput = input.bool(
+    true,
+    "Show Trend Dashboard",
+    group = GROUP_VISUAL
+)
+
+//=============================================================================
+// VALIDATION
+//=============================================================================
+
+if useSessionInput and not timeframe.isintraday
+    runtime.error("Session filtering requires an intraday chart.")
+
+if useHTFInput and timeframe.in_seconds(htfInput) <= timeframe.in_seconds(timeframe.period)
+    runtime.error("Higher timeframe must be greater than chart timeframe.")
+
+//=============================================================================
+// SESSION
+//=============================================================================
+
+string tradeSession = tradeSessionInput + ":" + daysInput
+string flatSession = flatSessionInput + ":" + daysInput
+
+bool inTradeSession = not na(
+    time(
+        timeframe.period,
+        tradeSession,
+        timezoneInput
+    )
+)
+
+bool inFlatSession = not na(
+    time(
+        timeframe.period,
+        flatSession,
+        timezoneInput
+    )
+)
+
+bool sessionOK = not useSessionInput or inTradeSession
+
+//=============================================================================
+// CORE INDICATORS
+//=============================================================================
+
+float fastEMA = ta.ema(
+    close,
+    fastEmaLengthInput
+)
+
+float slowEMA = ta.ema(
+    close,
+    slowEmaLengthInput
+)
+
+float atr = ta.atr(
+    atrLengthInput
+)
+
+[plusDI, minusDI, adx] = ta.dmi(
+    diLengthInput,
+    adxSmoothingInput
+)
+
+float volumeAverage = ta.sma(
+    volume,
+    volumeLengthInput
+)
+
+//=============================================================================
+// EMA SLOPE
+//=============================================================================
+// FIX (syntax error CE10156, "end of line without line continuation"):
+// same class of error already fixed in the previous two scripts this
+// session -- multi-line expressions outside brackets used 4-space or
+// 8-space continuation indents, both multiples of 4, which Pine reserves
+// for if/for/function block nesting. Every broken statement below is
+// collapsed onto a single line instead of re-indented. Bracket-delimited
+// multi-line calls and the multi-line "if" conditions that already used
+// a safe 3-space continuation are untouched.
+
+float slowSlope = slowEMA - slowEMA[slopeLookbackInput]
+
+float normalizedSlope = not na(atr) and atr > 0 ? slowSlope / atr : 0.0
+
+//=============================================================================
+// CONFIRMED HTF VALUES
+//=============================================================================
+
+[htfClose, htfFastEMA, htfSlowEMA] = request.security(
+    syminfo.tickerid,
+    htfInput,
+    [
+        close[1],
+        ta.ema(close, htfFastLengthInput)[1],
+        ta.ema(close, htfSlowLengthInput)[1]
+    ],
+    lookahead = barmerge.lookahead_on
+)
+
+bool htfBull = htfFastEMA > htfSlowEMA and htfClose > htfFastEMA
+
+bool htfBear = htfFastEMA < htfSlowEMA and htfClose < htfFastEMA
+
+//=============================================================================
+// LOCAL TREND
+//=============================================================================
+
+bool adxLongOK = not useAdxInput or (adx >= minimumAdxInput and plusDI > minusDI)
+
+bool adxShortOK = not useAdxInput or (adx >= minimumAdxInput and minusDI > plusDI)
+
+bool localBullTrend = fastEMA > slowEMA and close > slowEMA and normalizedSlope >= minimumSlopeAtrInput and adxLongOK
+
+bool localBearTrend = fastEMA < slowEMA and close < slowEMA and normalizedSlope <= -minimumSlopeAtrInput and adxShortOK
+
+bool bullTrend = localBullTrend and (not useHTFInput or htfBull)
+
+bool bearTrend = localBearTrend and (not useHTFInput or htfBear)
+
+//=============================================================================
+// VOLUME FILTER
+//=============================================================================
+
+bool volumeOK = not requireVolumeInput or volume >= volumeAverage * volumeMultiplierInput
+
+//=============================================================================
+// PULLBACK ENTRY
+//=============================================================================
+
+float pullbackTolerance = atr * pullbackToleranceAtrInput
+
+bool longPullbackTouch = bullTrend and low <= fastEMA + pullbackTolerance and low >= slowEMA - pullbackTolerance
+
+bool shortPullbackTouch = bearTrend and high >= fastEMA - pullbackTolerance and high <= slowEMA + pullbackTolerance
+
+bool longBullCandle = close > open and close > fastEMA
+
+bool shortBearCandle = close < open and close < fastEMA
+
+bool longPreviousBarBreak = close > high[1] and close > fastEMA
+
+bool shortPreviousBarBreak = close < low[1] and close < fastEMA
+
+bool longPullbackConfirmation = pullbackConfirmationInput == "Bull/Bear Candle" ? longBullCandle : longPreviousBarBreak
+
+bool shortPullbackConfirmation = pullbackConfirmationInput == "Bull/Bear Candle" ? shortBearCandle : shortPreviousBarBreak
+
+//=============================================================================
+// PULLBACK MEMORY
+//
+// A pullback can occur first and confirmation can happen a few bars later.
+//=============================================================================
+
+var bool longPullbackArmed = false
+var bool shortPullbackArmed = false
+
+var int longPullbackBar = na
+var int shortPullbackBar = na
+
+int pullbackExpirationBars = 5
+
+if longPullbackTouch
+    longPullbackArmed := true
+    longPullbackBar := bar_index
+
+    shortPullbackArmed := false
+    shortPullbackBar := na
+
+if shortPullbackTouch
+    shortPullbackArmed := true
+    shortPullbackBar := bar_index
+
+    longPullbackArmed := false
+    longPullbackBar := na
+
+//-----------------------------------------------------------------------------
+// Invalidate when trend is lost
+//-----------------------------------------------------------------------------
+
+if longPullbackArmed and not bullTrend
+    longPullbackArmed := false
+    longPullbackBar := na
+
+if shortPullbackArmed and not bearTrend
+    shortPullbackArmed := false
+    shortPullbackBar := na
+
+//-----------------------------------------------------------------------------
+// Expire
+//-----------------------------------------------------------------------------
+
+if longPullbackArmed and not na(longPullbackBar)
+    if bar_index - longPullbackBar > pullbackExpirationBars
+        longPullbackArmed := false
+        longPullbackBar := na
+
+if shortPullbackArmed and not na(shortPullbackBar)
+    if bar_index - shortPullbackBar > pullbackExpirationBars
+        shortPullbackArmed := false
+        shortPullbackBar := na
+
+//=============================================================================
+// BREAKOUT ENTRY
+//=============================================================================
+
+float priorHigh = ta.highest(high, breakoutLookbackInput)[1]
+
+float priorLow = ta.lowest(low, breakoutLookbackInput)[1]
+
+float breakoutBuffer = atr * breakoutBufferAtrInput
+
+float longBreakoutLevel = priorHigh + breakoutBuffer
+
+float shortBreakoutLevel = priorLow - breakoutBuffer
+
+bool longBreakout = bullTrend and close > longBreakoutLevel and close[1] <= longBreakoutLevel
+
+bool shortBreakout = bearTrend and close < shortBreakoutLevel and close[1] >= shortBreakoutLevel
+
+//=============================================================================
+// DAILY TRADE COUNT
+//=============================================================================
+
+bool newDay = timeframe.change("D")
+
+var int tradesToday = 0
+
+if newDay
+    tradesToday := 0
+
+    longPullbackArmed := false
+    shortPullbackArmed := false
+
+    longPullbackBar := na
+    shortPullbackBar := na
+
+//=============================================================================
+// ENTRY PERMISSION
+//=============================================================================
+
+bool canEnter = barstate.isconfirmed and sessionOK and strategy.position_size == 0 and tradesToday < maxTradesPerDayInput and volumeOK
+
+//=============================================================================
+// SELECT ENTRY MODEL
+//=============================================================================
+// FIX (separate from the syntax error above -- a real logic bug):
+// the original used bare "longEntrySignal =" / "shortEntrySignal ="
+// inside these if/else branches. In Pine, "=" on a name that already
+// exists in an outer scope does NOT reassign it -- it declares a NEW
+// variable shadowed to that block only. The outer longEntrySignal/
+// shortEntrySignal (declared above, used below in the conflict check and
+// the actual strategy.entry() calls) would have stayed permanently
+// false, since the shadowed copies vanish when the if/else block ends.
+// That alone would have produced zero entries even with the syntax fixed
+// silently and separately from any threshold/filter tuning. Changed both
+// to ":=", which is the correct outer-scope reassignment operator.
+
+bool longEntrySignal = false
+bool shortEntrySignal = false
+
+if entryModeInput == "Pullback Continuation"
+
+    longEntrySignal := canEnter and allowLongInput and bullTrend and longPullbackArmed and longPullbackConfirmation
+
+    shortEntrySignal := canEnter and allowShortInput and bearTrend and shortPullbackArmed and shortPullbackConfirmation
+
+else
+
+    longEntrySignal := canEnter and allowLongInput and bullTrend and longBreakout
+
+    shortEntrySignal := canEnter and allowShortInput and bearTrend and shortBreakout
+
+//=============================================================================
+// PREVENT SAME BAR CONFLICT
+//=============================================================================
+
+if longEntrySignal and shortEntrySignal
+    longEntrySignal := false
+    shortEntrySignal := false
+
+//=============================================================================
+// ALERT FUNCTIONS
+//=============================================================================
+
+f_entryAlert(
+    string direction,
+    string setup
+) =>
+
+    "TREND ENTRY " + direction + " | Symbol=" + syminfo.tickerid + " | TF=" + timeframe.period + " | Setup=" + setup + " | Signal=" + str.tostring(close, format.mintick)
+
+
+f_exitAlert(
+    string direction,
+    float stopPrice,
+    float targetPrice
+) =>
+
+    "TREND EXIT " + direction + " | Symbol=" + syminfo.tickerid + " | Stop=" + str.tostring(stopPrice, format.mintick) + " | Target=" + str.tostring(targetPrice, format.mintick)
+
+//=============================================================================
+// PENDING RISK INFORMATION
+//=============================================================================
+
+var float pendingATR = na
+var float pendingStructureStop = na
+
+//=============================================================================
+// LONG ENTRY
+//=============================================================================
+
+if longEntrySignal
+
+    pendingATR := atr
+
+    pendingStructureStop := ta.lowest(low, structureLookbackInput) - atr * structureBufferAtrInput
+
+    strategy.entry(
+        id = "Long",
+        direction = strategy.long,
+        qty = quantityInput,
+        comment = "BUY TREND",
+        alert_message = f_entryAlert(
+            "LONG",
+            entryModeInput
+        )
+    )
+
+    longPullbackArmed := false
+    longPullbackBar := na
+
+//=============================================================================
+// SHORT ENTRY
+//=============================================================================
+
+else if shortEntrySignal
+
+    pendingATR := atr
+
+    pendingStructureStop := ta.highest(high, structureLookbackInput) + atr * structureBufferAtrInput
+
+    strategy.entry(
+        id = "Short",
+        direction = strategy.short,
+        qty = quantityInput,
+        comment = "SELL TREND",
+        alert_message = f_entryAlert(
+            "SHORT",
+            entryModeInput
+        )
+    )
+
+    shortPullbackArmed := false
+    shortPullbackBar := na
+
+//=============================================================================
+// TRIANGLE ENTRY SIGNALS
+//=============================================================================
+
+plotshape(
+    showTrianglesInput and
+    longEntrySignal and
+    triangleSizeInput == "Tiny",
+    title = "Long Triangle Tiny",
+    style = shape.triangleup,
+    location = location.belowbar,
+    color = color.lime,
+    size = size.tiny
+)
+
+plotshape(
+    showTrianglesInput and
+    longEntrySignal and
+    triangleSizeInput == "Small",
+    title = "Long Triangle Small",
+    style = shape.triangleup,
+    location = location.belowbar,
+    color = color.lime,
+    size = size.small
+)
+
+plotshape(
+    showTrianglesInput and
+    longEntrySignal and
+    triangleSizeInput == "Normal",
+    title = "Long Triangle Normal",
+    style = shape.triangleup,
+    location = location.belowbar,
+    color = color.lime,
+    size = size.normal
+)
+
+plotshape(
+    showTrianglesInput and
+    shortEntrySignal and
+    triangleSizeInput == "Tiny",
+    title = "Short Triangle Tiny",
+    style = shape.triangledown,
+    location = location.abovebar,
+    color = color.red,
+    size = size.tiny
+)
+
+plotshape(
+    showTrianglesInput and
+    shortEntrySignal and
+    triangleSizeInput == "Small",
+    title = "Short Triangle Small",
+    style = shape.triangledown,
+    location = location.abovebar,
+    color = color.red,
+    size = size.small
+)
+
+plotshape(
+    showTrianglesInput and
+    shortEntrySignal and
+    triangleSizeInput == "Normal",
+    title = "Short Triangle Normal",
+    style = shape.triangledown,
+    location = location.abovebar,
+    color = color.red,
+    size = size.normal
+)
+
+//=============================================================================
+// ACTIVE TRADE
+//=============================================================================
+
+var float activeEntry = na
+var float activeStop = na
+var float activeTarget = na
+var float initialRisk = na
+
+varip int lastHandledEntryBar = na
+
+bool newLongFill = strategy.position_size > 0 and strategy.position_size[1] <= 0 and (na(lastHandledEntryBar) or lastHandledEntryBar != bar_index)
+
+bool newShortFill = strategy.position_size < 0 and strategy.position_size[1] >= 0 and (na(lastHandledEntryBar) or lastHandledEntryBar != bar_index)
+
+//=============================================================================
+// LONG FILL
+//=============================================================================
+
+if newLongFill
+
+    lastHandledEntryBar := bar_index
+    tradesToday += 1
+
+    activeEntry := strategy.position_avg_price
+
+    float entryATR = na(pendingATR) ? atr : pendingATR
+
+    float atrStop = activeEntry - entryATR * stopAtrInput
+
+    float structureStop = pendingStructureStop
+
+    if na(structureStop) or structureStop >= activeEntry
+        structureStop := atrStop
+
+    if stopMethodInput == "ATR"
+
+        activeStop := atrStop
+
+    else if stopMethodInput == "Structure"
+
+        activeStop := structureStop
+
+    else
+
+        activeStop := math.min(atrStop, structureStop)
+
+    activeStop := math.min(activeStop, activeEntry - syminfo.mintick)
+
+    initialRisk := activeEntry - activeStop
+
+    activeTarget := activeEntry + initialRisk * rewardRiskInput
+
+//=============================================================================
+// SHORT FILL
+//=============================================================================
+
+if newShortFill
+
+    lastHandledEntryBar := bar_index
+    tradesToday += 1
+
+    activeEntry := strategy.position_avg_price
+
+    float entryATR = na(pendingATR) ? atr : pendingATR
+
+    float atrStop = activeEntry + entryATR * stopAtrInput
+
+    float structureStop = pendingStructureStop
+
+    if na(structureStop) or structureStop <= activeEntry
+        structureStop := atrStop
+
+    if stopMethodInput == "ATR"
+
+        activeStop := atrStop
+
+    else if stopMethodInput == "Structure"
+
+        activeStop := structureStop
+
+    else
+
+        activeStop := math.max(atrStop, structureStop)
+
+    activeStop := math.max(activeStop, activeEntry + syminfo.mintick)
+
+    initialRisk := activeStop - activeEntry
+
+    activeTarget := activeEntry - initialRisk * rewardRiskInput
+
+//=============================================================================
+// LONG TRADE MANAGEMENT
+//=============================================================================
+
+if strategy.position_size > 0 and
+   not na(activeEntry) and
+   not na(initialRisk)
+
+    //-------------------------------------------------------------
+    // Break-even
+    //-------------------------------------------------------------
+
+    if breakEvenInput and
+       high >= activeEntry + initialRisk * breakEvenTriggerInput
+
+        float breakEvenStop = activeEntry + breakEvenOffsetTicksInput * syminfo.mintick
+
+        activeStop := math.max(activeStop, breakEvenStop)
+
+    //-------------------------------------------------------------
+    // Trailing
+    //-------------------------------------------------------------
+
+    if trailingInput and
+       high >= activeEntry + initialRisk * trailingStartRInput
+
+        float trailingCandidate = close - atr * trailingAtrInput
+
+        activeStop := math.max(activeStop, trailingCandidate)
+
+    strategy.exit(
+        id = "Long Exit",
+        from_entry = "Long",
+        stop = activeStop,
+        limit = activeTarget,
+        alert_message = f_exitAlert(
+            "LONG",
+            activeStop,
+            activeTarget
+        ),
+        disable_alert = not alertExitsInput
+    )
+
+//=============================================================================
+// SHORT TRADE MANAGEMENT
+//=============================================================================
+
+if strategy.position_size < 0 and
+   not na(activeEntry) and
+   not na(initialRisk)
+
+    //-------------------------------------------------------------
+    // Break-even
+    //-------------------------------------------------------------
+
+    if breakEvenInput and
+       low <= activeEntry - initialRisk * breakEvenTriggerInput
+
+        float breakEvenStop = activeEntry - breakEvenOffsetTicksInput * syminfo.mintick
+
+        activeStop := math.min(activeStop, breakEvenStop)
+
+    //-------------------------------------------------------------
+    // Trailing
+    //-------------------------------------------------------------
+
+    if trailingInput and
+       low <= activeEntry - initialRisk * trailingStartRInput
+
+        float trailingCandidate = close + atr * trailingAtrInput
+
+        activeStop := math.min(activeStop, trailingCandidate)
+
+    strategy.exit(
+        id = "Short Exit",
+        from_entry = "Short",
+        stop = activeStop,
+        limit = activeTarget,
+        alert_message = f_exitAlert(
+            "SHORT",
+            activeStop,
+            activeTarget
+        ),
+        disable_alert = not alertExitsInput
+    )
+
+//=============================================================================
+// FORCE FLAT
+//=============================================================================
+
+if forceFlatInput and
+   inFlatSession and
+   strategy.position_size != 0
+
+    string exitDirection = strategy.position_size > 0 ? "LONG" : "SHORT"
+
+    strategy.close_all(
+        comment = "END OF SESSION",
+        alert_message =
+            "TREND EOD EXIT " +
+            exitDirection +
+            " | Symbol=" +
+            syminfo.tickerid,
+        disable_alert = not alertExitsInput
+    )
+
+//=============================================================================
+// RESET TRADE LEVELS
+//=============================================================================
+
+if strategy.position_size == 0 and
+   not newLongFill and
+   not newShortFill
+
+    activeEntry := na
+    activeStop := na
+    activeTarget := na
+    initialRisk := na
+
+//=============================================================================
+// VISUALS
+//=============================================================================
+
+plot(
+    showEmaInput
+    ? fastEMA
+    : na,
+    "Fast EMA",
+    color = color.aqua,
+    linewidth = 2
+)
+
+plot(
+    showEmaInput
+    ? slowEMA
+    : na,
+    "Slow EMA",
+    color = color.orange,
+    linewidth = 2
+)
+
+//-----------------------------------------------------------------------------
+// Trend background
+//-----------------------------------------------------------------------------
+
+color trendBackground = bullTrend ? color.new(color.green, 92) : bearTrend ? color.new(color.red, 92) : color.new(color.gray, 96)
+
+bgcolor(
+    showTrendBackgroundInput
+    ? trendBackground
+    : na,
+    title = "Trend Background"
+)
+
+//-----------------------------------------------------------------------------
+// Trade levels
+//-----------------------------------------------------------------------------
+
+plot(
+    showTradeLevelsInput and
+    strategy.position_size != 0
+    ? activeEntry
+    : na,
+    "Entry",
+    color = color.blue,
+    linewidth = 2,
+    style = plot.style_linebr
+)
+
+plot(
+    showTradeLevelsInput and
+    strategy.position_size != 0
+    ? activeStop
+    : na,
+    "Stop",
+    color = color.red,
+    linewidth = 2,
+    style = plot.style_linebr
+)
+
+plot(
+    showTradeLevelsInput and
+    strategy.position_size != 0
+    ? activeTarget
+    : na,
+    "Target",
+    color = color.green,
+    linewidth = 2,
+    style = plot.style_linebr
+)
+
+//=============================================================================
+// DASHBOARD
+//=============================================================================
+
+var table dashboard = table.new(
+    position.top_right,
+    2,
+    6,
+    frame_width = 1,
+    border_width = 1
+)
+
+if barstate.islast
+
+    string trendText = bullTrend ? "BULLISH" : bearTrend ? "BEARISH" : "NEUTRAL"
+
+    string htfText = not useHTFInput ? "OFF" : htfBull ? "BULLISH" : htfBear ? "BEARISH" : "NEUTRAL"
+
+    string statusText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : sessionOK ? "WAITING" : "OUT OF SESSION"
+
+    if showDashboardInput
+
+        table.cell(
+            dashboard,
+            0,
+            0,
+            "TREND",
+            bgcolor = color.black,
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            1,
+            0,
+            trendText,
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            0,
+            1,
+            "HTF",
+            bgcolor = color.black,
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            1,
+            1,
+            htfText,
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            0,
+            2,
+            "ENTRY",
+            bgcolor = color.black,
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            1,
+            2,
+            entryModeInput,
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            0,
+            3,
+            "ADX",
+            bgcolor = color.black,
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            1,
+            3,
+            str.tostring(
+                adx,
+                "#.0"
+            ),
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            0,
+            4,
+            "TRADES",
+            bgcolor = color.black,
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            1,
+            4,
+            str.tostring(tradesToday) +
+            " / " +
+            str.tostring(maxTradesPerDayInput),
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            0,
+            5,
+            "STATUS",
+            bgcolor = color.black,
+            text_color = color.white
+        )
+
+        table.cell(
+            dashboard,
+            1,
+            5,
+            statusText,
+            text_color = color.white
+        )
+
+    else
+
+        table.clear(
+            dashboard,
+            0,
+            0,
+            1,
+            5
+        )

@@ -1,0 +1,509 @@
+//@version=6
+indicator("SMC NQ Pro v3 - SL/TP Automatico",
+     shorttitle="SMC NQ v3", overlay=true, max_boxes_count=300, max_lines_count=300, max_labels_count=300)
+
+// ══════════════════════════════════════════════════════════════════
+//  INPUTS
+// ══════════════════════════════════════════════════════════════════
+grp1 = "Order Blocks"
+showOB      = input.bool(true,  "Show Order Blocks", group=grp1)
+obLookback  = input.int(10,     "OB Lookback",       group=grp1, minval=3, maxval=50)
+obBullColor = input.color(color.new(#00bcd4, 75),    "Bullish OB", group=grp1)
+obBearColor = input.color(color.new(#ff5252, 75),    "Bearish OB", group=grp1)
+
+grp2 = "Fair Value Gaps"
+showFVG      = input.bool(true, "Show FVG", group=grp2)
+fvgBullColor = input.color(color.new(#4caf50, 80), "Bull FVG", group=grp2)
+fvgBearColor = input.color(color.new(#f44336, 80), "Bear FVG", group=grp2)
+
+grp3 = "BOS / CHoCH"
+showBOS     = input.bool(true, "Show BOS/CHoCH",    group=grp3)
+bosLookback = input.int(20,    "Structure Lookback", group=grp3, minval=5, maxval=100)
+
+grp4 = "Liquidity Sweeps"
+showLiq     = input.bool(true, "Show Liquidity Sweeps", group=grp4)
+liqLookback = input.int(15,    "Liq. Lookback",         group=grp4, minval=5, maxval=50)
+
+grp5 = "Premium and Discount"
+showPD = input.bool(true, "Show P&D Zones", group=grp5)
+pdLen  = input.int(50,    "PD Range Length", group=grp5, minval=20, maxval=200)
+
+grp6 = "Sesiones de Mercado"
+showSessions = input.bool(true, "Mostrar Sesiones", group=grp6)
+showLondon   = input.bool(true, "Londres",          group=grp6)
+showNewYork  = input.bool(true, "Nueva York",       group=grp6)
+showAsian    = input.bool(true, "Asiatica",         group=grp6)
+londonColor  = input.color(color.new(#2196f3, 88),  "Color Londres",    group=grp6)
+nyColor      = input.color(color.new(#ff9800, 88),  "Color Nueva York", group=grp6)
+asianColor   = input.color(color.new(#9c27b0, 88),  "Color Asiatica",   group=grp6)
+
+grp7 = "SL / TP Automatico"
+showSLTP = input.bool(true,   "Mostrar SL/TP",      group=grp7)
+rrRatio  = input.float(2.0,   "Risk:Reward Ratio",  group=grp7, minval=1.0, maxval=5.0, step=0.5)
+slMethod = input.string("OB", "Base del Stop Loss", group=grp7, options=["OB","Swing","ATR"])
+atrMult  = input.float(1.5,   "Multiplicador ATR",  group=grp7, minval=0.5, maxval=4.0, step=0.5)
+showRRBox= input.bool(true,   "Mostrar Caja RR",    group=grp7)
+
+grp8 = "Dashboard"
+showDash = input.bool(true, "Mostrar Dashboard", group=grp8)
+dashPos  = input.string("top_right", "Posicion", group=grp8,
+     options=["top_right","top_left","bottom_right","bottom_left"])
+
+// ══════════════════════════════════════════════════════════════════
+//  ATR
+// ══════════════════════════════════════════════════════════════════
+atrVal = ta.atr(14)
+
+// ══════════════════════════════════════════════════════════════════
+//  SWING DETECTION
+// ══════════════════════════════════════════════════════════════════
+isSwingHigh(len) =>
+    result = true
+    for i = 1 to len
+        if high[i] > high[len] or high[len - i] > high[len]
+            result := false
+    result
+
+isSwingLow(len) =>
+    result = true
+    for i = 1 to len
+        if low[i] < low[len] or low[len - i] < low[len]
+            result := false
+    result
+
+// ══════════════════════════════════════════════════════════════════
+//  ORDER BLOCKS
+// ══════════════════════════════════════════════════════════════════
+var box[] bullOBBoxes   = array.new_box()
+var box[] bearOBBoxes   = array.new_box()
+var float lastBullOBHigh = na
+var float lastBullOBLow  = na
+var float lastBearOBHigh = na
+var float lastBearOBLow  = na
+
+if showOB and barstate.isconfirmed
+    if close[1] < open[1] and close > open and close > high[1]
+        lastBullOBHigh := high[1]
+        lastBullOBLow  := low[1]
+        b = box.new(bar_index[1], high[1], bar_index + obLookback, low[1],
+             bgcolor=obBullColor, border_color=color.new(#00bcd4, 30), border_width=1)
+        array.push(bullOBBoxes, b)
+        if array.size(bullOBBoxes) > 5
+            box.delete(array.shift(bullOBBoxes))
+    if close[1] > open[1] and close < open and close < low[1]
+        lastBearOBHigh := high[1]
+        lastBearOBLow  := low[1]
+        b = box.new(bar_index[1], high[1], bar_index + obLookback, low[1],
+             bgcolor=obBearColor, border_color=color.new(#ff5252, 30), border_width=1)
+        array.push(bearOBBoxes, b)
+        if array.size(bearOBBoxes) > 5
+            box.delete(array.shift(bearOBBoxes))
+
+// ══════════════════════════════════════════════════════════════════
+//  FAIR VALUE GAPS
+// ══════════════════════════════════════════════════════════════════
+var box[] fvgBoxes = array.new_box()
+
+if showFVG and barstate.isconfirmed
+    if low > high[2]
+        b = box.new(bar_index[2], low, bar_index + 20, high[2],
+             bgcolor=fvgBullColor, border_color=color.new(#4caf50, 20), border_width=1)
+        array.push(fvgBoxes, b)
+    if high < low[2]
+        b = box.new(bar_index[2], low[2], bar_index + 20, high,
+             bgcolor=fvgBearColor, border_color=color.new(#f44336, 20), border_width=1)
+        array.push(fvgBoxes, b)
+    if array.size(fvgBoxes) > 10
+        box.delete(array.shift(fvgBoxes))
+
+// ══════════════════════════════════════════════════════════════════
+//  BOS / CHoCH
+// ══════════════════════════════════════════════════════════════════
+var float lastSwingH    = na
+var float lastSwingL    = na
+var int   lastSwingHBar = na
+var int   lastSwingLBar = na
+var bool  bullishBias   = true
+
+swingLen = math.round(bosLookback / 2)
+
+if isSwingHigh(swingLen)
+    lastSwingH    := high[swingLen]
+    lastSwingHBar := bar_index[swingLen]
+if isSwingLow(swingLen)
+    lastSwingL    := low[swingLen]
+    lastSwingLBar := bar_index[swingLen]
+
+bosBull   = not na(lastSwingH) and close > lastSwingH and close[1] <= lastSwingH[1]
+bosBear   = not na(lastSwingL) and close < lastSwingL and close[1] >= lastSwingL[1]
+chochBull = bosBear and bullishBias
+chochBear = bosBull and not bullishBias
+
+if bosBull
+    bullishBias := true
+if bosBear
+    bullishBias := false
+
+if showBOS
+    if bosBull and not chochBull
+        line.new(lastSwingHBar, lastSwingH, bar_index, lastSwingH,
+             color=#00e676, width=2, style=line.style_dashed)
+        label.new(bar_index, lastSwingH, "BOS UP",
+             color=color.new(#00e676, 20), textcolor=color.white,
+             size=size.small, style=label.style_label_down)
+    if bosBear and not chochBear
+        line.new(lastSwingLBar, lastSwingL, bar_index, lastSwingL,
+             color=#ff1744, width=2, style=line.style_dashed)
+        label.new(bar_index, lastSwingL, "BOS DOWN",
+             color=color.new(#ff1744, 20), textcolor=color.white,
+             size=size.small, style=label.style_label_up)
+    if chochBull
+        label.new(bar_index, low, "CHoCH UP",
+             color=color.new(#ff9800, 20), textcolor=color.white,
+             size=size.small, style=label.style_label_up)
+    if chochBear
+        label.new(bar_index, high, "CHoCH DOWN",
+             color=color.new(#ff9800, 20), textcolor=color.white,
+             size=size.small, style=label.style_label_down)
+
+// ══════════════════════════════════════════════════════════════════
+//  LIQUIDITY SWEEPS
+// ══════════════════════════════════════════════════════════════════
+liqHigh = ta.highest(high, liqLookback)[1]
+liqLow  = ta.lowest(low,   liqLookback)[1]
+
+bullSweep = low < liqLow   and close > liqLow
+bearSweep = high > liqHigh and close < liqHigh
+
+if showLiq
+    if bullSweep
+        label.new(bar_index, low, "Sweep UP",
+             color=color.new(#00bcd4, 10), textcolor=color.white,
+             size=size.small, style=label.style_label_up)
+        line.new(bar_index, liqLow, bar_index, low,
+             color=color.new(#00bcd4, 30), width=1, style=line.style_dotted)
+    if bearSweep
+        label.new(bar_index, high, "Sweep DOWN",
+             color=color.new(#e91e63, 10), textcolor=color.white,
+             size=size.small, style=label.style_label_down)
+        line.new(bar_index, liqHigh, bar_index, high,
+             color=color.new(#e91e63, 30), width=1, style=line.style_dotted)
+
+// ══════════════════════════════════════════════════════════════════
+//  PREMIUM & DISCOUNT
+// ══════════════════════════════════════════════════════════════════
+pdHigh = ta.highest(high, pdLen)
+pdLow  = ta.lowest(low,   pdLen)
+pdMid  = (pdHigh + pdLow) / 2
+pdPrem = pdMid + (pdHigh - pdMid) * 0.5
+pdDisc = pdMid - (pdMid - pdLow)  * 0.5
+
+inPremium  = close > pdPrem
+inDiscount = close < pdDisc
+
+if showPD
+    line.new(bar_index[1], pdMid,  bar_index, pdMid,
+         color=color.new(#9c27b0, 40), width=1, style=line.style_dotted)
+    line.new(bar_index[1], pdPrem, bar_index, pdPrem,
+         color=color.new(#f44336, 50), width=1, style=line.style_dotted)
+    line.new(bar_index[1], pdDisc, bar_index, pdDisc,
+         color=color.new(#4caf50, 50), width=1, style=line.style_dotted)
+
+if showPD and barstate.islast
+    label.new(bar_index, pdHigh, "PREMIUM - SELL",
+         color=color.new(#f44336, 10), textcolor=color.white,
+         size=size.small, style=label.style_label_left)
+    label.new(bar_index, pdMid, "EQUILIBRIO",
+         color=color.new(#9c27b0, 10), textcolor=color.white,
+         size=size.small, style=label.style_label_left)
+    label.new(bar_index, pdLow, "DISCOUNT - BUY",
+         color=color.new(#4caf50, 10), textcolor=color.white,
+         size=size.small, style=label.style_label_left)
+
+// ══════════════════════════════════════════════════════════════════
+//  SESIONES
+// ══════════════════════════════════════════════════════════════════
+londonOpen  = time(timeframe.period, "0800-1630:23456", "UTC")
+newYorkOpen = time(timeframe.period, "1330-2000:23456", "UTC")
+asianOpen   = time(timeframe.period, "0000-0800:23456", "UTC")
+overlapOpen = time(timeframe.period, "1330-1630:23456", "UTC")
+
+isLondon  = not na(londonOpen)
+isNY      = not na(newYorkOpen)
+isAsian   = not na(asianOpen)
+isOverlap = not na(overlapOpen)
+
+bgcolor(showSessions and showAsian  and isAsian  and not isLondon  ? asianColor             : na)
+bgcolor(showSessions and showLondon and isLondon and not isNY      ? londonColor            : na)
+bgcolor(showSessions and showNewYork and isNY    and not isOverlap ? nyColor                : na)
+bgcolor(showSessions and isOverlap                                 ? color.new(#ffeb3b, 92) : na)
+
+if showSessions and isLondon and not isLondon[1]
+    label.new(bar_index, high * 1.0003, "LONDON OPEN",
+         color=color.new(#2196f3, 10), textcolor=color.white,
+         size=size.small, style=label.style_label_down)
+
+if showSessions and isNY and not isNY[1]
+    label.new(bar_index, high * 1.0003, "NEW YORK OPEN",
+         color=color.new(#ff9800, 10), textcolor=color.white,
+         size=size.small, style=label.style_label_down)
+
+if showSessions and isAsian and not isAsian[1]
+    label.new(bar_index, high * 1.0003, "ASIAN OPEN",
+         color=color.new(#9c27b0, 10), textcolor=color.white,
+         size=size.small, style=label.style_label_down)
+
+// ══════════════════════════════════════════════════════════════════
+//  SENALES BUY / SELL
+// ══════════════════════════════════════════════════════════════════
+buySignal  = bullSweep and (bosBull or chochBull) and close < pdMid
+sellSignal = bearSweep and (bosBear or chochBear) and close > pdMid
+
+// ══════════════════════════════════════════════════════════════════
+//  SL / TP AUTOMATICO
+// ══════════════════════════════════════════════════════════════════
+var float buySL  = na
+var float buyTP  = na
+var float sellSL = na
+var float sellTP = na
+
+if buySignal and showSLTP
+    if slMethod == "OB"
+        buySL := not na(lastBullOBLow) ? lastBullOBLow - atrVal * 0.1 : close - atrVal * atrMult
+    else if slMethod == "Swing"
+        buySL := not na(lastSwingL) ? lastSwingL - atrVal * 0.1 : close - atrVal * atrMult
+    else
+        buySL := close - atrVal * atrMult
+
+    slDist = close - buySL
+    buyTP  := close + slDist * rrRatio
+
+    label.new(bar_index, buySL, "SL " + str.tostring(math.round(buySL, 1)),
+         color=color.new(#ff1744, 20), textcolor=color.white,
+         size=size.small, style=label.style_label_up)
+    label.new(bar_index, buyTP, "TP " + str.tostring(math.round(buyTP, 1)),
+         color=color.new(#00e676, 20), textcolor=color.white,
+         size=size.small, style=label.style_label_down)
+    line.new(bar_index, buySL, bar_index + 20, buySL,
+         color=color.new(#ff1744, 30), width=1, style=line.style_dashed)
+    line.new(bar_index, buyTP, bar_index + 20, buyTP,
+         color=color.new(#00e676, 30), width=1, style=line.style_dashed)
+    if showRRBox
+        box.new(bar_index, buyTP, bar_index + 20, buySL,
+             bgcolor=color.new(#00e676, 90),
+             border_color=color.new(#00e676, 50), border_width=1)
+
+if sellSignal and showSLTP
+    if slMethod == "OB"
+        sellSL := not na(lastBearOBHigh) ? lastBearOBHigh + atrVal * 0.1 : close + atrVal * atrMult
+    else if slMethod == "Swing"
+        sellSL := not na(lastSwingH) ? lastSwingH + atrVal * 0.1 : close + atrVal * atrMult
+    else
+        sellSL := close + atrVal * atrMult
+
+    slDist  = sellSL - close
+    sellTP  := close - slDist * rrRatio
+
+    label.new(bar_index, sellSL, "SL " + str.tostring(math.round(sellSL, 1)),
+         color=color.new(#ff1744, 20), textcolor=color.white,
+         size=size.small, style=label.style_label_down)
+    label.new(bar_index, sellTP, "TP " + str.tostring(math.round(sellTP, 1)),
+         color=color.new(#00e676, 20), textcolor=color.white,
+         size=size.small, style=label.style_label_up)
+    line.new(bar_index, sellSL, bar_index + 20, sellSL,
+         color=color.new(#ff1744, 30), width=1, style=line.style_dashed)
+    line.new(bar_index, sellTP, bar_index + 20, sellTP,
+         color=color.new(#00e676, 30), width=1, style=line.style_dotted)
+    if showRRBox
+        box.new(bar_index, sellSL, bar_index + 20, sellTP,
+             bgcolor=color.new(#f44336, 90),
+             border_color=color.new(#f44336, 50), border_width=1)
+
+plotshape(buySignal,  title="BUY",  location=location.belowbar,
+     style=shape.triangleup,   size=size.normal, color=#00e676, text="BUY")
+plotshape(sellSignal, title="SELL", location=location.abovebar,
+     style=shape.triangledown, size=size.normal, color=#ff1744, text="SELL")
+
+// ══════════════════════════════════════════════════════════════════
+//  BIAS SCORE  (sin emojis, sin multilínea)
+// ══════════════════════════════════════════════════════════════════
+biasScore = 0
+biasScore += bullishBias   ? 1 : 0
+biasScore += inDiscount    ? 1 : 0
+biasScore += close < pdMid ? 1 : 0
+biasScore += bullSweep     ? 1 : 0
+biasScore += bosBull       ? 1 : 0
+biasScore += chochBull     ? 1 : 0
+
+// *** CLAVE: cada rama en su propia variable, sin multilínea ***
+biasLabel = ""
+if biasScore >= 5
+    biasLabel := "ALCISTA FUERTE ++"
+else if biasScore >= 3
+    biasLabel := "ALCISTA DEBIL +"
+else if biasScore == 2
+    biasLabel := "NEUTRO"
+else if biasScore >= 1
+    biasLabel := "BAJISTA DEBIL -"
+else
+    biasLabel := "BAJISTA FUERTE --"
+
+sessionNow = ""
+if isOverlap
+    sessionNow := "NY+LONDON OVERLAP ***"
+else if isNY
+    sessionNow := "NEW YORK"
+else if isLondon
+    sessionNow := "LONDON"
+else if isAsian
+    sessionNow := "ASIAN"
+else
+    sessionNow := "FUERA DE SESION"
+
+pdZone = ""
+if inPremium
+    pdZone := "PREMIUM (SELL)"
+else if inDiscount
+    pdZone := "DISCOUNT (BUY)"
+else
+    pdZone := "EQUILIBRIO"
+
+strucLabel = bullishBias ? "ALCISTA" : "BAJISTA"
+strucColor = bullishBias ? color.new(#00e676, 0) : color.new(#ff1744, 0)
+
+sweepLabel = ""
+sweepColor = color.new(#78909c, 0)
+if bullSweep
+    sweepLabel := "BULL SWEEP UP"
+    sweepColor := color.new(#00bcd4, 0)
+else if bearSweep
+    sweepLabel := "BEAR SWEEP DOWN"
+    sweepColor := color.new(#e91e63, 0)
+else
+    sweepLabel := "Sin sweep"
+
+fvgLabel = ""
+fvgColor = color.new(#78909c, 0)
+if low > high[2]
+    fvgLabel := "FVG BULL"
+    fvgColor := color.new(#4caf50, 0)
+else if high < low[2]
+    fvgLabel := "FVG BEAR"
+    fvgColor := color.new(#f44336, 0)
+else
+    fvgLabel := "Sin FVG"
+
+biasColor = color.white
+if biasScore >= 4
+    biasColor := color.new(#00e676, 0)
+else if biasScore >= 3
+    biasColor := color.new(#69f0ae, 0)
+else if biasScore <= 1
+    biasColor := color.new(#ff1744, 0)
+else if biasScore == 1
+    biasColor := color.new(#ff7043, 0)
+
+pdColor2 = color.white
+if inPremium
+    pdColor2 := color.new(#ff5252, 0)
+else if inDiscount
+    pdColor2 := color.new(#69f0ae, 0)
+
+currentSL = buySignal ? buySL : sellSignal ? sellSL : na
+currentTP = buySignal ? buyTP : sellSignal ? sellTP : na
+
+slPts = 0.0
+tpPts = 0.0
+if buySignal and not na(buySL)
+    slPts := math.round(math.abs(close - buySL), 1)
+if sellSignal and not na(sellSL)
+    slPts := math.round(math.abs(close - sellSL), 1)
+if buySignal and not na(buyTP)
+    tpPts := math.round(math.abs(buyTP - close), 1)
+if sellSignal and not na(sellTP)
+    tpPts := math.round(math.abs(close - sellTP), 1)
+
+recLabel = ""
+recColor = color.new(#ffd54f, 0)
+if biasScore >= 4
+    recLabel := "BUSCAR LONG"
+    recColor := color.new(#00e676, 0)
+else if biasScore <= 1
+    recLabel := "BUSCAR SHORT"
+    recColor := color.new(#ff1744, 0)
+else
+    recLabel := "ESPERAR"
+
+// ══════════════════════════════════════════════════════════════════
+//  DASHBOARD
+// ══════════════════════════════════════════════════════════════════
+dashPosEnum = dashPos == "top_right"    ? position.top_right    :
+              dashPos == "top_left"     ? position.top_left     :
+              dashPos == "bottom_right" ? position.bottom_right :
+              position.bottom_left
+
+if showDash and barstate.islast
+    var table dash = table.new(dashPosEnum, 2, 13,
+         bgcolor=color.new(#0d0d1a, 5),
+         border_color=color.new(#3a3a5c, 50), border_width=1,
+         frame_color=color.new(#5c5cff, 30), frame_width=2)
+
+    table.cell(dash, 0, 0, "SMC NQ PRO v3",
+         text_color=color.white, bgcolor=color.new(#3f51b5, 20),
+         text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 1, 0, "LIVE DASHBOARD",
+         text_color=color.new(#7986cb, 0), bgcolor=color.new(#3f51b5, 20),
+         text_size=size.small, text_halign=text.align_center)
+
+    table.cell(dash, 0, 1, "Sesion",      text_color=color.new(#90a4ae, 0), text_size=size.small)
+    table.cell(dash, 1, 1, sessionNow,    text_color=color.white,           text_size=size.small)
+
+    table.cell(dash, 0, 2, "Sesgo",       text_color=color.new(#90a4ae, 0), text_size=size.small)
+    table.cell(dash, 1, 2, biasLabel,     text_color=biasColor,             text_size=size.small)
+
+    table.cell(dash, 0, 3, "Score",       text_color=color.new(#90a4ae, 0), text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(biasScore) + " / 6", text_color=biasColor, text_size=size.small)
+
+    table.cell(dash, 0, 4, "Zona PD",     text_color=color.new(#90a4ae, 0), text_size=size.small)
+    table.cell(dash, 1, 4, pdZone,        text_color=pdColor2,              text_size=size.small)
+
+    table.cell(dash, 0, 5, "Estructura",  text_color=color.new(#90a4ae, 0), text_size=size.small)
+    table.cell(dash, 1, 5, strucLabel,    text_color=strucColor,            text_size=size.small)
+
+    table.cell(dash, 0, 6, "Sweep",       text_color=color.new(#90a4ae, 0), text_size=size.small)
+    table.cell(dash, 1, 6, sweepLabel,    text_color=sweepColor,            text_size=size.small)
+
+    table.cell(dash, 0, 7, "FVG",         text_color=color.new(#90a4ae, 0), text_size=size.small)
+    table.cell(dash, 1, 7, fvgLabel,      text_color=fvgColor,              text_size=size.small)
+
+    table.cell(dash, 0, 8, "EQ Price",    text_color=color.new(#90a4ae, 0), text_size=size.small)
+    table.cell(dash, 1, 8, str.tostring(math.round(pdMid, 1)),
+         text_color=color.new(#ce93d8, 0), text_size=size.small)
+
+    slDisplay = not na(currentSL) ? str.tostring(math.round(currentSL, 1)) + " (" + str.tostring(slPts) + "pts)" : "---"
+    table.cell(dash, 0, 9,  "Stop Loss",  text_color=color.new(#90a4ae, 0), text_size=size.small)
+    table.cell(dash, 1, 9,  slDisplay,    text_color=color.new(#ff5252, 0), text_size=size.small)
+
+    tpDisplay = not na(currentTP) ? str.tostring(math.round(currentTP, 1)) + " (" + str.tostring(tpPts) + "pts)" : "---"
+    table.cell(dash, 0, 10, "Take Profit", text_color=color.new(#90a4ae, 0), text_size=size.small)
+    table.cell(dash, 1, 10, tpDisplay,     text_color=color.new(#00e676, 0), text_size=size.small)
+
+    rrDisplay = slPts > 0 ? str.tostring(rrRatio) + ":1" : "---"
+    table.cell(dash, 0, 11, "R:R Ratio",  text_color=color.new(#90a4ae, 0), text_size=size.small)
+    table.cell(dash, 1, 11, rrDisplay,    text_color=color.new(#ffd54f, 0), text_size=size.small)
+
+    table.cell(dash, 0, 12, "Accion",     text_color=color.new(#90a4ae, 0), text_size=size.small, bgcolor=color.new(#1a237e, 20))
+    table.cell(dash, 1, 12, recLabel,     text_color=recColor,              text_size=size.small, bgcolor=color.new(#1a237e, 20))
+
+// ══════════════════════════════════════════════════════════════════
+//  ALERTAS
+// ══════════════════════════════════════════════════════════════════
+alertcondition(buySignal,                  "SMC BUY",           "SMC BUY - NQ Scalping")
+alertcondition(sellSignal,                 "SMC SELL",          "SMC SELL - NQ Scalping")
+alertcondition(bullSweep,                  "Bullish Sweep",     "Bullish Sweep detectado")
+alertcondition(bearSweep,                  "Bearish Sweep",     "Bearish Sweep detectado")
+alertcondition(bosBull,                    "BOS Alcista",       "BOS Bullish")
+alertcondition(bosBear,                    "BOS Bajista",       "BOS Bearish")
+alertcondition(isLondon  and not isLondon[1],  "London Open",   "Abre Londres")
+alertcondition(isNY      and not isNY[1],      "New York Open", "Abre Nueva York")
+alertcondition(isOverlap and not isOverlap[1], "NY+LN Overlap", "Overlap NY+London activo")

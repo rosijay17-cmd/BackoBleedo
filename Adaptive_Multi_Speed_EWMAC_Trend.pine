@@ -1,0 +1,1481 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0.
+//@version=6
+strategy(
+     title="Adaptive Multi-Speed EWMAC Trend",
+     shorttitle="AMSEWMAC",
+     overlay=true,
+     pyramiding=0,
+     process_orders_on_close=true,
+     calc_on_every_tick=true,
+     calc_on_order_fills=true,
+     initial_capital=50000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=2.50,
+     slippage=1,
+     max_labels_count=500)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INPUT GROUPS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+string GRP_TREND   = "01 - Diversified Trend"
+string GRP_VOL     = "02 - Volatility Adjustment"
+string GRP_ENTRY   = "03 - Entry and Exit"
+string GRP_HTF     = "04 - Higher Timeframe"
+string GRP_RISK    = "05 - Risk Management"
+string GRP_SESSION = "06 - Session and Frequency"
+string GRP_DISPLAY = "07 - Display"
+string GRP_ALERTS  = "08 - Alerts"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// TREND INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+int atrLen = input.int(
+     32,
+     "Normalization ATR Length",
+     minval=2,
+     group=GRP_TREND)
+
+int fast1 = input.int(
+     8,
+     "Fast Speed 1",
+     minval=2,
+     group=GRP_TREND)
+
+int slow1 = input.int(
+     32,
+     "Slow Speed 1",
+     minval=4,
+     group=GRP_TREND)
+
+int fast2 = input.int(
+     16,
+     "Fast Speed 2",
+     minval=2,
+     group=GRP_TREND)
+
+int slow2 = input.int(
+     64,
+     "Slow Speed 2",
+     minval=4,
+     group=GRP_TREND)
+
+int fast3 = input.int(
+     32,
+     "Fast Speed 3",
+     minval=2,
+     group=GRP_TREND)
+
+int slow3 = input.int(
+     128,
+     "Slow Speed 3",
+     minval=4,
+     group=GRP_TREND)
+
+int forecastCalibrationLen = input.int(
+     250,
+     "Forecast Calibration Length",
+     minval=50,
+     group=GRP_TREND)
+
+float forecastDiversification = input.float(
+     1.20,
+     "Forecast Diversification Multiplier",
+     minval=0.50,
+     maxval=2.00,
+     step=0.05,
+     group=GRP_TREND)
+
+float individualForecastCap = input.float(
+     20.0,
+     "Individual Forecast Cap",
+     minval=5.0,
+     maxval=50.0,
+     step=1.0,
+     group=GRP_TREND)
+
+float combinedForecastCap = input.float(
+     20.0,
+     "Combined Forecast Cap",
+     minval=5.0,
+     maxval=50.0,
+     step=1.0,
+     group=GRP_TREND)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// VOLATILITY INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool useVolAdjustment = input.bool(
+     true,
+     "Adjust Forecast By Volatility",
+     group=GRP_VOL)
+
+int currentVolLen = input.int(
+     32,
+     "Current Volatility Length",
+     minval=5,
+     group=GRP_VOL)
+
+int longVolLen = input.int(
+     500,
+     "Long-Run Volatility Length",
+     minval=100,
+     group=GRP_VOL)
+
+int volRankLen = input.int(
+     500,
+     "Volatility Percentile Length",
+     minval=100,
+     group=GRP_VOL)
+
+int volMultiplierSmooth = input.int(
+     10,
+     "Volatility Multiplier Smoothing",
+     minval=1,
+     group=GRP_VOL)
+
+float minimumVolMultiplier = input.float(
+     0.50,
+     "Minimum Volatility Multiplier",
+     minval=0.10,
+     maxval=1.00,
+     step=0.05,
+     group=GRP_VOL)
+
+float maximumVolMultiplier = input.float(
+     2.00,
+     "Maximum Volatility Multiplier",
+     minval=1.00,
+     maxval=4.00,
+     step=0.05,
+     group=GRP_VOL)
+
+bool blockExtremeVol = input.bool(
+     false,
+     "Block Extreme Volatility Entries",
+     group=GRP_VOL)
+
+float extremeVolRank = input.float(
+     95.0,
+     "Extreme Volatility Percentile",
+     minval=75.0,
+     maxval=100.0,
+     step=1.0,
+     group=GRP_VOL)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ENTRY AND EXIT INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float entryForecast = input.float(
+     5.0,
+     "Entry Forecast Threshold",
+     minval=0.0,
+     maxval=20.0,
+     step=0.5,
+     group=GRP_ENTRY)
+
+float exitForecast = input.float(
+     0.0,
+     "Opposite Forecast Exit Threshold",
+     minval=0.0,
+     maxval=10.0,
+     step=0.5,
+     group=GRP_ENTRY)
+
+bool requireForecastAcceleration = input.bool(
+     false,
+     "Require Forecast Acceleration",
+     group=GRP_ENTRY)
+
+int accelerationLookback = input.int(
+     3,
+     "Forecast Acceleration Lookback",
+     minval=1,
+     maxval=20,
+     group=GRP_ENTRY)
+
+bool allowLong = input.bool(
+     true,
+     "Allow Longs",
+     group=GRP_ENTRY)
+
+bool allowShort = input.bool(
+     true,
+     "Allow Shorts",
+     group=GRP_ENTRY)
+
+bool reverseOnOppositeSignal = input.bool(
+     true,
+     "Reverse On Opposite Signal",
+     group=GRP_ENTRY)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HIGHER-TIMEFRAME INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool useHtfFilter = input.bool(
+     true,
+     "Use Confirmed HTF Filter",
+     group=GRP_HTF)
+
+string htfTimeframe = input.timeframe(
+     "60",
+     "Higher Timeframe",
+     group=GRP_HTF)
+
+int htfFastLen = input.int(
+     16,
+     "HTF Fast EMA",
+     minval=2,
+     group=GRP_HTF)
+
+int htfSlowLen = input.int(
+     64,
+     "HTF Slow EMA",
+     minval=4,
+     group=GRP_HTF)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// RISK INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+string sizingMode = input.string(
+     "Risk %",
+     "Position Sizing",
+     options=["Fixed", "Risk %", "Risk $"],
+     group=GRP_RISK)
+
+float fixedContracts = input.float(
+     1.0,
+     "Fixed Contracts",
+     minval=1.0,
+     step=1.0,
+     group=GRP_RISK)
+
+float riskPercent = input.float(
+     0.50,
+     "Account Risk %",
+     minval=0.05,
+     maxval=5.0,
+     step=0.05,
+     group=GRP_RISK)
+
+float riskDollars = input.float(
+     500.0,
+     "Maximum Risk Dollars",
+     minval=1.0,
+     step=25.0,
+     group=GRP_RISK)
+
+string stopMode = input.string(
+     "Hybrid",
+     "Initial Stop Mode",
+     options=["ATR", "Structure", "Hybrid"],
+     group=GRP_RISK)
+
+float initialStopAtr = input.float(
+     2.50,
+     "Initial ATR Stop",
+     minval=0.25,
+     step=0.25,
+     group=GRP_RISK)
+
+int structureLookback = input.int(
+     20,
+     "Structure Stop Lookback",
+     minval=2,
+     group=GRP_RISK)
+
+float structureBufferAtr = input.float(
+     0.25,
+     "Structure Buffer ATR",
+     minval=0.0,
+     step=0.05,
+     group=GRP_RISK)
+
+bool useTrailingStop = input.bool(
+     true,
+     "Use Chandelier Trail",
+     group=GRP_RISK)
+
+int trailLookback = input.int(
+     20,
+     "Trail Lookback",
+     minval=2,
+     group=GRP_RISK)
+
+float trailAtrMult = input.float(
+     3.00,
+     "Trail ATR Multiple",
+     minval=0.25,
+     step=0.25,
+     group=GRP_RISK)
+
+bool useBreakEven = input.bool(
+     false,
+     "Use Break-Even",
+     group=GRP_RISK)
+
+float breakEvenTriggerR = input.float(
+     1.50,
+     "Break-Even Trigger R",
+     minval=0.25,
+     step=0.25,
+     group=GRP_RISK)
+
+int maximumHoldingBars = input.int(
+     0,
+     "Maximum Holding Bars - 0 Disables",
+     minval=0,
+     group=GRP_RISK)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SESSION INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool useSessionFilter = input.bool(
+     false,
+     "Restrict Entries To Session",
+     group=GRP_SESSION)
+
+string tradingSession = input.session(
+     "0930-1600",
+     "Entry Session",
+     group=GRP_SESSION)
+
+string sessionTimezone = input.string(
+     "America/New_York",
+     "Session Timezone",
+     group=GRP_SESSION)
+
+int maximumTradesPerDay = input.int(
+     3,
+     "Maximum Trades Per Day",
+     minval=1,
+     maxval=20,
+     group=GRP_SESSION)
+
+int cooldownBars = input.int(
+     5,
+     "Cooldown Bars After Exit",
+     minval=0,
+     maxval=200,
+     group=GRP_SESSION)
+
+bool flattenAtSessionEnd = input.bool(
+     false,
+     "Flatten At Session End",
+     group=GRP_SESSION)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DISPLAY INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool showDashboard = input.bool(
+     true,
+     "Show Phone Dashboard",
+     group=GRP_DISPLAY)
+
+string dashboardPosition = input.string(
+     "Top Right",
+     "Dashboard Position",
+     options=[
+          "Top Right",
+          "Top Left",
+          "Bottom Right",
+          "Bottom Left"
+     ],
+     group=GRP_DISPLAY)
+
+bool showTrendEMAs = input.bool(
+     true,
+     "Show Price Trend EMAs",
+     group=GRP_DISPLAY)
+
+bool showSignals = input.bool(
+     true,
+     "Show Entry Markers",
+     group=GRP_DISPLAY)
+
+bool showStops = input.bool(
+     true,
+     "Show Active Stop",
+     group=GRP_DISPLAY)
+
+bool colorTrendBackground = input.bool(
+     true,
+     "Color Background By Forecast",
+     group=GRP_DISPLAY)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ALERT INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool enableDynamicAlerts = input.bool(
+     true,
+     "Enable Dynamic alert() Calls",
+     tooltip="Fires an explicit alert() call on every entry, labeled BULLISH/BEARISH with symbol, forecast, and stop. Works with a TradingView alert set to 'Any alert() function call'. The named alertcondition()s below work too, and strategy.entry/exit alert_message text works with an 'Order fills' alert -- pick whichever condition you prefer when creating the alert.",
+     group=GRP_ALERTS)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// COLORS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+color C_BULL    = color.rgb(0, 140, 255)
+color C_BEAR    = color.rgb(160, 90, 255)
+color C_GOOD    = color.rgb(20, 185, 100)
+color C_WARN    = color.rgb(245, 155, 20)
+color C_BAD     = color.rgb(240, 55, 75)
+color C_NEUTRAL = color.rgb(95, 105, 125)
+color C_DARK    = color.rgb(10, 18, 30)
+color C_CELL    = color.rgb(24, 35, 53)
+color C_TEXT    = color.white
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HELPERS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+f_clamp(float value, float minimum, float maximum) =>
+    math.max(minimum, math.min(maximum, value))
+
+f_forecast(
+     float source,
+     int fastLength,
+     int slowLength,
+     int calibrationLength,
+     float capValue) =>
+
+    float fastAverage = ta.ema(source, fastLength)
+    float slowAverage = ta.ema(source, slowLength)
+    float rawSignal = fastAverage - slowAverage
+    float meanAbsoluteSignal = ta.sma(
+         math.abs(rawSignal),
+         calibrationLength)
+
+    float result = 0.0
+
+    if not na(meanAbsoluteSignal) and meanAbsoluteSignal > 0.0
+        result := rawSignal / meanAbsoluteSignal * 10.0
+
+    f_clamp(result, -capValue, capValue)
+
+f_directionColor(float value) =>
+    color result = C_NEUTRAL
+
+    if value > 0.0
+        result := C_BULL
+    else if value < 0.0
+        result := C_BEAR
+
+    result
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ATR AND NORMALIZED PRICE
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float atrValue = ta.atr(atrLen)
+
+float normalizedReturn = 0.0
+
+if bar_index > 0 and not na(atrValue) and atrValue > 0.0
+    normalizedReturn := (close - close[1]) / atrValue
+
+var float normalizedPrice = 100.0
+
+if barstate.isfirst
+    normalizedPrice := 100.0
+else
+    normalizedPrice += normalizedReturn
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// MULTI-SPEED FORECASTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float forecast1 = f_forecast(
+     normalizedPrice,
+     fast1,
+     slow1,
+     forecastCalibrationLen,
+     individualForecastCap)
+
+float forecast2 = f_forecast(
+     normalizedPrice,
+     fast2,
+     slow2,
+     forecastCalibrationLen,
+     individualForecastCap)
+
+float forecast3 = f_forecast(
+     normalizedPrice,
+     fast3,
+     slow3,
+     forecastCalibrationLen,
+     individualForecastCap)
+
+float rawCombinedForecast =
+     (forecast1 + forecast2 + forecast3) / 3.0
+
+rawCombinedForecast *= forecastDiversification
+
+rawCombinedForecast := f_clamp(
+     rawCombinedForecast,
+     -combinedForecastCap,
+     combinedForecastCap)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// VOLATILITY REGIME
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float logReturn = na
+
+if bar_index > 0 and close > 0.0 and close[1] > 0.0
+    logReturn := math.log(close / close[1])
+
+float currentPctVol = ta.stdev(
+     logReturn,
+     currentVolLen)
+
+float longRunPctVol = ta.sma(
+     currentPctVol,
+     longVolLen)
+
+float relativeVolatility = na
+
+if not na(longRunPctVol) and longRunPctVol > 0.0
+    relativeVolatility := currentPctVol / longRunPctVol
+
+float volatilityRank = ta.percentrank(
+     relativeVolatility,
+     volRankLen)
+
+float volatilityQuantile = 0.50
+
+if not na(volatilityRank)
+    volatilityQuantile := volatilityRank / 100.0
+
+float rawVolMultiplier = math.pow(
+     2.0,
+     1.0 - 2.0 * volatilityQuantile)
+
+rawVolMultiplier := f_clamp(
+     rawVolMultiplier,
+     minimumVolMultiplier,
+     maximumVolMultiplier)
+
+float smoothedVolMultiplier = ta.ema(
+     rawVolMultiplier,
+     volMultiplierSmooth)
+
+float appliedVolMultiplier = 1.0
+
+if useVolAdjustment and not na(smoothedVolMultiplier)
+    appliedVolMultiplier := smoothedVolMultiplier
+
+float adjustedForecast =
+     rawCombinedForecast * appliedVolMultiplier
+
+adjustedForecast := f_clamp(
+     adjustedForecast,
+     -combinedForecastCap,
+     combinedForecastCap)
+
+bool extremeVolatility =
+     not na(volatilityRank) and
+     volatilityRank >= extremeVolRank
+
+bool volatilityEntryOK =
+     not blockExtremeVol or
+     not extremeVolatility
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CONFIRMED HTF FILTER
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+int chartSeconds = timeframe.in_seconds(timeframe.period)
+int htfSeconds = timeframe.in_seconds(htfTimeframe)
+
+bool htfValid = htfSeconds > chartSeconds
+
+[htfCloseConfirmed, htfFastConfirmed, htfSlowConfirmed] =
+     request.security(
+          syminfo.tickerid,
+          htfTimeframe,
+          [
+               close[1],
+               ta.ema(close, htfFastLen)[1],
+               ta.ema(close, htfSlowLen)[1]
+          ],
+          gaps=barmerge.gaps_off,
+          lookahead=barmerge.lookahead_on)
+
+bool htfBull =
+     htfValid and
+     htfCloseConfirmed > htfFastConfirmed and
+     htfFastConfirmed > htfSlowConfirmed
+
+bool htfBear =
+     htfValid and
+     htfCloseConfirmed < htfFastConfirmed and
+     htfFastConfirmed < htfSlowConfirmed
+
+bool longHtfOK =
+     not useHtfFilter or
+     not htfValid or
+     htfBull
+
+bool shortHtfOK =
+     not useHtfFilter or
+     not htfValid or
+     htfBear
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SESSION AND FREQUENCY
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool inTradingSession = not na(
+     time(
+          timeframe.period,
+          tradingSession,
+          sessionTimezone))
+
+bool sessionOK =
+     not useSessionFilter or
+     inTradingSession
+
+bool sessionEnded =
+     bar_index > 0 and
+     not inTradingSession and
+     inTradingSession[1]
+
+int dayIdentifier =
+     year(time, sessionTimezone) * 10000 +
+     month(time, sessionTimezone) * 100 +
+     dayofmonth(time, sessionTimezone)
+
+bool newTradingDay =
+     barstate.isfirst or
+     dayIdentifier != dayIdentifier[1]
+
+var int tradesToday = 0
+
+if newTradingDay
+    tradesToday := 0
+
+bool dailyTradeLimitOK =
+     tradesToday < maximumTradesPerDay
+
+var int lastExitBar = na
+
+bool cooldownOK =
+     na(lastExitBar) or
+     bar_index - lastExitBar >= cooldownBars
+
+int cooldownRemaining = 0
+
+if not cooldownOK and not na(lastExitBar)
+    cooldownRemaining := math.max(
+         0,
+         cooldownBars - (bar_index - lastExitBar))
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ENTRY CONDITIONS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool longAccelerationOK = true
+bool shortAccelerationOK = true
+
+if requireForecastAcceleration
+    longAccelerationOK :=
+         adjustedForecast > adjustedForecast[accelerationLookback]
+
+    shortAccelerationOK :=
+         adjustedForecast < adjustedForecast[accelerationLookback]
+
+bool longSignal = ta.crossover(
+     adjustedForecast,
+     entryForecast)
+
+bool shortSignal = ta.crossunder(
+     adjustedForecast,
+     -entryForecast)
+
+bool longContext =
+     allowLong and
+     volatilityEntryOK and
+     sessionOK and
+     dailyTradeLimitOK and
+     cooldownOK and
+     longHtfOK and
+     longAccelerationOK
+
+bool shortContext =
+     allowShort and
+     volatilityEntryOK and
+     sessionOK and
+     dailyTradeLimitOK and
+     cooldownOK and
+     shortHtfOK and
+     shortAccelerationOK
+
+bool flat = strategy.position_size == 0
+
+bool longEntry =
+     barstate.isconfirmed and
+     longSignal and
+     longContext and
+     (
+          flat or
+          (
+               reverseOnOppositeSignal and
+               strategy.position_size < 0
+          )
+     )
+
+bool shortEntry =
+     barstate.isconfirmed and
+     shortSignal and
+     shortContext and
+     (
+          flat or
+          (
+               reverseOnOppositeSignal and
+               strategy.position_size > 0
+          )
+     ) and
+     not longEntry
+
+bool longForecastExit =
+     barstate.isconfirmed and
+     strategy.position_size > 0 and
+     adjustedForecast <= -exitForecast
+
+bool shortForecastExit =
+     barstate.isconfirmed and
+     strategy.position_size < 0 and
+     adjustedForecast >= exitForecast
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// GLOBAL ROLLING CALCULATIONS
+// These must execute on every calculation.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float structureLowest = ta.lowest(
+     low,
+     structureLookback)
+
+float structureHighest = ta.highest(
+     high,
+     structureLookback)
+
+float rollingTrailHighest = ta.highest(
+     high,
+     trailLookback)
+
+float rollingTrailLowest = ta.lowest(
+     low,
+     trailLookback)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INITIAL STOP CANDIDATES
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float atrLongStop =
+     close - atrValue * initialStopAtr
+
+float atrShortStop =
+     close + atrValue * initialStopAtr
+
+float structureLongStop =
+     structureLowest - atrValue * structureBufferAtr
+
+float structureShortStop =
+     structureHighest + atrValue * structureBufferAtr
+
+float candidateLongStop = atrLongStop
+float candidateShortStop = atrShortStop
+
+if stopMode == "Structure"
+    candidateLongStop := structureLongStop
+    candidateShortStop := structureShortStop
+
+else if stopMode == "Hybrid"
+    candidateLongStop := math.min(
+         atrLongStop,
+         structureLongStop)
+
+    candidateShortStop := math.max(
+         atrShortStop,
+         structureShortStop)
+
+float minimumStopDistance = math.max(
+     syminfo.mintick * 2.0,
+     atrValue * 0.05)
+
+candidateLongStop := math.min(
+     candidateLongStop,
+     close - minimumStopDistance)
+
+candidateShortStop := math.max(
+     candidateShortStop,
+     close + minimumStopDistance)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// POSITION SIZING
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float pointValue = syminfo.pointvalue
+
+if na(pointValue) or pointValue <= 0.0
+    pointValue := 1.0
+
+float longRiskDistance =
+     close - candidateLongStop
+
+float shortRiskDistance =
+     candidateShortStop - close
+
+float riskBudget = riskDollars
+
+if sizingMode == "Risk %"
+    riskBudget :=
+         strategy.equity * riskPercent / 100.0
+
+float longQuantity = fixedContracts
+float shortQuantity = fixedContracts
+
+if sizingMode != "Fixed"
+    if longRiskDistance > syminfo.mintick
+        longQuantity := math.floor(
+             riskBudget /
+             (longRiskDistance * pointValue))
+
+    if shortRiskDistance > syminfo.mintick
+        shortQuantity := math.floor(
+             riskBudget /
+             (shortRiskDistance * pointValue))
+
+bool longSizeOK = longQuantity >= 1.0
+bool shortSizeOK = shortQuantity >= 1.0
+
+longEntry := longEntry and longSizeOK
+shortEntry := shortEntry and shortSizeOK
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PERSISTENT TRADE STATE
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var float activeEntry = na
+var float activeStop = na
+var float initialRisk = na
+var float highestSinceEntry = na
+var float lowestSinceEntry = na
+var int entryBar = na
+var bool breakEvenMoved = false
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ENTRIES
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if longEntry
+    activeEntry := close
+    activeStop := candidateLongStop
+    initialRisk := activeEntry - activeStop
+    highestSinceEntry := high
+    lowestSinceEntry := low
+    entryBar := bar_index
+    breakEvenMoved := false
+    tradesToday += 1
+
+    strategy.entry(
+         "Long",
+         strategy.long,
+         qty=longQuantity,
+         comment="EWMAC Long",
+         alert_message="AMSEWMAC BULLISH ENTRY - LONG")
+
+    if enableDynamicAlerts
+        alert(
+             "AMSEWMAC BULLISH ENTRY | LONG | " +
+             syminfo.ticker +
+             " | Forecast " + str.tostring(adjustedForecast, "#.0") +
+             " | Stop " + str.tostring(candidateLongStop, format.mintick),
+             alert.freq_once_per_bar_close)
+
+if shortEntry
+    activeEntry := close
+    activeStop := candidateShortStop
+    initialRisk := activeStop - activeEntry
+    highestSinceEntry := high
+    lowestSinceEntry := low
+    entryBar := bar_index
+    breakEvenMoved := false
+    tradesToday += 1
+
+    strategy.entry(
+         "Short",
+         strategy.short,
+         qty=shortQuantity,
+         comment="EWMAC Short",
+         alert_message="AMSEWMAC BEARISH ENTRY - SHORT")
+
+    if enableDynamicAlerts
+        alert(
+             "AMSEWMAC BEARISH ENTRY | SHORT | " +
+             syminfo.ticker +
+             " | Forecast " + str.tostring(adjustedForecast, "#.0") +
+             " | Stop " + str.tostring(candidateShortStop, format.mintick),
+             alert.freq_once_per_bar_close)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// TRAILING VALUES
+// Calculated globally on every update.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float calculatedLongTrail =
+     rollingTrailHighest - atrValue * trailAtrMult
+
+float calculatedShortTrail =
+     rollingTrailLowest + atrValue * trailAtrMult
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LONG POSITION MANAGEMENT
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if strategy.position_size > 0
+    highestSinceEntry := math.max(
+         nz(highestSinceEntry, high),
+         high)
+
+    lowestSinceEntry := math.min(
+         nz(lowestSinceEntry, low),
+         low)
+
+    if useTrailingStop
+        activeStop := math.max(
+             nz(activeStop, candidateLongStop),
+             calculatedLongTrail)
+
+    if useBreakEven and not breakEvenMoved and not na(initialRisk)
+        bool longBreakEvenReached =
+             high >= strategy.position_avg_price +
+             initialRisk * breakEvenTriggerR
+
+        if longBreakEvenReached
+            activeStop := math.max(
+                 nz(activeStop, strategy.position_avg_price),
+                 strategy.position_avg_price)
+
+            breakEvenMoved := true
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SHORT POSITION MANAGEMENT
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if strategy.position_size < 0
+    highestSinceEntry := math.max(
+         nz(highestSinceEntry, high),
+         high)
+
+    lowestSinceEntry := math.min(
+         nz(lowestSinceEntry, low),
+         low)
+
+    if useTrailingStop
+        activeStop := math.min(
+             nz(activeStop, candidateShortStop),
+             calculatedShortTrail)
+
+    if useBreakEven and not breakEvenMoved and not na(initialRisk)
+        bool shortBreakEvenReached =
+             low <= strategy.position_avg_price -
+             initialRisk * breakEvenTriggerR
+
+        if shortBreakEvenReached
+            activeStop := math.min(
+                 nz(activeStop, strategy.position_avg_price),
+                 strategy.position_avg_price)
+
+            breakEvenMoved := true
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PROTECTIVE STOPS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if strategy.position_size > 0 and not na(activeStop)
+    strategy.exit(
+         "Long Stop",
+         from_entry="Long",
+         stop=activeStop,
+         alert_message="AMSEWMAC STOP EXIT - LONG")
+
+if strategy.position_size < 0 and not na(activeStop)
+    strategy.exit(
+         "Short Stop",
+         from_entry="Short",
+         stop=activeStop,
+         alert_message="AMSEWMAC STOP EXIT - SHORT")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FORECAST EXITS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if longForecastExit
+    strategy.close(
+         "Long",
+         comment="Forecast Exit",
+         alert_message="AMSEWMAC FORECAST EXIT - LONG")
+
+if shortForecastExit
+    strategy.close(
+         "Short",
+         comment="Forecast Exit",
+         alert_message="AMSEWMAC FORECAST EXIT - SHORT")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// TIME AND SESSION EXITS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool holdingTimeExpired =
+     maximumHoldingBars > 0 and
+     strategy.position_size != 0 and
+     not na(entryBar) and
+     bar_index - entryBar >= maximumHoldingBars
+
+if holdingTimeExpired
+    strategy.close_all(
+         comment="Time Exit",
+         alert_message="AMSEWMAC TIME EXIT")
+
+if flattenAtSessionEnd and sessionEnded and strategy.position_size != 0
+    strategy.close_all(
+         comment="Session Exit",
+         immediately=true,
+         alert_message="AMSEWMAC SESSION EXIT")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CLOSED-POSITION RESET
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool positionJustClosed =
+     strategy.position_size == 0 and
+     strategy.position_size[1] != 0
+
+// v1.1 COOLDOWN FIX: a reversal (short -> long or long -> short in a
+// single combined order, submitted whenever reverseOnOppositeSignal is
+// on) never sets strategy.position_size to exactly 0 on any bar -- it
+// flips sign directly (e.g. -1 to +1). positionJustClosed alone
+// therefore never fired on a reversal, so lastExitBar (and cooldownOK)
+// never registered a reversal as an exit at all -- the strategy could
+// reverse back and forth with zero cooldown enforcement between
+// reversals, which is what "cooldown is not working" was actually
+// describing. Fixed by also tracking position sign flips as an exit
+// for cooldown purposes, while the full trade-state reset below still
+// only runs on a genuine flat close (a reversal's activeEntry/
+// activeStop/etc. are already correctly refreshed by the ENTRIES
+// section above on the same bar).
+bool positionReversed =
+     strategy.position_size != 0 and
+     strategy.position_size[1] != 0 and
+     math.sign(strategy.position_size) != math.sign(strategy.position_size[1])
+
+if positionJustClosed or positionReversed
+    lastExitBar := bar_index
+
+if positionJustClosed
+    activeEntry := na
+    activeStop := na
+    initialRisk := na
+    highestSinceEntry := na
+    lowestSinceEntry := na
+    entryBar := na
+    breakEvenMoved := false
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BLOCKER TEXT
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+string longBlocker = "CLEAR"
+
+if not allowLong
+    longBlocker := "LONG OFF"
+else if not volatilityEntryOK
+    longBlocker := "EXTREME VOL"
+else if not sessionOK
+    longBlocker := "SESSION"
+else if not dailyTradeLimitOK
+    longBlocker := "DAY LIMIT"
+else if not cooldownOK
+    longBlocker := "COOLDOWN"
+else if not longHtfOK
+    longBlocker := "HTF BLOCK"
+else if not longAccelerationOK
+    longBlocker := "NO ACCEL"
+else if adjustedForecast < entryForecast
+    longBlocker := "FORECAST LOW"
+else if not longSizeOK
+    longBlocker := "SIZE ZERO"
+else if strategy.position_size > 0
+    longBlocker := "ALREADY LONG"
+
+string shortBlocker = "CLEAR"
+
+if not allowShort
+    shortBlocker := "SHORT OFF"
+else if not volatilityEntryOK
+    shortBlocker := "EXTREME VOL"
+else if not sessionOK
+    shortBlocker := "SESSION"
+else if not dailyTradeLimitOK
+    shortBlocker := "DAY LIMIT"
+else if not cooldownOK
+    shortBlocker := "COOLDOWN"
+else if not shortHtfOK
+    shortBlocker := "HTF BLOCK"
+else if not shortAccelerationOK
+    shortBlocker := "NO ACCEL"
+else if adjustedForecast > -entryForecast
+    shortBlocker := "FORECAST LOW"
+else if not shortSizeOK
+    shortBlocker := "SIZE ZERO"
+else if strategy.position_size < 0
+    shortBlocker := "ALREADY SHORT"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PRICE TREND GUIDES
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float priceFastEma = ta.ema(close, fast2)
+float priceSlowEma = ta.ema(close, slow2)
+
+plot(
+     showTrendEMAs ? priceFastEma : na,
+     "Trend Fast EMA",
+     color=C_BULL,
+     linewidth=1)
+
+plot(
+     showTrendEMAs ? priceSlowEma : na,
+     "Trend Slow EMA",
+     color=C_WARN,
+     linewidth=2)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STOP AND ENTRY PLOTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float activeStopPlot =
+     showStops and strategy.position_size != 0
+     ? activeStop
+     : na
+
+plot(
+     activeStopPlot,
+     "Active Stop",
+     color=C_BAD,
+     linewidth=2,
+     style=plot.style_linebr)
+
+plotshape(
+     showSignals and longEntry,
+     title="Long Entry",
+     text="LONG",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=C_BULL,
+     textcolor=color.white,
+     size=size.small)
+
+plotshape(
+     showSignals and shortEntry,
+     title="Short Entry",
+     text="SHORT",
+     style=shape.labeldown,
+     location=location.abovebar,
+     color=C_BEAR,
+     textcolor=color.white,
+     size=size.small)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BACKGROUND
+// bgcolor is called once in global scope.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+color trendBackground = na
+
+if adjustedForecast >= entryForecast
+    trendBackground := color.new(C_BULL, 90)
+else if adjustedForecast <= -entryForecast
+    trendBackground := color.new(C_BEAR, 90)
+
+bgcolor(
+     colorTrendBackground
+     ? trendBackground
+     : na)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DASHBOARD POSITION
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+dashPosition =
+     dashboardPosition == "Top Left"
+     ? position.top_left
+     : dashboardPosition == "Bottom Right"
+     ? position.bottom_right
+     : dashboardPosition == "Bottom Left"
+     ? position.bottom_left
+     : position.top_right
+
+var table dash = table.new(
+     position=dashPosition,
+     columns=2,
+     rows=17,
+     bgcolor=C_DARK,
+     border_color=color.rgb(60, 75, 95),
+     border_width=1,
+     frame_color=C_BULL,
+     frame_width=2)
+
+f_row(
+     int row,
+     string labelText,
+     string valueText,
+     color valueColor) =>
+
+    table.cell(
+         dash,
+         0,
+         row,
+         labelText,
+         bgcolor=C_DARK,
+         text_color=C_TEXT,
+         text_size=size.tiny,
+         text_halign=text.align_left)
+
+    table.cell(
+         dash,
+         1,
+         row,
+         valueText,
+         bgcolor=valueColor,
+         text_color=C_TEXT,
+         text_size=size.small,
+         text_halign=text.align_right)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LIVE DASHBOARD
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if showDashboard and barstate.islast
+    string positionText = "FLAT"
+    color positionColor = C_NEUTRAL
+
+    if strategy.position_size > 0
+        positionText := "LONG"
+        positionColor := C_BULL
+    else if strategy.position_size < 0
+        positionText := "SHORT"
+        positionColor := C_BEAR
+
+    string signalText = "WAIT"
+    color signalColor = C_NEUTRAL
+
+    if longEntry
+        signalText := "LONG ENTRY"
+        signalColor := C_BULL
+    else if shortEntry
+        signalText := "SHORT ENTRY"
+        signalColor := C_BEAR
+    else if adjustedForecast >= entryForecast and longContext
+        signalText := "LONG READY"
+        signalColor := C_BULL
+    else if adjustedForecast <= -entryForecast and shortContext
+        signalText := "SHORT READY"
+        signalColor := C_BEAR
+
+    string biasText = "NEUTRAL"
+    color biasColor = C_NEUTRAL
+
+    if adjustedForecast >= entryForecast
+        biasText := "BULL"
+        biasColor := C_BULL
+    else if adjustedForecast <= -entryForecast
+        biasText := "BEAR"
+        biasColor := C_BEAR
+
+    string volText = "NORMAL"
+    color volColor = C_GOOD
+
+    if not na(volatilityRank)
+        if volatilityRank >= extremeVolRank
+            volText := "EXTREME"
+            volColor := C_BAD
+        else if volatilityRank >= 75.0
+            volText := "HIGH"
+            volColor := C_WARN
+        else if volatilityRank <= 25.0
+            volText := "LOW"
+            volColor := C_BULL
+
+    string htfText = "OFF"
+    color htfColor = C_NEUTRAL
+
+    if useHtfFilter
+        if not htfValid
+            htfText := "INVALID TF"
+            htfColor := C_WARN
+        else if htfBull
+            htfText := "BULL"
+            htfColor := C_BULL
+        else if htfBear
+            htfText := "BEAR"
+            htfColor := C_BEAR
+        else
+            htfText := "NEUTRAL"
+            htfColor := C_NEUTRAL
+
+    string stopText = "N/A"
+
+    if strategy.position_size != 0 and not na(activeStop)
+        stopText := str.tostring(
+             activeStop,
+             format.mintick)
+
+    string tradeText =
+         str.tostring(tradesToday) +
+         "/" +
+         str.tostring(maximumTradesPerDay)
+
+    string cooldownText = "READY"
+    color cooldownColor = C_GOOD
+
+    if not cooldownOK
+        cooldownText :=
+             str.tostring(cooldownRemaining) +
+             " BARS"
+
+        cooldownColor := C_WARN
+
+    color longBlockColor =
+         longBlocker == "CLEAR"
+         ? C_GOOD
+         : longBlocker == "ALREADY LONG"
+         ? C_BULL
+         : C_WARN
+
+    color shortBlockColor =
+         shortBlocker == "CLEAR"
+         ? C_GOOD
+         : shortBlocker == "ALREADY SHORT"
+         ? C_BEAR
+         : C_WARN
+
+    color stopColor =
+         strategy.position_size == 0
+         ? C_NEUTRAL
+         : C_BAD
+
+    color tradeColor =
+         dailyTradeLimitOK
+         ? C_CELL
+         : C_BAD
+
+    f_row(
+         0,
+         "SYSTEM",
+         "MULTI EWMAC",
+         C_CELL)
+
+    f_row(
+         1,
+         "POSITION",
+         positionText,
+         positionColor)
+
+    f_row(
+         2,
+         "SIGNAL",
+         signalText,
+         signalColor)
+
+    f_row(
+         3,
+         "BIAS",
+         biasText,
+         biasColor)
+
+    f_row(
+         4,
+         "FORECAST",
+         str.tostring(adjustedForecast, "#.0"),
+         f_directionColor(adjustedForecast))
+
+    f_row(
+         5,
+         "SPEED 1",
+         str.tostring(forecast1, "#.0"),
+         f_directionColor(forecast1))
+
+    f_row(
+         6,
+         "SPEED 2",
+         str.tostring(forecast2, "#.0"),
+         f_directionColor(forecast2))
+
+    f_row(
+         7,
+         "SPEED 3",
+         str.tostring(forecast3, "#.0"),
+         f_directionColor(forecast3))
+
+    f_row(
+         8,
+         "VOL RANK",
+         str.tostring(volatilityRank, "#.0") +
+         " " +
+         volText,
+         volColor)
+
+    f_row(
+         9,
+         "VOL MULT",
+         str.tostring(appliedVolMultiplier, "#.00") +
+         "x",
+         volColor)
+
+    f_row(
+         10,
+         "HTF",
+         htfText,
+         htfColor)
+
+    f_row(
+         11,
+         "L BLOCK",
+         longBlocker,
+         longBlockColor)
+
+    f_row(
+         12,
+         "S BLOCK",
+         shortBlocker,
+         shortBlockColor)
+
+    f_row(
+         13,
+         "STOP",
+         stopText,
+         stopColor)
+
+    f_row(
+         14,
+         "COOLDOWN",
+         cooldownText,
+         cooldownColor)
+
+    f_row(
+         15,
+         "TRADES",
+         tradeText,
+         tradeColor)
+
+    f_row(
+         16,
+         "ALERTS",
+         enableDynamicAlerts ? "ON" : "OFF",
+         enableDynamicAlerts ? C_GOOD : C_NEUTRAL)
+
+if not showDashboard and barstate.islast
+    table.clear(
+         dash,
+         0,
+         0,
+         1,
+         16)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ALERTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+alertcondition(
+     longEntry,
+     title="Adaptive EWMAC Long",
+     message="AMSEWMAC BULLISH ENTRY (LONG) on {{ticker}} {{interval}}")
+
+alertcondition(
+     shortEntry,
+     title="Adaptive EWMAC Short",
+     message="AMSEWMAC BEARISH ENTRY (SHORT) on {{ticker}} {{interval}}")
+
+alertcondition(
+     longForecastExit or shortForecastExit,
+     title="Adaptive EWMAC Forecast Exit",
+     message="Adaptive multi-speed EWMAC forecast exit on {{ticker}} {{interval}}")
