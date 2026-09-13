@@ -235,137 +235,156 @@ f_get15mBreakContext() =>
     var int levelSetCount = 0
     var int breakEventCount = 0
 
-    if newSessionLocal
-        if bar_index > 0 and barsIntoSessionLocal > 1
-            int endedBarsLocal = bar_index - sessionStartBarLocal
-            if endedBarsLocal >= minEndedSessionBarsInput and not na(atr15Local)
-                [pocPx, exHighPx, exLowPx, flipPx, absPx] = f_extractSessionPois(endedBarsLocal, profileRowsInput)
-                if not na(pocPx)
-                    pocLevel := pocPx
-                    pocBroken := false
-                    levelSetCount += 1
-                if not na(exHighPx)
-                    exHighLevel := exHighPx
-                    exHighBroken := false
-                    levelSetCount += 1
-                if not na(exLowPx)
-                    exLowLevel := exLowPx
-                    exLowBroken := false
-                    levelSetCount += 1
-                if not na(flipPx)
-                    flipLevel := flipPx
-                    flipBroken := false
-                    levelSetCount += 1
-                if showAbsorptionInput and not na(absPx)
-                    absLevel := absPx
-                    absBroken := false
-                    levelSetCount += 1
-        sessionIndexLocal += 1
-        sessionStartBarLocal := bar_index
-
-    float localBarDelta = f_delta(open, high, low, close, nz(volume, 0.0))
-    float buffer = not na(atr15Local) ? atr15Local * minBreakAtrMultInput : 0.0
-    float halfWidth = not na(atr15Local) ? atr15Local * poiAtrMultInput : na
-    bool deltaOkUp = not requireBreakDeltaConfirmationInput or localBarDelta > 0
-    bool deltaOkDown = not requireBreakDeltaConfirmationInput or localBarDelta < 0
-
+    // Declared here (not var, so still reset to the "no event" default
+    // every bar) so they're visible both to the mutation logic inside the
+    // isconfirmed guard below AND to the ta.valuewhen calls that read them
+    // afterward -- a variable declared inside an if-block isn't visible
+    // outside it in Pine.
     float eventDirection = 0.0
     float eventTypeCode = 0.0
     float eventZoneLow = na
     float eventZoneHigh = na
 
-    if not na(pocLevel) and not pocBroken and not na(halfWidth)
-        float zLow = pocLevel - halfWidth
-        float zHigh = pocLevel + halfWidth
-        bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
-        bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
-        if brokeUp and deltaOkUp
-            pocBroken := true
-            eventDirection := 1.0
-            eventTypeCode := 1.0
-            eventZoneLow := zLow
-            eventZoneHigh := zHigh
-        else if brokeDown and deltaOkDown
-            pocBroken := true
-            eventDirection := -1.0
-            eventTypeCode := 1.0
-            eventZoneLow := zLow
-            eventZoneHigh := zHigh
+    // Mutations (level assignment, broken flags, and the event signal
+    // itself) are gated behind barstate.isconfirmed -- this is the fix
+    // for the diagnosed bug: under lookahead_on, this function's "still
+    // forming" 15m bar gets re-evaluated multiple times before it
+    // closes. A plain accumulator (breakEventCount) is robust to that
+    // (repeated hits just keep counting), but a one-bar-transient event
+    // flag gated by a var bool guard (not pocBroken) is NOT: an early
+    // intrabar peek can flip pocBroken true and the event flag back to
+    // false again before the bar actually confirms, so ta.valuewhen
+    // never sees a stable true moment to anchor on. Same principle as
+    // Stage 3's CooldownModule (state mutation gated by
+    // barstate.isconfirmed) -- just not carried over to this file
+    // originally.
+    if barstate.isconfirmed
+        if newSessionLocal
+            if bar_index > 0 and barsIntoSessionLocal > 1
+                int endedBarsLocal = bar_index - sessionStartBarLocal
+                if endedBarsLocal >= minEndedSessionBarsInput and not na(atr15Local)
+                    [pocPx, exHighPx, exLowPx, flipPx, absPx] = f_extractSessionPois(endedBarsLocal, profileRowsInput)
+                    if not na(pocPx)
+                        pocLevel := pocPx
+                        pocBroken := false
+                        levelSetCount += 1
+                    if not na(exHighPx)
+                        exHighLevel := exHighPx
+                        exHighBroken := false
+                        levelSetCount += 1
+                    if not na(exLowPx)
+                        exLowLevel := exLowPx
+                        exLowBroken := false
+                        levelSetCount += 1
+                    if not na(flipPx)
+                        flipLevel := flipPx
+                        flipBroken := false
+                        levelSetCount += 1
+                    if showAbsorptionInput and not na(absPx)
+                        absLevel := absPx
+                        absBroken := false
+                        levelSetCount += 1
+            sessionIndexLocal += 1
+            sessionStartBarLocal := bar_index
 
-    if not na(exHighLevel) and not exHighBroken and not na(halfWidth)
-        float zLow = exHighLevel - halfWidth
-        float zHigh = exHighLevel + halfWidth
-        bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
-        bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
-        if brokeUp and deltaOkUp
-            exHighBroken := true
-            eventDirection := 1.0
-            eventTypeCode := 2.0
-            eventZoneLow := zLow
-            eventZoneHigh := zHigh
-        else if brokeDown and deltaOkDown
-            exHighBroken := true
-            eventDirection := -1.0
-            eventTypeCode := 2.0
-            eventZoneLow := zLow
-            eventZoneHigh := zHigh
+        float localBarDelta = f_delta(open, high, low, close, nz(volume, 0.0))
+        float buffer = not na(atr15Local) ? atr15Local * minBreakAtrMultInput : 0.0
+        float halfWidth = not na(atr15Local) ? atr15Local * poiAtrMultInput : na
+        bool deltaOkUp = not requireBreakDeltaConfirmationInput or localBarDelta > 0
+        bool deltaOkDown = not requireBreakDeltaConfirmationInput or localBarDelta < 0
 
-    if not na(exLowLevel) and not exLowBroken and not na(halfWidth)
-        float zLow = exLowLevel - halfWidth
-        float zHigh = exLowLevel + halfWidth
-        bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
-        bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
-        if brokeUp and deltaOkUp
-            exLowBroken := true
-            eventDirection := 1.0
-            eventTypeCode := 3.0
-            eventZoneLow := zLow
-            eventZoneHigh := zHigh
-        else if brokeDown and deltaOkDown
-            exLowBroken := true
-            eventDirection := -1.0
-            eventTypeCode := 3.0
-            eventZoneLow := zLow
-            eventZoneHigh := zHigh
+        if not na(pocLevel) and not pocBroken and not na(halfWidth)
+            float zLow = pocLevel - halfWidth
+            float zHigh = pocLevel + halfWidth
+            bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
+            bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
+            if brokeUp and deltaOkUp
+                pocBroken := true
+                eventDirection := 1.0
+                eventTypeCode := 1.0
+                eventZoneLow := zLow
+                eventZoneHigh := zHigh
+            else if brokeDown and deltaOkDown
+                pocBroken := true
+                eventDirection := -1.0
+                eventTypeCode := 1.0
+                eventZoneLow := zLow
+                eventZoneHigh := zHigh
 
-    if not na(flipLevel) and not flipBroken and not na(halfWidth)
-        float zLow = flipLevel - halfWidth
-        float zHigh = flipLevel + halfWidth
-        bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
-        bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
-        if brokeUp and deltaOkUp
-            flipBroken := true
-            eventDirection := 1.0
-            eventTypeCode := 4.0
-            eventZoneLow := zLow
-            eventZoneHigh := zHigh
-        else if brokeDown and deltaOkDown
-            flipBroken := true
-            eventDirection := -1.0
-            eventTypeCode := 4.0
-            eventZoneLow := zLow
-            eventZoneHigh := zHigh
+        if not na(exHighLevel) and not exHighBroken and not na(halfWidth)
+            float zLow = exHighLevel - halfWidth
+            float zHigh = exHighLevel + halfWidth
+            bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
+            bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
+            if brokeUp and deltaOkUp
+                exHighBroken := true
+                eventDirection := 1.0
+                eventTypeCode := 2.0
+                eventZoneLow := zLow
+                eventZoneHigh := zHigh
+            else if brokeDown and deltaOkDown
+                exHighBroken := true
+                eventDirection := -1.0
+                eventTypeCode := 2.0
+                eventZoneLow := zLow
+                eventZoneHigh := zHigh
 
-    if showAbsorptionInput and not na(absLevel) and not absBroken and not na(halfWidth)
-        float zLow = absLevel - halfWidth
-        float zHigh = absLevel + halfWidth
-        bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
-        bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
-        if brokeUp and deltaOkUp
-            absBroken := true
-            eventDirection := 1.0
-            eventTypeCode := 5.0
-            eventZoneLow := zLow
-            eventZoneHigh := zHigh
-        else if brokeDown and deltaOkDown
-            absBroken := true
-            eventDirection := -1.0
-            eventTypeCode := 5.0
-            eventZoneLow := zLow
-            eventZoneHigh := zHigh
+        if not na(exLowLevel) and not exLowBroken and not na(halfWidth)
+            float zLow = exLowLevel - halfWidth
+            float zHigh = exLowLevel + halfWidth
+            bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
+            bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
+            if brokeUp and deltaOkUp
+                exLowBroken := true
+                eventDirection := 1.0
+                eventTypeCode := 3.0
+                eventZoneLow := zLow
+                eventZoneHigh := zHigh
+            else if brokeDown and deltaOkDown
+                exLowBroken := true
+                eventDirection := -1.0
+                eventTypeCode := 3.0
+                eventZoneLow := zLow
+                eventZoneHigh := zHigh
 
-    if eventDirection != 0.0
-        breakEventCount += 1
+        if not na(flipLevel) and not flipBroken and not na(halfWidth)
+            float zLow = flipLevel - halfWidth
+            float zHigh = flipLevel + halfWidth
+            bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
+            bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
+            if brokeUp and deltaOkUp
+                flipBroken := true
+                eventDirection := 1.0
+                eventTypeCode := 4.0
+                eventZoneLow := zLow
+                eventZoneHigh := zHigh
+            else if brokeDown and deltaOkDown
+                flipBroken := true
+                eventDirection := -1.0
+                eventTypeCode := 4.0
+                eventZoneLow := zLow
+                eventZoneHigh := zHigh
+
+        if showAbsorptionInput and not na(absLevel) and not absBroken and not na(halfWidth)
+            float zLow = absLevel - halfWidth
+            float zHigh = absLevel + halfWidth
+            bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
+            bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
+            if brokeUp and deltaOkUp
+                absBroken := true
+                eventDirection := 1.0
+                eventTypeCode := 5.0
+                eventZoneLow := zLow
+                eventZoneHigh := zHigh
+            else if brokeDown and deltaOkDown
+                absBroken := true
+                eventDirection := -1.0
+                eventTypeCode := 5.0
+                eventZoneLow := zLow
+                eventZoneHigh := zHigh
+
+        if eventDirection != 0.0
+            breakEventCount += 1
 
     float latestZoneLow = ta.valuewhen(eventDirection != 0.0, eventZoneLow, 0)
     float latestZoneHigh = ta.valuewhen(eventDirection != 0.0, eventZoneHigh, 0)
