@@ -137,11 +137,11 @@ to this pattern in two rounds:
   applied to `f_get1hContext()` (4 return values), which had the identical
   bug for the same reason.
 
-**Still not independently re-confirmed by the user on a live chart** — round 2
-has been written and locally validated (bracket balance, no unguarded loops,
-single `indicator()` declaration) but not yet pushed/compiled on-device as of
-this note. Next time this file is touched, check whether "4H Pivots Ready"
-reads YES and update this note.
+**Confirmed working** on-device after round 2: "4H Pivots Ready" reads YES, 4H
+structure reads a real value (LH + LL, not MIXED), and the Change Log shows
+plausible transitions at increasing bar indices (e.g. bar 7021 → 7027 → 7035 →
+7045, 6-10 bars apart) rather than staying static — screenshot confirmed by the
+user on MNQU2 30m / 4H bias, 1H trend timeframes.
 
 ## When to use this pattern
 
