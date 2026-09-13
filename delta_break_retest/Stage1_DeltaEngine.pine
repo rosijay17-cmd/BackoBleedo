@@ -1,0 +1,82 @@
+//@version=6
+
+// ============================================================================
+// DELTA BREAK & RETEST -- STAGE 1: DELTA ENGINE
+// ----------------------------------------------------------------------------
+// Per the build spec (Section 9, Build Order), Stage 1:
+//   "Port the histogram as a pure function. Plot it. Sanity-check against a
+//    known session by eye."
+//
+// SCOPE DISCIPLINE (Section 0): the ONLY thing inherited from the old
+// strategy (Dynamic_P0_Delta_Profile_Strategy_v1_0_4.pine) is the per-bar
+// delta calculation -- its f_delta() helper. That function already took
+// nothing but OHLCV as parameters with zero coupling to P0/strategy state,
+// so it ports here completely unchanged as a pure function:
+//   f_delta(o, h, l, c, v) -> float
+// Nothing else from that script -- no cooldown logic, no state machine, no
+// entry/exit code, no filter helpers, no input block, no naming conventions
+// -- is used here or anywhere in this rebuild.
+//
+// Pine has no native bid/ask aggressor volume, so this remains a candle-
+// pressure ESTIMATE of delta: close position within the bar's range,
+// scaled by that bar's volume. Documented here exactly as it was in the
+// source so the estimate's limitation isn't lost in the port.
+//
+// NO TRADING LOGIC AT ALL in this stage -- indicator only, per the build
+// order. Bias, break detection, retest, triggers, orders, and every filter
+// come in later, gated stages, each measured before the next is added.
+// ============================================================================
+
+indicator(title = "Delta Break & Retest - Stage 1 Delta Engine", shorttitle = "DBR Stage1", overlay = false)
+
+// ============================================================================
+// PURE DELTA FUNCTION
+//-----------------------------------------------------------------------------
+// delta(bar) -> float, in spec terms. Nothing enters this function but
+// price/volume data -- no globals, no strategy state, no filter variables.
+// ============================================================================
+
+f_delta(float o, float h, float l, float c, float v) =>
+    float safeRange = math.max(h - l, syminfo.mintick)
+    float pressure = math.max(math.min((c - o) / safeRange, 1.0), -1.0)
+    v * pressure
+
+// ============================================================================
+// PER-BAR DELTA (this bar, current chart timeframe)
+// ============================================================================
+
+float barDelta = f_delta(open, high, low, close, nz(volume, 0.0))
+
+// ============================================================================
+// SESSION CUMULATIVE DELTA -- purely for the by-eye sanity check. Resets at
+// each new session so a day's cumulative delta can be read against price
+// action on the same day, the way a session CVD read normally would be.
+// ============================================================================
+
+bool newSession = ta.change(time("D")) != 0
+
+var float cumulativeDelta = 0.0
+
+if newSession
+    cumulativeDelta := 0.0
+
+cumulativeDelta := cumulativeDelta + barDelta
+
+// ============================================================================
+// PLOTS
+// ============================================================================
+
+plot(barDelta, title = "Per-Bar Delta", style = plot.style_histogram, color = barDelta >= 0 ? color.new(color.teal, 0) : color.new(color.orange, 0), linewidth = 2)
+hline(0, title = "Zero", color = color.gray, linestyle = hline.style_dashed)
+plot(cumulativeDelta, title = "Cumulative Delta (Session)", color = color.new(color.aqua, 20), linewidth = 2)
+
+// ============================================================================
+// DATA WINDOW -- raw inputs to the by-eye check
+// ============================================================================
+
+plot(open, title = "O", display = display.data_window)
+plot(high, title = "H", display = display.data_window)
+plot(low, title = "L", display = display.data_window)
+plot(close, title = "C", display = display.data_window)
+plot(nz(volume, 0.0), title = "V", display = display.data_window)
+plot(newSession ? 1 : 0, title = "New Session", display = display.data_window)
