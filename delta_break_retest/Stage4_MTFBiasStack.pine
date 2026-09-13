@@ -73,46 +73,44 @@ bool showTrendBarColorInput = input.bool(true, "Show 1H TrendOK Bar Color", grou
 // inline across a tuple literal.
 // ============================================================================
 
+// FIXED: the original version computed ta.pivothigh()/pivotlow() inside a
+// function pulled with lookahead=barmerge.lookahead_off, then hand-tracked
+// "latest vs. previous confirmed pivot" via var state watching the pulled
+// series change -- that combination never produced a real value through
+// request.security in practice (confirmed empirically: 0 pivot updates
+// seen across months of fully-loaded 4H history, Replay ruled out as the
+// cause). Replaced with the exact pattern already proven working elsewhere
+// in this repo (MTF_Second_Flip_Continuation_v1_2.pine's f_structureBias):
+// ta.valuewhen(not na(pivot), pivot, N) for "the Nth most recent confirmed
+// pivot" computed natively inside the function (no hand-rolled var
+// tracking needed), pulled with lookahead=barmerge.lookahead_on plus an
+// explicit [1] offset on the whole function call -- the standard safe MTF
+// idiom for functions like pivots that already carry their own internal
+// confirmation delay, which lookahead_off alone doesn't synchronize
+// correctly for.
 f_get4hContext() =>
-    float ph = ta.pivothigh(pivotLeftInput, pivotRightInput)
-    float pl = ta.pivotlow(pivotLeftInput, pivotRightInput)
+    float ph = ta.pivothigh(high, pivotLeftInput, pivotRightInput)
+    float pl = ta.pivotlow(low, pivotLeftInput, pivotRightInput)
+
+    float latestHigh = ta.valuewhen(not na(ph), ph, 0)
+    float previousHigh = ta.valuewhen(not na(ph), ph, 1)
+    float latestLow = ta.valuewhen(not na(pl), pl, 0)
+    float previousLow = ta.valuewhen(not na(pl), pl, 1)
+
     float ema = ta.ema(close, biasEmaLengthInput)
     bool aboveEma = close > ema
     bool slopeUp = ema > ema[biasSlopeLookbackInput]
     bool slopeDown = ema < ema[biasSlopeLookbackInput]
-    [ph, pl, aboveEma, slopeUp, slopeDown]
 
-[pivotHigh4h, pivotLow4h, closeAboveEma4h, emaSlopeUp4h, emaSlopeDown4h] = request.security(syminfo.tickerid, biasTimeframeInput, f_get4hContext(), lookahead = barmerge.lookahead_off)
+    [latestHigh, previousHigh, latestLow, previousLow, aboveEma, slopeUp, slopeDown]
+
+[lastPivotHigh, prevPivotHigh, lastPivotLow, prevPivotLow, closeAboveEma4h, emaSlopeUp4h, emaSlopeDown4h] = request.security(syminfo.tickerid, biasTimeframeInput, f_get4hContext()[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
 
 // ============================================================================
-// 4H STRUCTURE -- track the last two confirmed pivots by detecting when the
-// forward-filled pulled value steps to a new one.
+// 4H STRUCTURE -- latest vs. previous confirmed pivot, both now supplied
+// directly by ta.valuewhen() inside f_get4hContext(); no local state to
+// track here at all.
 // ============================================================================
-
-var float lastPivotHigh = na
-var float prevPivotHigh = na
-var float lastPivotLow = na
-var float prevPivotLow = na
-
-// DIAGNOSTIC: raw counts of how many times a genuinely new pivot value has
-// ever been seen, across the whole processed history -- pins down exactly
-// where the chain breaks instead of guessing. 0 on either means
-// ta.pivothigh()/pivotlow() pulled through request.security() is never
-// producing a real value at all (a real bug in that mechanism); a nonzero
-// but low count with haveEnoughPivots still false would instead point at
-// the na/comparison logic below it.
-var int pivotHighUpdateCount = 0
-var int pivotLowUpdateCount = 0
-
-if not na(pivotHigh4h) and pivotHigh4h != lastPivotHigh
-    prevPivotHigh := lastPivotHigh
-    lastPivotHigh := pivotHigh4h
-    pivotHighUpdateCount += 1
-
-if not na(pivotLow4h) and pivotLow4h != lastPivotLow
-    prevPivotLow := lastPivotLow
-    lastPivotLow := pivotLow4h
-    pivotLowUpdateCount += 1
 
 bool haveEnoughPivots = not na(lastPivotHigh) and not na(prevPivotHigh) and not na(lastPivotLow) and not na(prevPivotLow)
 
@@ -155,7 +153,12 @@ f_get1hContext() =>
     float er = f_efficiencyRatio(erLengthInput)
     [adx, emaFast, emaSlow, er]
 
-[adx1h, emaFast1h, emaSlow1h, er1h] = request.security(syminfo.tickerid, trendTimeframeInput, f_get1hContext(), lookahead = barmerge.lookahead_off)
+// Same safe MTF idiom as the 4H pull, applied here too for consistency --
+// this one already worked fine under the old lookahead_off (ADX/EMA/ER all
+// read correctly in testing), but there's no reason for the 4H and 1H
+// pulls to use two different lookahead strategies once one of them is
+// known to be the more robust choice.
+[adx1h, emaFast1h, emaSlow1h, er1h] = request.security(syminfo.tickerid, trendTimeframeInput, f_get1hContext()[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
 
 // ============================================================================
 // 1H TREND CONFIRMATION
@@ -204,14 +207,16 @@ bgcolor(showBiasBackgroundInput ? biasBg : na, title = "4H Bias Background")
 color trendBarColor = not trendOK ? na : bias == "LONG_ONLY" ? color.new(color.lime, 20) : bias == "SHORT_ONLY" ? color.new(color.red, 20) : na
 barcolor(showTrendBarColorInput ? trendBarColor : na, title = "1H TrendOK Bar Color")
 
-plot(pivotHigh4h, title = "4H Pivot High (raw)", color = color.new(color.orange, 60), style = plot.style_circles, display = display.data_window)
-plot(pivotLow4h, title = "4H Pivot Low (raw)", color = color.new(color.blue, 60), style = plot.style_circles, display = display.data_window)
+plot(lastPivotHigh, title = "4H Latest Confirmed Pivot High", color = color.new(color.orange, 60), style = plot.style_circles, display = display.data_window)
+plot(prevPivotHigh, title = "4H Previous Confirmed Pivot High", color = color.new(color.orange, 80), style = plot.style_circles, display = display.data_window)
+plot(lastPivotLow, title = "4H Latest Confirmed Pivot Low", color = color.new(color.blue, 60), style = plot.style_circles, display = display.data_window)
+plot(prevPivotLow, title = "4H Previous Confirmed Pivot Low", color = color.new(color.blue, 80), style = plot.style_circles, display = display.data_window)
 
 // ============================================================================
 // DASHBOARD
 // ============================================================================
 
-var table statusTable = table.new(position.top_right, 2, 16, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+var table statusTable = table.new(position.top_right, 2, 15, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
 
 if barstate.islast
     table.cell(statusTable, 0, 0, "STAGE 4 MTF BIAS STACK", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
@@ -232,39 +237,31 @@ if barstate.islast
     table.cell(statusTable, 0, 3, "4H Pivots Ready", text_color = color.white)
     table.cell(statusTable, 1, 3, haveEnoughPivots ? "YES" : "NO (insufficient 4H history)", text_color = haveEnoughPivots ? color.lime : color.orange)
 
-    // Pinpoints exactly where the chain breaks if Pivots Ready is stuck at
-    // NO even with plenty of history loaded: 0/0 here means
-    // ta.pivothigh()/pivotlow() pulled through request.security() is never
-    // producing a real value at all; a nonzero count with Pivots Ready
-    // still NO would instead point at the state-tracking logic above it.
-    table.cell(statusTable, 0, 4, "4H Pivot Updates Seen (H/L)", text_color = color.white)
-    table.cell(statusTable, 1, 4, str.tostring(pivotHighUpdateCount) + " / " + str.tostring(pivotLowUpdateCount), text_color = (pivotHighUpdateCount > 0 and pivotLowUpdateCount > 0) ? color.lime : color.orange)
+    table.cell(statusTable, 0, 4, "4H Price vs EMA / Slope", text_color = color.white)
+    table.cell(statusTable, 1, 4, (closeAboveEma4h ? "ABOVE" : "BELOW") + " / " + (emaSlopeUp4h ? "UP" : emaSlopeDown4h ? "DOWN" : "FLAT"), text_color = color.white)
 
-    table.cell(statusTable, 0, 5, "4H Price vs EMA / Slope", text_color = color.white)
-    table.cell(statusTable, 1, 5, (closeAboveEma4h ? "ABOVE" : "BELOW") + " / " + (emaSlopeUp4h ? "UP" : emaSlopeDown4h ? "DOWN" : "FLAT"), text_color = color.white)
+    table.cell(statusTable, 0, 5, "1H TrendOK", text_color = color.white)
+    table.cell(statusTable, 1, 5, trendOK ? "TRUE" : "FALSE", text_color = trendOK ? color.lime : color.gray)
 
-    table.cell(statusTable, 0, 6, "1H TrendOK", text_color = color.white)
-    table.cell(statusTable, 1, 6, trendOK ? "TRUE" : "FALSE", text_color = trendOK ? color.lime : color.gray)
-
-    table.cell(statusTable, 0, 7, "1H ADX", text_color = color.white)
-    table.cell(statusTable, 1, 7, str.tostring(adx1h, "#.0") + (adxOk ? " OK" : " LOW"), text_color = adxOk ? color.lime : color.gray)
+    table.cell(statusTable, 0, 6, "1H ADX", text_color = color.white)
+    table.cell(statusTable, 1, 6, str.tostring(adx1h, "#.0") + (adxOk ? " OK" : " LOW"), text_color = adxOk ? color.lime : color.gray)
 
     // Raw direction (not bias-gated) -- shows what the EMAs are actually
     // doing; color still reflects whether that agrees with the current
     // bias (emaStackOk), so a mismatch reads as gray even if the raw
     // direction itself looks decisive.
-    table.cell(statusTable, 0, 8, "1H EMA Stack", text_color = color.white)
-    table.cell(statusTable, 1, 8, emaStackRaw, text_color = emaStackOk ? color.lime : color.gray)
+    table.cell(statusTable, 0, 7, "1H EMA Stack", text_color = color.white)
+    table.cell(statusTable, 1, 7, emaStackRaw, text_color = emaStackOk ? color.lime : color.gray)
 
-    table.cell(statusTable, 0, 9, "1H Efficiency Ratio", text_color = color.white)
-    table.cell(statusTable, 1, 9, str.tostring(er1h, "#.##") + (erOk ? " OK" : " CHOP"), text_color = erOk ? color.lime : color.gray)
+    table.cell(statusTable, 0, 8, "1H Efficiency Ratio", text_color = color.white)
+    table.cell(statusTable, 1, 8, str.tostring(er1h, "#.##") + (erOk ? " OK" : " CHOP"), text_color = erOk ? color.lime : color.gray)
 
-    table.cell(statusTable, 0, 10, "Change Log", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
-    table.cell(statusTable, 1, 10, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 9, "Change Log", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 1, 9, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
 
     int maxLogRows = 5
     for r = 0 to maxLogRows - 1
-        int tableRow = 11 + r
+        int tableRow = 10 + r
         if r < array.size(changeLog)
             table.cell(statusTable, 0, tableRow, array.get(changeLog, r), text_color = color.white, text_halign = text.align_left)
             table.cell(statusTable, 1, tableRow, "", text_color = color.white)
