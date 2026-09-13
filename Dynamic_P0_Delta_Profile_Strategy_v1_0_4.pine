@@ -374,30 +374,70 @@ string entryMode = input.string(
      group = G_ENTRY
 )
 
-float acceptanceThreshold = input.float(
-     50.0,
-     "Acceptance Score Threshold",
+// Bull (long) and bear (short) sides get independent score requirements
+// instead of one shared threshold/dominance pair for both directions --
+// e.g. NQ/MNQ often has different long vs. short character, so the bar
+// for "accept this displacement" doesn't have to be identical on both
+// sides. Defaults below match the previously shared values so behavior
+// is unchanged until you actually diverge long vs. short.
+
+float acceptanceThresholdLong = input.float(
+     65.0,
+     "Acceptance Score Threshold (Long)",
      minval = 40.0,
      maxval = 95.0,
      step = 1.0,
+     tooltip = "Minimum acceptanceScore required for a BULLISH acceptance (long) setup.",
      group = G_ENTRY
 )
 
-float rejectionThreshold = input.float(
-     50.0,
-     "Rejection Score Threshold",
+float acceptanceThresholdShort = input.float(
+     65.0,
+     "Acceptance Score Threshold (Short)",
      minval = 40.0,
      maxval = 95.0,
      step = 1.0,
+     tooltip = "Minimum acceptanceScore required for a BEARISH acceptance (short) setup.",
      group = G_ENTRY
 )
 
-float scoreDominance = input.float(
+float rejectionThresholdLong = input.float(
+     50.0,
+     "Rejection Score Threshold (Long)",
+     minval = 40.0,
+     maxval = 95.0,
+     step = 1.0,
+     tooltip = "Minimum rejectionScore required for a BULLISH rejection (long, bounce back to P0) setup.",
+     group = G_ENTRY
+)
+
+float rejectionThresholdShort = input.float(
+     50.0,
+     "Rejection Score Threshold (Short)",
+     minval = 40.0,
+     maxval = 95.0,
+     step = 1.0,
+     tooltip = "Minimum rejectionScore required for a BEARISH rejection (short, bounce back to P0) setup.",
+     group = G_ENTRY
+)
+
+float scoreDominanceLong = input.float(
      24.0,
-     "Required Score Dominance",
+     "Required Score Dominance (Long)",
      minval = 0.0,
      maxval = 40.0,
      step = 1.0,
+     tooltip = "How far acceptanceScore (or rejectionScore, for a bullish rejection) must lead the opposing score before a LONG setup is allowed to dominate.",
+     group = G_ENTRY
+)
+
+float scoreDominanceShort = input.float(
+     24.0,
+     "Required Score Dominance (Short)",
+     minval = 0.0,
+     maxval = 40.0,
+     step = 1.0,
+     tooltip = "How far acceptanceScore (or rejectionScore, for a bearish rejection) must lead the opposing score before a SHORT setup is allowed to dominate.",
      group = G_ENTRY
 )
 
@@ -1317,37 +1357,47 @@ float rejectionScore = f_clamp(
 bool meaningfulDisplacement = math.abs(distanceFromP0ATR) >= minimumDistanceATR
 bool coherenceOK = profileCoherence >= minimumCoherence
 
-bool acceptanceDominant = (
-     acceptanceScore >= acceptanceThreshold + signalStabilityMargin and
-     acceptanceScore >= rejectionScore + scoreDominance)
+// Each direction now checks against its OWN threshold/dominance pair
+// instead of one shared gate for both bull and bear -- see G_ENTRY inputs.
+bool bullAcceptanceDominant = (
+     acceptanceScore >= acceptanceThresholdLong + signalStabilityMargin and
+     acceptanceScore >= rejectionScore + scoreDominanceLong)
 
-bool rejectionDominant = (
-     rejectionScore >= rejectionThreshold + signalStabilityMargin and
-     rejectionScore >= acceptanceScore + scoreDominance)
+bool bearAcceptanceDominant = (
+     acceptanceScore >= acceptanceThresholdShort + signalStabilityMargin and
+     acceptanceScore >= rejectionScore + scoreDominanceShort)
+
+bool bullRejectionDominant = (
+     rejectionScore >= rejectionThresholdLong + signalStabilityMargin and
+     rejectionScore >= acceptanceScore + scoreDominanceLong)
+
+bool bearRejectionDominant = (
+     rejectionScore >= rejectionThresholdShort + signalStabilityMargin and
+     rejectionScore >= acceptanceScore + scoreDominanceShort)
 
 bool bullishAcceptance = (
      meaningfulDisplacement and
      coherenceOK and
      displacementDirection > 0 and
-     acceptanceDominant)
+     bullAcceptanceDominant)
 
 bool bearishAcceptance = (
      meaningfulDisplacement and
      coherenceOK and
      displacementDirection < 0 and
-     acceptanceDominant)
+     bearAcceptanceDominant)
 
 bool bullishRejection = (
      meaningfulDisplacement and
      coherenceOK and
      displacementDirection < 0 and
-     rejectionDominant)
+     bullRejectionDominant)
 
 bool bearishRejection = (
      meaningfulDisplacement and
      coherenceOK and
      displacementDirection > 0 and
-     rejectionDominant)
+     bearRejectionDominant)
 
 string marketState = "EQUILIBRIUM"
 
