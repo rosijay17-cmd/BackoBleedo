@@ -1421,11 +1421,18 @@ if bearishRejection
 // ENTRY ENGINE
 //=============================================================================
 
-var int lastLongExitBar = -10000
-var int lastShortExitBar = -10000
+// Decoupled per ENTRY TYPE, not just per direction -- an Acceptance exit
+// no longer puts Rejection on cooldown (or vice versa), and each type's
+// own cooldown timer only resets when a trade of THAT specific type closes.
+var int lastAcceptanceLongExitBar = -10000
+var int lastAcceptanceShortExitBar = -10000
+var int lastRejectionLongExitBar = -10000
+var int lastRejectionShortExitBar = -10000
 
-bool cooldownOkLong = bar_index - lastLongExitBar >= cooldownBarsLongInput
-bool cooldownOkShort = bar_index - lastShortExitBar >= cooldownBarsShortInput
+bool cooldownOkAcceptanceLong = bar_index - lastAcceptanceLongExitBar >= cooldownBarsLongInput
+bool cooldownOkAcceptanceShort = bar_index - lastAcceptanceShortExitBar >= cooldownBarsShortInput
+bool cooldownOkRejectionLong = bar_index - lastRejectionLongExitBar >= cooldownBarsLongInput
+bool cooldownOkRejectionShort = bar_index - lastRejectionShortExitBar >= cooldownBarsShortInput
 bool flat = strategy.position_size == 0
 
 bool bullishCandleOK = not requireDirectionalCandle or close > open
@@ -1481,23 +1488,48 @@ bool rejectionShortRaw = (
 // false, true again multiple times across a 20+ bar cooldown window.
 //
 // This mirrors the fix already proven in Trend_Following_Strategy_v6_Cooldown
-// .pine: a per-direction armed flag that disarms the instant a trade closes
-// and only re-arms once the raw condition has genuinely gone false at least
-// once since then -- proof the old setup actually ended, not just a tick
-// count. The rearm check below runs BEFORE the entry engine reads these
-// flags; the disarm-on-exit writes (EXIT DETECTION / COOLDOWN, further down
-// this script) run AFTER, so a same-bar exit always has final say over a
+// .pine: a per-type armed flag that disarms the instant a trade of that
+// type closes and only re-arms once the underlying condition has genuinely
+// gone false at least once since then -- proof the old setup actually
+// ended, not just a tick count. Decoupled per ENTRY TYPE (Acceptance vs.
+// Rejection), not just per direction, so closing one type never affects
+// the other's cooldown.
+//
+// FIX: the first version of this guard rearmed on the full *Raw condition
+// (e.g. acceptanceLongRaw), which ANDs in bullishCandleOK/bearishCandleOK --
+// a single-bar candle-color check that flips on roughly every other bar
+// regardless of the broader trend. That meant the guard rearmed almost
+// immediately after any disarm (the instant one red bar occurred inside an
+// uptrend, say), providing essentially no real protection -- reported as
+// "cooldown not working at all". Rearming on the underlying
+// bullishAcceptance/bearishAcceptance/bullishRejection/bearishRejection
+// booleans instead (displacement + dominance only, no per-bar candle
+// noise) actually requires the acceptance/rejection dominance itself to
+// have genuinely lapsed, not just one red candle inside a still-valid
+// setup.
+//
+// The rearm check below runs BEFORE the entry engine reads these flags;
+// the disarm-on-exit writes (EXIT DETECTION / COOLDOWN, further down this
+// script) run AFTER, so a same-bar exit always has final say over a
 // same-bar rearm.
 //=============================================================================
 
-var bool longCooldownArmed = true
-var bool shortCooldownArmed = true
+var bool acceptanceLongCooldownArmed = true
+var bool acceptanceShortCooldownArmed = true
+var bool rejectionLongCooldownArmed = true
+var bool rejectionShortCooldownArmed = true
 
-if not acceptanceLongRaw and not rejectionLongRaw
-    longCooldownArmed := true
+if not bullishAcceptance
+    acceptanceLongCooldownArmed := true
 
-if not acceptanceShortRaw and not rejectionShortRaw
-    shortCooldownArmed := true
+if not bearishAcceptance
+    acceptanceShortCooldownArmed := true
+
+if not bullishRejection
+    rejectionLongCooldownArmed := true
+
+if not bearishRejection
+    rejectionShortCooldownArmed := true
 
 bool acceptanceLongFresh = (
      not requireFreshState or
@@ -1532,24 +1564,24 @@ bool structuralFilterShortOk = not useStructuralFilterInput or na(structuralSupp
 
 bool acceptanceLongArmed = (
      flat and
-     cooldownOkLong and
-     longCooldownArmed and
+     cooldownOkAcceptanceLong and
+     acceptanceLongCooldownArmed and
      acceptanceLongRaw and
      acceptanceLongFresh and
      structuralFilterLongOk)
 
 bool acceptanceShortArmed = (
      flat and
-     cooldownOkShort and
-     shortCooldownArmed and
+     cooldownOkAcceptanceShort and
+     acceptanceShortCooldownArmed and
      acceptanceShortRaw and
      acceptanceShortFresh and
      structuralFilterShortOk)
 
 bool rejectionLongArmed = (
      flat and
-     cooldownOkLong and
-     longCooldownArmed and
+     cooldownOkRejectionLong and
+     rejectionLongCooldownArmed and
      rejectionLongRaw and
      rejectionLongFresh and
      dynamicP0 > close and
@@ -1557,8 +1589,8 @@ bool rejectionLongArmed = (
 
 bool rejectionShortArmed = (
      flat and
-     cooldownOkShort and
-     shortCooldownArmed and
+     cooldownOkRejectionShort and
+     rejectionShortCooldownArmed and
      rejectionShortRaw and
      rejectionShortFresh and
      dynamicP0 < close and
@@ -1835,11 +1867,19 @@ if longClosed or shortClosed
         )
 
     if longClosed
-        lastLongExitBar := bar_index
-        longCooldownArmed := false
+        if activeTradeType == "ACCEPTANCE LONG"
+            lastAcceptanceLongExitBar := bar_index
+            acceptanceLongCooldownArmed := false
+        if activeTradeType == "REJECTION LONG"
+            lastRejectionLongExitBar := bar_index
+            rejectionLongCooldownArmed := false
     if shortClosed
-        lastShortExitBar := bar_index
-        shortCooldownArmed := false
+        if activeTradeType == "ACCEPTANCE SHORT"
+            lastAcceptanceShortExitBar := bar_index
+            acceptanceShortCooldownArmed := false
+        if activeTradeType == "REJECTION SHORT"
+            lastRejectionShortExitBar := bar_index
+            rejectionShortCooldownArmed := false
 
     activeEntry := na
     activeStop := na
@@ -2620,18 +2660,25 @@ if barstate.islast
             table.cell(architectureTable, 3, 9, f_pct(profileCoherence), text_color = color.white)
         table.cell(architectureTable, readCol, 9, profileCoherence >= minimumCoherence ? "STRUCTURED" : "NOISY", text_color = profileCoherence >= minimumCoherence ? acceptanceColor : color.gray)
 
-        // Cooldown bar, per side. Two gates feed into readiness now: the
-        // plain bar-count cooldown (cooldownOkLong/Short) AND the
-        // stale-signal guard (longCooldownArmed/shortCooldownArmed) added
-        // separately -- READY requires both, STALE means the bar count is
-        // done but the same raw setup never actually reset yet, COOLING
-        // means the bar count itself hasn't elapsed.
-        float longCooldownElapsed = bar_index - lastLongExitBar
+        // Cooldown bar, per side. Cooldown is now decoupled per ENTRY TYPE
+        // (Acceptance vs. Rejection), so the dashboard shows whichever
+        // type is actually enabled by Entry Mode -- Acceptance's timer
+        // when Acceptance is allowed (covers "Both" and "Acceptance
+        // Only"), otherwise Rejection's. Two gates feed into readiness:
+        // the plain bar-count cooldown AND the stale-signal guard --
+        // READY requires both, STALE means the bar count is done but the
+        // underlying condition never actually lapsed yet, COOLING means
+        // the bar count itself hasn't elapsed.
+        bool longCooldownOkForRead = allowAcceptance ? cooldownOkAcceptanceLong : cooldownOkRejectionLong
+        bool longCooldownArmedForRead = allowAcceptance ? acceptanceLongCooldownArmed : rejectionLongCooldownArmed
+        int lastLongExitBarForRead = allowAcceptance ? lastAcceptanceLongExitBar : lastRejectionLongExitBar
+
+        float longCooldownElapsed = bar_index - lastLongExitBarForRead
         float longCooldownProgressPct = f_clamp(100.0 * longCooldownElapsed / math.max(cooldownBarsLongInput, 1), 0.0, 100.0)
         int longCooldownBarsLeft = int(math.max(0.0, cooldownBarsLongInput - longCooldownElapsed))
-        string readLongCooldown = (not cooldownOkLong ?
+        string readLongCooldown = (not longCooldownOkForRead ?
              "COOLING" :
-             not longCooldownArmed ?
+             not longCooldownArmedForRead ?
              "STALE" :
              "READY")
 
@@ -2642,12 +2689,16 @@ if barstate.islast
             table.cell(architectureTable, 3, 10, str.tostring(longCooldownBarsLeft) + " left", text_color = color.white)
         table.cell(architectureTable, readCol, 10, readLongCooldown, text_color = readLongCooldown == "READY" ? acceptanceColor : readLongCooldown == "STALE" ? color.orange : rejectionColor)
 
-        float shortCooldownElapsed = bar_index - lastShortExitBar
+        bool shortCooldownOkForRead = allowAcceptance ? cooldownOkAcceptanceShort : cooldownOkRejectionShort
+        bool shortCooldownArmedForRead = allowAcceptance ? acceptanceShortCooldownArmed : rejectionShortCooldownArmed
+        int lastShortExitBarForRead = allowAcceptance ? lastAcceptanceShortExitBar : lastRejectionShortExitBar
+
+        float shortCooldownElapsed = bar_index - lastShortExitBarForRead
         float shortCooldownProgressPct = f_clamp(100.0 * shortCooldownElapsed / math.max(cooldownBarsShortInput, 1), 0.0, 100.0)
         int shortCooldownBarsLeft = int(math.max(0.0, cooldownBarsShortInput - shortCooldownElapsed))
-        string readShortCooldown = (not cooldownOkShort ?
+        string readShortCooldown = (not shortCooldownOkForRead ?
              "COOLING" :
-             not shortCooldownArmed ?
+             not shortCooldownArmedForRead ?
              "STALE" :
              "READY")
 
