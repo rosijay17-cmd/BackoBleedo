@@ -235,9 +235,45 @@ f_cleanupPois(array<Poi> registry, int currentSessionIndex, int freshnessSession
             array.remove(registry, i)
         i -= 1
 
+// If the registry is full, evict the oldest TESTED entry to make room --
+// a POI that got tested once, long ago, and never crossed again (so it
+// never contaminates) would otherwise occupy its slot forever once
+// "tested" takes it out of freshness-expiry eligibility. Untested/naked
+// levels are deliberately protected from eviction (the spec calls them
+// out as the cleanest, most valuable POI type) unless literally every
+// active slot is naked, in which case the oldest naked one goes instead
+// of refusing the new POI outright. A capped set that never rotates
+// isn't a watchlist, it's a monument.
+f_evictOldestForRoom(array<Poi> registry) =>
+    int evictIdx = -1
+    int oldestTestedSession = 999999
+    int oldestAnySession = 999999
+    int oldestAnyIdx = -1
+
+    if array.size(registry) > 0
+        for i = 0 to array.size(registry) - 1
+            Poi existing = array.get(registry, i)
+            if existing.createdSessionIndex < oldestAnySession
+                oldestAnySession := existing.createdSessionIndex
+                oldestAnyIdx := i
+            if existing.tested and existing.createdSessionIndex < oldestTestedSession
+                oldestTestedSession := existing.createdSessionIndex
+                evictIdx := i
+
+    if evictIdx < 0
+        evictIdx := oldestAnyIdx
+
+    if evictIdx >= 0
+        Poi evicted = array.get(registry, evictIdx)
+        if not na(evicted.zoneBox)
+            box.delete(evicted.zoneBox)
+        if not na(evicted.zoneLabel)
+            label.delete(evicted.zoneLabel)
+        array.remove(registry, evictIdx)
+
 f_tryAddPoi(array<Poi> registry, float price, string poiType, color poiColor, float atrVal, float zoneMult, float minSepMult, int maxActive, int sessIdx) =>
     bool added = false
-    if not na(price) and not na(atrVal) and atrVal > 0 and array.size(registry) < maxActive
+    if not na(price) and not na(atrVal) and atrVal > 0
         float halfWidth = atrVal * zoneMult
         float zLow = price - halfWidth
         float zHigh = price + halfWidth
@@ -250,6 +286,10 @@ f_tryAddPoi(array<Poi> registry, float price, string poiType, color poiColor, fl
                     tooClose := true
 
         if not tooClose
+            if array.size(registry) >= maxActive
+                f_evictOldestForRoom(registry)
+
+        if not tooClose and array.size(registry) < maxActive
             Poi newPoi = Poi.new(price = price, zoneLow = zLow, zoneHigh = zHigh, poiType = poiType, createdBar = bar_index, createdSessionIndex = sessIdx)
             newPoi.zoneBox := box.new(left = bar_index, top = zHigh, right = bar_index, bottom = zLow, xloc = xloc.bar_index, bgcolor = color.new(poiColor, 85), border_color = poiColor)
             newPoi.zoneLabel := label.new(bar_index, zHigh, poiType, style = label.style_label_down, color = color.new(poiColor, 20), textcolor = color.white, size = size.tiny)
