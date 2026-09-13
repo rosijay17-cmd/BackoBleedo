@@ -410,12 +410,33 @@ if array.size(poiRegistry) > 0
 
             p.touchedLastBar := touchedNow
 
-            if not na(p.zoneBox)
+            // Only keep stretching the box to the current bar while the
+            // zone is still "live" (unbroken, uncontaminated) -- once it
+            // breaks, freeze the box at the break bar instead of smearing
+            // it across every bar between the break and now. A zone that
+            // broke 200 bars ago doesn't need a horizontal line spanning
+            // those 200 bars; the break-event arrow label already marks
+            // exactly where it happened.
+            if not na(p.zoneBox) and not p.broken
                 box.set_right(p.zoneBox, bar_index)
 
+            // Fade BOTH the box and its original text label once a POI is
+            // no longer "live" -- contaminated (chopped through repeatedly,
+            // genuinely dead) or broken (played out, superseded by its own
+            // dedicated break-arrow label). Only still-live POIs (fresh /
+            // naked / tested-but-unbroken) keep their full poiType color, so
+            // the chart's visual weight tracks what's actually still
+            // relevant instead of every POI ever extracted competing at
+            // equal brightness.
             if p.contaminated and not na(p.zoneBox)
                 box.set_bgcolor(p.zoneBox, color.new(color.gray, 92))
                 box.set_border_color(p.zoneBox, color.new(color.gray, 60))
+                if not na(p.zoneLabel)
+                    label.set_color(p.zoneLabel, color.new(color.gray, 85))
+                    label.set_textcolor(p.zoneLabel, color.new(color.gray, 50))
+            else if p.broken and not na(p.zoneLabel)
+                label.set_color(p.zoneLabel, color.new(color.gray, 70))
+                label.set_textcolor(p.zoneLabel, color.new(color.gray, 35))
 
             // NEW: break detection -- stateless close-vs-close[1] comparison
             // against this POI's own fixed, buffered zone edges. See header
