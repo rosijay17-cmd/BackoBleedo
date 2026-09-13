@@ -2614,7 +2614,7 @@ architectureTablePosition = (
 var table architectureTable = table.new(
      architectureTablePosition,
      5,
-     13,
+     14,
      bgcolor = color.new(color.rgb(15, 20, 27), 10),
      border_width = 1
 )
@@ -2771,9 +2771,19 @@ if barstate.islast
         table.cell(architectureTable, 0, 12, "Exit Log", text_color = color.white)
         table.cell(architectureTable, 1, 12, exitLogText, text_color = color.white, text_halign = text.align_left)
 
+        // Most fundamental question left: is a real position ever open at
+        // all, on THIS bar, right now? If this reads 0 even while entry
+        // markers keep appearing, strategy.entry() isn't actually filling
+        // -- the markers are firing purely from our own script's scoring
+        // logic, independent of any real broker-side position ever
+        // forming, and longClosed/shortClosed can never fire because
+        // position_size never leaves 0 to begin with.
+        table.cell(architectureTable, 0, 13, "Position Size (Now)", text_color = color.white)
+        table.cell(architectureTable, 1, 13, str.tostring(strategy.position_size), text_color = strategy.position_size > 0 ? acceptanceColor : strategy.position_size < 0 ? rejectionColor : color.gray)
+
         dashboardSizeValue = f_dashboardSize(dashboardTextSize)
 
-        for dashboardRow = 0 to 12
+        for dashboardRow = 0 to 13
             for dashboardCol = 0 to 4
                 table.cell_set_text_size(
                      architectureTable,
