@@ -94,13 +94,25 @@ var float prevPivotHigh = na
 var float lastPivotLow = na
 var float prevPivotLow = na
 
+// DIAGNOSTIC: raw counts of how many times a genuinely new pivot value has
+// ever been seen, across the whole processed history -- pins down exactly
+// where the chain breaks instead of guessing. 0 on either means
+// ta.pivothigh()/pivotlow() pulled through request.security() is never
+// producing a real value at all (a real bug in that mechanism); a nonzero
+// but low count with haveEnoughPivots still false would instead point at
+// the na/comparison logic below it.
+var int pivotHighUpdateCount = 0
+var int pivotLowUpdateCount = 0
+
 if not na(pivotHigh4h) and pivotHigh4h != lastPivotHigh
     prevPivotHigh := lastPivotHigh
     lastPivotHigh := pivotHigh4h
+    pivotHighUpdateCount += 1
 
 if not na(pivotLow4h) and pivotLow4h != lastPivotLow
     prevPivotLow := lastPivotLow
     lastPivotLow := pivotLow4h
+    pivotLowUpdateCount += 1
 
 bool haveEnoughPivots = not na(lastPivotHigh) and not na(prevPivotHigh) and not na(lastPivotLow) and not na(prevPivotLow)
 
@@ -199,7 +211,7 @@ plot(pivotLow4h, title = "4H Pivot Low (raw)", color = color.new(color.blue, 60)
 // DASHBOARD
 // ============================================================================
 
-var table statusTable = table.new(position.top_right, 2, 15, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+var table statusTable = table.new(position.top_right, 2, 16, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
 
 if barstate.islast
     table.cell(statusTable, 0, 0, "STAGE 4 MTF BIAS STACK", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
@@ -220,31 +232,39 @@ if barstate.islast
     table.cell(statusTable, 0, 3, "4H Pivots Ready", text_color = color.white)
     table.cell(statusTable, 1, 3, haveEnoughPivots ? "YES" : "NO (insufficient 4H history)", text_color = haveEnoughPivots ? color.lime : color.orange)
 
-    table.cell(statusTable, 0, 4, "4H Price vs EMA / Slope", text_color = color.white)
-    table.cell(statusTable, 1, 4, (closeAboveEma4h ? "ABOVE" : "BELOW") + " / " + (emaSlopeUp4h ? "UP" : emaSlopeDown4h ? "DOWN" : "FLAT"), text_color = color.white)
+    // Pinpoints exactly where the chain breaks if Pivots Ready is stuck at
+    // NO even with plenty of history loaded: 0/0 here means
+    // ta.pivothigh()/pivotlow() pulled through request.security() is never
+    // producing a real value at all; a nonzero count with Pivots Ready
+    // still NO would instead point at the state-tracking logic above it.
+    table.cell(statusTable, 0, 4, "4H Pivot Updates Seen (H/L)", text_color = color.white)
+    table.cell(statusTable, 1, 4, str.tostring(pivotHighUpdateCount) + " / " + str.tostring(pivotLowUpdateCount), text_color = (pivotHighUpdateCount > 0 and pivotLowUpdateCount > 0) ? color.lime : color.orange)
 
-    table.cell(statusTable, 0, 5, "1H TrendOK", text_color = color.white)
-    table.cell(statusTable, 1, 5, trendOK ? "TRUE" : "FALSE", text_color = trendOK ? color.lime : color.gray)
+    table.cell(statusTable, 0, 5, "4H Price vs EMA / Slope", text_color = color.white)
+    table.cell(statusTable, 1, 5, (closeAboveEma4h ? "ABOVE" : "BELOW") + " / " + (emaSlopeUp4h ? "UP" : emaSlopeDown4h ? "DOWN" : "FLAT"), text_color = color.white)
 
-    table.cell(statusTable, 0, 6, "1H ADX", text_color = color.white)
-    table.cell(statusTable, 1, 6, str.tostring(adx1h, "#.0") + (adxOk ? " OK" : " LOW"), text_color = adxOk ? color.lime : color.gray)
+    table.cell(statusTable, 0, 6, "1H TrendOK", text_color = color.white)
+    table.cell(statusTable, 1, 6, trendOK ? "TRUE" : "FALSE", text_color = trendOK ? color.lime : color.gray)
+
+    table.cell(statusTable, 0, 7, "1H ADX", text_color = color.white)
+    table.cell(statusTable, 1, 7, str.tostring(adx1h, "#.0") + (adxOk ? " OK" : " LOW"), text_color = adxOk ? color.lime : color.gray)
 
     // Raw direction (not bias-gated) -- shows what the EMAs are actually
     // doing; color still reflects whether that agrees with the current
     // bias (emaStackOk), so a mismatch reads as gray even if the raw
     // direction itself looks decisive.
-    table.cell(statusTable, 0, 7, "1H EMA Stack", text_color = color.white)
-    table.cell(statusTable, 1, 7, emaStackRaw, text_color = emaStackOk ? color.lime : color.gray)
+    table.cell(statusTable, 0, 8, "1H EMA Stack", text_color = color.white)
+    table.cell(statusTable, 1, 8, emaStackRaw, text_color = emaStackOk ? color.lime : color.gray)
 
-    table.cell(statusTable, 0, 8, "1H Efficiency Ratio", text_color = color.white)
-    table.cell(statusTable, 1, 8, str.tostring(er1h, "#.##") + (erOk ? " OK" : " CHOP"), text_color = erOk ? color.lime : color.gray)
+    table.cell(statusTable, 0, 9, "1H Efficiency Ratio", text_color = color.white)
+    table.cell(statusTable, 1, 9, str.tostring(er1h, "#.##") + (erOk ? " OK" : " CHOP"), text_color = erOk ? color.lime : color.gray)
 
-    table.cell(statusTable, 0, 9, "Change Log", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
-    table.cell(statusTable, 1, 9, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 10, "Change Log", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 1, 10, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
 
     int maxLogRows = 5
     for r = 0 to maxLogRows - 1
-        int tableRow = 10 + r
+        int tableRow = 11 + r
         if r < array.size(changeLog)
             table.cell(statusTable, 0, tableRow, array.get(changeLog, r), text_color = color.white, text_halign = text.align_left)
             table.cell(statusTable, 1, tableRow, "", text_color = color.white)
