@@ -641,7 +641,11 @@ if barstate.islast
     string retestDisplay = retestState == "NONE" ? "NONE" : retestState + " " + f_typeCodeName(activeTypeCode)
     color retestColor = retestState == "TRIGGERED" ? (activeDirection == 1 ? color.lime : color.red) : retestState == "RETESTED" ? color.orange : retestState == "WATCHING" ? color.yellow : retestState == "INVALIDATED" ? color.gray : retestState == "EXPIRED" ? color.gray : color.gray
 
-    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+    // Version tag on the ALWAYS-VISIBLE header row (not diagnostics-only)
+    // specifically so a screenshot settles "which round is this running"
+    // at a glance, without needing the diagnostics toggle on -- this
+    // exact question has cost several rounds already.
+    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r3]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
     table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
     table.cell(statusTable, 0, 1, "Bias", text_color = color.white, text_size = size.small)
