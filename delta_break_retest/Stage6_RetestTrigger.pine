@@ -387,33 +387,33 @@ f_get15mBreakContext() =>
     if eventDirection != 0.0
         breakEventCount += 1
 
-    float latestZoneLow = ta.valuewhen(eventDirection != 0.0, eventZoneLow, 0)
-    float latestZoneHigh = ta.valuewhen(eventDirection != 0.0, eventZoneHigh, 0)
-    float latestDirection = ta.valuewhen(eventDirection != 0.0, eventDirection, 0)
-    float latestTypeCode = ta.valuewhen(eventDirection != 0.0, eventTypeCode, 0)
-    float latestEventTime = ta.valuewhen(eventDirection != 0.0, float(time), 0)
-
-    // DIAGNOSTIC (temporary, third probe): Levels Set and Break Events both
-    // proved real (244 / 112) with plain counters, but the ta.valuewhen-
-    // based outputs (this function's actual return values) still show dead
-    // on the outer script -- isolating the bug to the ta.valuewhen + [1] +
-    // lookahead_on chain specifically. This checks whether THAT chain works
-    // AT ALL in this exact shape, using a trivial, always-frequent
-    // condition with no custom var dependency (close > open, no relation
-    // to break state) instead of my hand-built eventDirection signal. If
-    // this ALSO comes back dead, ta.valuewhen itself doesn't work reliably
-    // here regardless of the condition's complexity (contradicts the
-    // Stage 4 pivot precedent and would need a bigger rethink). If this
-    // works but the real one doesn't, the bug is specific to how
-    // eventDirection/eventZoneLow etc. are built, not ta.valuewhen itself.
+    // FIX (round 3): rounds 1 (barstate.isconfirmed) and 2 (remove the
+    // Broken-flag dependency) BOTH failed -- confirmed on-device, Break
+    // Events climbed to 616 (proving the round-2 change took effect and
+    // events fire constantly) while Active Zone/Hours Since Break stayed
+    // dead regardless. Two rounds of hypotheses about WHY ta.valuewhen
+    // won't surface this signal have now both been falsified. Rather than
+    // keep guessing at ta.valuewhen's behavior in this exact shape,
+    // sidestep it: don't aggregate/forward-fill inside this
+    // security-pulled function at all. Return the RAW, mostly-zero
+    // per-bar signal instead (0.0 / na on non-event bars, a real value
+    // only on the specific 15m bar an event happens), and let the outer
+    // 5m script do the "remember the last real event" job with its own
+    // var state -- which has worked reliably all session (Stage 3's
+    // CooldownModule, this file's own retest state machine). gaps_off
+    // will naturally repeat one 15m bar's raw value across its 3
+    // overlapping 5m bars; the outer script's existing
+    // "breakEventTime != activeEventTime" check already de-duplicates
+    // that correctly without any change needed there.
+    //
+    // sanityLatestTime (ta.valuewhen-based) is kept as an ONGOING
+    // reference point, not because it's needed for anything now, but so
+    // the dashboard keeps proving ta.valuewhen itself still works in
+    // general even while this function stops relying on it for the real
+    // signal.
     float sanityLatestTime = ta.valuewhen(close > open, float(time), 0)
 
-    // DIAGNOSTIC (temporary, remove once the dead-value question is
-    // resolved): sessionIndexLocal proved var state advances fine (showed
-    // 50 on-device). levelSetCount and breakEventCount narrow the
-    // remaining question further -- does extraction ever produce a real
-    // level, and does the break condition itself ever actually fire.
-    [latestZoneLow[1], latestZoneHigh[1], latestDirection[1], latestTypeCode[1], latestEventTime[1], float(sessionIndexLocal)[1], float(levelSetCount)[1], float(breakEventCount)[1], sanityLatestTime[1]]
+    [eventZoneLow[1], eventZoneHigh[1], eventDirection[1], eventTypeCode[1], float(time)[1], float(sessionIndexLocal)[1], float(levelSetCount)[1], float(breakEventCount)[1], sanityLatestTime[1]]
 
 [breakZoneLow, breakZoneHigh, breakDirectionRaw, breakTypeCodeRaw, breakEventTimeRaw, breakDiagSessionCountRaw, breakDiagLevelSetCountRaw, breakDiagEventCountRaw, breakDiagSanityTimeRaw] = request.security(syminfo.tickerid, breakContextTimeframeInput, f_get15mBreakContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
 int breakDiagSessionCount = na(breakDiagSessionCountRaw) ? na : int(breakDiagSessionCountRaw)
@@ -422,7 +422,12 @@ int breakDiagEventCount = na(breakDiagEventCountRaw) ? na : int(breakDiagEventCo
 int breakDiagSanityTime = na(breakDiagSanityTimeRaw) ? na : int(breakDiagSanityTimeRaw)
 int breakDiagSanityHoursAgo = na(breakDiagSanityTime) ? na : int((time - breakDiagSanityTime) / (60 * 60 * 1000))
 
-bool haveBrokenAny = not na(breakDirectionRaw)
+// breakDirectionRaw/breakTypeCodeRaw are now the RAW per-bar signal (0.0 on
+// most pulls, a real value only on the specific bar an event happened) --
+// not a continuously forward-filled "last known event" the way the
+// ta.valuewhen version was. haveBrokenAny below means "did THIS pull
+// carry a real event," not "has one ever happened by now."
+bool haveBrokenAny = breakDirectionRaw != 0.0
 int breakDirection = haveBrokenAny ? int(breakDirectionRaw) : 0
 int breakTypeCode = haveBrokenAny ? int(breakTypeCodeRaw) : 0
 int breakEventTime = haveBrokenAny ? int(breakEventTimeRaw) : na
