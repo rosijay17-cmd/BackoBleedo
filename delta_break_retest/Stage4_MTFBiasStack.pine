@@ -1,0 +1,245 @@
+//@version=6
+
+// ============================================================================
+// DELTA BREAK & RETEST -- STAGE 4: MTF BIAS STACK
+// ----------------------------------------------------------------------------
+// Per the build spec, Section 9, Stage 4: "MTF bias stack. Plot 4H bias and
+// 1H trendOK as a background colour. Verify no repaint."
+//
+// Implements Section 2's timeframe hierarchy, top two links only:
+//   4H  -- bias / theater authority: bias in {LONG_ONLY, SHORT_ONLY, NO_TRADE}
+//   1H  -- trend confirmation: trendOK in {true, false}
+// The 15m (setup/POI/break) and 5m (execution/retest/trigger) links come in
+// Stages 5-6. STILL NO TRADING LOGIC of any kind here -- this plots two
+// context reads, nothing else.
+//
+// 4H BIAS (Section 2):
+//   Structure: last confirmed 4H swing sequence. HH+HL = up, LH+LL = down,
+//   anything else = mixed/neutral.
+//   Slow filter: 4H close vs 4H 50 EMA, and that EMA's slope over the last
+//   5 (4H) bars.
+//   BOTH must agree -- disagreement is NO_TRADE, not a coin flip, per spec.
+//
+// 1H TREND CONFIRMATION (Section 2):
+//   ADX(14) >= 20, EMA(21) vs EMA(50) stacked in the bias direction,
+//   Kaufman Efficiency Ratio(10) >= 0.30 (the spec's primary chop gate).
+//
+// NON-REPAINT DESIGN (the spec's explicit instruction to verify):
+//   Swing highs/lows use ta.pivothigh()/pivotlow(), which are structurally
+//   non-repainting -- a pivot only resolves `right` bars after the fact and
+//   never changes once confirmed. Pulled via request.security() at the
+//   library default lookahead = barmerge.lookahead_off (no forward
+//   peeking). gaps_off (the request.security default) forward-fills the
+//   last CONFIRMED value across subsequent lower-timeframe bars, which is
+//   exactly what lets a single pulled series behave as "the latest
+//   confirmed swing point," continuously available, without hand-rolled
+//   history tracking beyond detecting when that forward-filled value
+//   steps to a new one.
+//   HOW TO VERIFY BY EYE (Pine has no automated repaint test): the "Bias/
+//   TrendOK Change Log" on the dashboard records the bar index each time
+//   either value flips. Reload the script later (or on a different
+//   session/device) and confirm the same historical transitions still show
+//   the same bar index and value. A repainting MTF read would show a
+//   different bar index or value for the same historical transition on
+//   reload; this design shouldn't.
+// ============================================================================
+
+indicator(title = "Delta Break & Retest - Stage 4 MTF Bias Stack", shorttitle = "DBR Stage4", overlay = true)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+string biasTimeframeInput = input.timeframe("240", "4H Bias Timeframe", group = "4H Bias")
+int pivotLeftInput = input.int(3, "Swing Pivot Left Bars", minval = 1, maxval = 20, group = "4H Bias")
+int pivotRightInput = input.int(3, "Swing Pivot Right Bars", minval = 1, maxval = 20, group = "4H Bias", tooltip = "A pivot only confirms this many bars after it forms -- higher values are slower but more reliable, and this delay is exactly what keeps swing detection non-repainting.")
+int biasEmaLengthInput = input.int(50, "4H EMA Length", minval = 2, group = "4H Bias")
+int biasSlopeLookbackInput = input.int(5, "4H EMA Slope Lookback (Bars)", minval = 1, maxval = 50, group = "4H Bias")
+
+string trendTimeframeInput = input.timeframe("60", "1H Trend Timeframe", group = "1H Trend Confirmation")
+int adxLengthInput = input.int(14, "1H ADX / DI Length", minval = 1, group = "1H Trend Confirmation")
+float adxMinimumInput = input.float(20.0, "1H Minimum ADX", minval = 0, step = 0.5, group = "1H Trend Confirmation")
+int fastEmaInput = input.int(21, "1H Fast EMA", minval = 1, group = "1H Trend Confirmation")
+int slowEmaInput = input.int(50, "1H Slow EMA", minval = 2, group = "1H Trend Confirmation")
+int erLengthInput = input.int(10, "1H Efficiency Ratio Length", minval = 2, group = "1H Trend Confirmation")
+float erMinimumInput = input.float(0.30, "1H Minimum Efficiency Ratio", minval = 0, maxval = 1, step = 0.05, group = "1H Trend Confirmation")
+
+bool showBiasBackgroundInput = input.bool(true, "Show 4H Bias Background", group = "Display")
+bool showTrendBarColorInput = input.bool(true, "Show 1H TrendOK Bar Color", group = "Display")
+
+// ============================================================================
+// 4H CONTEXT -- one wrapper function so request.security only needs a
+// single call; ta.ema() is computed once per value rather than repeated
+// inline across a tuple literal.
+// ============================================================================
+
+f_get4hContext() =>
+    float ph = ta.pivothigh(pivotLeftInput, pivotRightInput)
+    float pl = ta.pivotlow(pivotLeftInput, pivotRightInput)
+    float ema = ta.ema(close, biasEmaLengthInput)
+    bool aboveEma = close > ema
+    bool slopeUp = ema > ema[biasSlopeLookbackInput]
+    bool slopeDown = ema < ema[biasSlopeLookbackInput]
+    [ph, pl, aboveEma, slopeUp, slopeDown]
+
+[pivotHigh4h, pivotLow4h, closeAboveEma4h, emaSlopeUp4h, emaSlopeDown4h] = request.security(syminfo.tickerid, biasTimeframeInput, f_get4hContext(), lookahead = barmerge.lookahead_off)
+
+// ============================================================================
+// 4H STRUCTURE -- track the last two confirmed pivots by detecting when the
+// forward-filled pulled value steps to a new one.
+// ============================================================================
+
+var float lastPivotHigh = na
+var float prevPivotHigh = na
+var float lastPivotLow = na
+var float prevPivotLow = na
+
+if not na(pivotHigh4h) and pivotHigh4h != lastPivotHigh
+    prevPivotHigh := lastPivotHigh
+    lastPivotHigh := pivotHigh4h
+
+if not na(pivotLow4h) and pivotLow4h != lastPivotLow
+    prevPivotLow := lastPivotLow
+    lastPivotLow := pivotLow4h
+
+bool haveEnoughPivots = not na(lastPivotHigh) and not na(prevPivotHigh) and not na(lastPivotLow) and not na(prevPivotLow)
+
+bool higherHigh = haveEnoughPivots and lastPivotHigh > prevPivotHigh
+bool lowerHigh = haveEnoughPivots and lastPivotHigh < prevPivotHigh
+bool higherLow = haveEnoughPivots and lastPivotLow > prevPivotLow
+bool lowerLow = haveEnoughPivots and lastPivotLow < prevPivotLow
+
+bool structureUp = higherHigh and higherLow
+bool structureDown = lowerHigh and lowerLow
+
+bool slowFilterUp = closeAboveEma4h and emaSlopeUp4h
+bool slowFilterDown = (not closeAboveEma4h) and emaSlopeDown4h
+
+// ============================================================================
+// 4H BIAS -- structure AND slow filter must both agree; disagreement is
+// NO_TRADE, not a coin flip, per spec.
+// ============================================================================
+
+string bias = structureUp and slowFilterUp ? "LONG_ONLY" : structureDown and slowFilterDown ? "SHORT_ONLY" : "NO_TRADE"
+
+// ============================================================================
+// 1H CONTEXT -- same one-function-per-security-call pattern. ta.dmi()
+// itself returns a 3-value tuple, which can't be nested as a single slot
+// inside another tuple literal, so it's destructured LOCALLY inside this
+// function and only the single ADX value is passed onward.
+// ============================================================================
+
+f_efficiencyRatio(int length) =>
+    float netMove = math.abs(close - close[length])
+    float sumMoves = 0.0
+    for i = 0 to length - 1
+        sumMoves += math.abs(close[i] - close[i + 1])
+    sumMoves > 0 ? netMove / sumMoves : 0.0
+
+f_get1hContext() =>
+    [plusDi, minusDi, adx] = ta.dmi(adxLengthInput, adxLengthInput)
+    float emaFast = ta.ema(close, fastEmaInput)
+    float emaSlow = ta.ema(close, slowEmaInput)
+    float er = f_efficiencyRatio(erLengthInput)
+    [adx, emaFast, emaSlow, er]
+
+[adx1h, emaFast1h, emaSlow1h, er1h] = request.security(syminfo.tickerid, trendTimeframeInput, f_get1hContext(), lookahead = barmerge.lookahead_off)
+
+// ============================================================================
+// 1H TREND CONFIRMATION
+// ============================================================================
+
+bool adxOk = adx1h >= adxMinimumInput
+bool emaStackOk = bias == "LONG_ONLY" ? emaFast1h > emaSlow1h : bias == "SHORT_ONLY" ? emaFast1h < emaSlow1h : false
+bool erOk = er1h >= erMinimumInput
+
+bool trendOK = bias != "NO_TRADE" and adxOk and emaStackOk and erOk
+
+// ============================================================================
+// CHANGE LOG -- for the spec's explicit "verify no repaint" instruction.
+// Records only actual transitions (not every bar), so reloading later and
+// comparing the same historical bar indices is a direct repaint check.
+// ============================================================================
+
+var string lastLoggedBias = ""
+var bool lastLoggedTrendOK = na
+var array<string> changeLog = array.new_string()
+
+if barstate.isconfirmed
+    if bias != lastLoggedBias
+        array.unshift(changeLog, "bar" + str.tostring(bar_index) + " BIAS -> " + bias)
+        if array.size(changeLog) > 8
+            array.pop(changeLog)
+        lastLoggedBias := bias
+
+    if trendOK != lastLoggedTrendOK
+        array.unshift(changeLog, "bar" + str.tostring(bar_index) + " TRENDOK -> " + str.tostring(trendOK))
+        if array.size(changeLog) > 8
+            array.pop(changeLog)
+        lastLoggedTrendOK := trendOK
+
+// ============================================================================
+// PLOTS -- background = 4H bias, bar color = 1H trendOK confirming it
+// ============================================================================
+
+color biasBg = bias == "LONG_ONLY" ? color.new(color.green, 85) : bias == "SHORT_ONLY" ? color.new(color.red, 85) : color.new(color.gray, 92)
+bgcolor(showBiasBackgroundInput ? biasBg : na, title = "4H Bias Background")
+
+color trendBarColor = not trendOK ? na : bias == "LONG_ONLY" ? color.new(color.lime, 20) : bias == "SHORT_ONLY" ? color.new(color.red, 20) : na
+barcolor(showTrendBarColorInput ? trendBarColor : na, title = "1H TrendOK Bar Color")
+
+plot(pivotHigh4h, title = "4H Pivot High (raw)", color = color.new(color.orange, 60), style = plot.style_circles, display = display.data_window)
+plot(pivotLow4h, title = "4H Pivot Low (raw)", color = color.new(color.blue, 60), style = plot.style_circles, display = display.data_window)
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+var table statusTable = table.new(position.top_right, 2, 14, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast
+    table.cell(statusTable, 0, 0, "STAGE 4 MTF BIAS STACK", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+
+    table.cell(statusTable, 0, 1, "4H Bias", text_color = color.white)
+    table.cell(statusTable, 1, 1, bias, text_color = bias == "LONG_ONLY" ? color.lime : bias == "SHORT_ONLY" ? color.red : color.gray)
+
+    table.cell(statusTable, 0, 2, "4H Structure", text_color = color.white)
+    table.cell(statusTable, 1, 2, structureUp ? "HH + HL" : structureDown ? "LH + LL" : "MIXED", text_color = color.white)
+
+    table.cell(statusTable, 0, 3, "4H Price vs EMA / Slope", text_color = color.white)
+    table.cell(statusTable, 1, 3, (closeAboveEma4h ? "ABOVE" : "BELOW") + " / " + (emaSlopeUp4h ? "UP" : emaSlopeDown4h ? "DOWN" : "FLAT"), text_color = color.white)
+
+    table.cell(statusTable, 0, 4, "1H TrendOK", text_color = color.white)
+    table.cell(statusTable, 1, 4, trendOK ? "TRUE" : "FALSE", text_color = trendOK ? color.lime : color.gray)
+
+    table.cell(statusTable, 0, 5, "1H ADX", text_color = color.white)
+    table.cell(statusTable, 1, 5, str.tostring(adx1h, "#.0") + (adxOk ? " OK" : " LOW"), text_color = adxOk ? color.lime : color.gray)
+
+    table.cell(statusTable, 0, 6, "1H EMA Stack", text_color = color.white)
+    table.cell(statusTable, 1, 6, emaStackOk ? "ALIGNED" : "NOT ALIGNED", text_color = emaStackOk ? color.lime : color.gray)
+
+    table.cell(statusTable, 0, 7, "1H Efficiency Ratio", text_color = color.white)
+    table.cell(statusTable, 1, 7, str.tostring(er1h, "#.##") + (erOk ? " OK" : " CHOP"), text_color = erOk ? color.lime : color.gray)
+
+    table.cell(statusTable, 0, 8, "Change Log", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 1, 8, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+
+    int maxLogRows = 5
+    for r = 0 to maxLogRows - 1
+        int tableRow = 9 + r
+        if r < array.size(changeLog)
+            table.cell(statusTable, 0, tableRow, array.get(changeLog, r), text_color = color.white, text_halign = text.align_left)
+            table.cell(statusTable, 1, tableRow, "", text_color = color.white)
+        else
+            table.cell(statusTable, 0, tableRow, "", text_color = color.white)
+            table.cell(statusTable, 1, tableRow, "", text_color = color.white)
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+
+plot(adx1h, title = "1H ADX", display = display.data_window)
+plot(er1h, title = "1H Efficiency Ratio", display = display.data_window)
+plot(emaFast1h, title = "1H EMA Fast", display = display.data_window)
+plot(emaSlow1h, title = "1H EMA Slow", display = display.data_window)
