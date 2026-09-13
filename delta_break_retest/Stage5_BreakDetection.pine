@@ -69,6 +69,11 @@ float barDelta = f_delta(open, high, low, close, nz(volume, 0.0))
 // ============================================================================
 
 int profileRowsInput = input.int(40, "Profile Rows (POI Extraction Granularity)", minval = 10, maxval = 120, group = "POI Extraction")
+bool showLiveProfileInput = input.bool(true, "Show Live Delta Profile (Price-Binned Histogram)", group = "Delta Profile", tooltip = "The price-by-price buy/sell strength histogram from Stage 1/2 -- teal/orange boxes at each price row, current session only. Restored per request; the dashboard's Buyers/Sellers bar is a compact SUMMARY of this, not a replacement for it.")
+int histogramOffsetInput = input.int(6, "Histogram Offset (Bars)", minval = 1, maxval = 60, group = "Delta Profile")
+int histogramWidthInput = input.int(30, "Histogram Max Width (Bars)", minval = 5, maxval = 100, group = "Delta Profile")
+color positiveDeltaColorInput = input.color(color.teal, "Positive Delta Color", group = "Delta Profile")
+color negativeDeltaColorInput = input.color(color.orange, "Negative Delta Color", group = "Delta Profile")
 string poiAtrTimeframeInput = input.timeframe("15", "POI Zone ATR Timeframe", group = "POI Extraction", tooltip = "Per spec: zone half-width is 0.25 x ATR(14) on 15m by default.")
 float poiAtrMultInput = input.float(0.25, "POI Zone Half-Width (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = "POI Extraction")
 int contaminationThresholdInput = input.int(3, "Contamination Threshold (Crossings)", minval = 1, maxval = 10, group = "POI Extraction")
@@ -477,6 +482,61 @@ if array.size(poiRegistry) > 0
                     array.unshift(breakLog, "bar" + str.tostring(bar_index) + " " + p.poiType + " DOWN @ " + str.tostring(close, format.mintick) + (p.breakAligned ? " (aligned)" : ""))
                     if array.size(breakLog) > 8
                         array.pop(breakLog)
+
+// ============================================================================
+// LIVE IN-SESSION DELTA PROFILE (Stage 1/2, restored)
+// ----------------------------------------------------------------------------
+// Dropped from this file's first draft as an out-of-scope carry-forward;
+// put back per explicit request -- the dashboard's Buyers/Sellers bar is a
+// single-number SUMMARY of recent buy/sell dominance, not a substitute for
+// seeing WHERE along the price axis that pressure actually concentrated.
+// Unchanged logic from Stage 1/2: current session only, rebuilt fresh each
+// bar on barstate.islast, drawn as teal/orange boxes to the right of price.
+// ============================================================================
+
+var array<box> profileBoxes = array.new_box()
+
+if showLiveProfileInput and barstate.islast
+
+    if array.size(profileBoxes) > 0
+        for i = 0 to array.size(profileBoxes) - 1
+            box.delete(array.get(profileBoxes, i))
+    array.clear(profileBoxes)
+
+    float scanHigh2 = -1.0e20
+    float scanLow2 = 1.0e20
+    int scanBars2 = math.min(barsIntoSession, 2000)
+
+    for i = 0 to scanBars2 - 1
+        scanHigh2 := math.max(scanHigh2, high[i])
+        scanLow2 := math.min(scanLow2, low[i])
+
+    float rowStep2 = math.max((scanHigh2 - scanLow2) / profileRowsInput, syminfo.mintick)
+
+    array<float> rowDelta2 = array.new_float(profileRowsInput, 0.0)
+
+    for i = 0 to scanBars2 - 1
+        float d2 = f_delta(open[i], high[i], low[i], close[i], nz(volume[i], 0.0))
+        int row2 = int(math.floor((close[i] - scanLow2) / rowStep2))
+        row2 := math.max(0, math.min(profileRowsInput - 1, row2))
+        array.set(rowDelta2, row2, array.get(rowDelta2, row2) + d2)
+
+    float maxAbs2 = 0.0
+    for row2 = 0 to profileRowsInput - 1
+        maxAbs2 := math.max(maxAbs2, math.abs(array.get(rowDelta2, row2)))
+
+    int centerX2 = bar_index + histogramOffsetInput
+
+    for row2 = 0 to profileRowsInput - 1
+        float d2 = array.get(rowDelta2, row2)
+        if d2 != 0
+            float rowLow2 = scanLow2 + row2 * rowStep2
+            float rowHigh2 = rowLow2 + rowStep2
+            int barWidth2 = maxAbs2 > 0 ? int(math.round(histogramWidthInput * math.abs(d2) / maxAbs2)) : 0
+            if barWidth2 > 0
+                color barColor2 = d2 >= 0 ? positiveDeltaColorInput : negativeDeltaColorInput
+                box rowBox2 = box.new(left = centerX2, top = rowHigh2, right = centerX2 + barWidth2, bottom = rowLow2, xloc = xloc.bar_index, bgcolor = color.new(barColor2, 15), border_color = color.new(barColor2, 40))
+                array.push(profileBoxes, rowBox2)
 
 // ============================================================================
 // DASHBOARD
