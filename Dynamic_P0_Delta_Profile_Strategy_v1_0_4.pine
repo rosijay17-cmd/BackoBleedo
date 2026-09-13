@@ -2523,7 +2523,7 @@ architectureTablePosition = (
 var table architectureTable = table.new(
      architectureTablePosition,
      5,
-     10,
+     12,
      bgcolor = color.new(color.rgb(15, 20, 27), 10),
      border_width = 1
 )
@@ -2620,9 +2620,47 @@ if barstate.islast
             table.cell(architectureTable, 3, 9, f_pct(profileCoherence), text_color = color.white)
         table.cell(architectureTable, readCol, 9, profileCoherence >= minimumCoherence ? "STRUCTURED" : "NOISY", text_color = profileCoherence >= minimumCoherence ? acceptanceColor : color.gray)
 
+        // Cooldown bar, per side. Two gates feed into readiness now: the
+        // plain bar-count cooldown (cooldownOkLong/Short) AND the
+        // stale-signal guard (longCooldownArmed/shortCooldownArmed) added
+        // separately -- READY requires both, STALE means the bar count is
+        // done but the same raw setup never actually reset yet, COOLING
+        // means the bar count itself hasn't elapsed.
+        float longCooldownElapsed = bar_index - lastLongExitBar
+        float longCooldownProgressPct = f_clamp(100.0 * longCooldownElapsed / math.max(cooldownBarsLongInput, 1), 0.0, 100.0)
+        int longCooldownBarsLeft = int(math.max(0.0, cooldownBarsLongInput - longCooldownElapsed))
+        string readLongCooldown = (not cooldownOkLong ?
+             "COOLING" :
+             not longCooldownArmed ?
+             "STALE" :
+             "READY")
+
+        table.cell(architectureTable, 0, 10, "Long Cooldown", text_color = color.white)
+        table.cell(architectureTable, 1, 10, f_bar(longCooldownProgressPct), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 10, f_bar(100.0 - longCooldownProgressPct), text_color = rejectionColor)
+        if showLiveColumnInput
+            table.cell(architectureTable, 3, 10, str.tostring(longCooldownBarsLeft) + " left", text_color = color.white)
+        table.cell(architectureTable, readCol, 10, readLongCooldown, text_color = readLongCooldown == "READY" ? acceptanceColor : readLongCooldown == "STALE" ? color.orange : rejectionColor)
+
+        float shortCooldownElapsed = bar_index - lastShortExitBar
+        float shortCooldownProgressPct = f_clamp(100.0 * shortCooldownElapsed / math.max(cooldownBarsShortInput, 1), 0.0, 100.0)
+        int shortCooldownBarsLeft = int(math.max(0.0, cooldownBarsShortInput - shortCooldownElapsed))
+        string readShortCooldown = (not cooldownOkShort ?
+             "COOLING" :
+             not shortCooldownArmed ?
+             "STALE" :
+             "READY")
+
+        table.cell(architectureTable, 0, 11, "Short Cooldown", text_color = color.white)
+        table.cell(architectureTable, 1, 11, f_bar(shortCooldownProgressPct), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 11, f_bar(100.0 - shortCooldownProgressPct), text_color = rejectionColor)
+        if showLiveColumnInput
+            table.cell(architectureTable, 3, 11, str.tostring(shortCooldownBarsLeft) + " left", text_color = color.white)
+        table.cell(architectureTable, readCol, 11, readShortCooldown, text_color = readShortCooldown == "READY" ? acceptanceColor : readShortCooldown == "STALE" ? color.orange : rejectionColor)
+
         dashboardSizeValue = f_dashboardSize(dashboardTextSize)
 
-        for dashboardRow = 0 to 9
+        for dashboardRow = 0 to 11
             for dashboardCol = 0 to 4
                 table.cell_set_text_size(
                      architectureTable,
