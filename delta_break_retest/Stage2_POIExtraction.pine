@@ -1,0 +1,399 @@
+//@version=6
+
+// ============================================================================
+// DELTA BREAK & RETEST -- STAGE 2: POI EXTRACTION
+// ----------------------------------------------------------------------------
+// Per the build spec (Section 9), Stage 2: "Delta profile + POI extraction.
+// Plot POI zones. No trading logic yet. Eyeball 10 sessions: do the levels
+// land where price actually reacts?"
+//
+// Builds on Stage 1 (delta engine + price-binned session profile, carried
+// forward unchanged) and adds POI extraction per Section 3 of the spec:
+//   - Delta POC        (row with max |net delta|)
+//   - Delta Extreme +  (most positive net-delta row -- session buy initiative)
+//   - Delta Extreme -  (most negative net-delta row -- session sell initiative)
+//   - Delta Flip Level (price where cumulative delta-by-price changes sign)
+//   - Absorption Node  (high |delta| relative to price range traversed --
+//                        the passive side ate aggression without giving up
+//                        ground)
+// Each POI extracted at session close, turned into a ZONE (price +/- 0.25 x
+// ATR(14) on 15m, per spec), then tracked with the hygiene rules from
+// Section 3: contamination counter (>=3 crossings retires it), freshness
+// expiry (default 2 sessions untested), minimum-separation merge, and a
+// capped active set (default 6).
+//
+// A prior session's still-untouched Delta POC naturally becomes the spec's
+// "Untested Naked Level" simply by surviving to a later session still
+// tested=false -- no separate extraction step needed, it's a STATUS a POC
+// POI can carry, flagged as such once it's outlived its own session.
+//
+// STILL NO TRADING LOGIC -- indicator only. No break detection, no retest,
+// no triggers, no orders. Those are Stages 4-7.
+//
+// SCOPE DISCIPLINE (Section 0) unchanged: f_delta() is the only thing ever
+// inherited from the old script. All POI/zone/registry code below is
+// written fresh for this rebuild.
+//
+// KNOWN RISK: this stage introduces Pine v6 user-defined types and an array
+// of object references (the POI registry) -- meaningfully more syntactic
+// surface area than the simple scalar diagnostics used so far, and I have
+// no live Pine compiler to verify it against. Flagging that plainly rather
+// than presenting it with the same confidence as Stage 1's simpler code --
+// if it throws a compile error, send the exact message and I'll fix it
+// directly rather than guess again.
+// ============================================================================
+
+indicator(title = "Delta Break & Retest - Stage 2 POI Extraction", shorttitle = "DBR Stage2", overlay = true, max_boxes_count = 200, max_labels_count = 200)
+
+// ============================================================================
+// PURE DELTA FUNCTION (unchanged from Stage 1 / the original port)
+// ============================================================================
+
+f_delta(float o, float h, float l, float c, float v) =>
+    float safeRange = math.max(h - l, syminfo.mintick)
+    float pressure = math.max(math.min((c - o) / safeRange, 1.0), -1.0)
+    v * pressure
+
+float barDelta = f_delta(open, high, low, close, nz(volume, 0.0))
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+int profileRowsInput = input.int(40, "Profile Rows", minval = 10, maxval = 120, group = "Delta Profile")
+int histogramOffsetInput = input.int(6, "Histogram Offset (Bars)", minval = 1, maxval = 60, group = "Delta Profile")
+int histogramWidthInput = input.int(30, "Histogram Max Width (Bars)", minval = 5, maxval = 100, group = "Delta Profile")
+color positiveDeltaColorInput = input.color(color.teal, "Positive Delta Color", group = "Delta Profile")
+color negativeDeltaColorInput = input.color(color.orange, "Negative Delta Color", group = "Delta Profile")
+bool showLiveProfileInput = input.bool(true, "Show Live In-Session Profile", group = "Delta Profile")
+
+string poiAtrTimeframeInput = input.timeframe("15", "POI Zone ATR Timeframe", group = "POI Extraction", tooltip = "Per spec: zone half-width is 0.25 x ATR(14) on 15m by default.")
+float poiAtrMultInput = input.float(0.25, "POI Zone Half-Width (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = "POI Extraction")
+int contaminationThresholdInput = input.int(3, "Contamination Threshold (Crossings)", minval = 1, maxval = 10, group = "POI Extraction", tooltip = "A POI is retired once price has crossed into its zone this many separate times.")
+int poiFreshnessSessionsInput = input.int(2, "POI Freshness (Sessions Untested)", minval = 1, maxval = 10, group = "POI Extraction")
+float minSeparationAtrMultInput = input.float(0.5, "Minimum POI Separation (x ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = "POI Extraction")
+int maxActivePoisInput = input.int(6, "Max Active POIs", minval = 1, maxval = 10, group = "POI Extraction")
+bool showAbsorptionInput = input.bool(true, "Extract Absorption Node", group = "POI Extraction")
+int minEndedSessionBarsInput = input.int(10, "Minimum Bars To Finalize A Session", minval = 3, maxval = 100, group = "POI Extraction", tooltip = "Safety floor -- a degenerate near-empty session (holiday, data gap) below this many bars is skipped rather than extracting garbage POIs from it.")
+
+color pocColorInput = input.color(color.aqua, "Delta POC Color", group = "POI Colors")
+color extremeColorInput = input.color(color.fuchsia, "Delta Extreme Color", group = "POI Colors")
+color flipColorInput = input.color(color.yellow, "Delta Flip Color", group = "POI Colors")
+color absorptionColorInput = input.color(color.silver, "Absorption Node Color", group = "POI Colors")
+
+// ============================================================================
+// 15m ATR (zone sizing only -- not a trade signal, so the standard
+// non-repainting request.security call is sufficient here; a formal
+// no-repaint check is explicit work in Stage 4's MTF bias stack, not
+// skipped, just not duplicated here)
+// ============================================================================
+
+float atr15 = request.security(syminfo.tickerid, poiAtrTimeframeInput, ta.atr(14), lookahead = barmerge.lookahead_off)
+
+// ============================================================================
+// SESSION TRACKING
+// ============================================================================
+
+bool newSession = ta.change(time("D")) != 0
+
+var int sessionStartBar = bar_index
+var int sessionIndex = 0
+
+int barsIntoSession = bar_index - sessionStartBar + 1
+
+var float cumulativeDelta = 0.0
+
+if newSession
+    cumulativeDelta := 0.0
+
+cumulativeDelta := cumulativeDelta + barDelta
+
+// ============================================================================
+// POI TYPE
+// ============================================================================
+
+type Poi
+    float price
+    float zoneLow
+    float zoneHigh
+    string poiType
+    int createdBar
+    int createdSessionIndex
+    int crossCount = 0
+    bool contaminated = false
+    bool tested = false
+    bool touchedLastBar = false
+    box zoneBox = na
+    label zoneLabel = na
+
+var array<Poi> poiRegistry = array.new<Poi>()
+
+// ============================================================================
+// SESSION PROFILE EXTRACTION (called once, at the close of each session)
+//-----------------------------------------------------------------------------
+// barsBack = number of bars in the just-ended session, referenced via [1]..
+// [barsBack] since this runs on the FIRST bar of the NEW session (bar_index
+// itself is the new session's first bar, "yesterday" starts at offset 1).
+// Returns [pocPrice, extremeHighPrice, extremeLowPrice, flipPrice,
+// absorptionPrice].
+// ============================================================================
+
+f_extractSessionPois(int barsBack, int rows) =>
+    float scanHigh = -1.0e20
+    float scanLow = 1.0e20
+
+    for i = 1 to barsBack
+        scanHigh := math.max(scanHigh, high[i])
+        scanLow := math.min(scanLow, low[i])
+
+    float rowStep = math.max((scanHigh - scanLow) / rows, syminfo.mintick)
+
+    array<float> rowDelta = array.new_float(rows, 0.0)
+    array<float> rowRange = array.new_float(rows, 0.0)
+    array<float> rowVolume = array.new_float(rows, 0.0)
+
+    for i = 1 to barsBack
+        float d = f_delta(open[i], high[i], low[i], close[i], nz(volume[i], 0.0))
+        int row = int(math.floor((close[i] - scanLow) / rowStep))
+        row := math.max(0, math.min(rows - 1, row))
+        array.set(rowDelta, row, array.get(rowDelta, row) + d)
+        array.set(rowRange, row, array.get(rowRange, row) + (high[i] - low[i]))
+        array.set(rowVolume, row, array.get(rowVolume, row) + nz(volume[i], 0.0))
+
+    float maxAbs = -1.0
+    int pocRow = -1
+
+    for row = 0 to rows - 1
+        float d = array.get(rowDelta, row)
+        if math.abs(d) > maxAbs
+            maxAbs := math.abs(d)
+            pocRow := row
+
+    float pocPrice = pocRow >= 0 ? scanLow + (pocRow + 0.5) * rowStep : na
+
+    float maxPos = 0.0
+    int maxPosRow = -1
+    float maxNeg = 0.0
+    int maxNegRow = -1
+
+    for row = 0 to rows - 1
+        float d = array.get(rowDelta, row)
+        if d > maxPos
+            maxPos := d
+            maxPosRow := row
+        if d < maxNeg
+            maxNeg := d
+            maxNegRow := row
+
+    float extremeHighPrice = maxPosRow >= 0 ? scanLow + (maxPosRow + 0.5) * rowStep : na
+    float extremeLowPrice = maxNegRow >= 0 ? scanLow + (maxNegRow + 0.5) * rowStep : na
+
+    float cum = 0.0
+    float prevCum = 0.0
+    float flipPrice = na
+
+    for row = 0 to rows - 1
+        prevCum := cum
+        cum := cum + array.get(rowDelta, row)
+        if row > 0 and ((prevCum <= 0 and cum > 0) or (prevCum >= 0 and cum < 0))
+            flipPrice := scanLow + row * rowStep
+
+    float totalVol = 0.0
+    for row = 0 to rows - 1
+        totalVol += array.get(rowVolume, row)
+    float avgVol = totalVol / rows
+
+    float bestRatio = -1.0
+    int absorptionRow = -1
+
+    for row = 0 to rows - 1
+        if row != pocRow and array.get(rowVolume, row) > avgVol * 0.5
+            float rng = array.get(rowRange, row)
+            float ratio = rng > 0 ? math.abs(array.get(rowDelta, row)) / rng : 0.0
+            if ratio > bestRatio
+                bestRatio := ratio
+                absorptionRow := row
+
+    float absorptionPrice = absorptionRow >= 0 ? scanLow + (absorptionRow + 0.5) * rowStep : na
+
+    [pocPrice, extremeHighPrice, extremeLowPrice, flipPrice, absorptionPrice]
+
+// ============================================================================
+// POI REGISTRY: cleanup (contaminated / expired-untested) and add-with-hygiene
+// ============================================================================
+
+f_cleanupPois(array<Poi> registry, int currentSessionIndex, int freshnessSessions) =>
+    int i = array.size(registry) - 1
+    while i >= 0
+        Poi p = array.get(registry, i)
+        bool expired = not p.tested and (currentSessionIndex - p.createdSessionIndex) >= freshnessSessions
+        if p.contaminated or expired
+            if not na(p.zoneBox)
+                box.delete(p.zoneBox)
+            if not na(p.zoneLabel)
+                label.delete(p.zoneLabel)
+            array.remove(registry, i)
+        i -= 1
+
+f_tryAddPoi(array<Poi> registry, float price, string poiType, color poiColor, float atrVal, float zoneMult, float minSepMult, int maxActive, int sessIdx) =>
+    bool added = false
+    if not na(price) and not na(atrVal) and atrVal > 0 and array.size(registry) < maxActive
+        float halfWidth = atrVal * zoneMult
+        float zLow = price - halfWidth
+        float zHigh = price + halfWidth
+
+        bool tooClose = false
+        for i = 0 to array.size(registry) - 1
+            Poi existing = array.get(registry, i)
+            if not existing.contaminated and math.abs(existing.price - price) < atrVal * minSepMult
+                tooClose := true
+
+        if not tooClose
+            Poi newPoi = Poi.new(price = price, zoneLow = zLow, zoneHigh = zHigh, poiType = poiType, createdBar = bar_index, createdSessionIndex = sessIdx)
+            newPoi.zoneBox := box.new(left = bar_index, top = zHigh, right = bar_index, bottom = zLow, xloc = xloc.bar_index, bgcolor = color.new(poiColor, 85), border_color = poiColor)
+            newPoi.zoneLabel := label.new(bar_index, zHigh, poiType, style = label.style_label_down, color = color.new(poiColor, 20), textcolor = color.white, size = size.tiny)
+            array.push(registry, newPoi)
+            added := true
+    added
+
+// ============================================================================
+// SESSION CLOSE: finalize the ended session's profile, extract POIs
+// ============================================================================
+
+if newSession
+    if bar_index > 0 and barsIntoSession > 1
+        int endedBars = bar_index - sessionStartBar
+        if endedBars >= minEndedSessionBarsInput and not na(atr15)
+            [pocPx, exHighPx, exLowPx, flipPx, absPx] = f_extractSessionPois(endedBars, profileRowsInput)
+
+            f_cleanupPois(poiRegistry, sessionIndex, poiFreshnessSessionsInput)
+
+            f_tryAddPoi(poiRegistry, pocPx, "Delta POC", pocColorInput, atr15, poiAtrMultInput, minSeparationAtrMultInput, maxActivePoisInput, sessionIndex)
+            f_tryAddPoi(poiRegistry, exHighPx, "Delta Extreme +", extremeColorInput, atr15, poiAtrMultInput, minSeparationAtrMultInput, maxActivePoisInput, sessionIndex)
+            f_tryAddPoi(poiRegistry, exLowPx, "Delta Extreme -", extremeColorInput, atr15, poiAtrMultInput, minSeparationAtrMultInput, maxActivePoisInput, sessionIndex)
+            f_tryAddPoi(poiRegistry, flipPx, "Delta Flip", flipColorInput, atr15, poiAtrMultInput, minSeparationAtrMultInput, maxActivePoisInput, sessionIndex)
+            if showAbsorptionInput
+                f_tryAddPoi(poiRegistry, absPx, "Absorption Node", absorptionColorInput, atr15, poiAtrMultInput, minSeparationAtrMultInput, maxActivePoisInput, sessionIndex)
+
+    sessionIndex += 1
+    sessionStartBar := bar_index
+
+// ============================================================================
+// EVERY BAR: update contamination / tested status, extend active zone boxes
+// ============================================================================
+
+if array.size(poiRegistry) > 0
+    for i = 0 to array.size(poiRegistry) - 1
+        Poi p = array.get(poiRegistry, i)
+
+        if not p.contaminated
+            bool touchedNow = high >= p.zoneLow and low <= p.zoneHigh
+
+            if touchedNow and not p.touchedLastBar
+                if not p.tested
+                    p.tested := true
+                p.crossCount := p.crossCount + 1
+                if p.crossCount >= contaminationThresholdInput
+                    p.contaminated := true
+
+            p.touchedLastBar := touchedNow
+
+            if not na(p.zoneBox)
+                box.set_right(p.zoneBox, bar_index)
+
+            if p.contaminated and not na(p.zoneBox)
+                box.set_bgcolor(p.zoneBox, color.new(color.gray, 92))
+                box.set_border_color(p.zoneBox, color.new(color.gray, 60))
+
+// ============================================================================
+// LIVE IN-SESSION PROFILE (Stage 1, carried forward unchanged, optional)
+// ============================================================================
+
+var array<box> profileBoxes = array.new_box()
+
+if showLiveProfileInput and barstate.islast
+
+    if array.size(profileBoxes) > 0
+        for i = 0 to array.size(profileBoxes) - 1
+            box.delete(array.get(profileBoxes, i))
+    array.clear(profileBoxes)
+
+    float scanHigh2 = -1.0e20
+    float scanLow2 = 1.0e20
+    int scanBars2 = math.min(barsIntoSession, 2000)
+
+    for i = 0 to scanBars2 - 1
+        scanHigh2 := math.max(scanHigh2, high[i])
+        scanLow2 := math.min(scanLow2, low[i])
+
+    float rowStep2 = math.max((scanHigh2 - scanLow2) / profileRowsInput, syminfo.mintick)
+
+    array<float> rowDelta2 = array.new_float(profileRowsInput, 0.0)
+
+    for i = 0 to scanBars2 - 1
+        float d2 = f_delta(open[i], high[i], low[i], close[i], nz(volume[i], 0.0))
+        int row2 = int(math.floor((close[i] - scanLow2) / rowStep2))
+        row2 := math.max(0, math.min(profileRowsInput - 1, row2))
+        array.set(rowDelta2, row2, array.get(rowDelta2, row2) + d2)
+
+    float maxAbs2 = 0.0
+    for row2 = 0 to profileRowsInput - 1
+        maxAbs2 := math.max(maxAbs2, math.abs(array.get(rowDelta2, row2)))
+
+    int centerX2 = bar_index + histogramOffsetInput
+
+    for row2 = 0 to profileRowsInput - 1
+        float d2 = array.get(rowDelta2, row2)
+        if d2 != 0
+            float rowLow2 = scanLow2 + row2 * rowStep2
+            float rowHigh2 = rowLow2 + rowStep2
+            int barWidth2 = maxAbs2 > 0 ? int(math.round(histogramWidthInput * math.abs(d2) / maxAbs2)) : 0
+            if barWidth2 > 0
+                color barColor2 = d2 >= 0 ? positiveDeltaColorInput : negativeDeltaColorInput
+                box rowBox2 = box.new(left = centerX2, top = rowHigh2, right = centerX2 + barWidth2, bottom = rowLow2, xloc = xloc.bar_index, bgcolor = color.new(barColor2, 15), border_color = color.new(barColor2, 40))
+                array.push(profileBoxes, rowBox2)
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+var table statusTable = table.new(position.top_right, 2, 16, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast
+    table.cell(statusTable, 0, 0, "STAGE 2 POI EXTRACTION", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+
+    table.cell(statusTable, 0, 1, "Session Index", text_color = color.white)
+    table.cell(statusTable, 1, 1, str.tostring(sessionIndex), text_color = color.white)
+
+    table.cell(statusTable, 0, 2, "ATR(14) on " + poiAtrTimeframeInput, text_color = color.white)
+    table.cell(statusTable, 1, 2, str.tostring(atr15, format.mintick), text_color = color.white)
+
+    table.cell(statusTable, 0, 3, "Active POIs", text_color = color.white)
+    table.cell(statusTable, 1, 3, str.tostring(array.size(poiRegistry)) + " / " + str.tostring(maxActivePoisInput), text_color = color.white)
+
+    table.cell(statusTable, 0, 4, "Session Net Delta", text_color = color.white)
+    table.cell(statusTable, 1, 4, str.tostring(cumulativeDelta, "#"), text_color = cumulativeDelta >= 0 ? positiveDeltaColorInput : negativeDeltaColorInput)
+
+    int listRowStart = 5
+    int maxListRows = 10
+
+    for r = 0 to maxListRows - 1
+        int tableRow = listRowStart + r
+        if r < array.size(poiRegistry)
+            Poi p = array.get(poiRegistry, r)
+            string statusText = p.contaminated ? "DEAD" : (not p.tested and (sessionIndex - p.createdSessionIndex) >= 1 ? "NAKED" : (p.tested ? "TESTED" : "FRESH"))
+            table.cell(statusTable, 0, tableRow, p.poiType, text_color = color.white)
+            table.cell(statusTable, 1, tableRow, str.tostring(p.price, format.mintick) + " " + statusText + " x" + str.tostring(p.crossCount), text_color = p.contaminated ? color.gray : color.white)
+        else
+            table.cell(statusTable, 0, tableRow, "", text_color = color.white)
+            table.cell(statusTable, 1, tableRow, "", text_color = color.white)
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+
+plot(barDelta, title = "Per-Bar Delta", display = display.data_window)
+plot(cumulativeDelta, title = "Cumulative Session Delta", display = display.data_window)
+plot(atr15, title = "ATR(14) on POI Timeframe", display = display.data_window)
+plot(array.size(poiRegistry), title = "Active POI Count", display = display.data_window)
