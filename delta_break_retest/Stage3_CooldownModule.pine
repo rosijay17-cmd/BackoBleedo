@@ -1,0 +1,298 @@
+//@version=6
+
+// ============================================================================
+// DELTA BREAK & RETEST -- STAGE 3: COOLDOWN MODULE (standalone, self-tested)
+// ----------------------------------------------------------------------------
+// Per the build spec, Section 6 ("this is the piece that failed before --
+// build it this way") and Section 9's explicit instruction: "Cooldown
+// module + test harness, standalone. Assert correct gating against
+// synthetic sequences. This is built BEFORE the entry logic, not after."
+//
+// No POI extraction, no bias stack, no break/retest, no orders in this file
+// at all -- it doesn't even reference price. This is the cooldown module in
+// total isolation, proven correct against a scripted synthetic sequence of
+// entries/exits on THIS chart's own bar_index, independent of whatever
+// symbol/timeframe it happens to be added to.
+//
+// ARCHITECTURAL RULES FOLLOWED (Section 6, non-negotiable):
+//   1. No countdown variables anywhere -- every gate is bar-index
+//      arithmetic compared at read time (barIndex - lastEventBar < N).
+//   2. All state mutation gated by barstate.isconfirmed.
+//   3. Cooldown state lives in its own module (the CooldownState type +
+//      f_canTrade/f_recordExit/f_resetSession functions below) with zero
+//      knowledge of any entry state machine -- there isn't one in this
+//      file to have knowledge of.
+//   4. The entry state machine (when it exists, Stage 6+) QUERIES via
+//      f_canTrade(); it never writes cooldown state directly -- only
+//      f_recordExit()/f_resetSession() do, and only those two functions
+//      mutate the CooldownState object.
+//   5. Every test run writes a result line (bar index, test name, actual
+//      vs. expected) to the dashboard -- nothing is asserted silently.
+//
+// FOUR INDEPENDENT LAYERS (Section 6 table), checked in this priority
+// order when more than one would apply on the same query (consecutive-loss
+// is an explicit "hard stop, no override" per spec, so it's checked first;
+// the other three don't carry an explicit priority in the spec, so global
+// post-trade -> per-POI -> per-direction was chosen as the most conservative
+// reading and is documented here rather than left implicit):
+//   1. CONSECUTIVE_LOSS_LOCKOUT -- 2 losses this session -> session over
+//   2. GLOBAL_POST_TRADE        -- 6 bars after a win / 12 after a loss
+//   3. POI_LOCKOUT              -- one attempt per POI, ever, this session
+//   4. DIRECTION_LOCKOUT        -- 12 bars after a loss in that direction
+// ============================================================================
+
+indicator(title = "Delta Break & Retest - Stage 3 Cooldown Module", shorttitle = "DBR Stage3", overlay = false)
+
+// ============================================================================
+// INPUTS -- cooldown parameters, matching Section 6's defaults
+// ============================================================================
+
+int globalCooldownWinBarsInput = input.int(6, "Global Post-Trade Cooldown (Bars, After Win)", minval = 0, group = "Cooldown Parameters")
+int globalCooldownLossBarsInput = input.int(12, "Global Post-Trade Cooldown (Bars, After Loss)", minval = 0, group = "Cooldown Parameters")
+int directionCooldownBarsInput = input.int(12, "Per-Direction Cooldown After Loss (Bars)", minval = 0, group = "Cooldown Parameters")
+int consecutiveLossLimitInput = input.int(2, "Consecutive-Loss Session Limit", minval = 1, group = "Cooldown Parameters")
+
+// ============================================================================
+// COOLDOWN MODULE
+//-----------------------------------------------------------------------------
+// Everything the rest of this file (and, later, the real entry state
+// machine) needs lives behind these three functions. Nothing outside this
+// section ever reaches into CooldownState's fields directly.
+// ============================================================================
+
+type CooldownState
+    int lastExitBarIndex = na
+    bool lastExitWasWin = false
+    int lastLongLossBar = na
+    int lastShortLossBar = na
+    int lossesThisSession = 0
+    array<string> usedPoiIds = array.new_string()
+
+f_poiUsed(array<string> usedIds, string poiId) =>
+    bool found = false
+    if array.size(usedIds) > 0
+        for i = 0 to array.size(usedIds) - 1
+            if array.get(usedIds, i) == poiId
+                found := true
+    found
+
+// QUERY -- read-only. The entry state machine calls this and only this.
+f_canTrade(CooldownState state, string direction, string poiId, int barIdx, int winBars, int lossBars, int dirBars, int lossLimit) =>
+    string reason = "OK"
+    bool tradeable = true
+
+    if state.lossesThisSession >= lossLimit
+        tradeable := false
+        reason := "CONSECUTIVE_LOSS_LOCKOUT"
+
+    if tradeable and not na(state.lastExitBarIndex)
+        int requiredBars = state.lastExitWasWin ? winBars : lossBars
+        if barIdx - state.lastExitBarIndex < requiredBars
+            tradeable := false
+            reason := "GLOBAL_POST_TRADE"
+
+    if tradeable and f_poiUsed(state.usedPoiIds, poiId)
+        tradeable := false
+        reason := "POI_LOCKOUT"
+
+    if tradeable
+        int lastDirLoss = direction == "long" ? state.lastLongLossBar : state.lastShortLossBar
+        if not na(lastDirLoss) and barIdx - lastDirLoss < dirBars
+            tradeable := false
+            reason := "DIRECTION_LOCKOUT"
+
+    [tradeable, reason]
+
+// MUTATION -- only these two functions ever change CooldownState, and only
+// ever called from a barstate.isconfirmed block (rule 2).
+f_recordExit(CooldownState state, int barIdx, bool isWin, string direction, string poiId) =>
+    state.lastExitBarIndex := barIdx
+    state.lastExitWasWin := isWin
+    if not isWin
+        if direction == "long"
+            state.lastLongLossBar := barIdx
+        else
+            state.lastShortLossBar := barIdx
+        state.lossesThisSession := state.lossesThisSession + 1
+    if not f_poiUsed(state.usedPoiIds, poiId)
+        array.push(state.usedPoiIds, poiId)
+
+f_resetSession(CooldownState state) =>
+    state.lossesThisSession := 0
+    array.clear(state.usedPoiIds)
+
+// ============================================================================
+// STANDALONE TEST HARNESS
+//-----------------------------------------------------------------------------
+// A single live CooldownState, driven entirely by a scripted synthetic
+// sequence anchored to t0 (the first bar this indicator sees on whatever
+// chart it's added to) -- deterministic and portable regardless of symbol
+// or timeframe, since nothing here touches price. Each numbered test is an
+// ASSERT against f_canTrade(); each unlabeled step between them is a setup
+// action (a synthetic exit or a session reset) that only mutates state.
+// ============================================================================
+
+var CooldownState cd = CooldownState.new()
+
+var int t0 = na
+if na(t0)
+    t0 := bar_index
+
+f_formatResult(string testName, bool actualTradeable, string actualReason, bool expectedTradeable, string expectedReason) =>
+    bool pass = actualTradeable == expectedTradeable and actualReason == expectedReason
+    string line = (pass ? "PASS  " : "FAIL  ") + testName + "  got=" + (actualTradeable ? "OK" : actualReason) + " want=" + (expectedTradeable ? "OK" : expectedReason)
+    [pass, line]
+
+var array<string> testLog = array.new_string()
+var int testsPassed = 0
+var int testsFailed = 0
+var bool testsRun = false
+
+if barstate.isconfirmed
+
+    // T1 (t0+5): clean slate -- nothing has happened yet, must be tradeable.
+    if bar_index == t0 + 5
+        [tr, rs] = f_canTrade(cd, "long", "POI_A", bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+        [pass, line] = f_formatResult("T1 clean slate", tr, rs, true, "OK")
+        array.push(testLog, line)
+        testsPassed += pass ? 1 : 0
+        testsFailed += pass ? 0 : 1
+
+    // setup: winning long exit at POI_A
+    if bar_index == t0 + 10
+        f_recordExit(cd, bar_index, true, "long", "POI_A")
+
+    // T2 (t0+11): 1 bar after a WIN -- global post-trade (6 bars) still active.
+    if bar_index == t0 + 11
+        [tr, rs] = f_canTrade(cd, "long", "POI_B", bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+        [pass, line] = f_formatResult("T2 post-win block", tr, rs, false, "GLOBAL_POST_TRADE")
+        array.push(testLog, line)
+        testsPassed += pass ? 1 : 0
+        testsFailed += pass ? 0 : 1
+
+    // T3 (t0+15): 5 bars after the win -- still short of the 6-bar requirement.
+    if bar_index == t0 + 15
+        [tr, rs] = f_canTrade(cd, "long", "POI_B", bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+        [pass, line] = f_formatResult("T3 still blocked", tr, rs, false, "GLOBAL_POST_TRADE")
+        array.push(testLog, line)
+        testsPassed += pass ? 1 : 0
+        testsFailed += pass ? 0 : 1
+
+    // T4 (t0+16): exactly 6 bars after the win -- global post-trade clears.
+    if bar_index == t0 + 16
+        [tr, rs] = f_canTrade(cd, "long", "POI_B", bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+        [pass, line] = f_formatResult("T4 win cooldown clears", tr, rs, true, "OK")
+        array.push(testLog, line)
+        testsPassed += pass ? 1 : 0
+        testsFailed += pass ? 0 : 1
+
+    // T5 (t0+20): global is long clear, but POI_A was already used this
+    // session -- per-POI lockout blocks regardless of bars elapsed.
+    if bar_index == t0 + 20
+        [tr, rs] = f_canTrade(cd, "long", "POI_A", bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+        [pass, line] = f_formatResult("T5 POI lockout", tr, rs, false, "POI_LOCKOUT")
+        array.push(testLog, line)
+        testsPassed += pass ? 1 : 0
+        testsFailed += pass ? 0 : 1
+
+    // setup: losing short exit at POI_C (1st loss this session)
+    if bar_index == t0 + 25
+        f_recordExit(cd, bar_index, false, "short", "POI_C")
+
+    // T6 (t0+30): 5 bars after a LOSS -- global post-trade (12 bars) active.
+    if bar_index == t0 + 30
+        [tr, rs] = f_canTrade(cd, "short", "POI_D", bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+        [pass, line] = f_formatResult("T6 post-loss block", tr, rs, false, "GLOBAL_POST_TRADE")
+        array.push(testLog, line)
+        testsPassed += pass ? 1 : 0
+        testsFailed += pass ? 0 : 1
+
+    // T7 (t0+37): exactly 12 bars after the loss -- global AND the
+    // per-direction (short) lockout clear together.
+    if bar_index == t0 + 37
+        [tr, rs] = f_canTrade(cd, "short", "POI_D", bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+        [pass, line] = f_formatResult("T7 loss cooldown clears", tr, rs, true, "OK")
+        array.push(testLog, line)
+        testsPassed += pass ? 1 : 0
+        testsFailed += pass ? 0 : 1
+
+    // setup: losing long exit at POI_E (2nd loss this session -> hits limit)
+    if bar_index == t0 + 40
+        f_recordExit(cd, bar_index, false, "long", "POI_E")
+
+    // T8 (t0+41): 2nd loss reached -- consecutive-loss lockout is a hard
+    // stop, overriding everything else, on the LONG side.
+    if bar_index == t0 + 41
+        [tr, rs] = f_canTrade(cd, "long", "POI_F", bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+        [pass, line] = f_formatResult("T8 consec-loss (long)", tr, rs, false, "CONSECUTIVE_LOSS_LOCKOUT")
+        array.push(testLog, line)
+        testsPassed += pass ? 1 : 0
+        testsFailed += pass ? 0 : 1
+
+    // T9 (t0+41): the same hard stop blocks the SHORT side too -- it isn't
+    // a per-direction lockout, it's a whole-session stop.
+    if bar_index == t0 + 41
+        [tr, rs] = f_canTrade(cd, "short", "POI_G", bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+        [pass, line] = f_formatResult("T9 consec-loss (short)", tr, rs, false, "CONSECUTIVE_LOSS_LOCKOUT")
+        array.push(testLog, line)
+        testsPassed += pass ? 1 : 0
+        testsFailed += pass ? 0 : 1
+
+    // setup: session resets (new day, in real usage)
+    if bar_index == t0 + 45
+        f_resetSession(cd)
+
+    // T10 (t0+46): reset clears the SESSION-scoped layers (POI lockout,
+    // consecutive-loss) but must NOT touch the bar-count timers -- last
+    // exit was the t0+40 loss, only 6 bars have passed, global post-trade
+    // (12-bar requirement) is correctly still active even after reset.
+    if bar_index == t0 + 46
+        [tr, rs] = f_canTrade(cd, "long", "POI_F", bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+        [pass, line] = f_formatResult("T10 reset != bar-count", tr, rs, false, "GLOBAL_POST_TRADE")
+        array.push(testLog, line)
+        testsPassed += pass ? 1 : 0
+        testsFailed += pass ? 0 : 1
+
+    // T11 (t0+52): 12 bars after the t0+40 loss -- global and direction
+    // (long) both clear, session-scoped layers already clear from the
+    // reset, POI_F was never used. Everything green.
+    if bar_index == t0 + 52
+        [tr, rs] = f_canTrade(cd, "long", "POI_F", bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+        [pass, line] = f_formatResult("T11 fully clear", tr, rs, true, "OK")
+        array.push(testLog, line)
+        testsPassed += pass ? 1 : 0
+        testsFailed += pass ? 0 : 1
+        testsRun := true
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+var table resultsTable = table.new(position.top_right, 2, 14, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast
+    string summaryText = testsRun ? str.tostring(testsPassed) + " / " + str.tostring(testsPassed + testsFailed) + " PASSED" : "running... (need " + str.tostring(math.max(0, t0 + 52 - bar_index)) + " more bars)"
+    color summaryColor = testsRun and testsFailed == 0 ? color.new(color.lime, 20) : testsRun ? color.new(color.red, 20) : color.new(color.gray, 30)
+
+    table.cell(resultsTable, 0, 0, "COOLDOWN MODULE TESTS", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(resultsTable, 1, 0, summaryText, text_color = color.white, bgcolor = summaryColor)
+
+    int maxRows = 12
+    for r = 0 to maxRows - 1
+        int tableRow = r + 1
+        if r < array.size(testLog)
+            string line = array.get(testLog, r)
+            bool linePass = str.startswith(line, "PASS")
+            table.cell(resultsTable, 0, tableRow, line, text_color = linePass ? color.lime : color.red, text_halign = text.align_left)
+            table.cell(resultsTable, 1, tableRow, "", text_color = color.white)
+        else
+            table.cell(resultsTable, 0, tableRow, "", text_color = color.white)
+            table.cell(resultsTable, 1, tableRow, "", text_color = color.white)
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+
+plot(testsPassed, title = "Tests Passed", display = display.data_window)
+plot(testsFailed, title = "Tests Failed", display = display.data_window)
+plot(cd.lossesThisSession, title = "Losses This Session", display = display.data_window)
