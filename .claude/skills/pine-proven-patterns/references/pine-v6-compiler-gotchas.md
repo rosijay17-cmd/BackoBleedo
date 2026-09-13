@@ -164,12 +164,60 @@ this is the same file as the MTF pivot pattern (#`mtf-confirmed-pivot-pull.md`);
 the first attempt to apply that pattern to a multi-value context function hit
 this exact error, caught live in the TradingView mobile Pine Editor.
 
+## 6. Comparing a value against `na` with `==`/`!=` is unreliable — always use `na()`/`not na()`
+
+**Symptom:** logic that's supposed to fire "the first time X happens" never
+fires — not once, not ever — even though every upstream signal feeding it is
+confirmed correct and firing constantly. No compile error, no runtime error;
+the condition just silently never becomes true.
+
+```pine
+var int activeEventTime = na
+
+bool newBreakEvent = breakDirection != 0 and breakEventTime != activeEventTime  // INVALID pattern
+```
+
+**Root cause:** Pine's `==`/`!=` comparison operators don't reliably behave
+like a normal equality check when one operand is `na` — comparing a real value
+against `na` this way does not consistently evaluate to `true`/`false` the way
+it intuitively should. The only safe way to test for "is this na" (or its
+inverse) is the dedicated `na(x)` function, never a naive `x == na` or
+`x != na`. This applies to `var`-initialized sentinels especially: a variable
+declared `var int x = na` and later compared with `!=` against a real value
+will not reliably detect "this hasn't been set yet."
+
+**Fix:** explicitly handle the not-yet-set case with `na()` before falling
+back to the normal comparison, once both sides are guaranteed non-na:
+
+```pine
+bool newBreakEvent = breakDirection != 0 and (na(activeEventTime) or breakEventTime != activeEventTime)
+```
+
+**Found in:** `delta_break_retest/Stage6_RetestTrigger.pine` — this was the
+actual root cause of a bug that survived FIVE rounds of unrelated fixes to a
+completely different part of the script (a `request.security()`/MTF pull) before
+being found. Every one of those five rounds correctly diagnosed and fixed real,
+legitimate issues in the pull layer (see `mtf-confirmed-pivot-pull.md`'s own
+history for two of them), and none of them mattered, because the actual bug was
+downstream in the *consumer* logic the whole time: `activeEventTime` started as
+`var int ... = na`, and `breakEventTime != activeEventTime` on the very first
+real event most likely evaluated to `na` (falsy) instead of `true` — so the
+first adoption never happened, the sentinel stayed `na` forever, and every
+subsequent event (600+) hit the identical broken comparison, permanently.
+**Lesson for next time a signal seems dead: audit the CONSUMER of a pulled
+value, not just the pull itself, especially any `!=`/`==` comparison touching
+a `var` initialized to `na`** — don't assume the bug is in the most recently
+touched or most exotic-looking code (the MTF pull here) just because it's the
+newest or most unusual part of the script.
+
 ## When to check this file
 
 Before writing a new `for i = 0 to array.size(x) - 1` loop, a new `type`
 declaration with a non-trivial default, a `var bool` that needs an "unset"
-sentinel, or a `request.security` wrapper function that touches any multi-return
-`ta.*` built-in. All four of these are easy to get wrong in ways that either fail
-to compile (2, 3, 4) or compile fine and fail silently/at runtime later (1) — (1)
-in particular will not surface until the array in question is actually empty,
-which may not happen until well into a real backtest.
+sentinel, a `request.security` wrapper function that touches any multi-return
+`ta.*` built-in, or ANY `==`/`!=` comparison where one side could be `na`
+(especially a `var` sentinel initialized to `na`). These are easy to get wrong
+in ways that either fail to compile (2, 3, 4) or compile fine and fail
+silently/at runtime later (1, 6) — (1) won't surface until the array in
+question is actually empty, and (6) won't surface as an error at all, just as
+logic that mysteriously never fires despite everything upstream working.

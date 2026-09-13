@@ -40,7 +40,7 @@ approach, especially for anything that has already caused a bug once.
 | 1 | MTF confirmed-pivot pull via `ta.valuewhen()` + `lookahead_on` + `[1]` offset (hand-rolled var-state pivot tracking through `request.security` does NOT work) | `references/mtf-confirmed-pivot-pull.md` | `MTF_Second_Flip_Continuation_v1_2.pine` (`f_structureBias()`); applied to fix `delta_break_retest/Stage4_MTFBiasStack.pine` |
 | 2 | Bar-index-arithmetic cooldown (reset on ENTRY not exit, no countdown var, `na` sentinel via large fallback) | `references/bar-index-cooldown-arithmetic.md` | `Trend_Following_Strategy_v6_Signal_Cooldown_FIX.pine`; applied in `delta_break_retest/Stage3_CooldownModule.pine` |
 | 3 | Broker-verified exit detection via `strategy.closedtrades.entry_id()` / `.exit_bar_index()` / `.profit()` instead of inferring exits from `strategy.position_size` transitions | `references/broker-verified-exit-detection.md` | `Ranger_V2_*_POC_State_*.pine` family, `P0_Rebuild_Stage0_SanityCheck.pine`; applied in `Dynamic_P0_Delta_Profile_Strategy_v1_0_4.pine` |
-| 4 | Pine v6 compiler-behavior gotchas (for-loop direction inference on empty arrays, UDT field default-value restriction, `var bool` cannot default to plain `na`, nested tuples from multi-return built-ins, `[]` operator can't index a multi-return tuple) | `references/pine-v6-compiler-gotchas.md` | Discovered/fixed live in `delta_break_retest/Stage2_POIExtraction.pine`, `Stage3_CooldownModule.pine`, `Stage4_MTFBiasStack.pine` |
+| 4 | Pine v6 compiler-behavior gotchas (for-loop direction inference on empty arrays, UDT field default-value restriction, `var bool` cannot default to plain `na`, nested tuples from multi-return built-ins, `[]` operator can't index a multi-return tuple, `==`/`!=` against `na` is unreliable — always use `na()`/`not na()`) | `references/pine-v6-compiler-gotchas.md` | Discovered/fixed live in `delta_break_retest/Stage2_POIExtraction.pine`, `Stage3_CooldownModule.pine`, `Stage4_MTFBiasStack.pine`, `Stage6_RetestTrigger.pine` |
 
 ## Update discipline notes
 
@@ -56,6 +56,27 @@ approach, especially for anything that has already caused a bug once.
 
 ## Changelog
 
+- **2026-09-13 (hard-won lesson)**: `Stage6_RetestTrigger.pine`'s retest/
+  trigger signal stayed dead (Active Zone / Hours Since Break both `--`)
+  through FIVE separate, individually well-reasoned, individually
+  falsified rounds of fixes to its `request.security()`/MTF pull layer
+  (confirmation timing, a Broken-flag dependency, internal `ta.valuewhen`
+  aggregation, the `na`-vs-`0.0` sentinel, and finally a two-layer
+  function-split matching `Supply_and_Demand_Zones_XL.pine`'s proven
+  structure — genuinely the right structural pattern, confirmed against
+  real working repo code per explicit user instruction to stop guessing
+  and check proven scripts, but still not the actual bug). Round 6 finally
+  found it by re-auditing the CONSUMER of the pulled value instead of the
+  pull itself: `bool newBreakEvent = breakDirection != 0 and breakEventTime
+  != activeEventTime`, comparing against a `var int activeEventTime = na`
+  sentinel with `!=` instead of `na()`. Logged as gotcha #6 in
+  `references/pine-v6-compiler-gotchas.md`. The meta-lesson, worth
+  repeating: when a signal is dead, don't assume the bug is in the most
+  recently touched or most exotic-looking code just because it's the
+  newest part of the script — audit the plain consumer logic too, and
+  audit `!=`/`==` comparisons against any `na`-initialized `var`
+  specifically, since Pine won't raise a compile or runtime error for this
+  one, it just silently never fires.
 - **2026-09-13 (correction)**: `references/mtf-confirmed-pivot-pull.md`'s
   original code sample was itself wrong in one detail — it applied the `[1]`
   offset to the whole pulled function call (`f_context()[1]`), which is only
