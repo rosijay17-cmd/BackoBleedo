@@ -238,8 +238,20 @@ f_get15mBreakContext() =>
     // Declared here (not var, so still reset to the "no event" default
     // every bar) so they're visible both to the mutation logic below AND
     // to the ta.valuewhen calls that read them afterward.
-    float eventDirection = 0.0
-    float eventTypeCode = 0.0
+    // FIX (round 4): rounds 1-3 all failed, including round 3's raw
+    // (non-valuewhen) signal -- confirmed on-device running [r3], Break
+    // Events climbed to a real, growing count (proving events genuinely
+    // fire) while Active Zone stayed dead regardless. Re-examined every
+    // WORKING signal in this whole investigation side by side: ph/pl (the
+    // proven pivot pattern) default to na; close > open's valuewhen source
+    // effectively rode on a dense boolean, but the na-vs-0.0 asymmetry
+    // stood out as the one structural difference nothing else has tested
+    // in isolation. eventDirection/eventTypeCode were the only signals in
+    // this whole file using a real number (0.0) as their "nothing
+    // happened" baseline instead of na -- every proven-working signal uses
+    // na. Switched both to na, matching the pivot pattern exactly.
+    float eventDirection = na
+    float eventTypeCode = na
     float eventZoneLow = na
     float eventZoneHigh = na
 
@@ -384,7 +396,7 @@ f_get15mBreakContext() =>
             eventZoneLow := zLow
             eventZoneHigh := zHigh
 
-    if eventDirection != 0.0
+    if not na(eventDirection)
         breakEventCount += 1
 
     // FIX (round 3): rounds 1 (barstate.isconfirmed) and 2 (remove the
@@ -427,7 +439,7 @@ int breakDiagSanityHoursAgo = na(breakDiagSanityTime) ? na : int((time - breakDi
 // not a continuously forward-filled "last known event" the way the
 // ta.valuewhen version was. haveBrokenAny below means "did THIS pull
 // carry a real event," not "has one ever happened by now."
-bool haveBrokenAny = breakDirectionRaw != 0.0
+bool haveBrokenAny = not na(breakDirectionRaw)
 int breakDirection = haveBrokenAny ? int(breakDirectionRaw) : 0
 int breakTypeCode = haveBrokenAny ? int(breakTypeCodeRaw) : 0
 int breakEventTime = haveBrokenAny ? int(breakEventTimeRaw) : na
@@ -645,7 +657,7 @@ if barstate.islast
     // specifically so a screenshot settles "which round is this running"
     // at a glance, without needing the diagnostics toggle on -- this
     // exact question has cost several rounds already.
-    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r3]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r4]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
     table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
     table.cell(statusTable, 0, 1, "Bias", text_color = color.white, text_size = size.small)
