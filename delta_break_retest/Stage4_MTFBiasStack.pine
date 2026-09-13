@@ -162,7 +162,7 @@ bool trendOK = bias != "NO_TRADE" and adxOk and emaStackOk and erOk
 // ============================================================================
 
 var string lastLoggedBias = ""
-var bool lastLoggedTrendOK = na
+var bool lastLoggedTrendOK = false
 var array<string> changeLog = array.new_string()
 
 if barstate.isconfirmed
