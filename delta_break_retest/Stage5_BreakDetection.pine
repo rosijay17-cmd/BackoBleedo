@@ -101,6 +101,11 @@ int slowEmaInput = input.int(50, "1H Slow EMA", minval = 2, group = "MTF Context
 int erLengthInput = input.int(10, "1H Efficiency Ratio Length", minval = 2, group = "MTF Context (Tag Only)")
 float erMinimumInput = input.float(0.30, "1H Minimum Efficiency Ratio", minval = 0, maxval = 1, step = 0.05, group = "MTF Context (Tag Only)")
 
+int deltaStrengthWindowInput = input.int(20, "Buyer/Seller Strength Window (Bars)", minval = 5, maxval = 200, group = "Signal Summary", tooltip = "How many recent bars' delta get pooled into the Buyers/Sellers strength bars.")
+color buyColorInput = input.color(color.teal, "Buyer Strength Color", group = "Signal Summary")
+color sellColorInput = input.color(color.orange, "Seller Strength Color", group = "Signal Summary")
+bool showDiagnosticsInput = input.bool(false, "Show Detailed Diagnostics (POI / Break Log / Session Info)", group = "Signal Summary", tooltip = "Off by default -- the dashboard shows only Bias, Regime, Bull/Bear Score, and Buyer/Seller strength. Turn this on to bring back the POI Status list, Break Log, session index, and ATR readout for debugging.")
+
 // ============================================================================
 // 15m ATR (zone sizing -- unchanged from Stage 2)
 // ============================================================================
@@ -387,6 +392,12 @@ bool emaStackOk = bias == "LONG_ONLY" ? emaFast1h > emaSlow1h : bias == "SHORT_O
 bool erOk = er1h >= erMinimumInput
 bool trendOK = bias != "NO_TRADE" and adxOk and emaStackOk and erOk
 
+// Raw (bias-independent) 1H stack direction -- needed by the bull/bear point
+// score below, which scores each direction on its own merits rather than
+// only ever evaluating the direction bias already picked.
+bool emaStackBullish1h = emaFast1h > emaSlow1h
+bool emaStackBearish1h = emaFast1h < emaSlow1h
+
 // ============================================================================
 // EVERY BAR: contamination/tested bookkeeping (unchanged from Stage 2) AND
 // NEW break detection, merged into one loop over the registry.
@@ -469,75 +480,166 @@ if array.size(poiRegistry) > 0
 
 // ============================================================================
 // DASHBOARD
+// ----------------------------------------------------------------------------
+// Redesigned per explicit request: the previous version dumped every raw
+// diagnostic (session index, ATR, individual POI rows, full break log) at
+// equal visual weight -- correct for validating each build stage, but too
+// much to read at a glance while actually watching the market. Default view
+// is now just five rows: Bias, Regime, Bull Score, Bear Score, and a
+// Buyer/Seller strength bar. Everything from the old detailed view still
+// exists underneath and is one toggle away (showDiagnosticsInput) for
+// debugging -- nothing was deleted, just hidden by default.
 // ============================================================================
 
-// Compact layout: bottom-right (clear of the symbol/price header at the top
-// of the screen), size.tiny on every cell, POI Status and Break Log each cut
-// from 5 rows to 3 -- 16 total rows instead of 20, noticeably smaller on a
-// phone screen without losing any distinct piece of information (just fewer
-// simultaneous POI/log entries visible at once).
-var table statusTable = table.new(position.bottom_right, 2, 16, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+int coreRows = 7
+int diagnosticRows = 13
+int tableRows = showDiagnosticsInput ? coreRows + diagnosticRows : coreRows
+
+var table statusTable = table.new(position.bottom_right, 2, tableRows, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
 
 if barstate.islast
-    table.cell(statusTable, 0, 0, "STAGE 5 BREAK DETECTION", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+    // ---- REGIME: single word, derived from the same ADX/ER chop gate and
+    // bias already computed above. CHOPPY when either strength/efficiency
+    // gate fails regardless of direction; TRANSITIONAL when the market has
+    // enough energy to trade (both gates pass) but 4H structure and the
+    // slow EMA filter disagree on direction (bias == NO_TRADE); otherwise
+    // TRENDING in whichever direction bias picked.
+    string regime = (not adxOk or not erOk) ? "CHOPPY" : bias == "LONG_ONLY" ? "TRENDING UP" : bias == "SHORT_ONLY" ? "TRENDING DOWN" : "TRANSITIONAL"
+    color regimeColor = regime == "CHOPPY" ? color.gray : regime == "TRANSITIONAL" ? color.orange : regime == "TRENDING UP" ? color.lime : color.red
+
+    // ---- BULL / BEAR POINT SCORE: six independent yes/no checks per side,
+    // each worth one point. Deliberately NOT combined into a single net
+    // number -- seeing bull=4/6 next to bear=1/6 (clear edge) reads
+    // differently than bull=3/6 next to bear=3/6 (no edge, not "nets to
+    // zero" which looks the same as "nothing computed"). Same six criteria
+    // mirrored per direction: 4H structure, 4H slow filter (price vs EMA +
+    // slope), 1H ADX strength (direction-agnostic), 1H EMA stack direction,
+    // 1H efficiency ratio (direction-agnostic), recent buyer/seller delta
+    // dominance (computed just below).
+    int bullPoints = 0
+    int bearPoints = 0
+    if structureUp
+        bullPoints += 1
+    if structureDown
+        bearPoints += 1
+    if slowFilterUp
+        bullPoints += 1
+    if slowFilterDown
+        bearPoints += 1
+    if adxOk
+        bullPoints += 1
+        bearPoints += 1
+    if emaStackBullish1h
+        bullPoints += 1
+    if emaStackBearish1h
+        bearPoints += 1
+    if erOk
+        bullPoints += 1
+        bearPoints += 1
+
+    // ---- BUYER / SELLER STRENGTH: pool the last N bars' delta into a
+    // positive (buy) pool and a negative (sell) pool, express each side's
+    // share as a 10-block bar. This is what was missing from the dashboard
+    // entirely in this stage (dropped from Stage 1/2's on-chart histogram
+    // for scope reasons) -- brought back here as a compact readout instead
+    // of the full price-binned profile, since the ask was specifically
+    // "levels of strength," not the detailed price-by-price breakdown.
+    float rollingBuyDelta = 0.0
+    float rollingSellDelta = 0.0
+    for i = 0 to deltaStrengthWindowInput - 1
+        float d = f_delta(open[i], high[i], low[i], close[i], nz(volume[i], 0.0))
+        if d > 0
+            rollingBuyDelta += d
+        else
+            rollingSellDelta += -d
+
+    if rollingBuyDelta > rollingSellDelta
+        bullPoints += 1
+    else if rollingSellDelta > rollingBuyDelta
+        bearPoints += 1
+
+    float totalDelta = rollingBuyDelta + rollingSellDelta
+    float buyRatio = totalDelta > 0 ? rollingBuyDelta / totalDelta : 0.5
+    float sellRatio = 1.0 - buyRatio
+    int buyBlocks = int(math.round(buyRatio * 10))
+    int sellBlocks = int(math.round(sellRatio * 10))
+    string buyBar = str.repeat("█", buyBlocks) + str.repeat("░", 10 - buyBlocks)
+    string sellBar = str.repeat("█", sellBlocks) + str.repeat("░", 10 - sellBlocks)
+
+    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
     table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
-    table.cell(statusTable, 0, 1, "Chart TF", text_color = color.white, text_size = size.tiny)
-    table.cell(statusTable, 1, 1, timeframe.period, text_color = timeframe.period == "15" ? color.lime : color.orange, text_size = size.tiny)
+    table.cell(statusTable, 0, 1, "Bias", text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 1, bias, text_color = bias == "LONG_ONLY" ? color.lime : bias == "SHORT_ONLY" ? color.red : color.gray, text_size = size.small)
 
-    table.cell(statusTable, 0, 2, "Session", text_color = color.white, text_size = size.tiny)
-    table.cell(statusTable, 1, 2, str.tostring(sessionIndex), text_color = color.white, text_size = size.tiny)
+    table.cell(statusTable, 0, 2, "Regime", text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 2, regime, text_color = regimeColor, text_size = size.small)
 
-    table.cell(statusTable, 0, 3, "ATR(14) " + poiAtrTimeframeInput, text_color = color.white, text_size = size.tiny)
-    table.cell(statusTable, 1, 3, str.tostring(atr15, format.mintick), text_color = color.white, text_size = size.tiny)
+    table.cell(statusTable, 0, 3, "Bull Score", text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 3, str.tostring(bullPoints) + " / 6", text_color = bullPoints >= 5 ? color.lime : bullPoints >= 3 ? color.white : color.gray, text_size = size.small)
 
-    table.cell(statusTable, 0, 4, "Active POIs", text_color = color.white, text_size = size.tiny)
-    table.cell(statusTable, 1, 4, str.tostring(array.size(poiRegistry)) + " / " + str.tostring(maxActivePoisInput), text_color = color.white, text_size = size.tiny)
+    table.cell(statusTable, 0, 4, "Bear Score", text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 4, str.tostring(bearPoints) + " / 6", text_color = bearPoints >= 5 ? color.red : bearPoints >= 3 ? color.white : color.gray, text_size = size.small)
 
-    int brokenCount = 0
-    if array.size(poiRegistry) > 0
-        for i = 0 to array.size(poiRegistry) - 1
-            if array.get(poiRegistry, i).broken
-                brokenCount += 1
+    table.cell(statusTable, 0, 5, "Buyers", text_color = buyColorInput, text_size = size.small)
+    table.cell(statusTable, 1, 5, buyBar + " " + str.tostring(int(math.round(buyRatio * 100))) + "%", text_color = buyColorInput, text_size = size.small)
 
-    table.cell(statusTable, 0, 5, "Broken", text_color = color.white, text_size = size.tiny)
-    table.cell(statusTable, 1, 5, str.tostring(brokenCount), text_color = brokenCount > 0 ? color.lime : color.gray, text_size = size.tiny)
+    table.cell(statusTable, 0, 6, "Sellers", text_color = sellColorInput, text_size = size.small)
+    table.cell(statusTable, 1, 6, sellBar + " " + str.tostring(int(math.round(sellRatio * 100))) + "%", text_color = sellColorInput, text_size = size.small)
 
-    table.cell(statusTable, 0, 6, "4H Bias", text_color = color.white, text_size = size.tiny)
-    table.cell(statusTable, 1, 6, bias, text_color = bias == "LONG_ONLY" ? color.lime : bias == "SHORT_ONLY" ? color.red : color.gray, text_size = size.tiny)
+    // ---- Everything below is the old detailed view, unchanged in content,
+    // only shown when showDiagnosticsInput is on.
+    if showDiagnosticsInput
+        table.cell(statusTable, 0, 7, "Chart TF", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 7, timeframe.period, text_color = timeframe.period == "15" ? color.lime : color.orange, text_size = size.tiny)
 
-    table.cell(statusTable, 0, 7, "1H TrendOK", text_color = color.white, text_size = size.tiny)
-    table.cell(statusTable, 1, 7, trendOK ? "TRUE" : "FALSE", text_color = trendOK ? color.lime : color.gray, text_size = size.tiny)
+        table.cell(statusTable, 0, 8, "Session", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 8, str.tostring(sessionIndex), text_color = color.white, text_size = size.tiny)
 
-    table.cell(statusTable, 0, 8, "POI STATUS", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
-    table.cell(statusTable, 1, 8, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        table.cell(statusTable, 0, 9, "ATR(14) " + poiAtrTimeframeInput, text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 9, str.tostring(atr15, format.mintick), text_color = color.white, text_size = size.tiny)
 
-    int poiRowStart = 9
-    int maxPoiRows = 3
-    for r = 0 to maxPoiRows - 1
-        int tableRow = poiRowStart + r
-        if r < array.size(poiRegistry)
-            Poi p = array.get(poiRegistry, r)
-            string statusText = p.contaminated ? "DEAD" : (p.broken ? "BROKEN " + p.breakDirection : (not p.tested and (sessionIndex - p.createdSessionIndex) >= 1 ? "NAKED" : (p.tested ? "TESTED" : "FRESH")))
-            table.cell(statusTable, 0, tableRow, p.poiType, text_color = color.white, text_size = size.tiny)
-            table.cell(statusTable, 1, tableRow, str.tostring(p.price, format.mintick) + " " + statusText, text_color = p.contaminated ? color.gray : (p.broken ? (p.breakDirection == "UP" ? color.lime : color.red) : color.white), text_size = size.tiny)
-        else
-            table.cell(statusTable, 0, tableRow, "", text_color = color.white, text_size = size.tiny)
-            table.cell(statusTable, 1, tableRow, "", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 0, 10, "Active POIs", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 10, str.tostring(array.size(poiRegistry)) + " / " + str.tostring(maxActivePoisInput), text_color = color.white, text_size = size.tiny)
 
-    table.cell(statusTable, 0, 12, "BREAK LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
-    table.cell(statusTable, 1, 12, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        int brokenCount = 0
+        if array.size(poiRegistry) > 0
+            for i = 0 to array.size(poiRegistry) - 1
+                if array.get(poiRegistry, i).broken
+                    brokenCount += 1
 
-    int logRowStart = 13
-    int maxLogRows = 3
-    for r = 0 to maxLogRows - 1
-        int tableRow = logRowStart + r
-        if r < array.size(breakLog)
-            table.cell(statusTable, 0, tableRow, array.get(breakLog, r), text_color = color.white, text_halign = text.align_left, text_size = size.tiny)
-            table.cell(statusTable, 1, tableRow, "", text_color = color.white, text_size = size.tiny)
-        else
-            table.cell(statusTable, 0, tableRow, "", text_color = color.white, text_size = size.tiny)
-            table.cell(statusTable, 1, tableRow, "", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 0, 11, "Broken", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 11, str.tostring(brokenCount), text_color = brokenCount > 0 ? color.lime : color.gray, text_size = size.tiny)
+
+        table.cell(statusTable, 0, 12, "POI STATUS", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        table.cell(statusTable, 1, 12, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+
+        int poiRowStart = 13
+        int maxPoiRows = 3
+        for r = 0 to maxPoiRows - 1
+            int tableRow = poiRowStart + r
+            if r < array.size(poiRegistry)
+                Poi p = array.get(poiRegistry, r)
+                string statusText = p.contaminated ? "DEAD" : (p.broken ? "BROKEN " + p.breakDirection : (not p.tested and (sessionIndex - p.createdSessionIndex) >= 1 ? "NAKED" : (p.tested ? "TESTED" : "FRESH")))
+                table.cell(statusTable, 0, tableRow, p.poiType, text_color = color.white, text_size = size.tiny)
+                table.cell(statusTable, 1, tableRow, str.tostring(p.price, format.mintick) + " " + statusText, text_color = p.contaminated ? color.gray : (p.broken ? (p.breakDirection == "UP" ? color.lime : color.red) : color.white), text_size = size.tiny)
+            else
+                table.cell(statusTable, 0, tableRow, "", text_color = color.white, text_size = size.tiny)
+                table.cell(statusTable, 1, tableRow, "", text_color = color.white, text_size = size.tiny)
+
+        table.cell(statusTable, 0, 16, "BREAK LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        table.cell(statusTable, 1, 16, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+
+        int logRowStart = 17
+        int maxLogRows = 3
+        for r = 0 to maxLogRows - 1
+            int tableRow = logRowStart + r
+            if r < array.size(breakLog)
+                table.cell(statusTable, 0, tableRow, array.get(breakLog, r), text_color = color.white, text_halign = text.align_left, text_size = size.tiny)
+                table.cell(statusTable, 1, tableRow, "", text_color = color.white, text_size = size.tiny)
+            else
+                table.cell(statusTable, 0, tableRow, "", text_color = color.white, text_size = size.tiny)
+                table.cell(statusTable, 1, tableRow, "", text_color = color.white, text_size = size.tiny)
 
 // ============================================================================
 // DATA WINDOW
