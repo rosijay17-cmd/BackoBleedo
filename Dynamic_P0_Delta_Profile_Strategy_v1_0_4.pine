@@ -2821,6 +2821,22 @@ plot(structuralVAL, title = "Structural VAL", display = display.data_window)
 plot(structuralSupport, title = "Structural Delta Support", display = display.data_window)
 plot(structuralResistance, title = "Structural Delta Resistance", display = display.data_window)
 
+// Cooldown ground-truth trace, always computed (every bar, not just on
+// entries/exits) via the Data Window -- no Strategy Tester subscription
+// and no Pine Logs needed. Tap/scrub any historical bar in the cluster
+// and read these directly: Position Size should visibly return to 0
+// between trades, Short Closed Event should show a 1 on the exact bar
+// it happens, and Last Accept Short Exit Bar should jump to that same
+// bar_index right after -- if it stays flat while trades keep closing,
+// that's the proof the cooldown timer genuinely isn't updating.
+plot(strategy.position_size, title = "Position Size", display = display.data_window)
+plot(longClosed ? 1 : 0, title = "Long Closed Event", display = display.data_window)
+plot(shortClosed ? 1 : 0, title = "Short Closed Event", display = display.data_window)
+plot(lastAcceptanceLongExitBar, title = "Last Accept Long Exit Bar", display = display.data_window)
+plot(lastAcceptanceShortExitBar, title = "Last Accept Short Exit Bar", display = display.data_window)
+plot(lastRejectionLongExitBar, title = "Last Reject Long Exit Bar", display = display.data_window)
+plot(lastRejectionShortExitBar, title = "Last Reject Short Exit Bar", display = display.data_window)
+
 // REALTIME VISUALS:
 // Dashboard, dynamic P0, value area, structural levels, and the right-side
 // profile histogram refresh on every realtime tick.
