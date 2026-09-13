@@ -1873,6 +1873,9 @@ bool shortClosed = (
      strategy.position_size[1] < 0)
 
 if longClosed or shortClosed
+    if showCooldownGapLabelsInput
+        label.new(bar_index, longClosed ? low : high, "EXIT type='" + activeTradeType + "'", style = longClosed ? label.style_label_down : label.style_label_up, color = color.new(color.red, 60), textcolor = color.white, size = size.tiny)
+
     if enableDynamicAlerts and alertExits
         string side = longClosed ? "LONG EXIT" : "SHORT EXIT"
 
