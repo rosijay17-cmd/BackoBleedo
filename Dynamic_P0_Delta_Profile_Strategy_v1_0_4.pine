@@ -1415,6 +1415,40 @@ bool rejectionShortRaw = (
      rejectionReturnOK and
      deltaPercent < 0)
 
+//=============================================================================
+// STALE-SIGNAL COOLDOWN GUARD
+//-----------------------------------------------------------------------------
+// A pure bar-count cooldown only delays a re-entry -- it says nothing about
+// whether the SAME raw setup that triggered the last trade is still sitting
+// there unchanged the whole time. If price parks at a range edge for longer
+// than the cooldown window, the raw acceptance/rejection condition can stay
+// (or flicker back) true throughout, and the instant bar_index - lastExitBar
+// clears the cooldown threshold, that same stale setup fires again
+// immediately -- which looks exactly like clustering even though the
+// bar-count minimum was technically honored. requireFreshState's own
+// acceptanceLongFresh-style checks only debounce a SINGLE continuous signal
+// (raw[1]), which does nothing to stop the raw condition from going true,
+// false, true again multiple times across a 20+ bar cooldown window.
+//
+// This mirrors the fix already proven in Trend_Following_Strategy_v6_Cooldown
+// .pine: a per-direction armed flag that disarms the instant a trade closes
+// and only re-arms once the raw condition has genuinely gone false at least
+// once since then -- proof the old setup actually ended, not just a tick
+// count. The rearm check below runs BEFORE the entry engine reads these
+// flags; the disarm-on-exit writes (EXIT DETECTION / COOLDOWN, further down
+// this script) run AFTER, so a same-bar exit always has final say over a
+// same-bar rearm.
+//=============================================================================
+
+var bool longCooldownArmed = true
+var bool shortCooldownArmed = true
+
+if not acceptanceLongRaw and not rejectionLongRaw
+    longCooldownArmed := true
+
+if not acceptanceShortRaw and not rejectionShortRaw
+    shortCooldownArmed := true
+
 bool acceptanceLongFresh = (
      not requireFreshState or
      not acceptanceLongRaw[1])
@@ -1449,6 +1483,7 @@ bool structuralFilterShortOk = not useStructuralFilterInput or na(structuralSupp
 bool acceptanceLongArmed = (
      flat and
      cooldownOkLong and
+     longCooldownArmed and
      acceptanceLongRaw and
      acceptanceLongFresh and
      structuralFilterLongOk)
@@ -1456,6 +1491,7 @@ bool acceptanceLongArmed = (
 bool acceptanceShortArmed = (
      flat and
      cooldownOkShort and
+     shortCooldownArmed and
      acceptanceShortRaw and
      acceptanceShortFresh and
      structuralFilterShortOk)
@@ -1463,6 +1499,7 @@ bool acceptanceShortArmed = (
 bool rejectionLongArmed = (
      flat and
      cooldownOkLong and
+     longCooldownArmed and
      rejectionLongRaw and
      rejectionLongFresh and
      dynamicP0 > close and
@@ -1471,6 +1508,7 @@ bool rejectionLongArmed = (
 bool rejectionShortArmed = (
      flat and
      cooldownOkShort and
+     shortCooldownArmed and
      rejectionShortRaw and
      rejectionShortFresh and
      dynamicP0 < close and
@@ -1748,8 +1786,10 @@ if longClosed or shortClosed
 
     if longClosed
         lastLongExitBar := bar_index
+        longCooldownArmed := false
     if shortClosed
         lastShortExitBar := bar_index
+        shortCooldownArmed := false
 
     activeEntry := na
     activeStop := na
