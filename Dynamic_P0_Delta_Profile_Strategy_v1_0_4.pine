@@ -1442,6 +1442,23 @@ bool cooldownOkRejectionLong = bar_index - lastRejectionLongExitBar >= cooldownB
 bool cooldownOkRejectionShort = bar_index - lastRejectionShortExitBar >= cooldownBarsShortInput
 bool flat = strategy.position_size == 0
 
+// Cumulative position-size change log -- unlike a live snapshot, this
+// builds up across the ENTIRE processed history (same var-array pattern
+// as exitLog), so it stays meaningful no matter what bar you're
+// scrolled back to looking at. Every entry AND every exit changes
+// strategy.position_size, so this traces the real fill sequence
+// directly: if it shows 0 -> -1 -> 0 -> -1 -> 0 pairs, positions really
+// are opening and closing; if it only ever shows 0 -> -1 -> -2 -> -3
+// (never returning to 0), pyramiding/netting is stacking instead of
+// closing, which would explain why longClosed/shortClosed never fires.
+var array<string> positionChangeLog = array.new_string()
+
+if strategy.position_size != strategy.position_size[1]
+    string posChangeEntry = str.tostring(strategy.position_size[1]) + "->" + str.tostring(strategy.position_size) + "@" + str.tostring(bar_index)
+    array.unshift(positionChangeLog, posChangeEntry)
+    if array.size(positionChangeLog) > 6
+        array.pop(positionChangeLog)
+
 bool bullishCandleOK = not requireDirectionalCandle or close > open
 bool bearishCandleOK = not requireDirectionalCandle or close < open
 
@@ -2771,15 +2788,22 @@ if barstate.islast
         table.cell(architectureTable, 0, 12, "Exit Log", text_color = color.white)
         table.cell(architectureTable, 1, 12, exitLogText, text_color = color.white, text_halign = text.align_left)
 
-        // Most fundamental question left: is a real position ever open at
-        // all, on THIS bar, right now? If this reads 0 even while entry
-        // markers keep appearing, strategy.entry() isn't actually filling
-        // -- the markers are firing purely from our own script's scoring
-        // logic, independent of any real broker-side position ever
-        // forming, and longClosed/shortClosed can never fire because
-        // position_size never leaves 0 to begin with.
-        table.cell(architectureTable, 0, 13, "Position Size (Now)", text_color = color.white)
-        table.cell(architectureTable, 1, 13, str.tostring(strategy.position_size), text_color = strategy.position_size > 0 ? acceptanceColor : strategy.position_size < 0 ? rejectionColor : color.gray)
+        // CORRECTED: a live "position size right now" reading only shows
+        // the CURRENT/last bar's state, not whatever bar you're scrolled
+        // back to looking at -- of course it reads flat if the strategy
+        // isn't in a trade at this exact moment, regardless of what
+        // happened historically. Showing the cumulative change log
+        // instead (same var-array pattern as Exit Log), which stays
+        // meaningful no matter the scroll position: if this is empty,
+        // strategy.position_size has NEVER changed throughout the ENTIRE
+        // processed history, meaning strategy.entry() has never actually
+        // filled once -- the entry markers are firing purely from our own
+        // scoring logic. If it's NOT empty, this shows the real
+        // 0->X->0->X sequence directly, which tells us whether closes are
+        // genuinely reaching exactly 0 or getting stuck somewhere else.
+        string positionLogText = array.size(positionChangeLog) > 0 ? array.join(positionChangeLog, "  ") : "no changes yet"
+        table.cell(architectureTable, 0, 13, "Position Log", text_color = color.white)
+        table.cell(architectureTable, 1, 13, positionLogText, text_color = color.white, text_halign = text.align_left)
 
         dashboardSizeValue = f_dashboardSize(dashboardTextSize)
 
