@@ -73,21 +73,26 @@ bool showTrendBarColorInput = input.bool(true, "Show 1H TrendOK Bar Color", grou
 // inline across a tuple literal.
 // ============================================================================
 
-// FIXED: the original version computed ta.pivothigh()/pivotlow() inside a
-// function pulled with lookahead=barmerge.lookahead_off, then hand-tracked
-// "latest vs. previous confirmed pivot" via var state watching the pulled
-// series change -- that combination never produced a real value through
-// request.security in practice (confirmed empirically: 0 pivot updates
-// seen across months of fully-loaded 4H history, Replay ruled out as the
-// cause). Replaced with the exact pattern already proven working elsewhere
-// in this repo (MTF_Second_Flip_Continuation_v1_2.pine's f_structureBias):
-// ta.valuewhen(not na(pivot), pivot, N) for "the Nth most recent confirmed
-// pivot" computed natively inside the function (no hand-rolled var
-// tracking needed), pulled with lookahead=barmerge.lookahead_on plus an
-// explicit [1] offset on the whole function call -- the standard safe MTF
-// idiom for functions like pivots that already carry their own internal
-// confirmation delay, which lookahead_off alone doesn't synchronize
-// correctly for.
+// FIXED (round 1): the original version computed ta.pivothigh()/pivotlow()
+// inside a function pulled with lookahead=barmerge.lookahead_off, then
+// hand-tracked "latest vs. previous confirmed pivot" via var state watching
+// the pulled series change -- that combination never produced a real value
+// through request.security in practice (confirmed empirically: 0 pivot
+// updates seen across months of fully-loaded 4H history, Replay ruled out
+// as the cause). Replaced with the pattern proven working elsewhere in this
+// repo (MTF_Second_Flip_Continuation_v1_2.pine's f_structureBias):
+// ta.valuewhen(not na(pivot), pivot, N) computed natively inside the
+// function, pulled with lookahead=barmerge.lookahead_on plus a one-bar-back
+// offset.
+//
+// FIXED (round 2, CE10123): that reference function returns a SINGLE value,
+// so f_structureBias()[1] is valid -- the [] history-reference operator can
+// only be applied to a single series, not to a tuple. This function returns
+// SEVEN values, so f_get4hContext()[1] is invalid ("operator SQBR" cannot
+// take a tuple argument). Fix: apply the [1] offset to each value
+// INDIVIDUALLY on the function's own last line, inside the function (still
+// evaluated in the pulled HTF context), and pass the tuple to
+// request.security with no outer [1].
 f_get4hContext() =>
     float ph = ta.pivothigh(high, pivotLeftInput, pivotRightInput)
     float pl = ta.pivotlow(low, pivotLeftInput, pivotRightInput)
@@ -102,9 +107,9 @@ f_get4hContext() =>
     bool slopeUp = ema > ema[biasSlopeLookbackInput]
     bool slopeDown = ema < ema[biasSlopeLookbackInput]
 
-    [latestHigh, previousHigh, latestLow, previousLow, aboveEma, slopeUp, slopeDown]
+    [latestHigh[1], previousHigh[1], latestLow[1], previousLow[1], aboveEma[1], slopeUp[1], slopeDown[1]]
 
-[lastPivotHigh, prevPivotHigh, lastPivotLow, prevPivotLow, closeAboveEma4h, emaSlopeUp4h, emaSlopeDown4h] = request.security(syminfo.tickerid, biasTimeframeInput, f_get4hContext()[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[lastPivotHigh, prevPivotHigh, lastPivotLow, prevPivotLow, closeAboveEma4h, emaSlopeUp4h, emaSlopeDown4h] = request.security(syminfo.tickerid, biasTimeframeInput, f_get4hContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
 
 // ============================================================================
 // 4H STRUCTURE -- latest vs. previous confirmed pivot, both now supplied
@@ -151,14 +156,17 @@ f_get1hContext() =>
     float emaFast = ta.ema(close, fastEmaInput)
     float emaSlow = ta.ema(close, slowEmaInput)
     float er = f_efficiencyRatio(erLengthInput)
-    [adx, emaFast, emaSlow, er]
+    [adx[1], emaFast[1], emaSlow[1], er[1]]
 
 // Same safe MTF idiom as the 4H pull, applied here too for consistency --
 // this one already worked fine under the old lookahead_off (ADX/EMA/ER all
 // read correctly in testing), but there's no reason for the 4H and 1H
 // pulls to use two different lookahead strategies once one of them is
-// known to be the more robust choice.
-[adx1h, emaFast1h, emaSlow1h, er1h] = request.security(syminfo.tickerid, trendTimeframeInput, f_get1hContext()[1], gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+// known to be the more robust choice. Offset is applied per-value INSIDE
+// the function (see f_get4hContext's comment) since this also returns a
+// tuple, not a single series -- request.security(...)[1] on the outer call
+// is invalid here (CE10123).
+[adx1h, emaFast1h, emaSlow1h, er1h] = request.security(syminfo.tickerid, trendTimeframeInput, f_get1hContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
 
 // ============================================================================
 // 1H TREND CONFIRMATION

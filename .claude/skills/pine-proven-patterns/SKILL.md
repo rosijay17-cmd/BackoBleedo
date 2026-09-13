@@ -40,7 +40,7 @@ approach, especially for anything that has already caused a bug once.
 | 1 | MTF confirmed-pivot pull via `ta.valuewhen()` + `lookahead_on` + `[1]` offset (hand-rolled var-state pivot tracking through `request.security` does NOT work) | `references/mtf-confirmed-pivot-pull.md` | `MTF_Second_Flip_Continuation_v1_2.pine` (`f_structureBias()`); applied to fix `delta_break_retest/Stage4_MTFBiasStack.pine` |
 | 2 | Bar-index-arithmetic cooldown (reset on ENTRY not exit, no countdown var, `na` sentinel via large fallback) | `references/bar-index-cooldown-arithmetic.md` | `Trend_Following_Strategy_v6_Signal_Cooldown_FIX.pine`; applied in `delta_break_retest/Stage3_CooldownModule.pine` |
 | 3 | Broker-verified exit detection via `strategy.closedtrades.entry_id()` / `.exit_bar_index()` / `.profit()` instead of inferring exits from `strategy.position_size` transitions | `references/broker-verified-exit-detection.md` | `Ranger_V2_*_POC_State_*.pine` family, `P0_Rebuild_Stage0_SanityCheck.pine`; applied in `Dynamic_P0_Delta_Profile_Strategy_v1_0_4.pine` |
-| 4 | Pine v6 compiler-behavior gotchas (for-loop direction inference on empty arrays, UDT field default-value restriction, `var bool` cannot default to plain `na`, nested tuples from multi-return built-ins) | `references/pine-v6-compiler-gotchas.md` | Discovered/fixed live in `delta_break_retest/Stage2_POIExtraction.pine`, `Stage3_CooldownModule.pine`, `Stage4_MTFBiasStack.pine` |
+| 4 | Pine v6 compiler-behavior gotchas (for-loop direction inference on empty arrays, UDT field default-value restriction, `var bool` cannot default to plain `na`, nested tuples from multi-return built-ins, `[]` operator can't index a multi-return tuple) | `references/pine-v6-compiler-gotchas.md` | Discovered/fixed live in `delta_break_retest/Stage2_POIExtraction.pine`, `Stage3_CooldownModule.pine`, `Stage4_MTFBiasStack.pine` |
 
 ## Update discipline notes
 
@@ -56,6 +56,17 @@ approach, especially for anything that has already caused a bug once.
 
 ## Changelog
 
+- **2026-09-13 (correction)**: `references/mtf-confirmed-pivot-pull.md`'s
+  original code sample was itself wrong in one detail — it applied the `[1]`
+  offset to the whole pulled function call (`f_context()[1]`), which is only
+  valid for a single-return function. Porting the pattern to
+  `Stage4_MTFBiasStack.pine`'s multi-value context functions
+  (`f_get4hContext()`, `f_get1hContext()`) hit CE10123 ("operator SQBR" can't
+  take a tuple) on the very next compile. Fixed in both the code and the
+  reference doc: for multi-return functions, `[1]` goes on each return value
+  individually, inside the function, not on the outer call. Logged as its own
+  gotcha (#5) in `references/pine-v6-compiler-gotchas.md` per this skill's own
+  "don't silently overwrite, surface the correction" rule.
 - **2026-09-13**: Skill created. Seeded with the four patterns above, all
   directly surfaced during the `delta_break_retest/` staged rebuild session:
   the MTF pivot fix (found by searching the repo per explicit user instruction

@@ -121,6 +121,49 @@ checking for this shape any time a built-in that returns multiple values
 (`ta.dmi`, `ta.macd`, `ta.bb`, `ta.kc`, etc.) is used inside a function destined
 for `request.security`.
 
+## 5. The `[]` history-reference operator can't be applied to a multi-return tuple (CE10123)
+
+**Symptom:** `Cannot call "operator SQBR" with argument "expr0"=...` naming a
+function call whose type is a list like `[series float, series float, series
+float, series float]`, followed by `An argument of [...] type was used but a
+"series na" is expected.`
+
+```pine
+f_context() =>
+    // ...
+    [valA, valB, valC, valD]
+
+// INVALID -- f_context() returns 4 values, not 1
+[a, b, c, d] = request.security(syminfo.tickerid, tf, f_context()[1], ...)
+```
+
+**Root cause:** `expr[N]` (the historical-reference operator) only accepts a
+single series expression. A function that returns multiple values returns a
+tuple, and a tuple is not a valid operand for `[]` — even though `[]` on a
+*single-return* function call (e.g. `f_structureBias()[1]` where
+`f_structureBias()` returns one `int`) is perfectly valid and is exactly the
+recommended way to apply a one-bar-back offset before a `lookahead_on`
+`request.security()` pull (see `references/mtf-confirmed-pivot-pull.md`).
+
+**Fix:** for a multi-return function, apply `[1]` to each return value
+INDIVIDUALLY on the function's own last line — still inside the function, so
+it's still evaluated in the pulled context — then pass the bare (un-indexed)
+function call to `request.security()`:
+
+```pine
+f_context() =>
+    // ...
+    [valA[1], valB[1], valC[1], valD[1]]   // offset baked in here
+
+[a, b, c, d] = request.security(syminfo.tickerid, tf, f_context(), ...)   // no outer [1]
+```
+
+**Found in:** `delta_break_retest/Stage4_MTFBiasStack.pine`, both
+`f_get4hContext()` (7 return values) and `f_get1hContext()` (4 return values) —
+this is the same file as the MTF pivot pattern (#`mtf-confirmed-pivot-pull.md`);
+the first attempt to apply that pattern to a multi-value context function hit
+this exact error, caught live in the TradingView mobile Pine Editor.
+
 ## When to check this file
 
 Before writing a new `for i = 0 to array.size(x) - 1` loop, a new `type`
