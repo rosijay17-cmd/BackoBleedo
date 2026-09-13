@@ -1892,31 +1892,75 @@ if strategy.position_size < 0
 // EXIT DETECTION / COOLDOWN
 //=============================================================================
 
-bool longClosed = (
-     strategy.position_size == 0 and
-     strategy.position_size[1] > 0)
+// SWITCHED from position-size-transition detection (strategy.position_size
+// == 0 and strategy.position_size[1] != 0) to Pine's own closed-trades
+// history. The diagnostics above (Exit Log / Position Log, both stuck at
+// "no changes/exits yet" across the entire backtest despite many visible
+// entry markers) point at this script's own position-size-diff tracking
+// missing the transition -- strategy.closedtrades is a monotonic counter
+// Pine maintains internally and increments the instant a trade genuinely
+// closes, regardless of how that surfaced (or didn't) in a bar-to-bar [1]
+// comparison. strategy.closedtrades.entry_id()/exit_bar_index() also query
+// the exact closed trade directly by its real entry id, instead of relying
+// on this script's own activeTradeType bookkeeping to infer which type it
+// was.
+var int processedClosedTrades = 0
+var string closedEntryIdThisUpdate = ""
+var int closedExitBarThisUpdate = na
 
-bool shortClosed = (
-     strategy.position_size == 0 and
-     strategy.position_size[1] < 0)
+bool acceptanceLongClosedNow = false
+bool acceptanceShortClosedNow = false
+bool rejectionLongClosedNow = false
+bool rejectionShortClosedNow = false
+
+bool closedTradeThisUpdate = strategy.closedtrades > processedClosedTrades
+
+if closedTradeThisUpdate
+    int closedTradeNumber = strategy.closedtrades - 1
+
+    closedEntryIdThisUpdate := strategy.closedtrades.entry_id(closedTradeNumber)
+    closedExitBarThisUpdate := strategy.closedtrades.exit_bar_index(closedTradeNumber)
+
+    if closedEntryIdThisUpdate == "Acceptance Long"
+        lastAcceptanceLongExitBar := closedExitBarThisUpdate
+        acceptanceLongCooldownArmed := false
+        acceptanceLongClosedNow := true
+
+    if closedEntryIdThisUpdate == "Acceptance Short"
+        lastAcceptanceShortExitBar := closedExitBarThisUpdate
+        acceptanceShortCooldownArmed := false
+        acceptanceShortClosedNow := true
+
+    if closedEntryIdThisUpdate == "Rejection Long"
+        lastRejectionLongExitBar := closedExitBarThisUpdate
+        rejectionLongCooldownArmed := false
+        rejectionLongClosedNow := true
+
+    if closedEntryIdThisUpdate == "Rejection Short"
+        lastRejectionShortExitBar := closedExitBarThisUpdate
+        rejectionShortCooldownArmed := false
+        rejectionShortClosedNow := true
+
+    processedClosedTrades := strategy.closedtrades
+
+bool longClosed = acceptanceLongClosedNow or rejectionLongClosedNow
+bool shortClosed = acceptanceShortClosedNow or rejectionShortClosedNow
 
 // Rolling exit log, shown on the dashboard (guaranteed visible on
 // mobile, unlike Pine Logs / Strategy Tester / Data Window custom
-// plots) -- records the RAW activeTradeType at the moment of every
-// detected exit, whatever it actually is, even if it doesn't match any
-// of the four expected strings. If it's ever unexpectedly empty or
-// mismatched here, that's the direct proof of why a cooldown timer
-// isn't updating -- no more inferring it from chart clutter.
+// plots) -- records the entry id Pine itself reports for the closed
+// trade, straight from strategy.closedtrades.entry_id(), not this
+// script's own activeTradeType guess.
 var array<string> exitLog = array.new_string()
 
-if longClosed or shortClosed
-    string exitLogEntry = (longClosed ? "L" : "S") + "|'" + activeTradeType + "'|bar" + str.tostring(bar_index)
+if closedTradeThisUpdate
+    string exitLogEntry = (longClosed ? "L" : "S") + "|'" + closedEntryIdThisUpdate + "'|bar" + str.tostring(closedExitBarThisUpdate)
     array.unshift(exitLog, exitLogEntry)
     if array.size(exitLog) > 4
         array.pop(exitLog)
 
     if showCooldownGapLabelsInput
-        label.new(bar_index, longClosed ? low : high, "EXIT type='" + activeTradeType + "'", style = longClosed ? label.style_label_down : label.style_label_up, color = color.new(color.red, 60), textcolor = color.white, size = size.tiny)
+        label.new(bar_index, longClosed ? low : high, "EXIT id='" + closedEntryIdThisUpdate + "'", style = longClosed ? label.style_label_down : label.style_label_up, color = color.new(color.red, 60), textcolor = color.white, size = size.tiny)
 
     if enableDynamicAlerts and alertExits
         string side = longClosed ? "LONG EXIT" : "SHORT EXIT"
@@ -1924,7 +1968,7 @@ if longClosed or shortClosed
         alert(
              side +
              " | " +
-             activeTradeType +
+             closedEntryIdThisUpdate +
              " | " +
              syminfo.ticker +
              " " +
@@ -1933,21 +1977,6 @@ if longClosed or shortClosed
              f_price(close),
              alert.freq_once_per_bar_close
         )
-
-    if longClosed
-        if activeTradeType == "ACCEPTANCE LONG"
-            lastAcceptanceLongExitBar := bar_index
-            acceptanceLongCooldownArmed := false
-        if activeTradeType == "REJECTION LONG"
-            lastRejectionLongExitBar := bar_index
-            rejectionLongCooldownArmed := false
-    if shortClosed
-        if activeTradeType == "ACCEPTANCE SHORT"
-            lastAcceptanceShortExitBar := bar_index
-            acceptanceShortCooldownArmed := false
-        if activeTradeType == "REJECTION SHORT"
-            lastRejectionShortExitBar := bar_index
-            rejectionShortCooldownArmed := false
 
     activeEntry := na
     activeStop := na
