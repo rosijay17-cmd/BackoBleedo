@@ -64,12 +64,26 @@ f_delta(float o, float h, float l, float c, float v) =>
 
 float barDelta = f_delta(open, high, low, close, nz(volume, 0.0))
 
+// The live delta profile's lookback can now reach up to 30 days scanned via
+// dynamic (variable) historical offsets -- time[i]/open[i]/high[i]/low[i]/
+// close[i]/volume[i] inside a while/for loop, not a fixed constant offset
+// Pine's compiler can size the buffer for automatically. Force the buffer
+// explicitly so a 30-day setting doesn't silently truncate on a chart
+// where the auto-detected default would otherwise be too small.
+max_bars_back(time, 5000)
+max_bars_back(open, 5000)
+max_bars_back(high, 5000)
+max_bars_back(low, 5000)
+max_bars_back(close, 5000)
+max_bars_back(volume, 5000)
+
 // ============================================================================
 // INPUTS
 // ============================================================================
 
 int profileRowsInput = input.int(40, "Profile Rows (POI Extraction Granularity)", minval = 10, maxval = 120, group = "POI Extraction")
-bool showLiveProfileInput = input.bool(true, "Show Live Delta Profile (Price-Binned Histogram)", group = "Delta Profile", tooltip = "The price-by-price buy/sell strength histogram from Stage 1/2 -- teal/orange boxes at each price row, current session only. Restored per request; the dashboard's Buyers/Sellers bar is a compact SUMMARY of this, not a replacement for it.")
+bool showLiveProfileInput = input.bool(true, "Show Live Delta Profile (Price-Binned Histogram)", group = "Delta Profile", tooltip = "The price-by-price buy/sell strength histogram from Stage 1/2 -- teal/orange boxes at each price row. Restored per request; the dashboard's Buyers/Sellers bar is a compact SUMMARY of this, not a replacement for it.")
+int histogramLookbackDaysInput = input.int(1, "Histogram Lookback (Days)", minval = 1, maxval = 30, group = "Delta Profile", tooltip = "How far back the live delta profile pools bars from -- a rolling window measured in calendar days from the most recent bar, not tied to session boundaries. 1 = roughly the last trading day; raise up to 30 to build the histogram from many days of bars instead of just the current session. Internally capped at 5000 bars scanned regardless of this setting, to stay inside Pine's own historical-offset limit on a low chart timeframe.")
 int histogramOffsetInput = input.int(6, "Histogram Offset (Bars)", minval = 1, maxval = 60, group = "Delta Profile")
 int histogramWidthInput = input.int(30, "Histogram Max Width (Bars)", minval = 5, maxval = 100, group = "Delta Profile")
 color positiveDeltaColorInput = input.color(color.teal, "Positive Delta Color", group = "Delta Profile")
@@ -505,7 +519,19 @@ if showLiveProfileInput and barstate.islast
 
     float scanHigh2 = -1.0e20
     float scanLow2 = 1.0e20
-    int scanBars2 = math.min(barsIntoSession, 2000)
+
+    // Lookback is a configurable ROLLING TIME WINDOW (up to 30 days) rather
+    // than being locked to "current session only" -- walk back bar by bar
+    // while still inside the window, capped at 5000 bars scanned (Pine's
+    // own historical-offset ceiling) so a large day count on a low chart
+    // timeframe can't ask for an unbounded number of bars.
+    int lookbackMs = histogramLookbackDaysInput * 24 * 60 * 60 * 1000
+    int cutoffTime = time - lookbackMs
+    int maxScanCap = 5000
+    int scanBars2 = 0
+    while scanBars2 < maxScanCap and scanBars2 < bar_index and time[scanBars2] >= cutoffTime
+        scanBars2 += 1
+    scanBars2 := math.max(scanBars2, 1)
 
     for i = 0 to scanBars2 - 1
         scanHigh2 := math.max(scanHigh2, high[i])
