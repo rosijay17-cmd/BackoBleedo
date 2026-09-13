@@ -150,6 +150,10 @@ f_get1hContext() =>
 // ============================================================================
 
 bool adxOk = adx1h >= adxMinimumInput
+// Raw stack direction, independent of bias -- used for the dashboard so it
+// shows what the EMAs are actually doing rather than a bias-gated "NOT
+// ALIGNED" that fires just because bias is NO_TRADE.
+string emaStackRaw = emaFast1h > emaSlow1h ? "BULLISH" : emaFast1h < emaSlow1h ? "BEARISH" : "FLAT"
 bool emaStackOk = bias == "LONG_ONLY" ? emaFast1h > emaSlow1h : bias == "SHORT_ONLY" ? emaFast1h < emaSlow1h : false
 bool erOk = er1h >= erMinimumInput
 
@@ -195,7 +199,7 @@ plot(pivotLow4h, title = "4H Pivot Low (raw)", color = color.new(color.blue, 60)
 // DASHBOARD
 // ============================================================================
 
-var table statusTable = table.new(position.top_right, 2, 14, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+var table statusTable = table.new(position.top_right, 2, 15, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
 
 if barstate.islast
     table.cell(statusTable, 0, 0, "STAGE 4 MTF BIAS STACK", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
@@ -207,27 +211,40 @@ if barstate.islast
     table.cell(statusTable, 0, 2, "4H Structure", text_color = color.white)
     table.cell(statusTable, 1, 2, structureUp ? "HH + HL" : structureDown ? "LH + LL" : "MIXED", text_color = color.white)
 
-    table.cell(statusTable, 0, 3, "4H Price vs EMA / Slope", text_color = color.white)
-    table.cell(statusTable, 1, 3, (closeAboveEma4h ? "ABOVE" : "BELOW") + " / " + (emaSlopeUp4h ? "UP" : emaSlopeDown4h ? "DOWN" : "FLAT"), text_color = color.white)
+    // Shows directly whether structure has enough confirmed swings to make
+    // any call at all -- MIXED can mean "genuinely no clean trend" or "not
+    // enough 4H history yet" (e.g. early in a Replay session, which only
+    // provides bars played back so far, not the full chart history); this
+    // row tells you which one you're looking at instead of leaving it to
+    // guesswork.
+    table.cell(statusTable, 0, 3, "4H Pivots Ready", text_color = color.white)
+    table.cell(statusTable, 1, 3, haveEnoughPivots ? "YES" : "NO (insufficient 4H history)", text_color = haveEnoughPivots ? color.lime : color.orange)
 
-    table.cell(statusTable, 0, 4, "1H TrendOK", text_color = color.white)
-    table.cell(statusTable, 1, 4, trendOK ? "TRUE" : "FALSE", text_color = trendOK ? color.lime : color.gray)
+    table.cell(statusTable, 0, 4, "4H Price vs EMA / Slope", text_color = color.white)
+    table.cell(statusTable, 1, 4, (closeAboveEma4h ? "ABOVE" : "BELOW") + " / " + (emaSlopeUp4h ? "UP" : emaSlopeDown4h ? "DOWN" : "FLAT"), text_color = color.white)
 
-    table.cell(statusTable, 0, 5, "1H ADX", text_color = color.white)
-    table.cell(statusTable, 1, 5, str.tostring(adx1h, "#.0") + (adxOk ? " OK" : " LOW"), text_color = adxOk ? color.lime : color.gray)
+    table.cell(statusTable, 0, 5, "1H TrendOK", text_color = color.white)
+    table.cell(statusTable, 1, 5, trendOK ? "TRUE" : "FALSE", text_color = trendOK ? color.lime : color.gray)
 
-    table.cell(statusTable, 0, 6, "1H EMA Stack", text_color = color.white)
-    table.cell(statusTable, 1, 6, emaStackOk ? "ALIGNED" : "NOT ALIGNED", text_color = emaStackOk ? color.lime : color.gray)
+    table.cell(statusTable, 0, 6, "1H ADX", text_color = color.white)
+    table.cell(statusTable, 1, 6, str.tostring(adx1h, "#.0") + (adxOk ? " OK" : " LOW"), text_color = adxOk ? color.lime : color.gray)
 
-    table.cell(statusTable, 0, 7, "1H Efficiency Ratio", text_color = color.white)
-    table.cell(statusTable, 1, 7, str.tostring(er1h, "#.##") + (erOk ? " OK" : " CHOP"), text_color = erOk ? color.lime : color.gray)
+    // Raw direction (not bias-gated) -- shows what the EMAs are actually
+    // doing; color still reflects whether that agrees with the current
+    // bias (emaStackOk), so a mismatch reads as gray even if the raw
+    // direction itself looks decisive.
+    table.cell(statusTable, 0, 7, "1H EMA Stack", text_color = color.white)
+    table.cell(statusTable, 1, 7, emaStackRaw, text_color = emaStackOk ? color.lime : color.gray)
 
-    table.cell(statusTable, 0, 8, "Change Log", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
-    table.cell(statusTable, 1, 8, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 8, "1H Efficiency Ratio", text_color = color.white)
+    table.cell(statusTable, 1, 8, str.tostring(er1h, "#.##") + (erOk ? " OK" : " CHOP"), text_color = erOk ? color.lime : color.gray)
+
+    table.cell(statusTable, 0, 9, "Change Log", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 1, 9, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
 
     int maxLogRows = 5
     for r = 0 to maxLogRows - 1
-        int tableRow = 9 + r
+        int tableRow = 10 + r
         if r < array.size(changeLog)
             table.cell(statusTable, 0, tableRow, array.get(changeLog, r), text_color = color.white, text_halign = text.align_left)
             table.cell(statusTable, 1, tableRow, "", text_color = color.white)
