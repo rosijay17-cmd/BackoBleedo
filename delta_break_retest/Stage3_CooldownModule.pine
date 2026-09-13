@@ -66,7 +66,7 @@ type CooldownState
     int lastLongLossBar = na
     int lastShortLossBar = na
     int lossesThisSession = 0
-    array<string> usedPoiIds = array.new_string()
+    array<string> usedPoiIds
 
 f_poiUsed(array<string> usedIds, string poiId) =>
     bool found = false
@@ -132,7 +132,7 @@ f_resetSession(CooldownState state) =>
 // action (a synthetic exit or a session reset) that only mutates state.
 // ============================================================================
 
-var CooldownState cd = CooldownState.new()
+var CooldownState cd = CooldownState.new(usedPoiIds = array.new_string())
 
 var int t0 = na
 if na(t0)
