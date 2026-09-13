@@ -2631,7 +2631,7 @@ architectureTablePosition = (
 var table architectureTable = table.new(
      architectureTablePosition,
      5,
-     14,
+     15,
      bgcolor = color.new(color.rgb(15, 20, 27), 10),
      border_width = 1
 )
@@ -2805,9 +2805,21 @@ if barstate.islast
         table.cell(architectureTable, 0, 13, "Position Log", text_color = color.white)
         table.cell(architectureTable, 1, 13, positionLogText, text_color = color.white, text_halign = text.align_left)
 
+        // Pine's OWN broker-side trade counters, queried directly --
+        // completely independent of any of the custom tracking above
+        // (activeTradeType, exitLog, positionChangeLog). If these are
+        // ALSO 0, that's the most authoritative confirmation possible
+        // that zero orders have ever actually filled -- ruling out a bug
+        // in this script's own tracking logic. If EITHER is nonzero
+        // while positionChangeLog above reads "no changes yet", that
+        // instead points at a bug in this script's tracking rather than
+        // the broker.
+        table.cell(architectureTable, 0, 14, "Broker Trades (Open/Closed)", text_color = color.white)
+        table.cell(architectureTable, 1, 14, str.tostring(strategy.opentrades) + " / " + str.tostring(strategy.closedtrades), text_color = (strategy.opentrades > 0 or strategy.closedtrades > 0) ? acceptanceColor : color.gray)
+
         dashboardSizeValue = f_dashboardSize(dashboardTextSize)
 
-        for dashboardRow = 0 to 13
+        for dashboardRow = 0 to 14
             for dashboardCol = 0 to 4
                 table.cell_set_text_size(
                      architectureTable,
