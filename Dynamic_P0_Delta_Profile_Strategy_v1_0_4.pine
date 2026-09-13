@@ -1883,7 +1883,21 @@ bool shortClosed = (
      strategy.position_size == 0 and
      strategy.position_size[1] < 0)
 
+// Rolling exit log, shown on the dashboard (guaranteed visible on
+// mobile, unlike Pine Logs / Strategy Tester / Data Window custom
+// plots) -- records the RAW activeTradeType at the moment of every
+// detected exit, whatever it actually is, even if it doesn't match any
+// of the four expected strings. If it's ever unexpectedly empty or
+// mismatched here, that's the direct proof of why a cooldown timer
+// isn't updating -- no more inferring it from chart clutter.
+var array<string> exitLog = array.new_string()
+
 if longClosed or shortClosed
+    string exitLogEntry = (longClosed ? "L" : "S") + "|'" + activeTradeType + "'|bar" + str.tostring(bar_index)
+    array.unshift(exitLog, exitLogEntry)
+    if array.size(exitLog) > 4
+        array.pop(exitLog)
+
     if showCooldownGapLabelsInput
         label.new(bar_index, longClosed ? low : high, "EXIT type='" + activeTradeType + "'", style = longClosed ? label.style_label_down : label.style_label_up, color = color.new(color.red, 60), textcolor = color.white, size = size.tiny)
 
@@ -2600,7 +2614,7 @@ architectureTablePosition = (
 var table architectureTable = table.new(
      architectureTablePosition,
      5,
-     12,
+     13,
      bgcolor = color.new(color.rgb(15, 20, 27), 10),
      border_width = 1
 )
@@ -2746,9 +2760,20 @@ if barstate.islast
             table.cell(architectureTable, 3, 11, str.tostring(shortCooldownBarsLeft) + " left", text_color = color.white)
         table.cell(architectureTable, readCol, 11, readShortCooldown, text_color = readShortCooldown == "READY" ? acceptanceColor : readShortCooldown == "STALE" ? color.orange : rejectionColor)
 
+        // Raw exit trace, guaranteed visible on mobile since it uses the
+        // same dashboard mechanism as every other row here (no Pine Logs,
+        // Strategy Tester, or Data Window needed). Shows the actual
+        // activeTradeType recorded at each of the last 4 detected exits,
+        // whatever it really was -- if it's ever unexpectedly empty or
+        // mismatched, that is the direct, on-chart proof of why a
+        // cooldown timer isn't updating.
+        string exitLogText = array.size(exitLog) > 0 ? array.join(exitLog, "  ") : "no exits yet"
+        table.cell(architectureTable, 0, 12, "Exit Log", text_color = color.white)
+        table.cell(architectureTable, 1, 12, exitLogText, text_color = color.white, text_halign = text.align_left)
+
         dashboardSizeValue = f_dashboardSize(dashboardTextSize)
 
-        for dashboardRow = 0 to 11
+        for dashboardRow = 0 to 12
             for dashboardCol = 0 to 4
                 table.cell_set_text_size(
                      architectureTable,
