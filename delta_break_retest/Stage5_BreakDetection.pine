@@ -450,23 +450,28 @@ if array.size(poiRegistry) > 0
 // DASHBOARD
 // ============================================================================
 
-var table statusTable = table.new(position.top_right, 2, 20, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+// Compact layout: bottom-right (clear of the symbol/price header at the top
+// of the screen), size.tiny on every cell, POI Status and Break Log each cut
+// from 5 rows to 3 -- 16 total rows instead of 20, noticeably smaller on a
+// phone screen without losing any distinct piece of information (just fewer
+// simultaneous POI/log entries visible at once).
+var table statusTable = table.new(position.bottom_right, 2, 16, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
 
 if barstate.islast
-    table.cell(statusTable, 0, 0, "STAGE 5 BREAK DETECTION", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
-    table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 0, "STAGE 5 BREAK DETECTION", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+    table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
-    table.cell(statusTable, 0, 1, "Chart Timeframe", text_color = color.white)
-    table.cell(statusTable, 1, 1, timeframe.period, text_color = timeframe.period == "15" ? color.lime : color.orange)
+    table.cell(statusTable, 0, 1, "Chart TF", text_color = color.white, text_size = size.tiny)
+    table.cell(statusTable, 1, 1, timeframe.period, text_color = timeframe.period == "15" ? color.lime : color.orange, text_size = size.tiny)
 
-    table.cell(statusTable, 0, 2, "Session Index", text_color = color.white)
-    table.cell(statusTable, 1, 2, str.tostring(sessionIndex), text_color = color.white)
+    table.cell(statusTable, 0, 2, "Session", text_color = color.white, text_size = size.tiny)
+    table.cell(statusTable, 1, 2, str.tostring(sessionIndex), text_color = color.white, text_size = size.tiny)
 
-    table.cell(statusTable, 0, 3, "ATR(14) on " + poiAtrTimeframeInput, text_color = color.white)
-    table.cell(statusTable, 1, 3, str.tostring(atr15, format.mintick), text_color = color.white)
+    table.cell(statusTable, 0, 3, "ATR(14) " + poiAtrTimeframeInput, text_color = color.white, text_size = size.tiny)
+    table.cell(statusTable, 1, 3, str.tostring(atr15, format.mintick), text_color = color.white, text_size = size.tiny)
 
-    table.cell(statusTable, 0, 4, "Active POIs", text_color = color.white)
-    table.cell(statusTable, 1, 4, str.tostring(array.size(poiRegistry)) + " / " + str.tostring(maxActivePoisInput), text_color = color.white)
+    table.cell(statusTable, 0, 4, "Active POIs", text_color = color.white, text_size = size.tiny)
+    table.cell(statusTable, 1, 4, str.tostring(array.size(poiRegistry)) + " / " + str.tostring(maxActivePoisInput), text_color = color.white, text_size = size.tiny)
 
     int brokenCount = 0
     if array.size(poiRegistry) > 0
@@ -474,44 +479,44 @@ if barstate.islast
             if array.get(poiRegistry, i).broken
                 brokenCount += 1
 
-    table.cell(statusTable, 0, 5, "Broken (Active Registry)", text_color = color.white)
-    table.cell(statusTable, 1, 5, str.tostring(brokenCount), text_color = brokenCount > 0 ? color.lime : color.gray)
+    table.cell(statusTable, 0, 5, "Broken", text_color = color.white, text_size = size.tiny)
+    table.cell(statusTable, 1, 5, str.tostring(brokenCount), text_color = brokenCount > 0 ? color.lime : color.gray, text_size = size.tiny)
 
-    table.cell(statusTable, 0, 6, "4H Bias", text_color = color.white)
-    table.cell(statusTable, 1, 6, bias, text_color = bias == "LONG_ONLY" ? color.lime : bias == "SHORT_ONLY" ? color.red : color.gray)
+    table.cell(statusTable, 0, 6, "4H Bias", text_color = color.white, text_size = size.tiny)
+    table.cell(statusTable, 1, 6, bias, text_color = bias == "LONG_ONLY" ? color.lime : bias == "SHORT_ONLY" ? color.red : color.gray, text_size = size.tiny)
 
-    table.cell(statusTable, 0, 7, "1H TrendOK", text_color = color.white)
-    table.cell(statusTable, 1, 7, trendOK ? "TRUE" : "FALSE", text_color = trendOK ? color.lime : color.gray)
+    table.cell(statusTable, 0, 7, "1H TrendOK", text_color = color.white, text_size = size.tiny)
+    table.cell(statusTable, 1, 7, trendOK ? "TRUE" : "FALSE", text_color = trendOK ? color.lime : color.gray, text_size = size.tiny)
 
-    table.cell(statusTable, 0, 8, "POI STATUS", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
-    table.cell(statusTable, 1, 8, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 8, "POI STATUS", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+    table.cell(statusTable, 1, 8, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
     int poiRowStart = 9
-    int maxPoiRows = 5
+    int maxPoiRows = 3
     for r = 0 to maxPoiRows - 1
         int tableRow = poiRowStart + r
         if r < array.size(poiRegistry)
             Poi p = array.get(poiRegistry, r)
             string statusText = p.contaminated ? "DEAD" : (p.broken ? "BROKEN " + p.breakDirection : (not p.tested and (sessionIndex - p.createdSessionIndex) >= 1 ? "NAKED" : (p.tested ? "TESTED" : "FRESH")))
-            table.cell(statusTable, 0, tableRow, p.poiType, text_color = color.white)
-            table.cell(statusTable, 1, tableRow, str.tostring(p.price, format.mintick) + " " + statusText, text_color = p.contaminated ? color.gray : (p.broken ? (p.breakDirection == "UP" ? color.lime : color.red) : color.white))
+            table.cell(statusTable, 0, tableRow, p.poiType, text_color = color.white, text_size = size.tiny)
+            table.cell(statusTable, 1, tableRow, str.tostring(p.price, format.mintick) + " " + statusText, text_color = p.contaminated ? color.gray : (p.broken ? (p.breakDirection == "UP" ? color.lime : color.red) : color.white), text_size = size.tiny)
         else
-            table.cell(statusTable, 0, tableRow, "", text_color = color.white)
-            table.cell(statusTable, 1, tableRow, "", text_color = color.white)
+            table.cell(statusTable, 0, tableRow, "", text_color = color.white, text_size = size.tiny)
+            table.cell(statusTable, 1, tableRow, "", text_color = color.white, text_size = size.tiny)
 
-    table.cell(statusTable, 0, 14, "BREAK LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
-    table.cell(statusTable, 1, 14, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 12, "BREAK LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+    table.cell(statusTable, 1, 12, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
-    int logRowStart = 15
-    int maxLogRows = 5
+    int logRowStart = 13
+    int maxLogRows = 3
     for r = 0 to maxLogRows - 1
         int tableRow = logRowStart + r
         if r < array.size(breakLog)
-            table.cell(statusTable, 0, tableRow, array.get(breakLog, r), text_color = color.white, text_halign = text.align_left)
-            table.cell(statusTable, 1, tableRow, "", text_color = color.white)
+            table.cell(statusTable, 0, tableRow, array.get(breakLog, r), text_color = color.white, text_halign = text.align_left, text_size = size.tiny)
+            table.cell(statusTable, 1, tableRow, "", text_color = color.white, text_size = size.tiny)
         else
-            table.cell(statusTable, 0, tableRow, "", text_color = color.white)
-            table.cell(statusTable, 1, tableRow, "", text_color = color.white)
+            table.cell(statusTable, 0, tableRow, "", text_color = color.white, text_size = size.tiny)
+            table.cell(statusTable, 1, tableRow, "", text_color = color.white, text_size = size.tiny)
 
 // ============================================================================
 // DATA WINDOW
