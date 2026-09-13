@@ -373,17 +373,34 @@ f_get15mBreakContext() =>
     float latestTypeCode = ta.valuewhen(eventDirection != 0.0, eventTypeCode, 0)
     float latestEventTime = ta.valuewhen(eventDirection != 0.0, float(time), 0)
 
+    // DIAGNOSTIC (temporary, third probe): Levels Set and Break Events both
+    // proved real (244 / 112) with plain counters, but the ta.valuewhen-
+    // based outputs (this function's actual return values) still show dead
+    // on the outer script -- isolating the bug to the ta.valuewhen + [1] +
+    // lookahead_on chain specifically. This checks whether THAT chain works
+    // AT ALL in this exact shape, using a trivial, always-frequent
+    // condition with no custom var dependency (close > open, no relation
+    // to break state) instead of my hand-built eventDirection signal. If
+    // this ALSO comes back dead, ta.valuewhen itself doesn't work reliably
+    // here regardless of the condition's complexity (contradicts the
+    // Stage 4 pivot precedent and would need a bigger rethink). If this
+    // works but the real one doesn't, the bug is specific to how
+    // eventDirection/eventZoneLow etc. are built, not ta.valuewhen itself.
+    float sanityLatestTime = ta.valuewhen(close > open, float(time), 0)
+
     // DIAGNOSTIC (temporary, remove once the dead-value question is
     // resolved): sessionIndexLocal proved var state advances fine (showed
     // 50 on-device). levelSetCount and breakEventCount narrow the
     // remaining question further -- does extraction ever produce a real
     // level, and does the break condition itself ever actually fire.
-    [latestZoneLow[1], latestZoneHigh[1], latestDirection[1], latestTypeCode[1], latestEventTime[1], float(sessionIndexLocal)[1], float(levelSetCount)[1], float(breakEventCount)[1]]
+    [latestZoneLow[1], latestZoneHigh[1], latestDirection[1], latestTypeCode[1], latestEventTime[1], float(sessionIndexLocal)[1], float(levelSetCount)[1], float(breakEventCount)[1], sanityLatestTime[1]]
 
-[breakZoneLow, breakZoneHigh, breakDirectionRaw, breakTypeCodeRaw, breakEventTimeRaw, breakDiagSessionCountRaw, breakDiagLevelSetCountRaw, breakDiagEventCountRaw] = request.security(syminfo.tickerid, breakContextTimeframeInput, f_get15mBreakContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+[breakZoneLow, breakZoneHigh, breakDirectionRaw, breakTypeCodeRaw, breakEventTimeRaw, breakDiagSessionCountRaw, breakDiagLevelSetCountRaw, breakDiagEventCountRaw, breakDiagSanityTimeRaw] = request.security(syminfo.tickerid, breakContextTimeframeInput, f_get15mBreakContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
 int breakDiagSessionCount = na(breakDiagSessionCountRaw) ? na : int(breakDiagSessionCountRaw)
 int breakDiagLevelSetCount = na(breakDiagLevelSetCountRaw) ? na : int(breakDiagLevelSetCountRaw)
 int breakDiagEventCount = na(breakDiagEventCountRaw) ? na : int(breakDiagEventCountRaw)
+int breakDiagSanityTime = na(breakDiagSanityTimeRaw) ? na : int(breakDiagSanityTimeRaw)
+int breakDiagSanityHoursAgo = na(breakDiagSanityTime) ? na : int((time - breakDiagSanityTime) / (60 * 60 * 1000))
 
 bool haveBrokenAny = not na(breakDirectionRaw)
 int breakDirection = haveBrokenAny ? int(breakDirectionRaw) : 0
@@ -544,7 +561,7 @@ if barstate.islast
 // ============================================================================
 
 int coreRows = 8
-int diagnosticRows = 7
+int diagnosticRows = 8
 int tableRows = showDiagnosticsInput ? coreRows + diagnosticRows : coreRows
 
 var table statusTable = table.new(position.bottom_right, 2, tableRows, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
@@ -654,15 +671,27 @@ if barstate.islast
         table.cell(statusTable, 0, 12, "Levels Set / Break Events (diag)", text_color = color.white, text_size = size.tiny)
         table.cell(statusTable, 1, 12, (na(breakDiagLevelSetCount) ? "--" : str.tostring(breakDiagLevelSetCount)) + " / " + (na(breakDiagEventCount) ? "--" : str.tostring(breakDiagEventCount)), text_color = (nz(breakDiagLevelSetCount) > 0 and nz(breakDiagEventCount) > 0) ? color.lime : color.orange, text_size = size.tiny)
 
-        table.cell(statusTable, 0, 13, "RETEST LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
-        table.cell(statusTable, 1, 13, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        // DIAGNOSTIC (temporary, third probe): a trivial ta.valuewhen with
+        // no relation to break state at all (close > open, true on roughly
+        // half of all bars) pulled through the exact same [1] +
+        // lookahead_on chain. If this shows a real, small "hours ago"
+        // number, ta.valuewhen itself works fine here and the bug is
+        // specific to how eventDirection/eventZoneLow are built. If this
+        // ALSO shows dead, ta.valuewhen doesn't work reliably in this exact
+        // shape regardless of the condition -- contradicts the Stage 4
+        // pivot precedent and needs a bigger rethink.
+        table.cell(statusTable, 0, 13, "Sanity ValueWhen Hrs Ago (diag)", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 13, na(breakDiagSanityHoursAgo) ? "-- (dead)" : str.tostring(breakDiagSanityHoursAgo), text_color = na(breakDiagSanityHoursAgo) ? color.orange : color.lime, text_size = size.tiny)
+
+        table.cell(statusTable, 0, 14, "RETEST LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        table.cell(statusTable, 1, 14, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
         if array.size(retestLog) > 0
-            table.cell(statusTable, 0, 14, array.get(retestLog, 0), text_color = color.white, text_halign = text.align_left, text_size = size.tiny)
-            table.cell(statusTable, 1, 14, "", text_color = color.white, text_size = size.tiny)
+            table.cell(statusTable, 0, 15, array.get(retestLog, 0), text_color = color.white, text_halign = text.align_left, text_size = size.tiny)
+            table.cell(statusTable, 1, 15, "", text_color = color.white, text_size = size.tiny)
         else
-            table.cell(statusTable, 0, 14, "", text_color = color.white, text_size = size.tiny)
-            table.cell(statusTable, 1, 14, "", text_color = color.white, text_size = size.tiny)
+            table.cell(statusTable, 0, 15, "", text_color = color.white, text_size = size.tiny)
+            table.cell(statusTable, 1, 15, "", text_color = color.white, text_size = size.tiny)
 
 // ============================================================================
 // DATA WINDOW
