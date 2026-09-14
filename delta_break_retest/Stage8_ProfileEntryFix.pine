@@ -555,18 +555,19 @@ int deltaProfileWidthInput = input.int(
 )
 
 string deltaProfilePlacementInput = input.string(
-     "Overlay Left",
+     "Right Side",
      "Profile Placement",
      options = ["Overlay Left", "Right Side"],
-     tooltip = "Overlay Left keeps the profile visible on mobile by drawing it just left of the current bar. Right Side draws it into the chart's right margin.",
+     tooltip = "Right Side draws the profile into the chart's blank right margin, past the last candle -- set the offset below to at least the Profile Width so it fully clears price instead of sitting on top of it. Overlay Left instead draws it directly over the last N historical candles (kept for anyone who prefers that compact look on a narrow phone screen), which is why it was the old default.",
      group = G_PROFILE
 )
 
 int deltaProfileOffsetInput = input.int(
-     2,
+     26,
      "Profile Horizontal Offset",
      minval = 0,
-     maxval = 40,
+     maxval = 60,
+     tooltip = "In Right Side mode this is measured from the current bar back to the LEFT edge of the profile -- keep it >= Profile Width so the box lands entirely in blank space past the last candle instead of overlapping price history.",
      group = G_PROFILE
 )
 
@@ -2262,7 +2263,7 @@ if barstate.islast and showDashboardInput
          "SHORT"
     )
 
-    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r5]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r6]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
     table.cell(statusTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86))
 
     table.cell(statusTable, 0, 1, "4H Bias", text_color = color.white)
@@ -2421,6 +2422,7 @@ plot(actualShortEntrySignal ? 1 : 0, title = "Actual Short Entry", display = dis
 // Volume Delta Profile:
 // Lookback:                       360 bars
 // Rows:                           40
-// Width:                          28 bars
-// Offset:                         8 bars
+// Placement:                      Right Side  (was Overlay Left -- sat on top of candles)
+// Width:                          24 bars
+// Offset:                         26 bars     (was 2 -- must be >= Width to clear price)
 // ============================================================================
