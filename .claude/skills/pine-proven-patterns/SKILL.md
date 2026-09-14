@@ -41,6 +41,7 @@ approach, especially for anything that has already caused a bug once.
 | 2 | Bar-index-arithmetic cooldown (reset on ENTRY not exit, no countdown var, `na` sentinel via large fallback) | `references/bar-index-cooldown-arithmetic.md` | `Trend_Following_Strategy_v6_Signal_Cooldown_FIX.pine`; applied in `delta_break_retest/Stage3_CooldownModule.pine` |
 | 3 | Broker-verified exit detection via `strategy.closedtrades.entry_id()` / `.exit_bar_index()` / `.profit()` instead of inferring exits from `strategy.position_size` transitions | `references/broker-verified-exit-detection.md` | `Ranger_V2_*_POC_State_*.pine` family, `P0_Rebuild_Stage0_SanityCheck.pine`; applied in `Dynamic_P0_Delta_Profile_Strategy_v1_0_4.pine` |
 | 4 | Pine v6 compiler-behavior gotchas (for-loop direction inference on empty arrays, UDT field default-value restriction, `var bool` cannot default to plain `na`, nested tuples from multi-return built-ins, `[]` operator can't index a multi-return tuple, `==`/`!=` against `na` is unreliable — always use `na()`/`not na()`) | `references/pine-v6-compiler-gotchas.md` | Discovered/fixed live in `delta_break_retest/Stage2_POIExtraction.pine`, `Stage3_CooldownModule.pine`, `Stage4_MTFBiasStack.pine`, `Stage6_RetestTrigger.pine` |
+| 5 | Futures `strategy()` orders can silently never fill without explicit `margin_long`/`margin_short` AND a chart symbol matching the actually-traded contract size (full-size vs. Micro) | `references/futures-strategy-margin-simulation.md` | `delta_break_retest/Stage7_OrdersRisk.pine` (confirmed: NQ1! silently rejected every order even with margin set; switching to MNQ1! + margin_long/margin_short = 3 together got 17/17 fills) |
 
 ## Update discipline notes
 
@@ -56,6 +57,18 @@ approach, especially for anything that has already caused a bug once.
 
 ## Changelog
 
+- **2026-09-14 (new pattern)**: `Stage7_OrdersRisk.pine` (the first
+  `strategy()` in this staged rebuild) submitted `strategy.entry()` calls
+  correctly and on schedule, but zero of them ever became real
+  `strategy.opentrades`/`closedtrades` -- no error, just silence. Traced to
+  Pine's 100%-margin default for `strategy()` (full notional value must be
+  covered by `initial_capital` unless `margin_long`/`margin_short` are set),
+  compounded by testing on the full-size `NQ1!` contract instead of the
+  Micro `MNQ1!` the user actually trades. Diagnosed without any Strategy
+  Tester access, using only dashboard/Data Window counters (a script-side
+  `strategy.entry()` call count vs. the broker's own trade count) plus an
+  unconditional "sanity order" control case. Logged as pattern #5 in
+  `references/futures-strategy-margin-simulation.md`.
 - **2026-09-13 (hard-won lesson)**: `Stage6_RetestTrigger.pine`'s retest/
   trigger signal stayed dead (Active Zone / Hours Since Break both `--`)
   through FIVE separate, individually well-reasoned, individually
