@@ -65,7 +65,18 @@
 // signal detection.
 // ============================================================================
 
-strategy(title = "Delta Break & Retest - Stage 7 Orders & Risk", shorttitle = "DBR Stage7", overlay = true, max_boxes_count = 50, max_labels_count = 100, default_qty_type = strategy.fixed, default_qty_value = 1, calc_on_order_fills = false, process_orders_on_close = false, initial_capital = 100000)
+// FIX: "dashboard only appears when a new candle opens" -- this is expected
+// default strategy() behavior, not a bug. Unlike indicator() (which
+// recalculates on every price tick by default), a strategy() only
+// recalculates once per bar unless calc_on_every_tick is explicitly turned
+// on. Added it below so the dashboard updates live within the forming bar,
+// matching Stage 5/6's indicator() behavior. Trade-off, worth knowing: with
+// calc_on_every_tick = true, order-fill simulation during backtesting can
+// evaluate intrabar price movement slightly differently than the default
+// bar-close-only recalculation -- for this script's market-order-at-open
+// fills that shouldn't change WHEN an order fills, only how often the
+// dashboard/state machine re-evaluates before that bar closes.
+strategy(title = "Delta Break & Retest - Stage 7 Orders & Risk", shorttitle = "DBR Stage7", overlay = true, max_boxes_count = 50, max_labels_count = 100, default_qty_type = strategy.fixed, default_qty_value = 1, calc_on_order_fills = false, calc_on_every_tick = true, process_orders_on_close = false, initial_capital = 100000)
 
 // ============================================================================
 // PURE DELTA FUNCTION (unchanged from Stage 1)
