@@ -76,7 +76,17 @@
 // bar-close-only recalculation -- for this script's market-order-at-open
 // fills that shouldn't change WHEN an order fills, only how often the
 // dashboard/state machine re-evaluates before that bar closes.
-strategy(title = "Delta Break & Retest - Stage 7 Orders & Risk", shorttitle = "DBR Stage7", overlay = true, max_boxes_count = 50, max_labels_count = 100, default_qty_type = strategy.fixed, default_qty_value = 1, calc_on_order_fills = false, calc_on_every_tick = true, process_orders_on_close = false, initial_capital = 100000)
+// FIX: "43 entry calls, 0 broker trades, no error" -- Pine's strategy()
+// margin model defaults to requiring the FULL NOTIONAL VALUE of a position
+// be covered by initial_capital unless margin_long/margin_short are set
+// explicitly. NQ1! (E-mini Nasdaq, $20/point) around 29,000 has a notional
+// value of roughly $580,000 PER CONTRACT -- nowhere close to the
+// initial_capital = 100000 this script declared, so every single order was
+// silently rejected for insufficient equity. Added margin_long/margin_short
+// at 3% (a rough approximation of real E-mini NQ margin requirements,
+// ~$17-20k per contract -- refine later if exact broker margin matters more
+// than "orders can fill at all").
+strategy(title = "Delta Break & Retest - Stage 7 Orders & Risk", shorttitle = "DBR Stage7", overlay = true, max_boxes_count = 50, max_labels_count = 100, default_qty_type = strategy.fixed, default_qty_value = 1, calc_on_order_fills = false, calc_on_every_tick = true, process_orders_on_close = false, initial_capital = 100000, margin_long = 3, margin_short = 3)
 
 // ============================================================================
 // PURE DELTA FUNCTION (unchanged from Stage 1)
