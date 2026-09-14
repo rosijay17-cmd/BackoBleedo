@@ -563,7 +563,7 @@ string deltaProfilePlacementInput = input.string(
 )
 
 int deltaProfileOffsetInput = input.int(
-     26,
+     36,
      "Profile Horizontal Offset",
      minval = 0,
      maxval = 60,
@@ -2263,7 +2263,7 @@ if barstate.islast and showDashboardInput
          "SHORT"
     )
 
-    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r6]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r7]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
     table.cell(statusTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86))
 
     table.cell(statusTable, 0, 1, "4H Bias", text_color = color.white)
@@ -2424,5 +2424,5 @@ plot(actualShortEntrySignal ? 1 : 0, title = "Actual Short Entry", display = dis
 // Rows:                           40
 // Placement:                      Right Side  (was Overlay Left -- sat on top of candles)
 // Width:                          24 bars
-// Offset:                         26 bars     (was 2 -- must be >= Width to clear price)
+// Offset:                         36 bars     (was 2 -- must be >= Width to clear price)
 // ============================================================================
