@@ -76,16 +76,20 @@
 // bar-close-only recalculation -- for this script's market-order-at-open
 // fills that shouldn't change WHEN an order fills, only how often the
 // dashboard/state machine re-evaluates before that bar closes.
-// FIX: "43 entry calls, 0 broker trades, no error" -- Pine's strategy()
-// margin model defaults to requiring the FULL NOTIONAL VALUE of a position
-// be covered by initial_capital unless margin_long/margin_short are set
-// explicitly. NQ1! (E-mini Nasdaq, $20/point) around 29,000 has a notional
-// value of roughly $580,000 PER CONTRACT -- nowhere close to the
-// initial_capital = 100000 this script declared, so every single order was
-// silently rejected for insufficient equity. Added margin_long/margin_short
-// at 3% (a rough approximation of real E-mini NQ margin requirements,
-// ~$17-20k per contract -- refine later if exact broker margin matters more
-// than "orders can fill at all").
+// FIX, CONFIRMED: "43 entry calls, 0 broker trades, no error" was traced to
+// Pine's strategy() margin model, which defaults to requiring the FULL
+// NOTIONAL VALUE of a position be covered by initial_capital unless
+// margin_long/margin_short are set explicitly. margin_long/margin_short = 3
+// (below) plus switching the CHART SYMBOL from full-size NQ1! to Micro
+// MNQ1! (1/10th the point value, matching the user's actual propfirm-traded
+// instrument) resolved it -- confirmed on-device, 17 entry calls / 17
+// broker trades, one already closed (a real loss, cooldown correctly
+// engaged afterward). A temporary unconditional "sanity order" diagnostic
+// (fired every 200 bars, no bracket, no gating) was used to isolate this
+// from a signal-logic bug before finding the actual cause -- removed now
+// that its job is done. RUN THIS ON THE MICRO CONTRACT (MNQ), not the
+// full-size one, both for margin-simulation headroom and because that's
+// what actually gets traded.
 strategy(title = "Delta Break & Retest - Stage 7 Orders & Risk", shorttitle = "DBR Stage7", overlay = true, max_boxes_count = 50, max_labels_count = 100, default_qty_type = strategy.fixed, default_qty_value = 1, calc_on_order_fills = false, calc_on_every_tick = true, process_orders_on_close = false, initial_capital = 100000, margin_long = 3, margin_short = 3)
 
 // ============================================================================
@@ -626,39 +630,6 @@ var array<string> orderLog = array.new_string()
 // different, more specific finding than just "Position: FLAT."
 var int entryCallCount = 0
 
-// SANITY TEST (temporary): margin_long/margin_short = 3 did NOT fix the
-// 0-fills problem -- confirmed on-device, still 22 script-side calls / 0
-// broker trades after that change took effect. Rather than guess a third
-// margin/config theory blind, isolate the question completely: this is a
-// trivial, unconditional 1-lot LONG entry with NO bracket, no cooldown
-// gate, no alignment check, no dependency on ANY of the real signal
-// logic -- fires once every 200 confirmed bars whenever flat, purely to
-// answer "can ANYTHING fill on this chart/account at all." If this ALSO
-// shows 0 broker trades, the problem is fundamental (symbol, account,
-// plan, or environment-level), not specific to the real entry's
-// conditions or bracket parameters. If THIS fills while the real signal
-// still doesn't, the problem narrows back to something specific about
-// the real entry (its stop/limit values, its qty, or its gating).
-var int sanityCallCount = 0
-var int lastSanityBar = na
-
-bool sanityDue = barstate.isconfirmed and strategy.position_size == 0 and (na(lastSanityBar) or bar_index - lastSanityBar >= 200)
-
-if sanityDue
-    strategy.entry("Sanity", strategy.long, qty = 1)
-    sanityCallCount += 1
-    lastSanityBar := bar_index
-
-int sanityTradeCount = 0
-if strategy.opentrades > 0
-    for i = 0 to strategy.opentrades - 1
-        if strategy.opentrades.entry_id(i) == "Sanity"
-            sanityTradeCount += 1
-if strategy.closedtrades > 0
-    for i = 0 to strategy.closedtrades - 1
-        if strategy.closedtrades.entry_id(i) == "Sanity"
-            sanityTradeCount += 1
-
 bool freshTrigger = retestState == "TRIGGERED" and (na(lastActedEventTime) or activeEventTime != lastActedEventTime)
 
 if barstate.isconfirmed and freshTrigger and strategy.position_size == 0
@@ -741,7 +712,7 @@ if barstate.islast
 // ============================================================================
 
 int coreRows = 10
-int diagnosticRows = 11
+int diagnosticRows = 10
 int tableRows = showDiagnosticsInput ? coreRows + diagnosticRows : coreRows
 
 var table statusTable = table.new(position.bottom_right, 2, tableRows, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
@@ -804,7 +775,7 @@ if barstate.islast
     [cooldownOk, cooldownReason] = f_canTrade(cd, queryDirection, queryPoiId, bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
     color cooldownColor = cooldownOk ? color.lime : color.orange
 
-    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r2]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r3]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
     table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
     table.cell(statusTable, 0, 1, "Bias", text_color = color.white, text_size = size.small)
@@ -861,19 +832,10 @@ if barstate.islast
         table.cell(statusTable, 0, 15, "Entry Calls (Script) / Trades (Broker)", text_color = color.white, text_size = size.tiny)
         table.cell(statusTable, 1, 15, str.tostring(entryCallCount) + " / " + str.tostring(strategy.opentrades + strategy.closedtrades), text_color = entryCallCount == (strategy.opentrades + strategy.closedtrades) ? color.lime : color.orange, text_size = size.tiny)
 
-        // SANITY TEST result: if this ALSO shows a mismatch (calls > 0,
-        // trades = 0), the problem is fundamental to this chart/account,
-        // not specific to the real signal's bracket/gating. If it matches
-        // (calls == trades) while the real signal above still mismatches,
-        // the problem is narrowed to something specific about the real
-        // entry instead.
-        table.cell(statusTable, 0, 16, "Sanity Calls / Trades (temp)", text_color = color.white, text_size = size.tiny)
-        table.cell(statusTable, 1, 16, str.tostring(sanityCallCount) + " / " + str.tostring(sanityTradeCount), text_color = sanityCallCount == sanityTradeCount ? color.lime : color.orange, text_size = size.tiny)
+        table.cell(statusTable, 0, 16, "ORDER LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        table.cell(statusTable, 1, 16, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
-        table.cell(statusTable, 0, 17, "ORDER LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
-        table.cell(statusTable, 1, 17, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
-
-        int orderLogRowStart = 18
+        int orderLogRowStart = 17
         int maxOrderLogRows = 3
         for r = 0 to maxOrderLogRows - 1
             int tableRow = orderLogRowStart + r
@@ -894,5 +856,3 @@ plot(strategy.position_size, title = "Position Size (Broker)", display = display
 plot(strategy.opentrades, title = "Open Trades (Broker)", display = display.data_window)
 plot(strategy.closedtrades, title = "Closed Trades (Broker)", display = display.data_window)
 plot(entryCallCount, title = "Entry Calls (Script)", display = display.data_window)
-plot(sanityCallCount, title = "Sanity Calls (Script)", display = display.data_window)
-plot(sanityTradeCount, title = "Sanity Trades (Broker)", display = display.data_window)
