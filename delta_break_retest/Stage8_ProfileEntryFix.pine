@@ -646,6 +646,13 @@ int deltaStrengthWindowInput = input.int(
      group = G_DASH
 )
 
+bool showFunnelDiagnosticsInput = input.bool(
+     true,
+     "Show Retest Funnel Diagnostics",
+     tooltip = "Second table: counts how many break events reach each stage of the retest/trigger chain, and which gate blocks a RETESTED bar most often. Use this to find where signals are dying without Strategy Tester access.",
+     group = G_DASH
+)
+
 
 // ============================================================================
 // EXECUTION PRESSURE / CANDLE QUALITY
@@ -1166,6 +1173,20 @@ var bool activeTriggerAligned = false
 var int retestTouchBar = na
 var float retestTouchPressure = na
 
+// -- retest funnel diagnostics: count where events die in the chain --
+var int cEvents = 0
+var int cRetested = 0
+var int cTriggered = 0
+var int cExpired = 0
+var int cInvalidated = 0
+var int cEvalBars = 0
+var int cReclaimFail = 0
+var int cExtensionFail = 0
+var int cBodyFail = 0
+var int cLocationFail = 0
+var int cDeltaFail = 0
+var int cRvolFail = 0
+
 bool newBreakEvent = (
      breakDirection != 0 and
      (
@@ -1175,6 +1196,7 @@ bool newBreakEvent = (
 )
 
 if newBreakEvent
+    cEvents += 1
     activeZoneLow := breakZoneLow
     activeZoneHigh := breakZoneHigh
     activeDirection := breakDirection
@@ -1202,6 +1224,7 @@ bool retestShortTouchNow = false
 if retestState == "WATCHING"
     if windowExpired
         retestState := "EXPIRED"
+        cExpired += 1
     else
         bool failedBeforeRetestLong = (
              activeDirection == 1 and
@@ -1215,6 +1238,7 @@ if retestState == "WATCHING"
 
         if failedBeforeRetestLong or failedBeforeRetestShort
             retestState := "INVALIDATED"
+            cInvalidated += 1
         else
             bool validLongTouch = (
                  activeDirection == 1 and
@@ -1236,6 +1260,7 @@ if retestState == "WATCHING"
 
             if validLongTouch or validShortTouch
                 retestState := "RETESTED"
+                cRetested += 1
                 retestTouchBar := bar_index
                 retestTouchPressure := executionDeltaPressure
                 retestLongTouchNow := validLongTouch
@@ -1273,8 +1298,10 @@ if retestState == "RETESTED"
 
     if windowExpired or retestTooOld
         retestState := "EXPIRED"
+        cExpired += 1
     else if invalidateLong or invalidateShort
         retestState := "INVALIDATED"
+        cInvalidated += 1
     else if barsAfterRetest >= minBarsAfterRetestInput
         float reclaimBuffer = atr5m * reclaimBufferAtrInput
         float maxExtension = atr5m * maxEntryExtensionAtrInput
@@ -1355,8 +1382,32 @@ if retestState == "RETESTED"
              rvolOk
         )
 
+        // -- funnel diagnostics: tally which gate(s) blocked this bar's attempt,
+        // resolved to the active event's own direction so a long event isn't
+        // penalized by the (always-false) short-side conditions and vice versa --
+        cEvalBars += 1
+
+        bool reclaimOkDir = activeDirection == 1 ? priceReclaimLong : priceReclaimShort
+        bool extensionOkDir = activeDirection == 1 ? extensionLongOk : extensionShortOk
+        bool locationOkDir = activeDirection == 1 ? candleLocationLongOk : candleLocationShortOk
+        bool deltaOkDir = activeDirection == 1 ? deltaLongOk : deltaShortOk
+
+        if not reclaimOkDir
+            cReclaimFail += 1
+        if not extensionOkDir
+            cExtensionFail += 1
+        if not candleBodyOk
+            cBodyFail += 1
+        if not locationOkDir
+            cLocationFail += 1
+        if not deltaOkDir
+            cDeltaFail += 1
+        if not rvolOk
+            cRvolFail += 1
+
         if triggerUpNow or triggerDownNow
             retestState := "TRIGGERED"
+            cTriggered += 1
 
             activeTriggerAligned := (
                  (
@@ -2199,7 +2250,7 @@ if barstate.islast and showDashboardInput
          "SHORT"
     )
 
-    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r1]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r2]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
     table.cell(statusTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86))
 
     table.cell(statusTable, 0, 1, "4H Bias", text_color = color.white)
@@ -2237,6 +2288,52 @@ if barstate.islast and showDashboardInput
 
     table.cell(statusTable, 0, 12, "Execution Chart", text_color = color.white)
     table.cell(statusTable, 1, 12, chartIsRecommended5m ? "5m RECOMMENDED" : timeframe.period + "m - USE 5m FOR EXEC", text_color = chartIsRecommended5m ? color.aqua : color.orange)
+
+
+// ============================================================================
+// RETEST FUNNEL DIAGNOSTICS
+// ----------------------------------------------------------------------------
+// Separate table so it can be toggled off independently of the main
+// dashboard. Shows how many break events reached each stage of the
+// WATCHING -> RETESTED -> TRIGGERED chain, and -- for bars where the
+// RETESTED trigger logic actually ran -- which single gate blocked it most.
+// ============================================================================
+
+var table funnelTable = table.new(
+     position.bottom_left,
+     2,
+     9,
+     bgcolor = color.new(color.rgb(15, 20, 27), 10),
+     border_width = 1
+)
+
+if barstate.islast and showDashboardInput and showFunnelDiagnosticsInput
+    table.cell(funnelTable, 0, 0, "RETEST FUNNEL", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(funnelTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+
+    table.cell(funnelTable, 0, 1, "Break Events", text_color = color.white)
+    table.cell(funnelTable, 1, 1, str.tostring(cEvents), text_color = color.white)
+
+    table.cell(funnelTable, 0, 2, "-> Retested", text_color = color.white)
+    table.cell(funnelTable, 1, 2, str.tostring(cRetested), text_color = cRetested > 0 ? color.aqua : color.gray)
+
+    table.cell(funnelTable, 0, 3, "-> Triggered", text_color = color.white)
+    table.cell(funnelTable, 1, 3, str.tostring(cTriggered), text_color = cTriggered > 0 ? color.aqua : color.gray)
+
+    table.cell(funnelTable, 0, 4, "Expired / Invalid", text_color = color.white)
+    table.cell(funnelTable, 1, 4, str.tostring(cExpired) + " / " + str.tostring(cInvalidated), text_color = color.orange)
+
+    table.cell(funnelTable, 0, 5, "Eval Bars (RETESTED)", text_color = color.white)
+    table.cell(funnelTable, 1, 5, str.tostring(cEvalBars), text_color = color.gray)
+
+    table.cell(funnelTable, 0, 6, "Fail: Reclaim / Ext", text_color = color.white)
+    table.cell(funnelTable, 1, 6, str.tostring(cReclaimFail) + " / " + str.tostring(cExtensionFail), text_color = color.orange)
+
+    table.cell(funnelTable, 0, 7, "Fail: Body / Loc", text_color = color.white)
+    table.cell(funnelTable, 1, 7, str.tostring(cBodyFail) + " / " + str.tostring(cLocationFail), text_color = color.orange)
+
+    table.cell(funnelTable, 0, 8, "Fail: Delta / RVOL", text_color = color.white)
+    table.cell(funnelTable, 1, 8, str.tostring(cDeltaFail) + " / " + str.tostring(cRvolFail), text_color = color.orange)
 
 
 // ============================================================================
