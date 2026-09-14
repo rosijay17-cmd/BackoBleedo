@@ -140,10 +140,11 @@ float retestWindowHoursInput = input.float(
 )
 
 int minBarsAfterRetestInput = input.int(
-     1,
+     0,
      "Minimum Bars After Retest Before Trigger",
      minval = 0,
      maxval = 5,
+     tooltip = "0 lets the trigger check run on the same bar as the retest touch itself, so a diamond can print on the same bar as its circle whenever reclaim/candle-quality already line up there -- the trigger always fires on the EARLIEST qualifying bar in its window, never a later one, so lowering this is what pulls diamonds as close as possible to circles.",
      group = G_EXEC
 )
 
@@ -2251,7 +2252,7 @@ if barstate.islast and showDashboardInput
          "SHORT"
     )
 
-    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r3]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r4]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
     table.cell(statusTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86))
 
     table.cell(statusTable, 0, 1, "4H Bias", text_color = color.white)
