@@ -1,0 +1,906 @@
+//@version=6
+
+// ============================================================================
+// DELTA BREAK & RETEST -- STAGE 7: ORDERS & RISK
+// ----------------------------------------------------------------------------
+// Per the build spec (Section 9), Stage 7: turn a confirmed TRIGGERED retest
+// (Stage 6) into an actual order, gated by the cooldown module (Stage 3),
+// with a stop and target attached. This is the FIRST script in this whole
+// staged rebuild that is a strategy() instead of an indicator() -- every
+// prior stage was deliberately trade-free per the spec's own discipline.
+//
+// RUN THIS ON A 5m CHART -- same as Stage 6; nothing about the execution
+// timeframe changes here.
+//
+// CARRIED FORWARD UNCHANGED (all of it -- proven working on-device as of
+// Stage 6 commit 00c14f8, [r7]): the delta function, the simplified 15m
+// break-context pull (two-layer function split + na-sentinel event signal,
+// the exact fix that took SEVEN rounds to find -- see
+// pine-proven-patterns/references/pine-v6-compiler-gotchas.md gotcha #6
+// before touching ANY of this section), the 4H/1H MTF context, the
+// Bias/Regime/Score/Buyers/Sellers dashboard, and the 5m retest/trigger
+// state machine. NONE of that logic changes in this file -- Stage 7's only
+// job is to act on a TRIGGERED state, not to re-derive it.
+//
+// NEW IN THIS STAGE:
+//   - CooldownModule, ported verbatim from Stage 3 (CooldownState type,
+//     f_poiUsed/f_canTrade/f_recordExit/f_resetSession) -- same four-layer
+//     priority order, same bar-index-arithmetic-at-read-time discipline, no
+//     countdown variables. Session reset now fires for real (new 5m-chart
+//     trading day), not just the Stage 3 test harness's scripted bar
+//     offsets.
+//   - Entry: on a FRESH TRIGGERED transition (not re-firing every bar the
+//     state stays TRIGGERED), flat position, cooldown allows it, and
+//     (unless the alignment gate is disabled) the trigger's own bias-
+//     alignment tag agrees with the current 4H bias.
+//   - Risk: stop at the zone's own invalidation edge (the same level that
+//     would flip the state to INVALIDATED if touched) plus a small ATR
+//     buffer; target at a configurable R-multiple of that same
+//     entry-to-stop distance. Fixed position size (contracts input) --
+//     equity-based sizing is a later refinement, not needed to validate
+//     the mechanics.
+//   - Exit detection: strategy.closedtrades.entry_id()/profit(), the
+//     broker-verified pattern from pine-proven-patterns (proven fix for
+//     the old P0 script's dead strategy.position_size bug) -- never
+//     inferred from strategy.position_size transitions.
+//
+// KNOWN RISK, flagged plainly per this repo's own established practice:
+// this is the first strategy() (not indicator()) in this staged rebuild.
+// order-fill timing, strategy.exit() bracket behavior, and
+// strategy.closedtrades indexing are all genuinely new territory for THIS
+// rebuild (though broker-verified exit detection specifically is already
+// proven elsewhere in the repo -- see
+// pine-proven-patterns/references/broker-verified-exit-detection.md). If
+// entries don't fire, or fire on the wrong bar, or exits don't record
+// against the cooldown correctly, send the exact symptom (a screenshot of
+// the Position/Cooldown dashboard rows, not just "it's not working") --
+// this file has diagnostics in the same spirit as Stage 6's, ready to add
+// counters if needed rather than guessing blind again.
+//
+// STILL SCOPE-DISCIPLINED: one contract, no explicit commission/slippage
+// modeling yet, no partial exits, no trailing stop, no equity-based sizing.
+// Validate that ONE clean entry->stop/target->cooldown cycle works
+// correctly before adding any of that -- exactly the spec's own
+// one-thing-at-a-time rule, now applied to risk management instead of
+// signal detection.
+// ============================================================================
+
+// FIX: "dashboard only appears when a new candle opens" -- this is expected
+// default strategy() behavior, not a bug. Unlike indicator() (which
+// recalculates on every price tick by default), a strategy() only
+// recalculates once per bar unless calc_on_every_tick is explicitly turned
+// on. Added it below so the dashboard updates live within the forming bar,
+// matching Stage 5/6's indicator() behavior. Trade-off, worth knowing: with
+// calc_on_every_tick = true, order-fill simulation during backtesting can
+// evaluate intrabar price movement slightly differently than the default
+// bar-close-only recalculation -- for this script's market-order-at-open
+// fills that shouldn't change WHEN an order fills, only how often the
+// dashboard/state machine re-evaluates before that bar closes.
+// FIX, CONFIRMED: "43 entry calls, 0 broker trades, no error" was traced to
+// Pine's strategy() margin model, which defaults to requiring the FULL
+// NOTIONAL VALUE of a position be covered by initial_capital unless
+// margin_long/margin_short are set explicitly. margin_long/margin_short = 3
+// (below) plus switching the CHART SYMBOL from full-size NQ1! to Micro
+// MNQ1! (1/10th the point value, matching the user's actual propfirm-traded
+// instrument) resolved it -- confirmed on-device, 17 entry calls / 17
+// broker trades, one already closed (a real loss, cooldown correctly
+// engaged afterward). A temporary unconditional "sanity order" diagnostic
+// (fired every 200 bars, no bracket, no gating) was used to isolate this
+// from a signal-logic bug before finding the actual cause -- removed now
+// that its job is done. RUN THIS ON THE MICRO CONTRACT (MNQ), not the
+// full-size one, both for margin-simulation headroom and because that's
+// what actually gets traded.
+strategy(title = "Delta Break & Retest - Stage 7 Orders & Risk", shorttitle = "DBR Stage7", overlay = true, max_boxes_count = 50, max_labels_count = 100, default_qty_type = strategy.fixed, default_qty_value = 1, calc_on_order_fills = false, calc_on_every_tick = true, process_orders_on_close = false, initial_capital = 100000, margin_long = 3, margin_short = 3)
+
+// ============================================================================
+// PURE DELTA FUNCTION (unchanged from Stage 1)
+// ============================================================================
+
+f_delta(float o, float h, float l, float c, float v) =>
+    float safeRange = math.max(h - l, syminfo.mintick)
+    float pressure = math.max(math.min((c - o) / safeRange, 1.0), -1.0)
+    v * pressure
+
+float barDelta = f_delta(open, high, low, close, nz(volume, 0.0))
+float atr5m = ta.atr(14)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+string breakContextTimeframeInput = input.timeframe("15", "15m Break-Context Timeframe", group = "15m Break Context", tooltip = "The timeframe Stage 5's POI/break logic normally runs on. Recomputed fresh here (simplified, see header) and pulled into this 5m script.")
+int profileRowsInput = input.int(40, "Profile Rows (Extraction Granularity)", minval = 10, maxval = 120, group = "15m Break Context")
+float poiAtrMultInput = input.float(0.25, "POI Zone Half-Width (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = "15m Break Context")
+int minEndedSessionBarsInput = input.int(10, "Minimum Bars To Finalize A Session", minval = 3, maxval = 100, group = "15m Break Context")
+bool showAbsorptionInput = input.bool(true, "Track Absorption Node", group = "15m Break Context")
+float minBreakAtrMultInput = input.float(0.10, "Minimum Break-Through Buffer (x ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = "15m Break Context")
+bool requireBreakDeltaConfirmationInput = input.bool(true, "Require Delta Confirmation On 15m Break Bar", group = "15m Break Context")
+
+float retestWindowHoursInput = input.float(12.0, "Retest Window (Hours)", minval = 0.5, maxval = 168.0, step = 0.5, group = "Retest / Trigger", tooltip = "How long a broken level stays eligible for a retest before it's marked EXPIRED. Measured from the 15m break bar's own timestamp, not from bar count -- comparable across the 15m break context and this 5m chart.")
+bool requireTriggerDeltaConfirmationInput = input.bool(true, "Require Delta Confirmation On 5m Trigger Bar", group = "Retest / Trigger")
+color retestZoneColorInput = input.color(color.yellow, "Active Retest Zone Color", group = "Retest / Trigger")
+color triggerUpColorInput = input.color(color.lime, "Trigger Up Color", group = "Retest / Trigger")
+color triggerDownColorInput = input.color(color.red, "Trigger Down Color", group = "Retest / Trigger")
+
+string biasTimeframeInput = input.timeframe("240", "4H Bias Timeframe", group = "MTF Context")
+int pivotLeftInput = input.int(3, "Swing Pivot Left Bars", minval = 1, maxval = 20, group = "MTF Context")
+int pivotRightInput = input.int(3, "Swing Pivot Right Bars", minval = 1, maxval = 20, group = "MTF Context")
+int biasEmaLengthInput = input.int(50, "4H EMA Length", minval = 2, group = "MTF Context")
+int biasSlopeLookbackInput = input.int(5, "4H EMA Slope Lookback (Bars)", minval = 1, maxval = 50, group = "MTF Context")
+string trendTimeframeInput = input.timeframe("60", "1H Trend Timeframe", group = "MTF Context")
+int adxLengthInput = input.int(14, "1H ADX / DI Length", minval = 1, group = "MTF Context")
+float adxMinimumInput = input.float(20.0, "1H Minimum ADX", minval = 0, step = 0.5, group = "MTF Context")
+int fastEmaInput = input.int(21, "1H Fast EMA", minval = 1, group = "MTF Context")
+int slowEmaInput = input.int(50, "1H Slow EMA", minval = 2, group = "MTF Context")
+int erLengthInput = input.int(10, "1H Efficiency Ratio Length", minval = 2, group = "MTF Context")
+float erMinimumInput = input.float(0.30, "1H Minimum Efficiency Ratio", minval = 0, maxval = 1, step = 0.05, group = "MTF Context")
+
+int deltaStrengthWindowInput = input.int(20, "Buyer/Seller Strength Window (Bars)", minval = 5, maxval = 200, group = "Signal Summary")
+color buyColorInput = input.color(color.teal, "Buyer Strength Color", group = "Signal Summary")
+color sellColorInput = input.color(color.orange, "Seller Strength Color", group = "Signal Summary")
+bool showDiagnosticsInput = input.bool(false, "Show Detailed Diagnostics", group = "Signal Summary")
+
+int globalCooldownWinBarsInput = input.int(6, "Global Post-Trade Cooldown (Bars, After Win)", minval = 0, group = "Cooldown")
+int globalCooldownLossBarsInput = input.int(12, "Global Post-Trade Cooldown (Bars, After Loss)", minval = 0, group = "Cooldown")
+int directionCooldownBarsInput = input.int(12, "Per-Direction Cooldown After Loss (Bars)", minval = 0, group = "Cooldown")
+int consecutiveLossLimitInput = input.int(2, "Consecutive-Loss Session Limit", minval = 1, group = "Cooldown")
+
+bool requireAlignedEntryInput = input.bool(true, "Require Bias-Aligned Trigger To Enter", group = "Orders / Risk", tooltip = "If on, only a TRIGGERED event tagged 'aligned' with the current 4H bias can open a trade -- a counter-trend trigger is logged but not traded.")
+
+// FILTER #1 (per-type performance data, one filter at a time per the build
+// spec): Delta Flip was the clear standout in the PER-TYPE breakdown -- 7
+// trades, 0% win rate, -$1478 net (64% of the entire -$2303 total loss) on
+// MNQ. Disabled by default. Absorption Node also showed 0% win rate
+// (-$787.50 over 6 trades) but roughly half the damage -- deliberately
+// left enabled so this filter's effect can be measured in isolation before
+// deciding whether a second one is warranted.
+bool enableDeltaFlipEntriesInput = input.bool(false, "Enable Delta Flip Entries", group = "Orders / Risk", tooltip = "Per-type performance data (see PER-TYPE dashboard section): Delta Flip was 0% win rate, -$1478 net over 7 trades on MNQ -- the single worst-performing entry type, and 64% of the total net loss on its own. Disabled by default; re-enable to test whether that holds on different data.")
+float stopBufferAtrMultInput = input.float(0.10, "Stop Buffer Beyond Invalidation (x ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = "Orders / Risk")
+float rMultipleInput = input.float(2.0, "Target (R-Multiples Of Entry-To-Stop Risk)", minval = 0.5, maxval = 10.0, step = 0.5, group = "Orders / Risk")
+int contractsInput = input.int(1, "Contracts Per Entry", minval = 1, maxval = 100, group = "Orders / Risk")
+
+// ============================================================================
+// SESSION PROFILE EXTRACTION -- unchanged from Stage 2/5/6.
+// ============================================================================
+
+f_extractSessionPois(int barsBack, int rows) =>
+    float scanHigh = -1.0e20
+    float scanLow = 1.0e20
+
+    for i = 1 to barsBack
+        scanHigh := math.max(scanHigh, high[i])
+        scanLow := math.min(scanLow, low[i])
+
+    float rowStep = math.max((scanHigh - scanLow) / rows, syminfo.mintick)
+
+    array<float> rowDelta = array.new_float(rows, 0.0)
+    array<float> rowRange = array.new_float(rows, 0.0)
+    array<float> rowVolume = array.new_float(rows, 0.0)
+
+    for i = 1 to barsBack
+        float d = f_delta(open[i], high[i], low[i], close[i], nz(volume[i], 0.0))
+        int row = int(math.floor((close[i] - scanLow) / rowStep))
+        row := math.max(0, math.min(rows - 1, row))
+        array.set(rowDelta, row, array.get(rowDelta, row) + d)
+        array.set(rowRange, row, array.get(rowRange, row) + (high[i] - low[i]))
+        array.set(rowVolume, row, array.get(rowVolume, row) + nz(volume[i], 0.0))
+
+    float maxAbs = -1.0
+    int pocRow = -1
+
+    for row = 0 to rows - 1
+        float d = array.get(rowDelta, row)
+        if math.abs(d) > maxAbs
+            maxAbs := math.abs(d)
+            pocRow := row
+
+    float pocPrice = pocRow >= 0 ? scanLow + (pocRow + 0.5) * rowStep : na
+
+    float maxPos = 0.0
+    int maxPosRow = -1
+    float maxNeg = 0.0
+    int maxNegRow = -1
+
+    for row = 0 to rows - 1
+        float d = array.get(rowDelta, row)
+        if d > maxPos
+            maxPos := d
+            maxPosRow := row
+        if d < maxNeg
+            maxNeg := d
+            maxNegRow := row
+
+    float extremeHighPrice = maxPosRow >= 0 ? scanLow + (maxPosRow + 0.5) * rowStep : na
+    float extremeLowPrice = maxNegRow >= 0 ? scanLow + (maxNegRow + 0.5) * rowStep : na
+
+    float cum = 0.0
+    float prevCum = 0.0
+    float flipPrice = na
+
+    for row = 0 to rows - 1
+        prevCum := cum
+        cum := cum + array.get(rowDelta, row)
+        if row > 0 and ((prevCum <= 0 and cum > 0) or (prevCum >= 0 and cum < 0))
+            flipPrice := scanLow + row * rowStep
+
+    float totalVol = 0.0
+    for row = 0 to rows - 1
+        totalVol += array.get(rowVolume, row)
+    float avgVol = totalVol / rows
+
+    float bestRatio = -1.0
+    int absorptionRow = -1
+
+    for row = 0 to rows - 1
+        if row != pocRow and array.get(rowVolume, row) > avgVol * 0.5
+            float rng = array.get(rowRange, row)
+            float ratio = rng > 0 ? math.abs(array.get(rowDelta, row)) / rng : 0.0
+            if ratio > bestRatio
+                bestRatio := ratio
+                absorptionRow := row
+
+    float absorptionPrice = absorptionRow >= 0 ? scanLow + (absorptionRow + 0.5) * rowStep : na
+
+    [pocPrice, extremeHighPrice, extremeLowPrice, flipPrice, absorptionPrice]
+
+// ============================================================================
+// 15m BREAK CONTEXT -- unchanged from Stage 6 [r7]. Do not touch this
+// section without re-reading pine-v6-compiler-gotchas.md gotcha #6 first.
+// ============================================================================
+
+f_get15mBreakContextRaw() =>
+    float atr15Local = ta.atr(14)
+    bool newSessionLocal = ta.change(time("D")) != 0
+    var int sessionStartBarLocal = bar_index
+    var int sessionIndexLocal = 0
+    int barsIntoSessionLocal = bar_index - sessionStartBarLocal + 1
+
+    var float pocLevel = na
+    var bool pocBroken = false
+    var float exHighLevel = na
+    var bool exHighBroken = false
+    var float exLowLevel = na
+    var bool exLowBroken = false
+    var float flipLevel = na
+    var bool flipBroken = false
+    var float absLevel = na
+    var bool absBroken = false
+
+    var int levelSetCount = 0
+    var int breakEventCount = 0
+
+    float eventDirection = na
+    float eventTypeCode = na
+    float eventZoneLow = na
+    float eventZoneHigh = na
+
+    if newSessionLocal
+        if bar_index > 0 and barsIntoSessionLocal > 1
+            int endedBarsLocal = bar_index - sessionStartBarLocal
+            if endedBarsLocal >= minEndedSessionBarsInput and not na(atr15Local)
+                [pocPx, exHighPx, exLowPx, flipPx, absPx] = f_extractSessionPois(endedBarsLocal, profileRowsInput)
+                if not na(pocPx)
+                    pocLevel := pocPx
+                    pocBroken := false
+                    levelSetCount += 1
+                if not na(exHighPx)
+                    exHighLevel := exHighPx
+                    exHighBroken := false
+                    levelSetCount += 1
+                if not na(exLowPx)
+                    exLowLevel := exLowPx
+                    exLowBroken := false
+                    levelSetCount += 1
+                if not na(flipPx)
+                    flipLevel := flipPx
+                    flipBroken := false
+                    levelSetCount += 1
+                if showAbsorptionInput and not na(absPx)
+                    absLevel := absPx
+                    absBroken := false
+                    levelSetCount += 1
+        sessionIndexLocal += 1
+        sessionStartBarLocal := bar_index
+
+    float localBarDelta = f_delta(open, high, low, close, nz(volume, 0.0))
+    float buffer = not na(atr15Local) ? atr15Local * minBreakAtrMultInput : 0.0
+    float halfWidth = not na(atr15Local) ? atr15Local * poiAtrMultInput : na
+    bool deltaOkUp = not requireBreakDeltaConfirmationInput or localBarDelta > 0
+    bool deltaOkDown = not requireBreakDeltaConfirmationInput or localBarDelta < 0
+
+    if not na(pocLevel) and not pocBroken and not na(halfWidth)
+        float zLow = pocLevel - halfWidth
+        float zHigh = pocLevel + halfWidth
+        bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
+        bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
+        if brokeUp and deltaOkUp
+            pocBroken := true
+            eventDirection := 1.0
+            eventTypeCode := 1.0
+            eventZoneLow := zLow
+            eventZoneHigh := zHigh
+        else if brokeDown and deltaOkDown
+            pocBroken := true
+            eventDirection := -1.0
+            eventTypeCode := 1.0
+            eventZoneLow := zLow
+            eventZoneHigh := zHigh
+
+    if not na(exHighLevel) and not exHighBroken and not na(halfWidth)
+        float zLow = exHighLevel - halfWidth
+        float zHigh = exHighLevel + halfWidth
+        bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
+        bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
+        if brokeUp and deltaOkUp
+            exHighBroken := true
+            eventDirection := 1.0
+            eventTypeCode := 2.0
+            eventZoneLow := zLow
+            eventZoneHigh := zHigh
+        else if brokeDown and deltaOkDown
+            exHighBroken := true
+            eventDirection := -1.0
+            eventTypeCode := 2.0
+            eventZoneLow := zLow
+            eventZoneHigh := zHigh
+
+    if not na(exLowLevel) and not exLowBroken and not na(halfWidth)
+        float zLow = exLowLevel - halfWidth
+        float zHigh = exLowLevel + halfWidth
+        bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
+        bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
+        if brokeUp and deltaOkUp
+            exLowBroken := true
+            eventDirection := 1.0
+            eventTypeCode := 3.0
+            eventZoneLow := zLow
+            eventZoneHigh := zHigh
+        else if brokeDown and deltaOkDown
+            exLowBroken := true
+            eventDirection := -1.0
+            eventTypeCode := 3.0
+            eventZoneLow := zLow
+            eventZoneHigh := zHigh
+
+    if not na(flipLevel) and not flipBroken and not na(halfWidth)
+        float zLow = flipLevel - halfWidth
+        float zHigh = flipLevel + halfWidth
+        bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
+        bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
+        if brokeUp and deltaOkUp
+            flipBroken := true
+            eventDirection := 1.0
+            eventTypeCode := 4.0
+            eventZoneLow := zLow
+            eventZoneHigh := zHigh
+        else if brokeDown and deltaOkDown
+            flipBroken := true
+            eventDirection := -1.0
+            eventTypeCode := 4.0
+            eventZoneLow := zLow
+            eventZoneHigh := zHigh
+
+    if showAbsorptionInput and not na(absLevel) and not absBroken and not na(halfWidth)
+        float zLow = absLevel - halfWidth
+        float zHigh = absLevel + halfWidth
+        bool brokeUp = close > zHigh + buffer and close[1] <= zHigh + buffer
+        bool brokeDown = close < zLow - buffer and close[1] >= zLow - buffer
+        if brokeUp and deltaOkUp
+            absBroken := true
+            eventDirection := 1.0
+            eventTypeCode := 5.0
+            eventZoneLow := zLow
+            eventZoneHigh := zHigh
+        else if brokeDown and deltaOkDown
+            absBroken := true
+            eventDirection := -1.0
+            eventTypeCode := 5.0
+            eventZoneLow := zLow
+            eventZoneHigh := zHigh
+
+    if not na(eventDirection)
+        breakEventCount += 1
+
+    float sanityLatestTime = ta.valuewhen(close > open, float(time), 0)
+
+    [eventZoneLow, eventZoneHigh, eventDirection, eventTypeCode, float(time), float(sessionIndexLocal), float(levelSetCount), float(breakEventCount), sanityLatestTime]
+
+f_get15mBreakContext() =>
+    [zoneLow, zoneHigh, direction, typeCode, eventTime, sessCount, lvlCount, evtCount, sanityTime] = f_get15mBreakContextRaw()
+    [zoneLow[1], zoneHigh[1], direction[1], typeCode[1], eventTime[1], sessCount[1], lvlCount[1], evtCount[1], sanityTime[1]]
+
+[breakZoneLow, breakZoneHigh, breakDirectionRaw, breakTypeCodeRaw, breakEventTimeRaw, breakDiagSessionCountRaw, breakDiagLevelSetCountRaw, breakDiagEventCountRaw, breakDiagSanityTimeRaw] = request.security(syminfo.tickerid, breakContextTimeframeInput, f_get15mBreakContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+int breakDiagSessionCount = na(breakDiagSessionCountRaw) ? na : int(breakDiagSessionCountRaw)
+int breakDiagLevelSetCount = na(breakDiagLevelSetCountRaw) ? na : int(breakDiagLevelSetCountRaw)
+int breakDiagEventCount = na(breakDiagEventCountRaw) ? na : int(breakDiagEventCountRaw)
+int breakDiagSanityTime = na(breakDiagSanityTimeRaw) ? na : int(breakDiagSanityTimeRaw)
+int breakDiagSanityHoursAgo = na(breakDiagSanityTime) ? na : int((time - breakDiagSanityTime) / (60 * 60 * 1000))
+
+bool haveBrokenAny = not na(breakDirectionRaw)
+int breakDirection = haveBrokenAny ? int(breakDirectionRaw) : 0
+int breakTypeCode = haveBrokenAny ? int(breakTypeCodeRaw) : 0
+int breakEventTime = haveBrokenAny ? int(breakEventTimeRaw) : na
+
+f_typeCodeName(int code) =>
+    code == 1 ? "Delta POC" : code == 2 ? "Delta Extreme +" : code == 3 ? "Delta Extreme -" : code == 4 ? "Delta Flip" : code == 5 ? "Absorption Node" : "?"
+
+// ============================================================================
+// 4H / 1H MTF CONTEXT -- unchanged from Stage 4/5/6.
+// ============================================================================
+
+f_get4hContext() =>
+    float ph = ta.pivothigh(high, pivotLeftInput, pivotRightInput)
+    float pl = ta.pivotlow(low, pivotLeftInput, pivotRightInput)
+
+    float latestHigh = ta.valuewhen(not na(ph), ph, 0)
+    float previousHigh = ta.valuewhen(not na(ph), ph, 1)
+    float latestLow = ta.valuewhen(not na(pl), pl, 0)
+    float previousLow = ta.valuewhen(not na(pl), pl, 1)
+
+    float ema = ta.ema(close, biasEmaLengthInput)
+    bool aboveEma = close > ema
+    bool slopeUp = ema > ema[biasSlopeLookbackInput]
+    bool slopeDown = ema < ema[biasSlopeLookbackInput]
+
+    [latestHigh[1], previousHigh[1], latestLow[1], previousLow[1], aboveEma[1], slopeUp[1], slopeDown[1]]
+
+[lastPivotHigh, prevPivotHigh, lastPivotLow, prevPivotLow, closeAboveEma4h, emaSlopeUp4h, emaSlopeDown4h] = request.security(syminfo.tickerid, biasTimeframeInput, f_get4hContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool haveEnoughPivots = not na(lastPivotHigh) and not na(prevPivotHigh) and not na(lastPivotLow) and not na(prevPivotLow)
+bool higherHigh = haveEnoughPivots and lastPivotHigh > prevPivotHigh
+bool lowerHigh = haveEnoughPivots and lastPivotHigh < prevPivotHigh
+bool higherLow = haveEnoughPivots and lastPivotLow > prevPivotLow
+bool lowerLow = haveEnoughPivots and lastPivotLow < prevPivotLow
+bool structureUp = higherHigh and higherLow
+bool structureDown = lowerHigh and lowerLow
+bool slowFilterUp = closeAboveEma4h and emaSlopeUp4h
+bool slowFilterDown = (not closeAboveEma4h) and emaSlopeDown4h
+string bias = structureUp and slowFilterUp ? "LONG_ONLY" : structureDown and slowFilterDown ? "SHORT_ONLY" : "NO_TRADE"
+
+f_efficiencyRatio(int length) =>
+    float netMove = math.abs(close - close[length])
+    float sumMoves = 0.0
+    for i = 0 to length - 1
+        sumMoves += math.abs(close[i] - close[i + 1])
+    sumMoves > 0 ? netMove / sumMoves : 0.0
+
+f_get1hContext() =>
+    [plusDi, minusDi, adx] = ta.dmi(adxLengthInput, adxLengthInput)
+    float emaFast = ta.ema(close, fastEmaInput)
+    float emaSlow = ta.ema(close, slowEmaInput)
+    float er = f_efficiencyRatio(erLengthInput)
+    [adx[1], emaFast[1], emaSlow[1], er[1]]
+
+[adx1h, emaFast1h, emaSlow1h, er1h] = request.security(syminfo.tickerid, trendTimeframeInput, f_get1hContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool adxOk = adx1h >= adxMinimumInput
+bool erOk = er1h >= erMinimumInput
+bool emaStackBullish1h = emaFast1h > emaSlow1h
+bool emaStackBearish1h = emaFast1h < emaSlow1h
+
+// ============================================================================
+// COOLDOWN MODULE -- ported verbatim from Stage 3 (11/11 self-tests passed
+// there). Same four-layer priority order, same rules: no countdown
+// variables (bar-index arithmetic at read time only), mutation gated by
+// barstate.isconfirmed, the entry logic below only ever QUERIES via
+// f_canTrade() and never touches CooldownState fields directly.
+// ============================================================================
+
+type CooldownState
+    int lastExitBarIndex = na
+    bool lastExitWasWin = false
+    int lastLongLossBar = na
+    int lastShortLossBar = na
+    int lossesThisSession = 0
+    array<string> usedPoiIds
+
+f_poiUsed(array<string> usedIds, string poiId) =>
+    bool found = false
+    if array.size(usedIds) > 0
+        for i = 0 to array.size(usedIds) - 1
+            if array.get(usedIds, i) == poiId
+                found := true
+    found
+
+f_canTrade(CooldownState state, string direction, string poiId, int barIdx, int winBars, int lossBars, int dirBars, int lossLimit) =>
+    string reason = "OK"
+    bool tradeable = true
+
+    if state.lossesThisSession >= lossLimit
+        tradeable := false
+        reason := "CONSECUTIVE_LOSS_LOCKOUT"
+
+    if tradeable and not na(state.lastExitBarIndex)
+        int requiredBars = state.lastExitWasWin ? winBars : lossBars
+        if barIdx - state.lastExitBarIndex < requiredBars
+            tradeable := false
+            reason := "GLOBAL_POST_TRADE"
+
+    if tradeable and f_poiUsed(state.usedPoiIds, poiId)
+        tradeable := false
+        reason := "POI_LOCKOUT"
+
+    if tradeable
+        int lastDirLoss = direction == "long" ? state.lastLongLossBar : state.lastShortLossBar
+        if not na(lastDirLoss) and barIdx - lastDirLoss < dirBars
+            tradeable := false
+            reason := "DIRECTION_LOCKOUT"
+
+    [tradeable, reason]
+
+f_recordExit(CooldownState state, int barIdx, bool isWin, string direction, string poiId) =>
+    state.lastExitBarIndex := barIdx
+    state.lastExitWasWin := isWin
+    if not isWin
+        if direction == "long"
+            state.lastLongLossBar := barIdx
+        else
+            state.lastShortLossBar := barIdx
+        state.lossesThisSession := state.lossesThisSession + 1
+    if not f_poiUsed(state.usedPoiIds, poiId)
+        array.push(state.usedPoiIds, poiId)
+
+f_resetSession(CooldownState state) =>
+    state.lossesThisSession := 0
+    array.clear(state.usedPoiIds)
+
+var CooldownState cd = CooldownState.new(usedPoiIds = array.new_string())
+
+// Real session reset (not the Stage 3 test harness's scripted bar offsets):
+// a new calendar day on THIS (5m) chart clears the session-scoped layers
+// (POI lockout, consecutive-loss) while leaving the bar-count timers alone,
+// per Stage 3's own T10 test ("reset != bar-count").
+bool newDay5m = ta.change(time("D")) != 0
+if barstate.isconfirmed and newDay5m
+    f_resetSession(cd)
+
+// ============================================================================
+// RETEST / TRIGGER STATE MACHINE (5m, native chart bars) -- unchanged from
+// Stage 6, with one addition: activeTriggerAligned persists the "aligned
+// with current bias" tag from the TRIGGERED transition so the entry logic
+// below can read it (it was a label-only local in Stage 6).
+// ============================================================================
+
+var float activeZoneLow = na
+var float activeZoneHigh = na
+var int activeDirection = 0
+var int activeTypeCode = 0
+var int activeEventTime = na
+var string retestState = "NONE"
+var bool activeTriggerAligned = false
+var array<string> retestLog = array.new_string()
+
+bool newBreakEvent = breakDirection != 0 and (na(activeEventTime) or breakEventTime != activeEventTime)
+
+if newBreakEvent
+    activeZoneLow := breakZoneLow
+    activeZoneHigh := breakZoneHigh
+    activeDirection := breakDirection
+    activeTypeCode := breakTypeCode
+    activeEventTime := breakEventTime
+    retestState := "WATCHING"
+    array.unshift(retestLog, "bar" + str.tostring(bar_index) + " NEW " + f_typeCodeName(breakTypeCode) + " " + (breakDirection == 1 ? "UP" : "DOWN"))
+    if array.size(retestLog) > 8
+        array.pop(retestLog)
+
+int hoursSinceEvent = na(activeEventTime) ? na : int((time - activeEventTime) / (60 * 60 * 1000))
+bool windowExpired = not na(activeEventTime) and hoursSinceEvent > retestWindowHoursInput
+
+if retestState == "WATCHING" or retestState == "RETESTED"
+    if windowExpired
+        retestState := "EXPIRED"
+        array.unshift(retestLog, "bar" + str.tostring(bar_index) + " EXPIRED " + f_typeCodeName(activeTypeCode))
+        if array.size(retestLog) > 8
+            array.pop(retestLog)
+    else
+        bool touchingZone = high >= activeZoneLow and low <= activeZoneHigh
+        if touchingZone and retestState == "WATCHING"
+            retestState := "RETESTED"
+
+        if retestState == "RETESTED"
+            bool triggerOkUp = not requireTriggerDeltaConfirmationInput or barDelta > 0
+            bool triggerOkDown = not requireTriggerDeltaConfirmationInput or barDelta < 0
+            bool triggerUp = activeDirection == 1 and close > activeZoneHigh and triggerOkUp
+            bool triggerDown = activeDirection == -1 and close < activeZoneLow and triggerOkDown
+            bool invalidateUp = activeDirection == 1 and close < activeZoneLow
+            bool invalidateDown = activeDirection == -1 and close > activeZoneHigh
+
+            if triggerUp or triggerDown
+                retestState := "TRIGGERED"
+                activeTriggerAligned := (triggerUp and bias == "LONG_ONLY") or (triggerDown and bias == "SHORT_ONLY")
+                label.new(bar_index, triggerUp ? activeZoneHigh : activeZoneLow, (triggerUp ? "▲▲ " : "▼▼ ") + f_typeCodeName(activeTypeCode) + " RETEST", style = triggerUp ? label.style_label_up : label.style_label_down, color = color.new(triggerUp ? triggerUpColorInput : triggerDownColorInput, activeTriggerAligned ? 0 : 55), textcolor = color.white, size = size.small)
+                array.unshift(retestLog, "bar" + str.tostring(bar_index) + " TRIGGERED " + f_typeCodeName(activeTypeCode) + " " + (triggerUp ? "UP" : "DOWN") + (activeTriggerAligned ? " (aligned)" : ""))
+                if array.size(retestLog) > 8
+                    array.pop(retestLog)
+            else if invalidateUp or invalidateDown
+                retestState := "INVALIDATED"
+                array.unshift(retestLog, "bar" + str.tostring(bar_index) + " INVALIDATED " + f_typeCodeName(activeTypeCode))
+                if array.size(retestLog) > 8
+                    array.pop(retestLog)
+
+// ============================================================================
+// ORDERS -- entry on a fresh TRIGGERED transition, gated by cooldown and
+// (unless disabled) bias alignment. lastActedEventTime prevents re-entering
+// every bar while retestState stays "TRIGGERED" (a var, so it holds until
+// the next event overwrites it) -- same na-safe comparison shape as
+// newBreakEvent above, per gotcha #6.
+// ============================================================================
+
+var int lastActedEventTime = na
+var string openTradeDirection = ""
+var string openTradePoiId = ""
+var int openTradeTypeCode = 0
+var array<string> orderLog = array.new_string()
+
+// PER-TYPE PERFORMANCE TRACKING -- per the build spec's filter discipline
+// ("measure before you filter, one at a time"): before deciding to
+// eliminate a POI type as an entry trigger, know its actual trade count,
+// win count, and net profit. Indexed 0-4 for typeCode 1-5 (POC, Extreme+,
+// Extreme-, Flip, Absorption).
+var array<int> typeTradeCount = array.new_int(5, 0)
+var array<int> typeWinCount = array.new_int(5, 0)
+var array<float> typeProfitSum = array.new_float(5, 0.0)
+
+// DIAGNOSTIC: counts how many times THIS SCRIPT actually called
+// strategy.entry(), independent of whether the broker ever filled it.
+// Compared against strategy.opentrades + strategy.closedtrades (the
+// broker's own count) on the dashboard -- if the script-side count is
+// higher, some submitted orders never became real trades, which is a
+// different, more specific finding than just "Position: FLAT."
+var int entryCallCount = 0
+
+bool freshTrigger = retestState == "TRIGGERED" and (na(lastActedEventTime) or activeEventTime != lastActedEventTime)
+
+if barstate.isconfirmed and freshTrigger and strategy.position_size == 0
+    string directionStr = activeDirection == 1 ? "long" : "short"
+    string poiId = f_typeCodeName(activeTypeCode) + "_" + str.tostring(activeEventTime)
+    bool alignedOk = not requireAlignedEntryInput or activeTriggerAligned
+    bool typeEnabled = activeTypeCode == 4 ? enableDeltaFlipEntriesInput : true
+
+    [tradeable, reason] = f_canTrade(cd, directionStr, poiId, bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+
+    lastActedEventTime := activeEventTime
+
+    if alignedOk and typeEnabled and tradeable
+        float stopPrice = directionStr == "long" ? activeZoneLow - stopBufferAtrMultInput * atr5m : activeZoneHigh + stopBufferAtrMultInput * atr5m
+        float riskPerUnit = math.abs(close - stopPrice)
+        float targetPrice = directionStr == "long" ? close + riskPerUnit * rMultipleInput : close - riskPerUnit * rMultipleInput
+        string entryId = directionStr == "long" ? "Long" : "Short"
+
+        openTradeDirection := directionStr
+        openTradePoiId := poiId
+        openTradeTypeCode := activeTypeCode
+
+        if directionStr == "long"
+            strategy.entry(entryId, strategy.long, qty = contractsInput)
+        else
+            strategy.entry(entryId, strategy.short, qty = contractsInput)
+        strategy.exit(entryId + " Exit", entryId, stop = stopPrice, limit = targetPrice)
+        entryCallCount += 1
+
+        array.unshift(orderLog, "bar" + str.tostring(bar_index) + " SUBMITTED " + entryId + " " + f_typeCodeName(activeTypeCode) + " stop=" + str.tostring(stopPrice, format.mintick) + " tgt=" + str.tostring(targetPrice, format.mintick))
+        if array.size(orderLog) > 8
+            array.pop(orderLog)
+    else
+        array.unshift(orderLog, "bar" + str.tostring(bar_index) + " SKIP " + f_typeCodeName(activeTypeCode) + " (" + (not typeEnabled ? "TYPE_DISABLED" : not alignedOk ? "NOT_ALIGNED" : reason) + ")")
+        if array.size(orderLog) > 8
+            array.pop(orderLog)
+
+// ============================================================================
+// EXIT DETECTION -- broker-verified via strategy.closedtrades, the proven
+// pattern from pine-proven-patterns/references/broker-verified-exit-
+// detection.md (the exact fix for the old P0 script's dead
+// strategy.position_size bug). Never inferred from strategy.position_size
+// transitions.
+// ============================================================================
+
+var int processedClosedTrades = 0
+
+if strategy.closedtrades > processedClosedTrades
+    int closedIdx = strategy.closedtrades - 1
+    string closedEntryId = strategy.closedtrades.entry_id(closedIdx)
+    float closedProfit = strategy.closedtrades.profit(closedIdx)
+    bool isWin = closedProfit > 0
+    string closedDirection = closedEntryId == "Long" ? "long" : "short"
+
+    f_recordExit(cd, bar_index, isWin, closedDirection, openTradePoiId)
+
+    if openTradeTypeCode >= 1 and openTradeTypeCode <= 5
+        int typeIdx = openTradeTypeCode - 1
+        array.set(typeTradeCount, typeIdx, array.get(typeTradeCount, typeIdx) + 1)
+        if isWin
+            array.set(typeWinCount, typeIdx, array.get(typeWinCount, typeIdx) + 1)
+        array.set(typeProfitSum, typeIdx, array.get(typeProfitSum, typeIdx) + closedProfit)
+
+    array.unshift(orderLog, "bar" + str.tostring(bar_index) + " EXIT " + closedEntryId + " " + (isWin ? "WIN" : "LOSS") + " " + str.tostring(closedProfit, format.mintick))
+    if array.size(orderLog) > 8
+        array.pop(orderLog)
+
+    processedClosedTrades := strategy.closedtrades
+
+// ============================================================================
+// ACTIVE ZONE VISUAL -- unchanged from Stage 6.
+// ============================================================================
+
+var box activeZoneBox = na
+
+if barstate.islast
+    if not na(activeZoneBox)
+        box.delete(activeZoneBox)
+    if retestState == "WATCHING" or retestState == "RETESTED"
+        color zoneDrawColor = retestState == "RETESTED" ? (activeDirection == 1 ? triggerUpColorInput : triggerDownColorInput) : retestZoneColorInput
+        activeZoneBox := box.new(left = bar_index - 40, top = activeZoneHigh, right = bar_index + 5, bottom = activeZoneLow, xloc = xloc.bar_index, bgcolor = color.new(zoneDrawColor, 85), border_color = zoneDrawColor)
+
+// ============================================================================
+// DASHBOARD -- Stage 6's compact rows unchanged, plus two new always-visible
+// rows: Position (broker-verified, per the P0-script lesson: trust
+// strategy.position_size/opentrades, never a custom tracker) and Cooldown
+// (queries f_canTrade() for whatever direction the active candidate
+// implies -- read-only, matches rule 3's "entry logic only ever queries").
+// ============================================================================
+
+int coreRows = 10
+int diagnosticRows = 16
+int tableRows = showDiagnosticsInput ? coreRows + diagnosticRows : coreRows
+
+var table statusTable = table.new(position.bottom_right, 2, tableRows, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast
+    string regime = (not adxOk or not erOk) ? "CHOPPY" : bias == "LONG_ONLY" ? "TRENDING UP" : bias == "SHORT_ONLY" ? "TRENDING DOWN" : "TRANSITIONAL"
+    color regimeColor = regime == "CHOPPY" ? color.gray : regime == "TRANSITIONAL" ? color.orange : regime == "TRENDING UP" ? color.lime : color.red
+
+    int bullPoints = 0
+    int bearPoints = 0
+    if structureUp
+        bullPoints += 1
+    if structureDown
+        bearPoints += 1
+    if slowFilterUp
+        bullPoints += 1
+    if slowFilterDown
+        bearPoints += 1
+    if adxOk
+        bullPoints += 1
+        bearPoints += 1
+    if emaStackBullish1h
+        bullPoints += 1
+    if emaStackBearish1h
+        bearPoints += 1
+    if erOk
+        bullPoints += 1
+        bearPoints += 1
+
+    float rollingBuyDelta = 0.0
+    float rollingSellDelta = 0.0
+    for i = 0 to deltaStrengthWindowInput - 1
+        float d = f_delta(open[i], high[i], low[i], close[i], nz(volume[i], 0.0))
+        if d > 0
+            rollingBuyDelta += d
+        else
+            rollingSellDelta += -d
+
+    if rollingBuyDelta > rollingSellDelta
+        bullPoints += 1
+    else if rollingSellDelta > rollingBuyDelta
+        bearPoints += 1
+
+    float totalDelta = rollingBuyDelta + rollingSellDelta
+    float buyRatio = totalDelta > 0 ? rollingBuyDelta / totalDelta : 0.5
+    float sellRatio = 1.0 - buyRatio
+    int buyBlocks = int(math.round(buyRatio * 10))
+    int sellBlocks = int(math.round(sellRatio * 10))
+    string buyBar = str.repeat("█", buyBlocks) + str.repeat("░", 10 - buyBlocks)
+    string sellBar = str.repeat("█", sellBlocks) + str.repeat("░", 10 - sellBlocks)
+
+    string retestDisplay = retestState == "NONE" ? "NONE" : retestState + " " + f_typeCodeName(activeTypeCode)
+    color retestColor = retestState == "TRIGGERED" ? (activeDirection == 1 ? color.lime : color.red) : retestState == "RETESTED" ? color.orange : retestState == "WATCHING" ? color.yellow : retestState == "INVALIDATED" ? color.gray : retestState == "EXPIRED" ? color.gray : color.gray
+
+    string positionDisplay = strategy.position_size == 0 ? "FLAT" : (strategy.position_size > 0 ? "LONG " : "SHORT ") + str.tostring(math.abs(strategy.position_size), "#")
+    color positionColor = strategy.position_size == 0 ? color.gray : strategy.position_size > 0 ? color.lime : color.red
+
+    string queryDirection = activeDirection == 1 ? "long" : activeDirection == -1 ? "short" : "long"
+    string queryPoiId = na(activeEventTime) ? "none" : f_typeCodeName(activeTypeCode) + "_" + str.tostring(activeEventTime)
+    [cooldownOk, cooldownReason] = f_canTrade(cd, queryDirection, queryPoiId, bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+    color cooldownColor = cooldownOk ? color.lime : color.orange
+
+    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r5]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+    table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+
+    table.cell(statusTable, 0, 1, "Bias", text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 1, bias, text_color = bias == "LONG_ONLY" ? color.lime : bias == "SHORT_ONLY" ? color.red : color.gray, text_size = size.small)
+
+    table.cell(statusTable, 0, 2, "Regime", text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 2, regime, text_color = regimeColor, text_size = size.small)
+
+    table.cell(statusTable, 0, 3, "Bull Score", text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 3, str.tostring(bullPoints) + " / 6", text_color = bullPoints >= 5 ? color.lime : bullPoints >= 3 ? color.white : color.gray, text_size = size.small)
+
+    table.cell(statusTable, 0, 4, "Bear Score", text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 4, str.tostring(bearPoints) + " / 6", text_color = bearPoints >= 5 ? color.red : bearPoints >= 3 ? color.white : color.gray, text_size = size.small)
+
+    table.cell(statusTable, 0, 5, "Buyers", text_color = buyColorInput, text_size = size.small)
+    table.cell(statusTable, 1, 5, buyBar + " " + str.tostring(int(math.round(buyRatio * 100))) + "%", text_color = buyColorInput, text_size = size.small)
+
+    table.cell(statusTable, 0, 6, "Sellers", text_color = sellColorInput, text_size = size.small)
+    table.cell(statusTable, 1, 6, sellBar + " " + str.tostring(int(math.round(sellRatio * 100))) + "%", text_color = sellColorInput, text_size = size.small)
+
+    table.cell(statusTable, 0, 7, "Retest", text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 7, retestDisplay, text_color = retestColor, text_size = size.small)
+
+    table.cell(statusTable, 0, 8, "Position", text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 8, positionDisplay, text_color = positionColor, text_size = size.small)
+
+    table.cell(statusTable, 0, 9, "Cooldown", text_color = color.white, text_size = size.small)
+    table.cell(statusTable, 1, 9, cooldownOk ? "OK" : cooldownReason, text_color = cooldownColor, text_size = size.small)
+
+    if showDiagnosticsInput
+        table.cell(statusTable, 0, 10, "Chart TF", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 10, timeframe.period, text_color = timeframe.period == "5" ? color.lime : color.orange, text_size = size.tiny)
+
+        table.cell(statusTable, 0, 11, "Active Zone", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 11, na(activeZoneLow) ? "--" : str.tostring(activeZoneLow, format.mintick) + " - " + str.tostring(activeZoneHigh, format.mintick), text_color = color.white, text_size = size.tiny)
+
+        table.cell(statusTable, 0, 12, "Hours Since Break", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 12, na(hoursSinceEvent) ? "--" : str.tostring(hoursSinceEvent), text_color = color.white, text_size = size.tiny)
+
+        table.cell(statusTable, 0, 13, "Closed Trades (Broker)", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 13, str.tostring(strategy.closedtrades) + " / Losses " + str.tostring(cd.lossesThisSession), text_color = color.white, text_size = size.tiny)
+
+        table.cell(statusTable, 0, 14, "Net Profit (Broker)", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 14, str.tostring(strategy.netprofit, format.mintick), text_color = strategy.netprofit >= 0 ? color.lime : color.red, text_size = size.tiny)
+
+        // DIAGNOSTIC: without Strategy Tester access, this is the direct
+        // way to see whether a submitted order ever actually became a
+        // real broker-side trade. entryCallCount is purely script-side
+        // (incremented every time strategy.entry() is called, regardless
+        // of outcome); opentrades+closedtrades is the broker's own count
+        // of trades that actually exist. If the script-side number is
+        // higher, some submitted orders never filled -- a different,
+        // more specific finding than "Position: FLAT" alone.
+        table.cell(statusTable, 0, 15, "Entry Calls (Script) / Trades (Broker)", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 15, str.tostring(entryCallCount) + " / " + str.tostring(strategy.opentrades + strategy.closedtrades), text_color = entryCallCount == (strategy.opentrades + strategy.closedtrades) ? color.lime : color.orange, text_size = size.tiny)
+
+        // PER-TYPE PERFORMANCE -- per the build spec's filter discipline:
+        // know each POI type's actual trade count / win rate / net profit
+        // before deciding to eliminate it as an entry trigger. A type with
+        // few trades isn't necessarily "bad" yet -- small samples are
+        // noisy. A type with many trades and a consistently negative sum
+        // is the one worth actually cutting.
+        table.cell(statusTable, 0, 16, "PER-TYPE (Trades/Win%/NetP&L)", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        table.cell(statusTable, 1, 16, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+
+        for t = 0 to 4
+            int tableRow = 17 + t
+            int tCount = array.get(typeTradeCount, t)
+            int tWins = array.get(typeWinCount, t)
+            float tProfit = array.get(typeProfitSum, t)
+            string tName = f_typeCodeName(t + 1)
+            string tText = tCount == 0 ? "0 trades" : str.tostring(tCount) + " / " + str.tostring(int(math.round(tWins * 100.0 / tCount))) + "% / " + str.tostring(tProfit, format.mintick)
+            color tColor = tCount == 0 ? color.gray : tProfit > 0 ? color.lime : tProfit < 0 ? color.red : color.white
+            table.cell(statusTable, 0, tableRow, tName, text_color = color.white, text_size = size.tiny)
+            table.cell(statusTable, 1, tableRow, tText, text_color = tColor, text_size = size.tiny)
+
+        table.cell(statusTable, 0, 22, "ORDER LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        table.cell(statusTable, 1, 22, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+
+        int orderLogRowStart = 23
+        int maxOrderLogRows = 3
+        for r = 0 to maxOrderLogRows - 1
+            int tableRow = orderLogRowStart + r
+            if r < array.size(orderLog)
+                table.cell(statusTable, 0, tableRow, array.get(orderLog, r), text_color = color.white, text_halign = text.align_left, text_size = size.tiny)
+                table.cell(statusTable, 1, tableRow, "", text_color = color.white, text_size = size.tiny)
+            else
+                table.cell(statusTable, 0, tableRow, "", text_color = color.white, text_size = size.tiny)
+                table.cell(statusTable, 1, tableRow, "", text_color = color.white, text_size = size.tiny)
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+
+plot(barDelta, title = "Per-Bar Delta", display = display.data_window)
+plot(activeDirection, title = "Active Retest Direction", display = display.data_window)
+plot(strategy.position_size, title = "Position Size (Broker)", display = display.data_window)
+plot(strategy.opentrades, title = "Open Trades (Broker)", display = display.data_window)
+plot(strategy.closedtrades, title = "Closed Trades (Broker)", display = display.data_window)
+plot(entryCallCount, title = "Entry Calls (Script)", display = display.data_window)

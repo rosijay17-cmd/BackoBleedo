@@ -1,0 +1,480 @@
+//@version=6
+strategy("BBL MTF",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=1,
+     pyramiding=0)
+
+//━━━━━━━━━━━━━━━━━━━
+// Inputs
+//━━━━━━━━━━━━━━━━━━━
+htf        = input.timeframe("60", "Higher Timeframe")
+bbLen      = input.int(20, "BB Length")
+bbMult     = input.float(2.0, "BB Multiplier")
+
+adxLen     = input.int(14, "ADX Length")
+rocHTFLen  = input.int(9, "HTF ROC Length")
+rocExecLen = input.int(9, "Execution ROC Length")
+atrLen     = input.int(14, "ATR Length")
+rvolLen    = input.int(20, "RVOL Length")
+
+htfAdxMin  = input.float(20, "HTF ADX Minimum", tooltip="Raised from 15 -- ADX below ~20 is a weak/developing trend, not a real directional regime. This is the most upstream gate: tightening it here cascades through bias, direction score, and the dashboard REGIME row.")
+execAdxMin = input.float(12, "Execution ADX Minimum")
+rvolMin    = input.float(1.1, "RVOL Minimum", tooltip="Raised from 1.0 -- a small floor above average volume, filtering the quietest bars out of the base RVOL gate.")
+rocMinPct  = input.float(0.08, "Minimum ROC Magnitude %", minval=0.0, step=0.01, tooltip="Direction-score ROC check now requires this minimum magnitude, not just sign -- filters near-zero/noise drift from counting as momentum. Raise for a choppier instrument, lower for a slow one.")
+reclaimBodyMin = input.float(0.50, "Minimum Reclaim/Reject Body %", minval=0.0, maxval=1.0, step=0.05, tooltip="Bull Reclaim / Bear Reject (the weakest of the five candle-confirmation types -- no distinctive shape required, just a directional close back above/below basis+EMA) now also requires this minimum body-to-range ratio, filtering indecisive reclaim candles.")
+
+dirMinScore  = input.int(85, "Minimum Direction Score", tooltip="Raised from 75. At the old threshold, HTF bias + ADX + ROC alone (no volume delta needed) already cleared it. At 85, that same path needs band expansion too, or delta in place of band -- effectively requires 4 of the 5 direction components instead of 3.")
+execMinScore = input.int(80, "Minimum Execution Score", tooltip="Raised from 70. At the old threshold, exec trend + recent pullback + any one candle pattern + a bare RVOL floor already cleared it, with no momentum or ATR expansion required. At 80, that same path now also needs ATR expansion (volatility confirmation) to clear.")
+
+pullbackLookback = input.int(6, "Pullback Lookback Bars", minval=1, tooltip="Reduced from 10 -- a pullback further back than this is stale; requiring confirmation to cluster closer to the actual retracement cuts the tail of setups that were really just late-trend continuation candles with no real pullback nearby.")
+cooldownBars     = input.int(10, "Cooldown Bars", minval=0, tooltip="Now also measured from the last CLOSED trade, not only the last signal bar -- see the Cooldown section below. Prevents an immediate re-signal right after a fast stop-out.")
+
+emaFastLen = input.int(21, "Execution Fast EMA")
+emaSlowLen = input.int(50, "Execution Slow EMA")
+useVWAP    = input.bool(true, "Use VWAP Filter")
+
+atrSLMult  = input.float(1.5, "ATR Stop Multiplier")
+rrTarget   = input.float(2.0, "Risk Reward Target")
+
+showDashboard = input.bool(true, "Show Dashboard")
+dashboardPos  = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
+
+showCandleLabels    = input.bool(true, "Show Candle Labels")
+colorConfirmBars    = input.bool(true, "Color Confirmation Candles")
+candleLabelLookback = input.int(25, "Show Candle Labels Last X Bars", minval=1)
+
+//━━━━━━━━━━━━━━━━━━━
+// Functions
+//━━━━━━━━━━━━━━━━━━━
+f_adx(_len) =>
+    upMove   = high - high[1]
+    downMove = low[1] - low
+    plusDM   = upMove > downMove and upMove > 0 ? upMove : 0.0
+    minusDM  = downMove > upMove and downMove > 0 ? downMove : 0.0
+    trur     = ta.rma(ta.tr(true), _len)
+    plusDI   = 100 * ta.rma(plusDM, _len) / trur
+    minusDI  = 100 * ta.rma(minusDM, _len) / trur
+    dx       = 100 * math.abs(plusDI - minusDI) / math.max(plusDI + minusDI, 0.000001)
+    ta.rma(dx, _len)
+
+f_bbWidth() =>
+    _basis = ta.sma(close, bbLen)
+    _dev   = bbMult * ta.stdev(close, bbLen)
+    ((_basis + _dev) - (_basis - _dev)) / _basis
+
+// FIX 1: added LONG and SHORT cases so the POSITION row shows the correct color
+f_directionColor(_state) =>
+    _state == "BULL" or _state == "BUY" or _state == "LONG" or str.contains(_state, "BUY") ? color.rgb(0, 120, 255) :
+     _state == "BEAR" or _state == "SELL" or _state == "SHORT" or str.contains(_state, "SELL") ? color.rgb(140, 80, 255) :
+     color.gray
+
+f_conditionColor(_state) =>
+    _state == "TREND" or _state == "EXP" or _state == "HIGH" or _state == "STRONG" or _state == "READY" ? color.green :
+     _state == "BUILD" or _state == "OK" or _state == "RANGE" or _state == "SQZ" or _state == "CONT" ? color.orange :
+     color.red
+
+f_scoreColor(_score) =>
+    _score >= 80 ? color.green :
+     _score >= 65 ? color.orange :
+     color.red
+
+f_summaryColor(_summary) =>
+    str.contains(_summary, "BUY") or str.contains(_summary, "BULL") ? color.rgb(0, 120, 255) :
+     str.contains(_summary, "SELL") or str.contains(_summary, "BEAR") ? color.rgb(140, 80, 255) :
+     str.contains(_summary, "COOLDOWN") or str.contains(_summary, "WAIT") or str.contains(_summary, "BUILDING") ? color.orange :
+     color.gray
+
+f_row(_dash, _row, _left, _right, _bgRight) =>
+    table.cell(_dash, 0, _row, _left,  text_color=color.white, bgcolor=color.rgb(40, 44, 55), text_size=size.small)
+    table.cell(_dash, 1, _row, _right, text_color=color.white, bgcolor=_bgRight,              text_size=size.small)
+
+//━━━━━━━━━━━━━━━━━━━
+// Bollinger + Execution Indicators
+//━━━━━━━━━━━━━━━━━━━
+basis = ta.sma(close, bbLen)
+dev   = bbMult * ta.stdev(close, bbLen)
+upper = basis + dev
+lower = basis - dev
+
+bbWidth     = (upper - lower) / basis
+bbExpanding = bbWidth > bbWidth[1]
+
+rocExec = ta.roc(close, rocExecLen)
+atr     = ta.atr(atrLen)
+adxExec = f_adx(adxLen)
+
+avgVol = ta.sma(volume, rvolLen)
+rvol   = avgVol > 0 ? volume / avgVol : 0.0
+
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+vwapVal = ta.vwap(hlc3)
+
+//━━━━━━━━━━━━━━━━━━━
+// HTF Calculations
+//━━━━━━━━━━━━━━━━━━━
+htfClose = request.security(syminfo.tickerid, htf, close, barmerge.gaps_off, barmerge.lookahead_off)
+htfBasis = request.security(syminfo.tickerid, htf, ta.sma(close, bbLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfRoc   = request.security(syminfo.tickerid, htf, ta.roc(close, rocHTFLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfAdx   = request.security(syminfo.tickerid, htf, f_adx(adxLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+htfBandWidth     = request.security(syminfo.tickerid, htf, f_bbWidth(), barmerge.gaps_off, barmerge.lookahead_off)
+htfBandWidthPrev = request.security(syminfo.tickerid, htf, f_bbWidth()[1], barmerge.gaps_off, barmerge.lookahead_off)
+
+bandExpanding = htfBandWidth > htfBandWidthPrev
+
+//━━━━━━━━━━━━━━━━━━━
+// Bias
+//━━━━━━━━━━━━━━━━━━━
+bullBias = htfClose > htfBasis and htfRoc > 0 and htfAdx > htfAdxMin
+bearBias = htfClose < htfBasis and htfRoc < 0 and htfAdx > htfAdxMin
+
+//━━━━━━━━━━━━━━━━━━━
+// Execution Trend Filter
+//━━━━━━━━━━━━━━━━━━━
+bullExecTrend = close > emaFast and emaFast > emaSlow and close > emaSlow and (not useVWAP or close > vwapVal)
+bearExecTrend = close < emaFast and emaFast < emaSlow and close < emaSlow and (not useVWAP or close < vwapVal)
+
+//━━━━━━━━━━━━━━━━━━━
+// Pullback Logic
+// FIX 5: gate pullbacks on bias direction so price below basis in a downtrend
+//        doesn't register as a "bull pullback"; removed `lower`/`upper` boundary
+//        from the OR to avoid false positives on deep dips in counter-trend moves
+//━━━━━━━━━━━━━━━━━━━
+bullPullback = bullBias and (low <= basis or low <= emaFast)
+bearPullback = bearBias and (high >= basis or high >= emaFast)
+
+bullPullbackRecent = ta.barssince(bullPullback) <= pullbackLookback
+bearPullbackRecent = ta.barssince(bearPullback) <= pullbackLookback
+
+//━━━━━━━━━━━━━━━━━━━
+// Momentum Trigger
+//━━━━━━━━━━━━━━━━━━━
+earlyBullMomentum = rocExec > rocExec[1] and close > close[1] and close > open
+earlyBearMomentum = rocExec < rocExec[1] and close < close[1] and close < open
+
+//━━━━━━━━━━━━━━━━━━━
+// Candle Confirmation Logic
+//━━━━━━━━━━━━━━━━━━━
+bodySize    = math.abs(close - open)
+candleRange = high - low
+upperWick   = high - math.max(open, close)
+lowerWick   = math.min(open, close) - low
+
+bodyPct      = candleRange > 0 ? bodySize / candleRange : 0.0
+upperWickPct = candleRange > 0 ? upperWick / candleRange : 0.0
+lowerWickPct = candleRange > 0 ? lowerWick / candleRange : 0.0
+
+bullCandle = close > open
+bearCandle = close < open
+
+bullEngulf = bullCandle and close > open[1] and open < close[1] and close[1] < open[1]
+bearEngulf = bearCandle and close < open[1] and open > close[1] and close[1] > open[1]
+
+bullPinbar = lowerWickPct >= 0.45 and bodyPct <= 0.40 and close > low + candleRange * 0.55
+bearPinbar = upperWickPct >= 0.45 and bodyPct <= 0.40 and close < high - candleRange * 0.55
+
+bullMarubozu = bullCandle and bodyPct >= 0.70 and close >= high - candleRange * 0.15
+bearMarubozu = bearCandle and bodyPct >= 0.70 and close <= low + candleRange * 0.15
+
+insideBar = high < high[1] and low > low[1]
+
+bullInsideBreak = insideBar[1] and close > high[1] and bullCandle
+bearInsideBreak = insideBar[1] and close < low[1] and bearCandle
+
+bullReclaim = bullPullbackRecent and close > basis and close > emaFast and bullCandle and bodyPct >= reclaimBodyMin
+bearReject  = bearPullbackRecent and close < basis and close < emaFast and bearCandle and bodyPct >= reclaimBodyMin
+
+bullCandleConfirm = bullEngulf or bullPinbar or bullMarubozu or bullInsideBreak or bullReclaim
+bearCandleConfirm = bearEngulf or bearPinbar or bearMarubozu or bearInsideBreak or bearReject
+
+candleState =
+     bullCandleConfirm ? "BULL" :
+     bearCandleConfirm ? "BEAR" :
+     "NONE"
+
+//━━━━━━━━━━━━━━━━━━━
+// Base Metrics
+//━━━━━━━━━━━━━━━━━━━
+volDelta = close > open ? volume : close < open ? -volume : 0.0
+deltaMA  = ta.sma(volDelta, rvolLen)
+
+deltaBull = deltaMA > 0
+deltaBear = deltaMA < 0
+
+atrAvg       = ta.sma(atr, atrLen)
+atrExpanding = atr > atrAvg
+
+rocBull = rocExec > rocMinPct
+rocBear = rocExec < -rocMinPct
+
+adxStrong   = adxExec >= 25
+adxBuilding = adxExec >= execAdxMin
+
+rvolGood   = rvol >= rvolMin
+rvolStrong = rvol >= 1.5
+
+//━━━━━━━━━━━━━━━━━━━
+// Direction Score
+//━━━━━━━━━━━━━━━━━━━
+bullDirectionScore = 0
+bullDirectionScore += bullBias ? 30 : 0
+bullDirectionScore += bandExpanding ? 15 : 0
+bullDirectionScore += rocBull ? 20 : 0
+bullDirectionScore += deltaBull ? 15 : 0
+bullDirectionScore += adxStrong ? 20 : adxBuilding ? 10 : 0
+
+bearDirectionScore = 0
+bearDirectionScore += bearBias ? 30 : 0
+bearDirectionScore += bandExpanding ? 15 : 0
+bearDirectionScore += rocBear ? 20 : 0
+bearDirectionScore += deltaBear ? 15 : 0
+bearDirectionScore += adxStrong ? 20 : adxBuilding ? 10 : 0
+
+directionScore = bullDirectionScore > bearDirectionScore ? bullDirectionScore : bearDirectionScore
+directionSide  = bullDirectionScore > bearDirectionScore ? "BULL" : bearDirectionScore > bullDirectionScore ? "BEAR" : "NEUT"
+
+//━━━━━━━━━━━━━━━━━━━
+// Execution Score
+//━━━━━━━━━━━━━━━━━━━
+bullExecutionScore = 0
+bullExecutionScore += bullExecTrend ? 20 : 0
+bullExecutionScore += bullPullbackRecent ? 20 : 0
+bullExecutionScore += earlyBullMomentum ? 15 : 0
+bullExecutionScore += bullCandleConfirm ? 25 : 0
+bullExecutionScore += rvolStrong ? 10 : rvolGood ? 5 : 0
+bullExecutionScore += atrExpanding ? 10 : 0
+
+bearExecutionScore = 0
+bearExecutionScore += bearExecTrend ? 20 : 0
+bearExecutionScore += bearPullbackRecent ? 20 : 0
+bearExecutionScore += earlyBearMomentum ? 15 : 0
+bearExecutionScore += bearCandleConfirm ? 25 : 0
+bearExecutionScore += rvolStrong ? 10 : rvolGood ? 5 : 0
+bearExecutionScore += atrExpanding ? 10 : 0
+
+executionScore =
+     directionSide == "BULL" ? bullExecutionScore :
+     directionSide == "BEAR" ? bearExecutionScore :
+     0
+
+//━━━━━━━━━━━━━━━━━━━
+// Cooldown
+//━━━━━━━━━━━━━━━━━━━
+var int lastBuySignalBar  = na
+var int lastSellSignalBar = na
+var int lastExitBar       = na
+
+// FIX: cooldown previously measured bars only since the last SIGNAL bar. A
+// trade that stopped out fast (well before cooldownBars elapsed from entry)
+// could be immediately followed by a fresh signal the moment the position
+// flattened, since strategy.position_size == 0 was the only other gate.
+// Cooldown now also requires cooldownBars since the last CLOSED trade.
+buyCooldownPassed  = (na(lastBuySignalBar) or bar_index - lastBuySignalBar >= cooldownBars) and (na(lastExitBar) or bar_index - lastExitBar >= cooldownBars)
+sellCooldownPassed = (na(lastSellSignalBar) or bar_index - lastSellSignalBar >= cooldownBars) and (na(lastExitBar) or bar_index - lastExitBar >= cooldownBars)
+
+//━━━━━━━━━━━━━━━━━━━
+// Raw Entry Conditions
+//━━━━━━━━━━━━━━━━━━━
+buyReady =
+     directionSide == "BULL" and
+     directionScore >= dirMinScore and
+     bullExecutionScore >= execMinScore
+
+sellReady =
+     directionSide == "BEAR" and
+     directionScore >= dirMinScore and
+     bearExecutionScore >= execMinScore
+
+//━━━━━━━━━━━━━━━━━━━
+// Signals - BAR CLOSE ONLY
+//━━━━━━━━━━━━━━━━━━━
+buySignal =
+     barstate.isconfirmed and
+     buyReady and
+     buyCooldownPassed and
+     strategy.position_size == 0
+
+sellSignal =
+     barstate.isconfirmed and
+     sellReady and
+     sellCooldownPassed and
+     strategy.position_size == 0
+
+//━━━━━━━━━━━━━━━━━━━
+// Entry Window / Blocker
+//━━━━━━━━━━━━━━━━━━━
+positionState =
+     strategy.position_size > 0 ? "LONG" :
+     strategy.position_size < 0 ? "SHORT" :
+     "FLAT"
+
+entryWindow =
+     strategy.position_size != 0 ? "IN POSITION" :
+     directionSide == "BULL" and not buyCooldownPassed ? "BUY COOLDOWN" :
+     directionSide == "BEAR" and not sellCooldownPassed ? "SELL COOLDOWN" :
+     buyReady ? "BUY READY" :
+     sellReady ? "SELL READY" :
+     directionSide == "BULL" and directionScore >= dirMinScore and not bullPullbackRecent ? "WAIT BULL PULLBACK" :
+     directionSide == "BEAR" and directionScore >= dirMinScore and not bearPullbackRecent ? "WAIT BEAR PULLBACK" :
+     directionSide == "BULL" and directionScore >= dirMinScore and bullPullbackRecent and not bullCandleConfirm ? "WAIT BULL CANDLE" :
+     directionSide == "BEAR" and directionScore >= dirMinScore and bearPullbackRecent and not bearCandleConfirm ? "WAIT BEAR CANDLE" :
+     directionScore >= 65 ? "DIRECTION BUILDING" :
+     "WAIT"
+
+signalState =
+     buySignal ? "BUY FIRED" :
+     sellSignal ? "SELL FIRED" :
+     entryWindow
+
+summary = signalState
+
+//━━━━━━━━━━━━━━━━━━━
+// Risk Management
+// SL and TP reference close at signal bar; for bar-close entries this equals fill
+//━━━━━━━━━━━━━━━━━━━
+longSL  = close - atrSLMult * atr
+shortSL = close + atrSLMult * atr
+
+longRisk  = close - longSL
+shortRisk = shortSL - close
+
+longTP  = close + longRisk * rrTarget
+shortTP = close - shortRisk * rrTarget
+
+//━━━━━━━━━━━━━━━━━━━
+// Alert Messages
+//━━━━━━━━━━━━━━━━━━━
+buyAlertMsg =
+     "RANGER TAB ▲ LONG\n" +
+     syminfo.ticker + " | 5m | BBL Strategy\n" +
+     "─────────────────────\n" +
+     "ENTRY   " + str.tostring(close,   format.mintick) + "\n" +
+     "STOP    " + str.tostring(longSL,  format.mintick) + "  (" + str.tostring(longSL  - close, format.mintick) + ")\n" +
+     "TARGET  " + str.tostring(longTP,  format.mintick) + "  (+" + str.tostring(longTP - close, format.mintick) + ")\n" +
+     "DIR     " + str.tostring(directionScore, "#") + "/100  EXEC " + str.tostring(bullExecutionScore, "#") + "/100"
+
+sellAlertMsg =
+     "RANGER TAB ▼ SHORT\n" +
+     syminfo.ticker + " | 5m | BBL Strategy\n" +
+     "─────────────────────\n" +
+     "ENTRY   " + str.tostring(close,    format.mintick) + "\n" +
+     "STOP    " + str.tostring(shortSL,  format.mintick) + "  (+" + str.tostring(shortSL  - close, format.mintick) + ")\n" +
+     "TARGET  " + str.tostring(shortTP,  format.mintick) + "  (" + str.tostring(shortTP - close,  format.mintick) + ")\n" +
+     "DIR     " + str.tostring(directionScore, "#") + "/100  EXEC " + str.tostring(bearExecutionScore, "#") + "/100"
+
+//━━━━━━━━━━━━━━━━━━━
+// Orders + Ranger Tab alerts
+// strategy.entry uses alert_message for broker/webhook
+// alert() fires the push notification via "Any alert() call | Once Per Bar Close"
+//━━━━━━━━━━━━━━━━━━━
+if buySignal
+    lastBuySignalBar := bar_index
+    strategy.entry("BUY", strategy.long, alert_message=buyAlertMsg)
+    strategy.exit("EXIT BUY", "BUY", stop=longSL, limit=longTP)
+    alert(buyAlertMsg, alert.freq_once_per_bar_close)
+
+if sellSignal
+    lastSellSignalBar := bar_index
+    strategy.entry("SELL", strategy.short, alert_message=sellAlertMsg)
+    strategy.exit("EXIT SELL", "SELL", stop=shortSL, limit=shortTP)
+    alert(sellAlertMsg, alert.freq_once_per_bar_close)
+
+// FIX: feeds the exit-based half of the cooldown above.
+positionJustClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+if positionJustClosed
+    lastExitBar := bar_index
+
+// 5-minute timeframe guard — Ranger Tab only fires on 5-min chart
+on5min = timeframe.period == "5"
+
+alertcondition(buySignal,  title="BUY Alert",  message="BUY")
+alertcondition(sellSignal, title="SELL Alert", message="SELL")
+
+// Ranger Tab — directional, bar-close only, 5-min only
+// buySignal/sellSignal already include barstate.isconfirmed
+alertcondition(buySignal  and on5min, "Ranger Tab — LONG",  "LONG | {{ticker}} | 5m | BBL Strategy | Price {{close}}")
+alertcondition(sellSignal and on5min, "Ranger Tab — SHORT", "SHORT | {{ticker}} | 5m | BBL Strategy | Price {{close}}")
+
+//━━━━━━━━━━━━━━━━━━━
+// Dashboard States
+//━━━━━━━━━━━━━━━━━━━
+biasState  = bullBias ? "BULL" : bearBias ? "BEAR" : "NEUT"
+regState   = bandExpanding and htfAdx > htfAdxMin ? "TREND" : "RANGE"
+volState   = bbExpanding ? "EXP" : "SQZ"
+rvolState  = rvolStrong ? "HIGH" : rvolGood ? "OK" : "LOW"
+deltaState = deltaBull ? "BUY" : deltaBear ? "SELL" : "NEUT"
+rocState   = rocBull ? "BULL" : rocBear ? "BEAR" : "NEUT"
+adxState   = adxStrong ? "STRONG" : adxBuilding ? "BUILD" : "WEAK"
+
+//━━━━━━━━━━━━━━━━━━━
+// Dashboard Table
+//━━━━━━━━━━━━━━━━━━━
+tablePosition =
+     dashboardPos == "Top Left" ? position.top_left :
+     dashboardPos == "Bottom Right" ? position.bottom_right :
+     dashboardPos == "Bottom Left" ? position.bottom_left :
+     position.top_right
+
+var table dash = table.new(tablePosition, 2, 13, border_width=1)
+
+if showDashboard
+    f_row(dash, 0,  "SUMMARY",   summary,                                                    f_summaryColor(summary))
+    f_row(dash, 1,  "DIR SCORE", str.tostring(directionScore) + "/100 " + directionSide,    f_scoreColor(directionScore))
+    f_row(dash, 2,  "EXE SCORE", str.tostring(executionScore) + "/100",                     f_scoreColor(executionScore))
+    f_row(dash, 3,  "ENTRY",     entryWindow,                                                f_summaryColor(entryWindow))
+    f_row(dash, 4,  "POSITION",  positionState,                                              f_directionColor(positionState))
+    f_row(dash, 5,  "BIAS",      biasState,                                                  f_directionColor(biasState))
+    f_row(dash, 6,  "REGIME",    regState,                                                   f_conditionColor(regState))
+    f_row(dash, 7,  "VOL",       volState,                                                   f_conditionColor(volState))
+    f_row(dash, 8,  "RVOL",      str.tostring(rvol, "#.##") + " " + rvolState,              f_conditionColor(rvolState))
+    f_row(dash, 9,  "DELTA",     deltaState,                                                 f_directionColor(deltaState))
+    f_row(dash, 10, "ROC",       rocState,                                                   f_directionColor(rocState))
+    f_row(dash, 11, "ADX",       str.tostring(adxExec, "#") + " " + adxState,               f_conditionColor(adxState))
+    f_row(dash, 12, "CANDLE",    candleState,                                                f_directionColor(candleState))
+
+//━━━━━━━━━━━━━━━━━━━
+// Plots
+//━━━━━━━━━━━━━━━━━━━
+plot(basis,   "BB Basis", color=color.orange)
+plot(upper,   "BB Upper", color=color.blue)
+plot(lower,   "BB Lower", color=color.blue)
+
+plot(emaFast,             "Fast EMA", color=color.yellow)
+plot(emaSlow,             "Slow EMA", color=color.purple)
+plot(useVWAP ? vwapVal : na, "VWAP", color=color.white)
+
+plotshape(buySignal,  title="BUY Signal",  style=shape.triangleup,   location=location.belowbar, color=color.rgb(0, 120, 255),   size=size.small, text="BUY")
+plotshape(sellSignal, title="SELL Signal", style=shape.triangledown,  location=location.abovebar, color=color.rgb(140, 80, 255), size=size.small, text="SELL")
+
+//━━━━━━━━━━━━━━━━━━━
+// Candle Visuals - Recent Only
+//━━━━━━━━━━━━━━━━━━━
+recentCandleWindow = bar_index >= last_bar_index - candleLabelLookback
+showRecentCandle   = showCandleLabels and recentCandleWindow
+
+barcolor(
+     colorConfirmBars and recentCandleWindow ?
+     bullCandleConfirm ? color.rgb(0, 120, 255) :
+     bearCandleConfirm ? color.rgb(140, 80, 255) :
+     na : na)
+
+plotshape(showRecentCandle and bullEngulf,      title="Bull Engulf",   text="ENG", style=shape.labelup,     location=location.belowbar, color=color.rgb(0,120,255),   textcolor=color.white, size=size.tiny)
+plotshape(showRecentCandle and bearEngulf,      title="Bear Engulf",   text="ENG", style=shape.labeldown,   location=location.abovebar, color=color.rgb(140,80,255),  textcolor=color.white, size=size.tiny)
+
+plotshape(showRecentCandle and bullPinbar,      title="Bull Pinbar",   text="PIN", style=shape.circle,      location=location.belowbar, color=color.rgb(0,120,255),   textcolor=color.white, size=size.tiny)
+plotshape(showRecentCandle and bearPinbar,      title="Bear Pinbar",   text="PIN", style=shape.circle,      location=location.abovebar, color=color.rgb(140,80,255),  textcolor=color.white, size=size.tiny)
+
+plotshape(showRecentCandle and bullMarubozu,    title="Bull Marubozu", text="MAR", style=shape.labelup,     location=location.belowbar, color=color.rgb(0,120,255),   textcolor=color.white, size=size.tiny)
+plotshape(showRecentCandle and bearMarubozu,    title="Bear Marubozu", text="MAR", style=shape.labeldown,   location=location.abovebar, color=color.rgb(140,80,255),  textcolor=color.white, size=size.tiny)
+
+plotshape(showRecentCandle and bullReclaim,     title="Bull Reclaim",  text="REC", style=shape.triangleup,  location=location.belowbar, color=color.rgb(0,120,255),   textcolor=color.white, size=size.tiny)
+plotshape(showRecentCandle and bearReject,      title="Bear Reject",   text="REJ", style=shape.triangledown, location=location.abovebar, color=color.rgb(140,80,255), textcolor=color.white, size=size.tiny)
+
+//━━━━━━━━━━━━━━━━━━━
+// Background Bias
+//━━━━━━━━━━━━━━━━━━━
+bgcolor(bullBias ? color.new(color.rgb(0, 120, 255),  88) : na)
+bgcolor(bearBias ? color.new(color.rgb(140, 80, 255), 88) : na)
