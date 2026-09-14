@@ -210,14 +210,78 @@ a `var` initialized to `na`** — don't assume the bug is in the most recently
 touched or most exotic-looking code (the MTF pull here) just because it's the
 newest or most unusual part of the script.
 
+## 7. A binary operator can trail a closing paren and still be "outside all brackets" (CE10156)
+
+**Symptom:** `Syntax error at input 'end of line without line continuation'
+(CE10156)` on a line that is just a bare `) *` (or `) +`, `) -`, `) /`) with
+its right-hand operand on the next line — inside a script that otherwise
+compiles, in a file whose brackets are fully balanced overall.
+
+```pine
+float rowMid = (
+     rowLow +
+     rowHigh
+) *
+0.5
+```
+
+**Root cause:** Pine's line-continuation rule for an expression that is NOT
+wrapped in a bracket is indentation-based: the next line must be indented
+*more* than the statement's own start line to count as a continuation. Once
+`)` closes the last open paren tied to this statement, the parser is back to
+bracket depth 0 for that expression — a trailing `*` at that point is no
+longer bracket-protected, and `0.5` on the next line sits at (or near) the
+statement's own base indentation, so it reads as a new, incomplete statement
+rather than a continuation. This is subtly different from gotcha reasoning
+about "just balance your brackets" — **overall file-wide bracket balance is
+not sufficient to catch this**; a checker (or a human) has to confirm bracket
+depth is still `> 0` specifically at the point a line *ends* with a trailing
+operator, not just that total open/close counts match by EOF. A heuristic
+script that only checks aggregate `([{`/`)]}` balance will report "OK" on a
+file with this exact bug, because the counts are still even overall — the bug
+is about *where in the file* depth returns to the statement's base, not
+whether it ever does.
+
+**Fix:** Keep the operator and its right-hand operand inside the same
+bracket, or at minimum on the same physical line as the closing paren, so the
+whole binary expression stays bracket-protected:
+
+```pine
+float rowMid = (
+     rowLow +
+     rowHigh
+) * 0.5
+```
+
+**How to check a whole file for this (reusable technique):** track running
+bracket depth line by line (ignoring `//` comments and string literals) and
+flag any line that both (a) ends with a trailing binary operator
+(`+ - * /`) and (b) has depth `== 0` (or, more generally, `==` the depth the
+enclosing statement started at) immediately after that line's own brackets
+are counted. A line ending in an operator with depth still `> 0` is safe (an
+outer paren is still open and will absorb the continuation); depth `== 0` at
+that exact line is the bug.
+
+**Found in:** `delta_break_retest/Stage8_ProfileEntryFix.pine`, in the new
+Volume Delta Profile section's `rowMid` calculation — the one genuine syntax
+error in an otherwise very large, pervasively reformatted file (nearly every
+boolean/ternary rewritten into multi-line hanging-indent style). Confirmed via
+TradingView's own compiler (CE10156) after an initial by-eye + aggregate-
+balance review missed it; a targeted depth-at-line-end scan afterward found
+it was the only such line in 2300+ lines, and confirmed no other instance
+existed once fixed.
+
 ## When to check this file
 
 Before writing a new `for i = 0 to array.size(x) - 1` loop, a new `type`
 declaration with a non-trivial default, a `var bool` that needs an "unset"
 sentinel, a `request.security` wrapper function that touches any multi-return
-`ta.*` built-in, or ANY `==`/`!=` comparison where one side could be `na`
-(especially a `var` sentinel initialized to `na`). These are easy to get wrong
-in ways that either fail to compile (2, 3, 4) or compile fine and fail
-silently/at runtime later (1, 6) — (1) won't surface until the array in
-question is actually empty, and (6) won't surface as an error at all, just as
-logic that mysteriously never fires despite everything upstream working.
+`ta.*` built-in, ANY `==`/`!=` comparison where one side could be `na`
+(especially a `var` sentinel initialized to `na`), or ANY multi-line
+expression reformatted so an operator trails a closing paren onto its own
+line — that last one needs a depth-at-line-end check, not just an aggregate
+bracket-balance check. These are easy to get wrong in ways that either fail
+to compile (2, 3, 4, 7) or compile fine and fail silently/at runtime later
+(1, 6) — (1) won't surface until the array in question is actually empty, (6)
+won't surface as an error at all, and (7) will pass a naive "are the brackets
+balanced" check while still failing to compile.

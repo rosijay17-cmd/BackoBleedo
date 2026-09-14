@@ -40,7 +40,7 @@ approach, especially for anything that has already caused a bug once.
 | 1 | MTF confirmed-pivot pull via `ta.valuewhen()` + `lookahead_on` + `[1]` offset (hand-rolled var-state pivot tracking through `request.security` does NOT work) | `references/mtf-confirmed-pivot-pull.md` | `MTF_Second_Flip_Continuation_v1_2.pine` (`f_structureBias()`); applied to fix `delta_break_retest/Stage4_MTFBiasStack.pine` |
 | 2 | Bar-index-arithmetic cooldown (reset on ENTRY not exit, no countdown var, `na` sentinel via large fallback) | `references/bar-index-cooldown-arithmetic.md` | `Trend_Following_Strategy_v6_Signal_Cooldown_FIX.pine`; applied in `delta_break_retest/Stage3_CooldownModule.pine` |
 | 3 | Broker-verified exit detection via `strategy.closedtrades.entry_id()` / `.exit_bar_index()` / `.profit()` instead of inferring exits from `strategy.position_size` transitions | `references/broker-verified-exit-detection.md` | `Ranger_V2_*_POC_State_*.pine` family, `P0_Rebuild_Stage0_SanityCheck.pine`; applied in `Dynamic_P0_Delta_Profile_Strategy_v1_0_4.pine` |
-| 4 | Pine v6 compiler-behavior gotchas (for-loop direction inference on empty arrays, UDT field default-value restriction, `var bool` cannot default to plain `na`, nested tuples from multi-return built-ins, `[]` operator can't index a multi-return tuple, `==`/`!=` against `na` is unreliable — always use `na()`/`not na()`) | `references/pine-v6-compiler-gotchas.md` | Discovered/fixed live in `delta_break_retest/Stage2_POIExtraction.pine`, `Stage3_CooldownModule.pine`, `Stage4_MTFBiasStack.pine`, `Stage6_RetestTrigger.pine` |
+| 4 | Pine v6 compiler-behavior gotchas (for-loop direction inference on empty arrays, UDT field default-value restriction, `var bool` cannot default to plain `na`, nested tuples from multi-return built-ins, `[]` operator can't index a multi-return tuple, `==`/`!=` against `na` is unreliable — always use `na()`/`not na()`, a trailing binary operator after a closing paren is NOT bracket-protected even when the file's overall bracket count balances) | `references/pine-v6-compiler-gotchas.md` | Discovered/fixed live in `delta_break_retest/Stage2_POIExtraction.pine`, `Stage3_CooldownModule.pine`, `Stage4_MTFBiasStack.pine`, `Stage6_RetestTrigger.pine`, `Stage8_ProfileEntryFix.pine` |
 | 5 | Futures `strategy()` orders can silently never fill without explicit `margin_long`/`margin_short` AND a chart symbol matching the actually-traded contract size (full-size vs. Micro) | `references/futures-strategy-margin-simulation.md` | `delta_break_retest/Stage7_OrdersRisk.pine` (confirmed: NQ1! silently rejected every order even with margin set; switching to MNQ1! + margin_long/margin_short = 3 together got 17/17 fills) |
 
 ## Update discipline notes
@@ -57,6 +57,21 @@ approach, especially for anything that has already caused a bug once.
 
 ## Changelog
 
+- **2026-09-14 (new gotcha)**: `Stage8_ProfileEntryFix.pine` — a large,
+  user-authored rewrite with nearly every boolean/ternary reformatted into
+  multi-line hanging-indent style — compiled with one syntax error
+  (CE10156) at a line reading `) *` followed by `0.5` on the next line. An
+  initial review (aggregate open/close bracket-count balance, checked
+  across the whole 2300+-line file) reported "balanced" and missed it,
+  because the bug isn't about whether brackets balance overall — it's about
+  a trailing binary operator sitting at bracket depth 0 (outside every open
+  paren) at the exact point its line ends, which is invisible to a simple
+  aggregate count. A line-by-line running-depth scan found it immediately
+  once written, confirmed it was the only such line in the file, and
+  confirmed none remained after the fix (merging the operator onto the same
+  line as its closing paren). Logged as gotcha #7 in
+  `references/pine-v6-compiler-gotchas.md`, including the reusable
+  depth-at-line-end scanning technique.
 - **2026-09-14 (new pattern)**: `Stage7_OrdersRisk.pine` (the first
   `strategy()` in this staged rebuild) submitted `strategy.entry()` calls
   correctly and on schedule, but zero of them ever became real
