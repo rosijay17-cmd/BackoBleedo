@@ -148,7 +148,7 @@ int minBarsAfterRetestInput = input.int(
 )
 
 int maxBarsAfterRetestInput = input.int(
-     3,
+     4,
      "Maximum Bars After Retest To Trigger",
      minval = 1,
      maxval = 12,
@@ -174,7 +174,7 @@ float reclaimBufferAtrInput = input.float(
 )
 
 float maxEntryExtensionAtrInput = input.float(
-     0.35,
+     0.50,
      "Maximum Entry Extension From Zone (ATR)",
      minval = 0.10,
      maxval = 1.50,
@@ -192,7 +192,7 @@ float minimumTriggerBodyFractionInput = input.float(
 )
 
 float minimumTriggerCloseLocationInput = input.float(
-     0.65,
+     0.58,
      "Minimum Trigger Close Location",
      minval = 0.50,
      maxval = 0.95,
@@ -201,8 +201,9 @@ float minimumTriggerCloseLocationInput = input.float(
 )
 
 bool requireTriggerDeltaConfirmationInput = input.bool(
-     true,
+     false,
      "Require Pressure Rotation On Trigger",
+     tooltip = "OFF by default: on-device funnel diagnostics showed this gate (an OHLCV-estimated pressure proxy, not real order-flow delta) blocking ~76% of every retest attempt on MNQ 5m, far more than any other single gate. Turn back on only after re-tuning its thresholds/window against fresh funnel data -- do not just flip it on blind.",
      group = G_EXEC
 )
 
@@ -2250,7 +2251,7 @@ if barstate.islast and showDashboardInput
          "SHORT"
     )
 
-    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r2]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r3]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
     table.cell(statusTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86))
 
     table.cell(statusTable, 0, 1, "4H Bias", text_color = color.white)
@@ -2371,24 +2372,36 @@ plot(actualLongEntrySignal ? 1 : 0, title = "Actual Long Entry", display = displ
 plot(actualShortEntrySignal ? 1 : 0, title = "Actual Short Entry", display = display.data_window)
 
 // ============================================================================
-// RECOMMENDED STARTING SETTINGS - MNQ 5m
+// RECOMMENDED STARTING SETTINGS - MNQ 5m [r3]
 // ----------------------------------------------------------------------------
+// [r3] update: on-device retest-funnel diagnostics (bottom-left table, see
+// "Show Retest Funnel Diagnostics") on real MNQ1! 5m history showed the
+// ORIGINAL defaults below let only 1 trigger through 188 RETESTED eval bars
+// (0.5%) -- the pressure-rotation gate alone was blocking ~76% of every
+// attempt, with close-location and entry-extension as the next two largest
+// blockers. Defaults changed below reflect that data. This is a first-pass,
+// data-informed loosening on a ~200-event sample across a couple weeks of
+// history -- NOT a validated edge. Re-run the funnel after any further
+// change, and treat these as a starting point for a real quantor
+// walk-forward validation before sizing real risk off them.
+//
 // 4H Bias TF:                     240
 // 1H Trend TF:                    60
 // Require 1H Trend Agreement:     ON
 //
 // Break-to-retest window:         4-6 hours
 // Min bars after retest:          1
-// Max bars after retest:          3
+// Max bars after retest:          4          (was 3)
 // Max retest overshoot:           0.10 ATR
 // Reclaim buffer:                 0.05 ATR
-// Max entry extension:            0.35 ATR
+// Max entry extension:            0.50 ATR   (was 0.35 -- 2nd/3rd largest funnel blocker)
 // Min trigger body/range:         0.30
-// Min trigger close location:     0.65
+// Min trigger close location:     0.58       (was 0.65 -- 2nd largest funnel blocker, 63% fail)
 //
 // Pressure window:                3
 // Minimum pressure:               8%
 // Minimum pressure rotation:      10%
+// Require Pressure Rotation:      OFF        (was ON -- confirmed dominant blocker, 76% fail)
 // RVOL requirement:               OFF initially
 //
 // Max entry risk:                 1.25 ATR
