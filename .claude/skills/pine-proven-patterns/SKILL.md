@@ -37,11 +37,12 @@ approach, especially for anything that has already caused a bug once.
 
 | # | Concept | Reference file | Proven in |
 |---|---|---|---|
-| 1 | MTF confirmed-pivot pull via `ta.valuewhen()` + `lookahead_on` + `[1]` offset (hand-rolled var-state pivot tracking through `request.security` does NOT work) | `references/mtf-confirmed-pivot-pull.md` | `MTF_Second_Flip_Continuation_v1_2.pine` (`f_structureBias()`); applied to fix `delta_break_retest/Stage4_MTFBiasStack.pine` |
-| 2 | Bar-index-arithmetic cooldown (reset on ENTRY not exit, no countdown var, `na` sentinel via large fallback) | `references/bar-index-cooldown-arithmetic.md` | `Trend_Following_Strategy_v6_Signal_Cooldown_FIX.pine`; applied in `delta_break_retest/Stage3_CooldownModule.pine` |
-| 3 | Broker-verified exit detection via `strategy.closedtrades.entry_id()` / `.exit_bar_index()` / `.profit()` instead of inferring exits from `strategy.position_size` transitions | `references/broker-verified-exit-detection.md` | `Ranger_V2_*_POC_State_*.pine` family, `P0_Rebuild_Stage0_SanityCheck.pine`; applied in `Dynamic_P0_Delta_Profile_Strategy_v1_0_4.pine` |
+| 1 | MTF confirmed-pivot pull via `ta.valuewhen()` + `lookahead_on` + `[1]` offset (hand-rolled var-state pivot tracking through `request.security` does NOT work) | `references/mtf-confirmed-pivot-pull.md` | `MTF_Second_Flip_Continuation_v1_2.pine` (`f_structureBias()`); applied to fix `delta_break_retest/Stage4_MTFBiasStack.pine`; reused verbatim in `Stage8_ProfileEntryFix.pine` and `Stage9_ChangePointVolumePressure.pine` |
+| 2 | Bar-index-arithmetic cooldown (reset on ENTRY not exit, no countdown var, `na` sentinel via large fallback) | `references/bar-index-cooldown-arithmetic.md` | `Trend_Following_Strategy_v6_Signal_Cooldown_FIX.pine`; applied in `delta_break_retest/Stage3_CooldownModule.pine`; reused (renamed `usedPoiIds` -> `usedEventIds`) in `Stage9_ChangePointVolumePressure.pine` |
+| 3 | Broker-verified exit detection via `strategy.closedtrades.entry_id()` / `.exit_bar_index()` / `.profit()` instead of inferring exits from `strategy.position_size` transitions | `references/broker-verified-exit-detection.md` | `Ranger_V2_*_POC_State_*.pine` family, `P0_Rebuild_Stage0_SanityCheck.pine`; applied in `Dynamic_P0_Delta_Profile_Strategy_v1_0_4.pine`; reused verbatim in `Stage8_ProfileEntryFix.pine` and `Stage9_ChangePointVolumePressure.pine` |
 | 4 | Pine v6 compiler-behavior gotchas (for-loop direction inference on empty arrays, UDT field default-value restriction, `var bool` cannot default to plain `na`, nested tuples from multi-return built-ins, `[]` operator can't index a multi-return tuple, `==`/`!=` against `na` is unreliable — always use `na()`/`not na()`, a trailing binary operator after a closing paren is NOT bracket-protected even when the file's overall bracket count balances) | `references/pine-v6-compiler-gotchas.md` | Discovered/fixed live in `delta_break_retest/Stage2_POIExtraction.pine`, `Stage3_CooldownModule.pine`, `Stage4_MTFBiasStack.pine`, `Stage6_RetestTrigger.pine`, `Stage8_ProfileEntryFix.pine` |
 | 5 | Futures `strategy()` orders can silently never fill without explicit `margin_long`/`margin_short` AND a chart symbol matching the actually-traded contract size (full-size vs. Micro) | `references/futures-strategy-margin-simulation.md` | `delta_break_retest/Stage7_OrdersRisk.pine` (confirmed: NQ1! silently rejected every order even with margin set; switching to MNQ1! + margin_long/margin_short = 3 together got 17/17 fills) |
+| 6 | A signal detector that runs natively on the chart's own execution timeframe (no `request.security` pull) still needs explicit `barstate.isconfirmed` gating around its own state mutation before it can safely drive `strategy.entry()` — harmless to skip in a pure `indicator()`, not safe once it's a `strategy()` | `references/native-timeframe-confirmation-gating.md` | `delta_break_retest/Stage9_ChangePointVolumePressure.pine` (porting a user-supplied CUSUM change-point indicator into a strategy) |
 
 ## Update discipline notes
 
@@ -57,6 +58,32 @@ approach, especially for anything that has already caused a bug once.
 
 ## Changelog
 
+- **2026-09-14 (new pattern + first cross-stage reuse)**: Built
+  `Stage9_ChangePointVolumePressure.pine` on explicit user instruction
+  to give a user-supplied CUSUM change-point detector "parity" with
+  Stage 8's entry logic and add volume pressure. Reused three already-
+  proven patterns verbatim/near-verbatim for the first time across
+  stages in this rebuild (MTF pivot pull, bar-index cooldown, broker-
+  verified exit detection), and applied Stage 8's own funnel-tuned
+  retest defaults directly as this file's starting defaults instead of
+  reintroducing the over-tight values that took four rounds to fix
+  there. The one genuinely new pattern: the CUSUM detector, unlike
+  Stage 8's 15m break context, runs natively on the chart's own
+  execution timeframe with no `request.security` pull -- the user's
+  original script (a pure `indicator()`) never gated its accumulator
+  update/regime-state mutation behind `barstate.isconfirmed`, which is
+  harmless for a plot (it just repaints until the bar closes) but would
+  be a real correctness bug once that same state drives
+  `strategy.entry()` calls directly, since an intrabar tick could fire
+  `isChange` (and reset the CUSUM accumulators) multiple times before
+  the bar actually closes. Logged as pattern #6 in
+  `references/native-timeframe-confirmation-gating.md`. Also applied
+  the volume-pressure lesson from Stage 8's own funnel diagnostics
+  (`references/futures-strategy-margin-simulation.md`'s sibling
+  finding, really the funnel diagnostics changelog entry below):
+  built the new pressure gate as a single plain condition instead of
+  Stage 8's double-AND (absolute level AND rotation-from-touch), which
+  that file's own on-device data proved blocked ~76% of every attempt.
 - **2026-09-14 (new gotcha)**: `Stage8_ProfileEntryFix.pine` — a large,
   user-authored rewrite with nearly every boolean/ternary reformatted into
   multi-line hanging-indent style — compiled with one syntax error
