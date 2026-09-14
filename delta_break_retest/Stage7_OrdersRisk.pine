@@ -146,6 +146,15 @@ int directionCooldownBarsInput = input.int(12, "Per-Direction Cooldown After Los
 int consecutiveLossLimitInput = input.int(2, "Consecutive-Loss Session Limit", minval = 1, group = "Cooldown")
 
 bool requireAlignedEntryInput = input.bool(true, "Require Bias-Aligned Trigger To Enter", group = "Orders / Risk", tooltip = "If on, only a TRIGGERED event tagged 'aligned' with the current 4H bias can open a trade -- a counter-trend trigger is logged but not traded.")
+
+// FILTER #1 (per-type performance data, one filter at a time per the build
+// spec): Delta Flip was the clear standout in the PER-TYPE breakdown -- 7
+// trades, 0% win rate, -$1478 net (64% of the entire -$2303 total loss) on
+// MNQ. Disabled by default. Absorption Node also showed 0% win rate
+// (-$787.50 over 6 trades) but roughly half the damage -- deliberately
+// left enabled so this filter's effect can be measured in isolation before
+// deciding whether a second one is warranted.
+bool enableDeltaFlipEntriesInput = input.bool(false, "Enable Delta Flip Entries", group = "Orders / Risk", tooltip = "Per-type performance data (see PER-TYPE dashboard section): Delta Flip was 0% win rate, -$1478 net over 7 trades on MNQ -- the single worst-performing entry type, and 64% of the total net loss on its own. Disabled by default; re-enable to test whether that holds on different data.")
 float stopBufferAtrMultInput = input.float(0.10, "Stop Buffer Beyond Invalidation (x ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = "Orders / Risk")
 float rMultipleInput = input.float(2.0, "Target (R-Multiples Of Entry-To-Stop Risk)", minval = 0.5, maxval = 10.0, step = 0.5, group = "Orders / Risk")
 int contractsInput = input.int(1, "Contracts Per Entry", minval = 1, maxval = 100, group = "Orders / Risk")
@@ -646,12 +655,13 @@ if barstate.isconfirmed and freshTrigger and strategy.position_size == 0
     string directionStr = activeDirection == 1 ? "long" : "short"
     string poiId = f_typeCodeName(activeTypeCode) + "_" + str.tostring(activeEventTime)
     bool alignedOk = not requireAlignedEntryInput or activeTriggerAligned
+    bool typeEnabled = activeTypeCode == 4 ? enableDeltaFlipEntriesInput : true
 
     [tradeable, reason] = f_canTrade(cd, directionStr, poiId, bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
 
     lastActedEventTime := activeEventTime
 
-    if alignedOk and tradeable
+    if alignedOk and typeEnabled and tradeable
         float stopPrice = directionStr == "long" ? activeZoneLow - stopBufferAtrMultInput * atr5m : activeZoneHigh + stopBufferAtrMultInput * atr5m
         float riskPerUnit = math.abs(close - stopPrice)
         float targetPrice = directionStr == "long" ? close + riskPerUnit * rMultipleInput : close - riskPerUnit * rMultipleInput
@@ -672,7 +682,7 @@ if barstate.isconfirmed and freshTrigger and strategy.position_size == 0
         if array.size(orderLog) > 8
             array.pop(orderLog)
     else
-        array.unshift(orderLog, "bar" + str.tostring(bar_index) + " SKIP " + f_typeCodeName(activeTypeCode) + " (" + (not alignedOk ? "NOT_ALIGNED" : reason) + ")")
+        array.unshift(orderLog, "bar" + str.tostring(bar_index) + " SKIP " + f_typeCodeName(activeTypeCode) + " (" + (not typeEnabled ? "TYPE_DISABLED" : not alignedOk ? "NOT_ALIGNED" : reason) + ")")
         if array.size(orderLog) > 8
             array.pop(orderLog)
 
@@ -793,7 +803,7 @@ if barstate.islast
     [cooldownOk, cooldownReason] = f_canTrade(cd, queryDirection, queryPoiId, bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
     color cooldownColor = cooldownOk ? color.lime : color.orange
 
-    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r4]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r5]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
     table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
     table.cell(statusTable, 0, 1, "Bias", text_color = color.white, text_size = size.small)
