@@ -597,6 +597,14 @@ var string openTradeDirection = ""
 var string openTradePoiId = ""
 var array<string> orderLog = array.new_string()
 
+// DIAGNOSTIC: counts how many times THIS SCRIPT actually called
+// strategy.entry(), independent of whether the broker ever filled it.
+// Compared against strategy.opentrades + strategy.closedtrades (the
+// broker's own count) on the dashboard -- if the script-side count is
+// higher, some submitted orders never became real trades, which is a
+// different, more specific finding than just "Position: FLAT."
+var int entryCallCount = 0
+
 bool freshTrigger = retestState == "TRIGGERED" and (na(lastActedEventTime) or activeEventTime != lastActedEventTime)
 
 if barstate.isconfirmed and freshTrigger and strategy.position_size == 0
@@ -622,8 +630,9 @@ if barstate.isconfirmed and freshTrigger and strategy.position_size == 0
         else
             strategy.entry(entryId, strategy.short, qty = contractsInput)
         strategy.exit(entryId + " Exit", entryId, stop = stopPrice, limit = targetPrice)
+        entryCallCount += 1
 
-        array.unshift(orderLog, "bar" + str.tostring(bar_index) + " ENTER " + entryId + " " + f_typeCodeName(activeTypeCode) + " stop=" + str.tostring(stopPrice, format.mintick) + " tgt=" + str.tostring(targetPrice, format.mintick))
+        array.unshift(orderLog, "bar" + str.tostring(bar_index) + " SUBMITTED " + entryId + " " + f_typeCodeName(activeTypeCode) + " stop=" + str.tostring(stopPrice, format.mintick) + " tgt=" + str.tostring(targetPrice, format.mintick))
         if array.size(orderLog) > 8
             array.pop(orderLog)
     else
@@ -678,7 +687,7 @@ if barstate.islast
 // ============================================================================
 
 int coreRows = 10
-int diagnosticRows = 9
+int diagnosticRows = 10
 int tableRows = showDiagnosticsInput ? coreRows + diagnosticRows : coreRows
 
 var table statusTable = table.new(position.bottom_right, 2, tableRows, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
@@ -787,10 +796,21 @@ if barstate.islast
         table.cell(statusTable, 0, 14, "Net Profit (Broker)", text_color = color.white, text_size = size.tiny)
         table.cell(statusTable, 1, 14, str.tostring(strategy.netprofit, format.mintick), text_color = strategy.netprofit >= 0 ? color.lime : color.red, text_size = size.tiny)
 
-        table.cell(statusTable, 0, 15, "ORDER LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
-        table.cell(statusTable, 1, 15, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        // DIAGNOSTIC: without Strategy Tester access, this is the direct
+        // way to see whether a submitted order ever actually became a
+        // real broker-side trade. entryCallCount is purely script-side
+        // (incremented every time strategy.entry() is called, regardless
+        // of outcome); opentrades+closedtrades is the broker's own count
+        // of trades that actually exist. If the script-side number is
+        // higher, some submitted orders never filled -- a different,
+        // more specific finding than "Position: FLAT" alone.
+        table.cell(statusTable, 0, 15, "Entry Calls (Script) / Trades (Broker)", text_color = color.white, text_size = size.tiny)
+        table.cell(statusTable, 1, 15, str.tostring(entryCallCount) + " / " + str.tostring(strategy.opentrades + strategy.closedtrades), text_color = entryCallCount == (strategy.opentrades + strategy.closedtrades) ? color.lime : color.orange, text_size = size.tiny)
 
-        int orderLogRowStart = 16
+        table.cell(statusTable, 0, 16, "ORDER LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        table.cell(statusTable, 1, 16, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+
+        int orderLogRowStart = 17
         int maxOrderLogRows = 3
         for r = 0 to maxOrderLogRows - 1
             int tableRow = orderLogRowStart + r
@@ -808,3 +828,6 @@ if barstate.islast
 plot(barDelta, title = "Per-Bar Delta", display = display.data_window)
 plot(activeDirection, title = "Active Retest Direction", display = display.data_window)
 plot(strategy.position_size, title = "Position Size (Broker)", display = display.data_window)
+plot(strategy.opentrades, title = "Open Trades (Broker)", display = display.data_window)
+plot(strategy.closedtrades, title = "Closed Trades (Broker)", display = display.data_window)
+plot(entryCallCount, title = "Entry Calls (Script)", display = display.data_window)
