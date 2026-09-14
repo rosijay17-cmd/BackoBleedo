@@ -656,6 +656,52 @@ bool showFunnelDiagnosticsInput = input.bool(
      group = G_DASH
 )
 
+string dashboardSizeInput = input.string(
+     "Small",
+     "Dashboard Text Size",
+     options = ["Tiny", "Small", "Normal", "Large"],
+     tooltip = "Shrinks both tables' text (and therefore their footprint) without hiding any row -- use Tiny on a small phone screen.",
+     group = G_DASH
+)
+
+string dashboardPositionInput = input.string(
+     "Bottom Right",
+     "Main Dashboard Position",
+     options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"],
+     group = G_DASH
+)
+
+string funnelPositionInput = input.string(
+     "Bottom Left",
+     "Funnel Diagnostics Position",
+     options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"],
+     tooltip = "Keep this different from Main Dashboard Position or the two tables will stack on top of each other.",
+     group = G_DASH
+)
+
+f_tablePosition(string label) =>
+    switch label
+        "Top Left" => position.top_left
+        "Top Center" => position.top_center
+        "Top Right" => position.top_right
+        "Middle Left" => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right" => position.middle_right
+        "Bottom Left" => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Bottom Right" => position.bottom_right
+        => position.bottom_right
+
+f_tableTextSize(string label) =>
+    switch label
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        => size.small
+
+tableTextSize = f_tableTextSize(dashboardSizeInput)
+
 
 // ============================================================================
 // EXECUTION PRESSURE / CANDLE QUALITY
@@ -2183,7 +2229,7 @@ if barstate.islast
 // ============================================================================
 
 var table statusTable = table.new(
-     position.bottom_right,
+     f_tablePosition(dashboardPositionInput),
      2,
      13,
      bgcolor = color.new(color.rgb(15, 20, 27), 10),
@@ -2263,44 +2309,44 @@ if barstate.islast and showDashboardInput
          "SHORT"
     )
 
-    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r7]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
-    table.cell(statusTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r8]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = tableTextSize)
+    table.cell(statusTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = tableTextSize)
 
-    table.cell(statusTable, 0, 1, "4H Bias", text_color = color.white)
-    table.cell(statusTable, 1, 1, bias, text_color = bias == "LONG_ONLY" ? color.aqua : bias == "SHORT_ONLY" ? color.orange : color.gray)
+    table.cell(statusTable, 0, 1, "4H Bias", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 1, bias, text_color = bias == "LONG_ONLY" ? color.aqua : bias == "SHORT_ONLY" ? color.orange : color.gray, text_size = tableTextSize)
 
-    table.cell(statusTable, 0, 2, "1H Trend", text_color = color.white)
-    table.cell(statusTable, 1, 2, long1hTrendOk ? "BULL" : short1hTrendOk ? "BEAR" : "MIXED", text_color = long1hTrendOk ? color.aqua : short1hTrendOk ? color.orange : color.gray)
+    table.cell(statusTable, 0, 2, "1H Trend", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 2, long1hTrendOk ? "BULL" : short1hTrendOk ? "BEAR" : "MIXED", text_color = long1hTrendOk ? color.aqua : short1hTrendOk ? color.orange : color.gray, text_size = tableTextSize)
 
-    table.cell(statusTable, 0, 3, "Regime", text_color = color.white)
-    table.cell(statusTable, 1, 3, regime, text_color = regime == "TRENDING UP" ? color.aqua : regime == "TRENDING DOWN" ? color.orange : color.gray)
+    table.cell(statusTable, 0, 3, "Regime", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 3, regime, text_color = regime == "TRENDING UP" ? color.aqua : regime == "TRENDING DOWN" ? color.orange : color.gray, text_size = tableTextSize)
 
-    table.cell(statusTable, 0, 4, "Retest", text_color = color.white)
-    table.cell(statusTable, 1, 4, retestState + " " + f_typeCodeName(activeTypeCode), text_color = retestState == "TRIGGERED" ? color.white : color.gray)
+    table.cell(statusTable, 0, 4, "Retest", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 4, retestState + " " + f_typeCodeName(activeTypeCode), text_color = retestState == "TRIGGERED" ? color.white : color.gray, text_size = tableTextSize)
 
-    table.cell(statusTable, 0, 5, "Pressure", text_color = color.white)
-    table.cell(statusTable, 1, 5, str.tostring(executionDeltaPressure, "#.0") + "%", text_color = executionDeltaPressure >= 0 ? color.aqua : color.orange)
+    table.cell(statusTable, 0, 5, "Pressure", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 5, str.tostring(executionDeltaPressure, "#.0") + "%", text_color = executionDeltaPressure >= 0 ? color.aqua : color.orange, text_size = tableTextSize)
 
-    table.cell(statusTable, 0, 6, "RVOL", text_color = color.white)
-    table.cell(statusTable, 1, 6, str.tostring(triggerRvol, "#.##") + "x", text_color = triggerRvol >= minimumTriggerRvolInput ? color.white : color.gray)
+    table.cell(statusTable, 0, 6, "RVOL", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 6, str.tostring(triggerRvol, "#.##") + "x", text_color = triggerRvol >= minimumTriggerRvolInput ? color.white : color.gray, text_size = tableTextSize)
 
-    table.cell(statusTable, 0, 7, "Buyers", text_color = color.aqua)
-    table.cell(statusTable, 1, 7, str.tostring(int(math.round(buyRatio * 100.0))) + "%", text_color = color.aqua)
+    table.cell(statusTable, 0, 7, "Buyers", text_color = color.aqua, text_size = tableTextSize)
+    table.cell(statusTable, 1, 7, str.tostring(int(math.round(buyRatio * 100.0))) + "%", text_color = color.aqua, text_size = tableTextSize)
 
-    table.cell(statusTable, 0, 8, "Sellers", text_color = color.orange)
-    table.cell(statusTable, 1, 8, str.tostring(int(math.round(sellRatio * 100.0))) + "%", text_color = color.orange)
+    table.cell(statusTable, 0, 8, "Sellers", text_color = color.orange, text_size = tableTextSize)
+    table.cell(statusTable, 1, 8, str.tostring(int(math.round(sellRatio * 100.0))) + "%", text_color = color.orange, text_size = tableTextSize)
 
-    table.cell(statusTable, 0, 9, "Position", text_color = color.white)
-    table.cell(statusTable, 1, 9, positionDisplay, text_color = strategy.position_size > 0 ? color.aqua : strategy.position_size < 0 ? color.orange : color.gray)
+    table.cell(statusTable, 0, 9, "Position", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 9, positionDisplay, text_color = strategy.position_size > 0 ? color.aqua : strategy.position_size < 0 ? color.orange : color.gray, text_size = tableTextSize)
 
-    table.cell(statusTable, 0, 10, "Cooldown", text_color = color.white)
-    table.cell(statusTable, 1, 10, cooldownOk ? "READY" : cooldownReason, text_color = cooldownOk ? color.aqua : color.orange)
+    table.cell(statusTable, 0, 10, "Cooldown", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 10, cooldownOk ? "READY" : cooldownReason, text_color = cooldownOk ? color.aqua : color.orange, text_size = tableTextSize)
 
-    table.cell(statusTable, 0, 11, "Broker Trades", text_color = color.white)
-    table.cell(statusTable, 1, 11, str.tostring(strategy.opentrades) + " / " + str.tostring(strategy.closedtrades), text_color = color.white)
+    table.cell(statusTable, 0, 11, "Broker Trades", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 11, str.tostring(strategy.opentrades) + " / " + str.tostring(strategy.closedtrades), text_color = color.white, text_size = tableTextSize)
 
-    table.cell(statusTable, 0, 12, "Execution Chart", text_color = color.white)
-    table.cell(statusTable, 1, 12, chartIsRecommended5m ? "5m RECOMMENDED" : timeframe.period + "m - USE 5m FOR EXEC", text_color = chartIsRecommended5m ? color.aqua : color.orange)
+    table.cell(statusTable, 0, 12, "Execution Chart", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 12, chartIsRecommended5m ? "5m RECOMMENDED" : timeframe.period + "m - USE 5m FOR EXEC", text_color = chartIsRecommended5m ? color.aqua : color.orange, text_size = tableTextSize)
 
 
 // ============================================================================
@@ -2313,7 +2359,7 @@ if barstate.islast and showDashboardInput
 // ============================================================================
 
 var table funnelTable = table.new(
-     position.bottom_left,
+     f_tablePosition(funnelPositionInput),
      2,
      9,
      bgcolor = color.new(color.rgb(15, 20, 27), 10),
@@ -2321,32 +2367,32 @@ var table funnelTable = table.new(
 )
 
 if barstate.islast and showDashboardInput and showFunnelDiagnosticsInput
-    table.cell(funnelTable, 0, 0, "RETEST FUNNEL", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
-    table.cell(funnelTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(funnelTable, 0, 0, "RETEST FUNNEL", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = tableTextSize)
+    table.cell(funnelTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = tableTextSize)
 
-    table.cell(funnelTable, 0, 1, "Break Events", text_color = color.white)
-    table.cell(funnelTable, 1, 1, str.tostring(cEvents), text_color = color.white)
+    table.cell(funnelTable, 0, 1, "Break Events", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 1, str.tostring(cEvents), text_color = color.white, text_size = tableTextSize)
 
-    table.cell(funnelTable, 0, 2, "-> Retested", text_color = color.white)
-    table.cell(funnelTable, 1, 2, str.tostring(cRetested), text_color = cRetested > 0 ? color.aqua : color.gray)
+    table.cell(funnelTable, 0, 2, "-> Retested", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 2, str.tostring(cRetested), text_color = cRetested > 0 ? color.aqua : color.gray, text_size = tableTextSize)
 
-    table.cell(funnelTable, 0, 3, "-> Triggered", text_color = color.white)
-    table.cell(funnelTable, 1, 3, str.tostring(cTriggered), text_color = cTriggered > 0 ? color.aqua : color.gray)
+    table.cell(funnelTable, 0, 3, "-> Triggered", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 3, str.tostring(cTriggered), text_color = cTriggered > 0 ? color.aqua : color.gray, text_size = tableTextSize)
 
-    table.cell(funnelTable, 0, 4, "Expired / Invalid", text_color = color.white)
-    table.cell(funnelTable, 1, 4, str.tostring(cExpired) + " / " + str.tostring(cInvalidated), text_color = color.orange)
+    table.cell(funnelTable, 0, 4, "Expired / Invalid", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 4, str.tostring(cExpired) + " / " + str.tostring(cInvalidated), text_color = color.orange, text_size = tableTextSize)
 
-    table.cell(funnelTable, 0, 5, "Eval Bars (RETESTED)", text_color = color.white)
-    table.cell(funnelTable, 1, 5, str.tostring(cEvalBars), text_color = color.gray)
+    table.cell(funnelTable, 0, 5, "Eval Bars (RETESTED)", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 5, str.tostring(cEvalBars), text_color = color.gray, text_size = tableTextSize)
 
-    table.cell(funnelTable, 0, 6, "Fail: Reclaim / Ext", text_color = color.white)
-    table.cell(funnelTable, 1, 6, str.tostring(cReclaimFail) + " / " + str.tostring(cExtensionFail), text_color = color.orange)
+    table.cell(funnelTable, 0, 6, "Fail: Reclaim / Ext", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 6, str.tostring(cReclaimFail) + " / " + str.tostring(cExtensionFail), text_color = color.orange, text_size = tableTextSize)
 
-    table.cell(funnelTable, 0, 7, "Fail: Body / Loc", text_color = color.white)
-    table.cell(funnelTable, 1, 7, str.tostring(cBodyFail) + " / " + str.tostring(cLocationFail), text_color = color.orange)
+    table.cell(funnelTable, 0, 7, "Fail: Body / Loc", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 7, str.tostring(cBodyFail) + " / " + str.tostring(cLocationFail), text_color = color.orange, text_size = tableTextSize)
 
-    table.cell(funnelTable, 0, 8, "Fail: Delta / RVOL", text_color = color.white)
-    table.cell(funnelTable, 1, 8, str.tostring(cDeltaFail) + " / " + str.tostring(cRvolFail), text_color = color.orange)
+    table.cell(funnelTable, 0, 8, "Fail: Delta / RVOL", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 8, str.tostring(cDeltaFail) + " / " + str.tostring(cRvolFail), text_color = color.orange, text_size = tableTextSize)
 
 
 // ============================================================================
