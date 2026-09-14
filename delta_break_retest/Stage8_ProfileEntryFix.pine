@@ -1458,9 +1458,19 @@ if barstate.isconfirmed and freshTrigger and strategy.position_size == 0
          str.tostring(activeEventTime)
     )
 
+    // -- checked LIVE against current bias, not the frozen activeTriggerAligned
+    // snapshot from the (possibly much earlier) trigger bar -- retestState stays
+    // "TRIGGERED" until a new break event arrives, so if a prior position was
+    // still open at trigger time, entry can fire many bars later once flat; using
+    // a stale alignment reading from the original trigger bar could let a
+    // counter-trend entry through if bias flipped in that gap --
     bool alignedOk = (
          not requireAlignedEntryInput or
-         activeTriggerAligned
+         (
+              directionStr == "long" ?
+              fullLongContext :
+              fullShortContext
+         )
     )
 
     bool typeEnabled = (
@@ -2252,7 +2262,7 @@ if barstate.islast and showDashboardInput
          "SHORT"
     )
 
-    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r4]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 0, 0, "DBR STAGE 8.0.2 [r5]", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
     table.cell(statusTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86))
 
     table.cell(statusTable, 0, 1, "4H Bias", text_color = color.white)
