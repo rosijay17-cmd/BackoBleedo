@@ -620,7 +620,17 @@ if retestState == "WATCHING" or retestState == "RETESTED"
 var int lastActedEventTime = na
 var string openTradeDirection = ""
 var string openTradePoiId = ""
+var int openTradeTypeCode = 0
 var array<string> orderLog = array.new_string()
+
+// PER-TYPE PERFORMANCE TRACKING -- per the build spec's filter discipline
+// ("measure before you filter, one at a time"): before deciding to
+// eliminate a POI type as an entry trigger, know its actual trade count,
+// win count, and net profit. Indexed 0-4 for typeCode 1-5 (POC, Extreme+,
+// Extreme-, Flip, Absorption).
+var array<int> typeTradeCount = array.new_int(5, 0)
+var array<int> typeWinCount = array.new_int(5, 0)
+var array<float> typeProfitSum = array.new_float(5, 0.0)
 
 // DIAGNOSTIC: counts how many times THIS SCRIPT actually called
 // strategy.entry(), independent of whether the broker ever filled it.
@@ -649,6 +659,7 @@ if barstate.isconfirmed and freshTrigger and strategy.position_size == 0
 
         openTradeDirection := directionStr
         openTradePoiId := poiId
+        openTradeTypeCode := activeTypeCode
 
         if directionStr == "long"
             strategy.entry(entryId, strategy.long, qty = contractsInput)
@@ -684,6 +695,13 @@ if strategy.closedtrades > processedClosedTrades
 
     f_recordExit(cd, bar_index, isWin, closedDirection, openTradePoiId)
 
+    if openTradeTypeCode >= 1 and openTradeTypeCode <= 5
+        int typeIdx = openTradeTypeCode - 1
+        array.set(typeTradeCount, typeIdx, array.get(typeTradeCount, typeIdx) + 1)
+        if isWin
+            array.set(typeWinCount, typeIdx, array.get(typeWinCount, typeIdx) + 1)
+        array.set(typeProfitSum, typeIdx, array.get(typeProfitSum, typeIdx) + closedProfit)
+
     array.unshift(orderLog, "bar" + str.tostring(bar_index) + " EXIT " + closedEntryId + " " + (isWin ? "WIN" : "LOSS") + " " + str.tostring(closedProfit, format.mintick))
     if array.size(orderLog) > 8
         array.pop(orderLog)
@@ -712,7 +730,7 @@ if barstate.islast
 // ============================================================================
 
 int coreRows = 10
-int diagnosticRows = 10
+int diagnosticRows = 16
 int tableRows = showDiagnosticsInput ? coreRows + diagnosticRows : coreRows
 
 var table statusTable = table.new(position.bottom_right, 2, tableRows, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
@@ -775,7 +793,7 @@ if barstate.islast
     [cooldownOk, cooldownReason] = f_canTrade(cd, queryDirection, queryPoiId, bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
     color cooldownColor = cooldownOk ? color.lime : color.orange
 
-    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r3]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+    table.cell(statusTable, 0, 0, "DELTA BREAK & RETEST [r4]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
     table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
     table.cell(statusTable, 0, 1, "Bias", text_color = color.white, text_size = size.small)
@@ -832,10 +850,30 @@ if barstate.islast
         table.cell(statusTable, 0, 15, "Entry Calls (Script) / Trades (Broker)", text_color = color.white, text_size = size.tiny)
         table.cell(statusTable, 1, 15, str.tostring(entryCallCount) + " / " + str.tostring(strategy.opentrades + strategy.closedtrades), text_color = entryCallCount == (strategy.opentrades + strategy.closedtrades) ? color.lime : color.orange, text_size = size.tiny)
 
-        table.cell(statusTable, 0, 16, "ORDER LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        // PER-TYPE PERFORMANCE -- per the build spec's filter discipline:
+        // know each POI type's actual trade count / win rate / net profit
+        // before deciding to eliminate it as an entry trigger. A type with
+        // few trades isn't necessarily "bad" yet -- small samples are
+        // noisy. A type with many trades and a consistently negative sum
+        // is the one worth actually cutting.
+        table.cell(statusTable, 0, 16, "PER-TYPE (Trades/Win%/NetP&L)", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
         table.cell(statusTable, 1, 16, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
 
-        int orderLogRowStart = 17
+        for t = 0 to 4
+            int tableRow = 17 + t
+            int tCount = array.get(typeTradeCount, t)
+            int tWins = array.get(typeWinCount, t)
+            float tProfit = array.get(typeProfitSum, t)
+            string tName = f_typeCodeName(t + 1)
+            string tText = tCount == 0 ? "0 trades" : str.tostring(tCount) + " / " + str.tostring(int(math.round(tWins * 100.0 / tCount))) + "% / " + str.tostring(tProfit, format.mintick)
+            color tColor = tCount == 0 ? color.gray : tProfit > 0 ? color.lime : tProfit < 0 ? color.red : color.white
+            table.cell(statusTable, 0, tableRow, tName, text_color = color.white, text_size = size.tiny)
+            table.cell(statusTable, 1, tableRow, tText, text_color = tColor, text_size = size.tiny)
+
+        table.cell(statusTable, 0, 22, "ORDER LOG", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+        table.cell(statusTable, 1, 22, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = size.tiny)
+
+        int orderLogRowStart = 23
         int maxOrderLogRows = 3
         for r = 0 to maxOrderLogRows - 1
             int tableRow = orderLogRowStart + r
