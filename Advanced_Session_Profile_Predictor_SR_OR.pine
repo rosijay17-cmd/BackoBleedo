@@ -453,8 +453,8 @@ var label shortLabel = na
 var label longLabel = na
 if barstate.islast
     if na(profileLabel)
-        profileLabel := label.new(x=bar_index, y=high * 1.005, text="Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
-    label.set_text(profileLabel, "Session Profil: " + nextProfile)
+        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r1] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(profileLabel, "[r1] Session Profil: " + nextProfile)
     label.set_x(profileLabel, bar_index)
     label.set_y(profileLabel, high * 1.005)
 
@@ -469,6 +469,14 @@ if barstate.islast
     label.set_text(longLabel, longCondition)
     label.set_x(longLabel, bar_index)
     label.set_y(longLabel, high * 1.001)
+
+// Diagnostic: if these two ever diverge in the Data Window, the labels are
+// genuinely not tracking the current bar. If they always match, the label
+// position code is working and the issue is elsewhere (stale/cached script,
+// or the numbers inside the text -- which intentionally freeze to the Asia
+// session's close/high for the rest of the day, by original design).
+plot(bar_index, "Current Bar Index (Data Window)", display=display.data_window)
+plot(na(profileLabel) ? na : label.get_x(profileLabel), "Profile Label X (Data Window)", display=display.data_window)
 
 
 // ============================================================================
