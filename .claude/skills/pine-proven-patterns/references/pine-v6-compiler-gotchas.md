@@ -87,8 +87,30 @@ equivalent to fall back on, so pick the value that reads as "unset."
 var bool lastLoggedTrendOK = false
 ```
 
-**Found in:** `delta_break_retest/Stage4_MTFBiasStack.pine`. Audited all other
-files — only instance.
+**Found in:** `delta_break_retest/Stage4_MTFBiasStack.pine` (originally
+logged as "the only instance" — that was wrong; see the correction below).
+
+**Correction (2026-09-16):** a second, independent instance surfaced in
+`Advanced_Session_Profile_Predictor_SR_OR.pine` — six occurrences (four
+inside a ChartPrime-derived support/resistance function, two at global
+scope), all in a script the user pasted fresh and asked to have
+"regenerated with perfect parity." Because the exact `var bool x = na`
+construct was copied over unchanged during that regeneration (as parity
+requires for anything that actually *runs*), it surfaced TradingView's own
+CE10173 the first time the user tried to compile it — meaning the
+**original** script the user pasted almost certainly never compiled
+successfully either; this predates any change made in this repo. Confirmed
+in all six cases that the fix (seed with `false` instead of `na`) changes
+nothing observable: each flag is either unconditionally reassigned via
+`ta.crossover()`/`ta.crossunder()` on every bar (so the seed is only ever
+visible for the instant before that first assignment) or read only inside
+plain boolean `and` expressions downstream, where `na` and `false` are
+indistinguishable. Lesson for next time: a "preserve parity" pass still
+needs this gotcha's own check applied to the source being regenerated —
+copying a construct verbatim for parity does not exempt it from a Pine v6
+restriction that would have broken the original just the same. Audited all
+other files in the repo root and `delta_break_retest/` again after this —
+no further instances found.
 
 ## 4. Multi-return built-ins can't be nested inside another tuple literal
 

@@ -353,10 +353,16 @@ f_calcSupportResistance(srSource, srLookback) =>
     var color resistanceColor = color.new(color.red, 30)
     var color supportColor = color.new(color.green, 30)
 
-    var bool resistanceBreakout = na
-    var bool supportBreakout = na
-    var bool resistanceHolds = na
-    var bool supportHolds = na
+    // Pine v6 will not accept plain `na` as a `var bool` initial value
+    // (CE10173 -- see pine-proven-patterns skill gotcha #3). `false` is
+    // behaviorally identical here: all four are unconditionally reassigned
+    // via ta.crossover()/ta.crossunder() every single bar below, so this
+    // seed value is only ever visible for the instant before that first
+    // assignment.
+    var bool resistanceBreakout = false
+    var bool supportBreakout = false
+    var bool resistanceHolds = false
+    var bool supportHolds = false
 
     pivotHigh = ta.pivothigh(srSource, srLookback, srLookback)
     pivotLow = ta.pivotlow(srSource, srLookback, srLookback)
@@ -423,8 +429,11 @@ f_calcSupportResistance(srSource, srLookback) =>
 // RESISTANCE <-> SUPPORT ROLLOVER TRACKING
 // ============================================================================
 
-var bool resistanceBecameSupport = na
-var bool supportBecameResistance = na
+// Same CE10173 fix as above -- both are only ever read inside plain
+// boolean `and` expressions below (e.g. resistanceBecameSupport[1]), where
+// `na` and `false` behave identically, so this changes nothing observable.
+var bool resistanceBecameSupport = false
+var bool supportBecameResistance = false
 if resistanceBreakout
     resistanceBecameSupport := true
 if resistanceHolds

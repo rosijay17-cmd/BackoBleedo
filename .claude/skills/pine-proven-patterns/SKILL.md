@@ -58,6 +58,24 @@ approach, especially for anything that has already caused a bug once.
 
 ## Changelog
 
+- **2026-09-16 (correction)**: `references/pine-v6-compiler-gotchas.md`'s
+  gotcha #3 (`var bool` cannot be initialized to plain `na`, CE10173) was
+  logged as having only one instance in the repo. A second, independent
+  instance turned up in `Advanced_Session_Profile_Predictor_SR_OR.pine`
+  (six occurrences) — a fresh script the user pasted and asked to have
+  "regenerated with perfect parity," where the invalid construct was
+  copied over unchanged (as parity demanded) and then failed to compile on
+  the user's device, confirming the **original** pasted script almost
+  certainly never compiled successfully either. Fixed by seeding `false`
+  instead, confirmed behavior-identical in all six cases (each flag is
+  either reassigned unconditionally every bar or only ever read inside a
+  plain boolean `and`, where `na` and `false` are indistinguishable).
+  Corrected in the reference file rather than silently overwriting the old
+  "only instance" claim, per this skill's own discipline. Lesson: a
+  "preserve parity" pass on someone else's script still needs every
+  documented gotcha's own check applied to what's being copied — parity
+  with a construct that never compiled just reproduces the same compile
+  error, it doesn't exempt anything from the underlying Pine v6 rule.
 - **2026-09-14 (new pattern + first cross-stage reuse)**: Built
   `Stage9_ChangePointVolumePressure.pine` on explicit user instruction
   to give a user-supplied CUSUM change-point detector "parity" with
