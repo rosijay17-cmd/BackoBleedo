@@ -1,0 +1,515 @@
+//@version=6
+indicator("Advanced Session Profile Predictor with SR Boxes & OR", overlay=true, max_boxes_count=50)
+
+// ============================================================================
+// ADVANCED SESSION PROFILE PREDICTOR WITH SR BOXES & OR -- REGENERATED
+// ----------------------------------------------------------------------------
+// PARITY NOTE: this is a straight code-organization / naming / comment
+// cleanup of the original script. Every input's displayed title, tooltip,
+// group, and default value; every plotted/labeled string; every group
+// membership (including the ones that are NOT grouped in the original, kept
+// ungrouped here too); and every branch of logic (including its exact
+// ordering) are unchanged. Only internal identifier names, comment language
+// (English throughout instead of mixed Danish/English), and section
+// structure were touched -- nothing about what appears on the chart or in
+// the Settings panel should look or behave any differently than the
+// original. A separate list of suggested (NOT applied) improvements is
+// provided alongside this file, since several of them WOULD change visible
+// behavior and are therefore deliberately left out of this regeneration.
+// ============================================================================
+
+
+// ============================================================================
+// INPUTS -- SESSIONS & TREND THRESHOLD
+// ----------------------------------------------------------------------------
+// Left ungrouped, exactly as in the original (they appear above the
+// explicit groups in the Settings panel because of that).
+// ============================================================================
+
+timezoneInput = input.string("UTC", "Tidszone", options=["UTC", "Europe/London", "America/New_York"])
+asiaSessionInput = input.session("0000-0800", "Asien Session")
+londonSessionInput = input.session("0800-1600", "London Session")
+newYorkSessionInput = input.session("1300-2100", "New York Session")
+trendThresholdInput = input.float(1.5, "Trend Tærskel", minval=1.0, step=0.1)
+
+
+// ============================================================================
+// INPUTS -- SR (SUPPORT/RESISTANCE) SETTINGS
+// ============================================================================
+
+srLookbackInput = input.int(20, "Lookback Period", minval=1, group="SR Settings")
+volumeFilterLengthInput = input.int(2, "Delta Volume Filter Length", tooltip="Higher input filters low volume boxes", group="SR Settings")
+boxWidthMultInput = input.float(1, "Adjust Box Width", maxval=1000, minval=0, step=0.1, group="SR Settings")
+
+
+// ============================================================================
+// INPUTS -- TRADERS DYNAMIC INDEX (TDI) & MOMENTUM
+// ----------------------------------------------------------------------------
+// momentumLengthInput is left ungrouped, exactly as in the original (it has
+// no `group=` there either, unlike its TDI siblings -- see the improvements
+// note on this).
+// ============================================================================
+
+string G_TDI = 'Traders Dynamic Index Settings'
+
+tdiRsiPeriodInput = input.int(21, minval=1, title="RSI Period", group=G_TDI)
+tdiBandLengthInput = input.int(34, minval=1, title="Band Length", group=G_TDI)
+tdiFastMaLengthInput = input.int(2, minval=1, title="Fast MA on RSI", group=G_TDI)
+tdiSlowMaLengthInput = input.int(7, minval=0, title="Slow MA on RSI", group=G_TDI)
+tdiSourceInput = input.source(close, title="TDI Source", group=G_TDI)
+momentumLengthInput = input.int(12, minval=1, title="Momentum Length")
+
+
+// ============================================================================
+// SESSION DETECTION
+// ============================================================================
+
+asiaInSession = nz(time(timeframe.period, asiaSessionInput, timezoneInput), 0) != 0
+londonInSession = nz(time(timeframe.period, londonSessionInput, timezoneInput), 0) != 0
+nyInSession = nz(time(timeframe.period, newYorkSessionInput, timezoneInput), 0) != 0
+
+
+// ============================================================================
+// PER-SESSION OPEN / CLOSE / HIGH / LOW TRACKING
+// ----------------------------------------------------------------------------
+// NOTE (kept exactly as original): this is an if / else-if chain, so on any
+// bar where more than one session window is simultaneously true (the given
+// default windows overlap between 13:00-16:00, where London and New York
+// are both active), only the FIRST matching branch updates. London is
+// checked before New York, so New York's own open/high/low/close tracking
+// does not begin until London's window ends, even though New York is
+// already "in session." See the improvements note on this -- it is
+// preserved here unchanged for parity.
+// ============================================================================
+
+var float asiaOpen = na
+var float asiaClose = na
+var float asiaHigh = na
+var float asiaLow = na
+var float londonOpen = na
+var float londonClose = na
+var float londonHigh = na
+var float londonLow = na
+var float nyOpen = na
+var float nyClose = na
+var float nyHigh = na
+var float nyLow = na
+
+if asiaInSession
+    asiaOpen := na(asiaOpen) ? open : asiaOpen
+    asiaClose := close
+    asiaHigh := math.max(high, nz(asiaHigh, low))
+    asiaLow := math.min(low, nz(asiaLow, high))
+else if londonInSession
+    londonOpen := na(londonOpen) ? open : londonOpen
+    londonClose := close
+    londonHigh := math.max(high, nz(londonHigh, low))
+    londonLow := math.min(low, nz(londonLow, high))
+else if nyInSession
+    nyOpen := na(nyOpen) ? open : nyOpen
+    nyClose := close
+    nyHigh := math.max(high, nz(nyHigh, low))
+    nyLow := math.min(low, nz(nyLow, high))
+
+
+// ============================================================================
+// OPENING RANGE (OR) -- FIRST 15 MINUTES OF EACH SESSION
+// ============================================================================
+
+var float asiaOrHigh = na
+var float asiaOrLow = na
+var float londonOrHigh = na
+var float londonOrLow = na
+var float nyOrHigh = na
+var float nyOrLow = na
+var int asiaSessionStartTime = na
+var int londonSessionStartTime = na
+var int nySessionStartTime = na
+var box asiaOrBox = na
+var box londonOrBox = na
+var box nyOrBox = na
+
+// Detect the start of each session by time.
+if asiaInSession and na(asiaSessionStartTime)
+    asiaSessionStartTime := timestamp(timezoneInput, year, month, dayofmonth, 0, 0)  // Asia start (00:00)
+if londonInSession and na(londonSessionStartTime)
+    londonSessionStartTime := timestamp(timezoneInput, year, month, dayofmonth, 8, 0)  // London start (08:00)
+if nyInSession and na(nySessionStartTime)
+    nySessionStartTime := timestamp(timezoneInput, year, month, dayofmonth, 13, 0)  // New York start (13:00)
+
+// Build the OR box over the first 15 minutes (900000 ms) of each session.
+if asiaInSession and time >= asiaSessionStartTime and time <= asiaSessionStartTime + 900000
+    asiaOrHigh := math.max(high, nz(asiaOrHigh, high))
+    asiaOrLow := math.min(low, nz(asiaOrLow, low))
+    if na(asiaOrBox)
+        asiaOrBox := box.new(left=bar_index, top=high, right=bar_index+1, bottom=low, bgcolor=color.new(color.yellow, 90), border_color=color.yellow)
+    else
+        box.set_top(asiaOrBox, asiaOrHigh)
+        box.set_bottom(asiaOrBox, asiaOrLow)
+        box.set_right(asiaOrBox, bar_index + 1)
+else if time > asiaSessionStartTime + 900000 and not na(asiaOrBox)
+    box.set_right(asiaOrBox, bar_index)  // Freeze the box at the end of the OR window.
+
+if londonInSession and time >= londonSessionStartTime and time <= londonSessionStartTime + 900000
+    londonOrHigh := math.max(high, nz(londonOrHigh, high))
+    londonOrLow := math.min(low, nz(londonOrLow, low))
+    if na(londonOrBox)
+        londonOrBox := box.new(left=bar_index, top=high, right=bar_index+1, bottom=low, bgcolor=color.new(color.red, 90), border_color=color.red)
+    else
+        box.set_top(londonOrBox, londonOrHigh)
+        box.set_bottom(londonOrBox, londonOrLow)
+        box.set_right(londonOrBox, bar_index + 1)
+else if time > londonSessionStartTime + 900000 and not na(londonOrBox)
+    box.set_right(londonOrBox, bar_index)
+
+if nyInSession and time >= nySessionStartTime and time <= nySessionStartTime + 900000
+    nyOrHigh := math.max(high, nz(nyOrHigh, high))
+    nyOrLow := math.min(low, nz(nyOrLow, low))
+    if na(nyOrBox)
+        nyOrBox := box.new(left=bar_index, top=high, right=bar_index+1, bottom=low, bgcolor=color.new(color.blue, 90), border_color=color.blue)
+    else
+        box.set_top(nyOrBox, nyOrHigh)
+        box.set_bottom(nyOrBox, nyOrLow)
+        box.set_right(nyOrBox, bar_index + 1)
+else if time > nySessionStartTime + 900000 and not na(nyOrBox)
+    box.set_right(nyOrBox, bar_index)
+
+
+// ============================================================================
+// SESSION BACKGROUND HIGHLIGHT
+// ============================================================================
+
+bgcolor(asiaInSession ? color.new(color.yellow, 90) : na, title="Asien Session")
+bgcolor(londonInSession ? color.new(color.red, 90) : na, title="London Session")
+bgcolor(nyInSession ? color.new(color.blue, 90) : na, title="New York Session")
+
+
+// ============================================================================
+// SESSION PROFILE PATTERN DETECTION
+// ============================================================================
+
+asiaRange = asiaHigh - asiaLow
+londonRange = londonHigh - londonLow
+nyRange = nyHigh - nyLow
+asiaDirection = nz(asiaClose, 0) > nz(asiaOpen, 0) ? 1 : (nz(asiaClose, 0) < nz(asiaOpen, 0) ? -1 : 0)
+londonDirection = nz(londonClose, 0) > nz(londonOpen, 0) ? 1 : (nz(londonClose, 0) < nz(londonOpen, 0) ? -1 : 0)
+nyDirection = nz(nyClose, 0) > nz(nyOpen, 0) ? 1 : (nz(nyClose, 0) < nz(nyOpen, 0) ? -1 : 0)
+asiaTrending = nz(asiaRange, 0) > nz(ta.sma(asiaRange, 5), 0) * trendThresholdInput
+londonTrending = nz(londonRange, 0) > nz(ta.sma(londonRange, 5), 0) * trendThresholdInput
+londonConsolidating = nz(londonRange, 0) < nz(ta.sma(londonRange, 5), 0)
+londonManipulatesAsiaHigh = nz(londonHigh, 0) > nz(asiaHigh, 0) and nz(londonLow, 0) < nz(asiaClose, 0)
+londonManipulatesAsiaLow = nz(londonLow, 0) < nz(asiaLow, 0) and nz(londonHigh, 0) > nz(asiaClose, 0)
+nyManipulatesLondonHigh = nz(nyHigh, 0) > nz(londonHigh, 0) and nz(nyLow, 0) < nz(londonClose, 0)
+nyManipulatesLondonLow = nz(nyLow, 0) < nz(londonLow, 0) and nz(nyHigh, 0) > nz(londonClose, 0)
+
+
+// ============================================================================
+// PROFILE PREDICTION
+// ============================================================================
+
+var string nextProfile = "Ukendt"
+if not nyInSession and londonInSession and not na(asiaHigh)
+    if asiaTrending and londonTrending and asiaDirection == londonDirection
+        nextProfile := "Profil 1: Trend Continuation"
+    else if asiaTrending and londonConsolidating
+        nextProfile := "Profil 2: NY Manipulation"
+    else if not asiaTrending and (londonManipulatesAsiaHigh or londonManipulatesAsiaLow)
+        if londonManipulatesAsiaHigh
+            nextProfile := "Profil 3: London+NY Manipulation"
+        else
+            nextProfile := "Profil 4: Consolidation+Continuation"
+    else
+        nextProfile := "Ingen klar profil"
+
+
+// ============================================================================
+// SHORT / LONG CONDITION TEXT (BASED ON PREDICTED PROFILE + CURRENT PRICE)
+// ============================================================================
+
+var string shortCondition = "No Short"
+var string longCondition = "No Long"
+if barstate.islast
+    if nextProfile == "Profil 1: Trend Continuation"
+        if asiaDirection == 1 and londonDirection == 1
+            if close < asiaHigh
+                longCondition := "IF price hits " + str.tostring(asiaHigh) + " LONG (A/L/NY)"
+            else
+                longCondition := "No Long (over " + str.tostring(asiaHigh) + ")"
+            shortCondition := "No Short"
+        else if asiaDirection == -1 and londonDirection == -1
+            if close > asiaLow
+                shortCondition := "IF price hits " + str.tostring(asiaLow) + " SHORT (A/L/NY)"
+            else
+                shortCondition := "No Short (under " + str.tostring(asiaLow) + ")"
+            longCondition := "No Long"
+    else if nextProfile == "Profil 2: NY Manipulation"
+        if asiaDirection == 1
+            if close < asiaHigh
+                longCondition := "IF price hits " + str.tostring(asiaHigh) + " LONG (A/L/NY)"
+            else if nyInSession and close < londonHigh
+                longCondition := "IF price hits " + str.tostring(londonHigh) + " LONG (NY)"
+            else
+                longCondition := "No Long (over " + str.tostring(londonHigh) + ")"
+            if close > londonLow
+                shortCondition := "IF price hits " + str.tostring(londonLow) + " SHORT (L/NY)"
+            else
+                shortCondition := "No Short (under " + str.tostring(londonLow) + ")"
+        else if asiaDirection == -1
+            if close > asiaLow
+                shortCondition := "IF price hits " + str.tostring(asiaLow) + " SHORT (A/L/NY)"
+            else if nyInSession and close > londonLow
+                shortCondition := "IF price hits " + str.tostring(londonLow) + " SHORT (NY)"
+            else
+                shortCondition := "No Short (under " + str.tostring(londonLow) + ")"
+            if close < londonHigh
+                longCondition := "IF price hits " + str.tostring(londonHigh) + " LONG (L/NY)"
+            else
+                longCondition := "No Long (over " + str.tostring(londonHigh) + ")"
+    else if nextProfile == "Profil 3: London+NY Manipulation"
+        if close > asiaClose
+            shortCondition := "IF price hits " + str.tostring(asiaClose) + " SHORT (L/NY)"
+        else
+            shortCondition := "No Short (under " + str.tostring(asiaClose) + ")"
+        if close < asiaHigh
+            longCondition := "IF price hits " + str.tostring(asiaHigh) + " LONG (L/NY)"
+        else
+            longCondition := "No Long (over " + str.tostring(asiaHigh) + ")"
+    else if nextProfile == "Profil 4: Consolidation+Continuation"
+        if close > asiaLow
+            shortCondition := "IF price hits " + str.tostring(asiaLow) + " SHORT (L/NY)"
+        else
+            shortCondition := "No Short (under " + str.tostring(asiaLow) + ")"
+        if close < asiaClose
+            longCondition := "IF price hits " + str.tostring(asiaClose) + " LONG (L/NY)"
+        else
+            longCondition := "No Long (over " + str.tostring(asiaClose) + ")"
+    else
+        shortCondition := "No Short"
+        longCondition := "No Long"
+
+
+// ============================================================================
+// DELTA VOLUME (CHARTPRIME)
+// ============================================================================
+
+f_upAndDownVolume() =>
+    posVol = 0.0
+    negVol = 0.0
+    var isBuyVolume = true
+    if close > open
+        isBuyVolume := true
+    else if close < open
+        isBuyVolume := false
+    if isBuyVolume
+        posVol := posVol + volume
+    else
+        negVol := negVol - volume
+    posVol + negVol
+
+
+// ============================================================================
+// SUPPORT / RESISTANCE (CHARTPRIME)
+// ============================================================================
+
+f_calcSupportResistance(srSource, srLookback) =>
+    deltaVolume = f_upAndDownVolume()
+    deltaVolumeHigh = ta.highest(deltaVolume / 2.5, volumeFilterLengthInput)
+    deltaVolumeLow = ta.lowest(deltaVolume / 2.5, volumeFilterLengthInput)
+
+    var float supportLevel = na
+    var float supportBreakLevel = na
+    var float resistanceLevel = na
+    var float resistanceBreakLevel = na
+    var box supportBox = na
+    var box resistanceBox = na
+    var color resistanceColor = color.new(color.red, 30)
+    var color supportColor = color.new(color.green, 30)
+
+    var bool resistanceBreakout = na
+    var bool supportBreakout = na
+    var bool resistanceHolds = na
+    var bool supportHolds = na
+
+    pivotHigh = ta.pivothigh(srSource, srLookback, srLookback)
+    pivotLow = ta.pivotlow(srSource, srLookback, srLookback)
+    atrValue = ta.atr(200)
+    boxWidth = atrValue * boxWidthMultInput
+
+    if (not na(pivotLow)) and deltaVolume > deltaVolumeHigh
+        supportLevel := pivotLow
+        supportBreakLevel := supportLevel - boxWidth
+        topLeft = chart.point.from_index(bar_index - srLookback, supportLevel)
+        bottomRight = chart.point.from_index(bar_index, supportBreakLevel)
+        supportBox := box.new(
+             top_left=topLeft,
+             bottom_right=bottomRight,
+             border_color=color.green,
+             border_width=1,
+             bgcolor=supportColor,
+             text="Vol: " + str.tostring(math.round(deltaVolume, 2)),
+             text_color=chart.fg_color,
+             text_size=size.small
+         )
+
+    if (not na(pivotHigh)) and deltaVolume < deltaVolumeLow
+        resistanceLevel := pivotHigh
+        resistanceBreakLevel := resistanceLevel + boxWidth
+        topLeft = chart.point.from_index(bar_index - srLookback, resistanceLevel)
+        bottomRight = chart.point.from_index(bar_index, resistanceBreakLevel)
+        resistanceBox := box.new(
+             top_left=topLeft,
+             bottom_right=bottomRight,
+             border_color=color.red,
+             border_width=1,
+             bgcolor=resistanceColor,
+             text="Vol: " + str.tostring(math.round(deltaVolume, 2)),
+             text_color=chart.fg_color,
+             text_size=size.small
+         )
+
+    if not na(supportBox)
+        supportBox.set_right(bar_index + 1)
+    if not na(resistanceBox)
+        resistanceBox.set_right(bar_index + 1)
+
+    resistanceBreakout := ta.crossover(low, resistanceBreakLevel)
+    resistanceHolds := ta.crossunder(high, resistanceLevel)
+    supportHolds := ta.crossover(low, supportLevel)
+    supportBreakout := ta.crossunder(high, supportBreakLevel)
+
+    if supportBreakout and not na(supportBox)
+        supportBox.set_border_style(line.style_dashed)
+    if supportHolds and not na(supportBox)
+        supportBox.set_border_style(line.style_solid)
+    if resistanceBreakout and not na(resistanceBox)
+        resistanceBox.set_border_style(line.style_dashed)
+    if resistanceHolds and not na(resistanceBox)
+        resistanceBox.set_border_style(line.style_solid)
+
+    [supportLevel, resistanceLevel, resistanceBreakout, resistanceHolds, supportHolds, supportBreakout]
+
+[supportLevel, resistanceLevel, resistanceBreakout, resistanceHolds, supportHolds, supportBreakout] = f_calcSupportResistance(close, srLookbackInput)
+
+
+// ============================================================================
+// RESISTANCE <-> SUPPORT ROLLOVER TRACKING
+// ============================================================================
+
+var bool resistanceBecameSupport = na
+var bool supportBecameResistance = na
+if resistanceBreakout
+    resistanceBecameSupport := true
+if resistanceHolds
+    resistanceBecameSupport := false
+if supportBreakout
+    supportBecameResistance := true
+if supportHolds
+    supportBecameResistance := false
+
+
+// ============================================================================
+// INFO LABELS (PROFILE / SHORT / LONG)
+// ============================================================================
+
+var label profileLabel = na
+var label shortLabel = na
+var label longLabel = na
+if barstate.islast
+    if na(profileLabel)
+        profileLabel := label.new(x=bar_index, y=high * 1.005, text="Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(profileLabel, "Session Profil: " + nextProfile)
+    label.set_x(profileLabel, bar_index)
+    label.set_y(profileLabel, high * 1.005)
+
+    if na(shortLabel)
+        shortLabel := label.new(x=bar_index, y=high * 1.003, text=shortCondition, color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(shortLabel, shortCondition)
+    label.set_x(shortLabel, bar_index)
+    label.set_y(shortLabel, high * 1.003)
+
+    if na(longLabel)
+        longLabel := label.new(x=bar_index, y=high * 1.001, text=longCondition, color=color.green, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(longLabel, longCondition)
+    label.set_x(longLabel, bar_index)
+    label.set_y(longLabel, high * 1.001)
+
+
+// ============================================================================
+// SR BREAKOUT / HOLD MARKERS
+// ============================================================================
+
+plotchar(resistanceHolds, "Resistance Holds", "◆", color=#e92929, size=size.tiny, location=location.abovebar, offset=-1)
+plotchar(supportHolds, "Support Holds", "◆", color=#20ca26, size=size.tiny, location=location.belowbar, offset=-1)
+plotchar(resistanceBreakout and resistanceBecameSupport[1], "Resistance as Support Holds", "◆", color=#20ca26, size=size.tiny, location=location.belowbar, offset=-1)
+plotchar(supportBreakout and supportBecameResistance[1], "Support as Resistance Holds", "◆", color=#e92929, size=size.tiny, location=location.abovebar, offset=-1)
+
+if supportBreakout and not supportBecameResistance[1]
+    label.new(bar_index[1], supportLevel[1], text="Break Sup", style=label.style_label_down, color=#7e1e1e, textcolor=chart.fg_color, size=size.small)
+if resistanceBreakout and not resistanceBecameSupport[1]
+    label.new(bar_index[1], resistanceLevel[1], text="Break Res", style=label.style_label_up, color=#2b6d2d, textcolor=chart.fg_color, size=size.small)
+
+
+// ============================================================================
+// SESSION HIGH / LOW LINES
+// ============================================================================
+
+plot(asiaHigh, "Asien High", color=color.yellow, style=plot.style_cross)
+plot(asiaLow, "Asien Low", color=color.yellow, style=plot.style_cross)
+plot(londonHigh, "London High", color=color.red, style=plot.style_cross)
+plot(londonLow, "London Low", color=color.red, style=plot.style_cross)
+plot(nyHigh, "NY High", color=color.blue, style=plot.style_cross)
+plot(nyLow, "NY Low", color=color.blue, style=plot.style_cross)
+
+
+// ============================================================================
+// TDI & MOMENTUM
+// ============================================================================
+
+tdiRsi = ta.rsi(tdiSourceInput, tdiRsiPeriodInput)
+tdiMa = ta.sma(tdiRsi, tdiBandLengthInput)
+tdiOffset = 1.6185 * ta.stdev(tdiRsi, tdiBandLengthInput)
+tdiUpperBand = tdiMa + tdiOffset
+tdiLowerBand = tdiMa - tdiOffset
+tdiFastMa = ta.sma(tdiRsi, tdiFastMaLengthInput)
+momentum = tdiSourceInput - tdiSourceInput[momentumLengthInput]
+momentumRising = momentum > momentum[1]
+momentumFalling = momentum < momentum[1]
+tdiBullishMove = tdiFastMa > tdiUpperBand and tdiFastMa > 68
+tdiBearishMove = tdiFastMa < tdiLowerBand and tdiFastMa < 32
+
+plotshape(tdiBullishMove and momentumRising ? high : na, style=shape.arrowup, color=color.new(color.lime, 0), size=size.normal, location=location.abovebar, title="Bullish Arrow")
+plotshape(tdiBearishMove and momentumFalling ? low : na, style=shape.arrowdown, color=color.new(#FF0000, 0), size=size.normal, location=location.belowbar, title="Bearish Arrow")
+
+
+// ============================================================================
+// RESET ON NEW DAY
+// ============================================================================
+
+if dayofmonth != dayofmonth[1]
+    asiaOpen := na
+    asiaClose := na
+    asiaHigh := na
+    asiaLow := na
+    londonOpen := na
+    londonClose := na
+    londonHigh := na
+    londonLow := na
+    nyOpen := na
+    nyClose := na
+    nyHigh := na
+    nyLow := na
+    asiaOrHigh := na
+    asiaOrLow := na
+    londonOrHigh := na
+    londonOrLow := na
+    nyOrHigh := na
+    nyOrLow := na
+    asiaSessionStartTime := na
+    londonSessionStartTime := na
+    nySessionStartTime := na
+    if not na(asiaOrBox)
+        box.delete(asiaOrBox)
+    if not na(londonOrBox)
+        box.delete(londonOrBox)
+    if not na(nyOrBox)
+        box.delete(nyOrBox)
