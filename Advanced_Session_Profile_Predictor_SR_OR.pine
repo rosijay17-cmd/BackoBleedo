@@ -82,6 +82,22 @@ momentumLengthInput = input.int(12, minval=1, title="Momentum Length", group=G_T
 
 
 // ============================================================================
+// INPUTS -- TDI CONFIRMATION & OUTCOME TRACKING
+// ----------------------------------------------------------------------------
+// New: links the two previously-independent signal halves (session-profile
+// price triggers + TDI momentum), and scores every trigger touch forward
+// in time instead of leaving the prediction system unvalidated.
+// ============================================================================
+
+string G_OUTCOME = "Outcome Tracking & TDI Confirmation"
+
+showTdiConfirmationInput = input.bool(true, "Show Trigger-Touch Markers (Plain + TDI-Confirmed)", group=G_OUTCOME)
+showOutcomeTrackerInput = input.bool(true, "Show Outcome Tracker Table", group=G_OUTCOME)
+outcomeHorizonBarsInput = input.int(20, "Outcome Tracking Horizon (Bars)", minval=1, maxval=500, tooltip="How many bars forward to watch a triggered touch before giving up on it (marked Expired if neither target nor stop is hit in time).", group=G_OUTCOME)
+outcomeTargetAtrInput = input.float(1.0, "Outcome Target / Stop (x ATR)", minval=0.1, step=0.1, tooltip="A triggered touch is scored a Win if price moves this many ATR in the predicted direction before moving the same amount against it (a simple 1:1 race), a Loss if the reverse happens first, or Expired if neither happens within the horizon.", group=G_OUTCOME)
+
+
+// ============================================================================
 // SESSION DETECTION
 // ============================================================================
 
@@ -256,64 +272,100 @@ if not nyInSession and londonInSession and not na(asiaHigh)
 
 var string shortCondition = "No Short"
 var string longCondition = "No Long"
+// Parallel float trigger prices, added alongside the text so a real
+// crossover/crossunder touch can be detected below instead of the trigger
+// staying purely informational text. na whenever the text says "No
+// Short"/"No Long". Every branch below follows the same shape: a SHORT
+// trigger price is always ABOVE the current close (waiting for price to
+// drop down to it), a LONG trigger price is always BELOW it (waiting to
+// rise up to it) -- confirmed by re-reading every branch's own close-vs-
+// level comparison against the original text it produces.
+var float shortTriggerPrice = na
+var float longTriggerPrice = na
 if barstate.islast
     if nextProfile == "Profil 1: Trend Continuation"
         if asiaDirection == 1 and londonDirection == 1
             if close < asiaHigh
                 longCondition := "IF price hits " + str.tostring(asiaHigh) + " LONG (A/L/NY)"
+                longTriggerPrice := asiaHigh
             else
                 longCondition := "No Long (over " + str.tostring(asiaHigh) + ")"
+                longTriggerPrice := na
             shortCondition := "No Short"
+            shortTriggerPrice := na
         else if asiaDirection == -1 and londonDirection == -1
             if close > asiaLow
                 shortCondition := "IF price hits " + str.tostring(asiaLow) + " SHORT (A/L/NY)"
+                shortTriggerPrice := asiaLow
             else
                 shortCondition := "No Short (under " + str.tostring(asiaLow) + ")"
+                shortTriggerPrice := na
             longCondition := "No Long"
+            longTriggerPrice := na
     else if nextProfile == "Profil 2: NY Manipulation"
         if asiaDirection == 1
             if close < asiaHigh
                 longCondition := "IF price hits " + str.tostring(asiaHigh) + " LONG (A/L/NY)"
+                longTriggerPrice := asiaHigh
             else if nyInSession and close < londonHigh
                 longCondition := "IF price hits " + str.tostring(londonHigh) + " LONG (NY)"
+                longTriggerPrice := londonHigh
             else
                 longCondition := "No Long (over " + str.tostring(londonHigh) + ")"
+                longTriggerPrice := na
             if close > londonLow
                 shortCondition := "IF price hits " + str.tostring(londonLow) + " SHORT (L/NY)"
+                shortTriggerPrice := londonLow
             else
                 shortCondition := "No Short (under " + str.tostring(londonLow) + ")"
+                shortTriggerPrice := na
         else if asiaDirection == -1
             if close > asiaLow
                 shortCondition := "IF price hits " + str.tostring(asiaLow) + " SHORT (A/L/NY)"
+                shortTriggerPrice := asiaLow
             else if nyInSession and close > londonLow
                 shortCondition := "IF price hits " + str.tostring(londonLow) + " SHORT (NY)"
+                shortTriggerPrice := londonLow
             else
                 shortCondition := "No Short (under " + str.tostring(londonLow) + ")"
+                shortTriggerPrice := na
             if close < londonHigh
                 longCondition := "IF price hits " + str.tostring(londonHigh) + " LONG (L/NY)"
+                longTriggerPrice := londonHigh
             else
                 longCondition := "No Long (over " + str.tostring(londonHigh) + ")"
+                longTriggerPrice := na
     else if nextProfile == "Profil 3: London+NY Manipulation"
         if close > asiaClose
             shortCondition := "IF price hits " + str.tostring(asiaClose) + " SHORT (L/NY)"
+            shortTriggerPrice := asiaClose
         else
             shortCondition := "No Short (under " + str.tostring(asiaClose) + ")"
+            shortTriggerPrice := na
         if close < asiaHigh
             longCondition := "IF price hits " + str.tostring(asiaHigh) + " LONG (L/NY)"
+            longTriggerPrice := asiaHigh
         else
             longCondition := "No Long (over " + str.tostring(asiaHigh) + ")"
+            longTriggerPrice := na
     else if nextProfile == "Profil 4: Consolidation+Continuation"
         if close > asiaLow
             shortCondition := "IF price hits " + str.tostring(asiaLow) + " SHORT (L/NY)"
+            shortTriggerPrice := asiaLow
         else
             shortCondition := "No Short (under " + str.tostring(asiaLow) + ")"
+            shortTriggerPrice := na
         if close < asiaClose
             longCondition := "IF price hits " + str.tostring(asiaClose) + " LONG (L/NY)"
+            longTriggerPrice := asiaClose
         else
             longCondition := "No Long (over " + str.tostring(asiaClose) + ")"
+            longTriggerPrice := na
     else
         shortCondition := "No Short"
         longCondition := "No Long"
+        shortTriggerPrice := na
+        longTriggerPrice := na
 
 
 // ============================================================================
@@ -530,6 +582,230 @@ tdiBearishMove = tdiFastMa < tdiLowerBand and tdiFastMa < 32
 plot(tdiSlowMa, "TDI Signal Line (Slow MA)", color=color.orange, display=display.data_window)
 plotshape(tdiBullishMove and momentumRising ? high : na, style=shape.arrowup, color=color.new(color.lime, 0), size=size.normal, location=location.abovebar, title="Bullish Arrow")
 plotshape(tdiBearishMove and momentumFalling ? low : na, style=shape.arrowdown, color=color.new(#FF0000, 0), size=size.normal, location=location.belowbar, title="Bearish Arrow")
+
+// Same TDI criteria the arrows already use above, reused as-is -- this is
+// the confirmation link between the profile price-triggers and the TDI
+// momentum state, not a new invented threshold.
+bool tdiConfirmsShort = tdiBearishMove and momentumFalling
+bool tdiConfirmsLong = tdiBullishMove and momentumRising
+
+
+// ============================================================================
+// TRIGGER-TOUCH DETECTION
+// ----------------------------------------------------------------------------
+// The session-profile SHORT/LONG condition text above states a price level
+// but never previously confirmed when it was actually reached. Every branch
+// follows the same shape (re-verified against each one's own close-vs-level
+// comparison): a SHORT trigger price is always above the current close,
+// waiting for price to drop down to it; a LONG trigger price is always
+// below it, waiting to rise up to it.
+// ============================================================================
+
+bool shortTouchNow = not na(shortTriggerPrice) and ta.crossunder(close, shortTriggerPrice)
+bool longTouchNow = not na(longTriggerPrice) and ta.crossover(close, longTriggerPrice)
+bool shortTouchConfirmedNow = shortTouchNow and tdiConfirmsShort
+bool longTouchConfirmedNow = longTouchNow and tdiConfirmsLong
+
+plotshape(showTdiConfirmationInput and shortTouchNow and not shortTouchConfirmedNow ? high : na, title="Short Trigger Touch", style=shape.xcross, color=color.new(color.red, 40), size=size.tiny, location=location.abovebar)
+plotshape(showTdiConfirmationInput and longTouchNow and not longTouchConfirmedNow ? low : na, title="Long Trigger Touch", style=shape.xcross, color=color.new(color.green, 40), size=size.tiny, location=location.belowbar)
+plotshape(showTdiConfirmationInput and shortTouchConfirmedNow ? high : na, title="Short Trigger Touch (TDI Confirmed)", style=shape.triangledown, color=color.red, size=size.small, location=location.abovebar, text="TDI")
+plotshape(showTdiConfirmationInput and longTouchConfirmedNow ? low : na, title="Long Trigger Touch (TDI Confirmed)", style=shape.triangleup, color=color.green, size=size.small, location=location.belowbar, text="TDI")
+
+alertcondition(shortTouchNow, title="Short Trigger Touched", message="Session Profile SHORT trigger touched (check TDI confirmation on chart) -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(longTouchNow, title="Long Trigger Touched", message="Session Profile LONG trigger touched (check TDI confirmation on chart) -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(shortTouchConfirmedNow, title="Short Trigger Touched + TDI Confirmed", message="Session Profile SHORT trigger touched AND TDI confirms bearish momentum -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(longTouchConfirmedNow, title="Long Trigger Touched + TDI Confirmed", message="Session Profile LONG trigger touched AND TDI confirms bullish momentum -- {{ticker}} {{interval}} @ {{close}}")
+
+
+// ============================================================================
+// OUTCOME TRACKING
+// ----------------------------------------------------------------------------
+// Scores every trigger touch forward in time instead of leaving the
+// prediction system as an unvalidated guess: a simple 1:1 race to
+// outcomeTargetAtrInput ATR in the predicted direction (Win) vs. against it
+// (Loss), or Expired if neither happens within outcomeHorizonBarsInput bars.
+// Tracked per profile+direction, and separately by whether TDI confirmed
+// the touch, to answer "does TDI confirmation actually help" with real
+// counts rather than assuming it does. Deliberately NOT reset on a new day
+// (see RESET ON NEW DAY below) -- this is meant to accumulate a running
+// record across the whole history loaded, not restart daily.
+// ============================================================================
+
+f_profileCode(string profile) =>
+    switch profile
+        "Profil 1: Trend Continuation" => 0
+        "Profil 2: NY Manipulation" => 1
+        "Profil 3: London+NY Manipulation" => 2
+        "Profil 4: Consolidation+Continuation" => 3
+        => -1
+
+float outcomeAtr = ta.atr(14)
+int currentProfileCode = f_profileCode(nextProfile)
+
+var array<int> pendingProfileCode = array.new_int()
+var array<bool> pendingIsShort = array.new_bool()
+var array<bool> pendingTdiConfirmed = array.new_bool()
+var array<int> pendingEntryBar = array.new_int()
+var array<float> pendingTargetPrice = array.new_float()
+var array<float> pendingStopPrice = array.new_float()
+
+// 8 buckets: profileCode (0-3) * 2 + (isShort ? 0 : 1)
+var array<int> statWins = array.new_int(8, 0)
+var array<int> statLosses = array.new_int(8, 0)
+var array<int> statExpired = array.new_int(8, 0)
+
+var int confirmedWins = 0
+var int confirmedLosses = 0
+var int unconfirmedWins = 0
+var int unconfirmedLosses = 0
+
+// Registering a NEW pending touch is gated behind barstate.isconfirmed --
+// same reasoning as the native-timeframe-confirmation-gating pattern this
+// account's Pine work already established: a crossover/crossunder right at
+// a level could in principle register on a still-forming bar and then
+// un-happen before that bar closes. Resolving an ALREADY-pending touch
+// below is not gated the same way -- once a bar's real high/low has
+// actually reached a target or stop, that is a real, already-happened
+// price event regardless of whether the bar itself has closed yet.
+if barstate.isconfirmed and not na(outcomeAtr)
+    if shortTouchNow and currentProfileCode >= 0
+        array.push(pendingProfileCode, currentProfileCode)
+        array.push(pendingIsShort, true)
+        array.push(pendingTdiConfirmed, tdiConfirmsShort)
+        array.push(pendingEntryBar, bar_index)
+        array.push(pendingTargetPrice, close - outcomeTargetAtrInput * outcomeAtr)
+        array.push(pendingStopPrice, close + outcomeTargetAtrInput * outcomeAtr)
+
+    if longTouchNow and currentProfileCode >= 0
+        array.push(pendingProfileCode, currentProfileCode)
+        array.push(pendingIsShort, false)
+        array.push(pendingTdiConfirmed, tdiConfirmsLong)
+        array.push(pendingEntryBar, bar_index)
+        array.push(pendingTargetPrice, close + outcomeTargetAtrInput * outcomeAtr)
+        array.push(pendingStopPrice, close - outcomeTargetAtrInput * outcomeAtr)
+
+if array.size(pendingEntryBar) > 0
+    for i = array.size(pendingEntryBar) - 1 to 0
+        bool isShortPending = array.get(pendingIsShort, i)
+        float targetPending = array.get(pendingTargetPrice, i)
+        float stopPending = array.get(pendingStopPrice, i)
+        int entryBarPending = array.get(pendingEntryBar, i)
+        int profileCodePending = array.get(pendingProfileCode, i)
+        bool tdiConfirmedPending = array.get(pendingTdiConfirmed, i)
+
+        bool hitTarget = isShortPending ? low <= targetPending : high >= targetPending
+        bool hitStop = isShortPending ? high >= stopPending : low <= stopPending
+        bool expired = bar_index - entryBarPending >= outcomeHorizonBarsInput
+
+        int statIdx = profileCodePending * 2 + (isShortPending ? 0 : 1)
+        bool resolved = false
+        bool wasWin = false
+
+        if hitTarget and hitStop
+            // Ambiguous same-bar case (a wide bar spanning both target and
+            // stop) -- conservatively scored as a loss rather than
+            // guessing which was actually touched first intrabar.
+            resolved := true
+            wasWin := false
+        else if hitTarget
+            resolved := true
+            wasWin := true
+        else if hitStop
+            resolved := true
+            wasWin := false
+
+        if resolved
+            if wasWin
+                array.set(statWins, statIdx, array.get(statWins, statIdx) + 1)
+                if tdiConfirmedPending
+                    confirmedWins += 1
+                else
+                    unconfirmedWins += 1
+            else
+                array.set(statLosses, statIdx, array.get(statLosses, statIdx) + 1)
+                if tdiConfirmedPending
+                    confirmedLosses += 1
+                else
+                    unconfirmedLosses += 1
+            array.remove(pendingProfileCode, i)
+            array.remove(pendingIsShort, i)
+            array.remove(pendingTdiConfirmed, i)
+            array.remove(pendingEntryBar, i)
+            array.remove(pendingTargetPrice, i)
+            array.remove(pendingStopPrice, i)
+        else if expired
+            array.set(statExpired, statIdx, array.get(statExpired, statIdx) + 1)
+            array.remove(pendingProfileCode, i)
+            array.remove(pendingIsShort, i)
+            array.remove(pendingTdiConfirmed, i)
+            array.remove(pendingEntryBar, i)
+            array.remove(pendingTargetPrice, i)
+            array.remove(pendingStopPrice, i)
+
+
+// ============================================================================
+// OUTCOME TRACKER DASHBOARD
+// ============================================================================
+
+f_tablePosition(string label) =>
+    switch label
+        "Top Left" => position.top_left
+        "Top Center" => position.top_center
+        "Top Right" => position.top_right
+        "Middle Left" => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right" => position.middle_right
+        "Bottom Left" => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Bottom Right" => position.bottom_right
+        => position.bottom_right
+
+f_tableTextSize(string label) =>
+    switch label
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        => size.small
+
+outcomeTablePositionInput = input.string("Bottom Right", "Outcome Table Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=G_OUTCOME)
+outcomeTableSizeInput = input.string("Small", "Outcome Table Text Size", options=["Tiny", "Small", "Normal", "Large"], group=G_OUTCOME)
+
+f_winRateCell(int wins, int losses) =>
+    int total = wins + losses
+    total > 0 ? str.tostring(wins) + "-" + str.tostring(losses) + " (" + str.tostring(math.round(wins / total * 100)) + "%)" : "0-0 (--)"
+
+f_profileStatCell(int profileCode) =>
+    (
+     "S " + f_winRateCell(array.get(statWins, profileCode * 2 + 0), array.get(statLosses, profileCode * 2 + 0)) +
+     " / L " + f_winRateCell(array.get(statWins, profileCode * 2 + 1), array.get(statLosses, profileCode * 2 + 1))
+    )
+
+var table outcomeTable = table.new(f_tablePosition(outcomeTablePositionInput), 2, 7, bgcolor=color.new(color.rgb(15, 20, 27), 10), border_width=1)
+
+if barstate.islast and showOutcomeTrackerInput
+    outcomeTextSize = f_tableTextSize(outcomeTableSizeInput)
+
+    table.cell(outcomeTable, 0, 0, "OUTCOME TRACKER", text_color=color.white, bgcolor=color.rgb(22, 52, 86), text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 0, "", text_color=color.white, bgcolor=color.rgb(22, 52, 86), text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 1, "Profile 1", text_color=color.white, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 1, f_profileStatCell(0), text_color=color.gray, text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 2, "Profile 2", text_color=color.white, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 2, f_profileStatCell(1), text_color=color.gray, text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 3, "Profile 3", text_color=color.white, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 3, f_profileStatCell(2), text_color=color.gray, text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 4, "Profile 4", text_color=color.white, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 4, f_profileStatCell(3), text_color=color.gray, text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 5, "TDI Confirmed", text_color=color.aqua, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 5, f_winRateCell(confirmedWins, confirmedLosses), text_color=color.aqua, text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 6, "TDI Unconfirmed", text_color=color.orange, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 6, f_winRateCell(unconfirmedWins, unconfirmedLosses), text_color=color.orange, text_size=outcomeTextSize)
 
 
 // ============================================================================

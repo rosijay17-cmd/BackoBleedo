@@ -293,6 +293,15 @@ balance review missed it; a targeted depth-at-line-end scan afterward found
 it was the only such line in 2300+ lines, and confirmed no other instance
 existed once fixed.
 
+**Caught proactively (2026-09-16):** while adding new code to
+`Advanced_Session_Profile_Predictor_SR_OR.pine` (an outcome-tracking dashboard
+cell helper concatenating strings across two lines with no enclosing parens),
+the same depth-at-line-end scan flagged the new function BEFORE any compile
+attempt — this time catching a bug of my own making, not just diagnosing one
+after TradingView's compiler had already flagged it. Worth running this scan
+as a standing habit on any newly-written multi-line string/expression
+concatenation, not just when debugging an existing CE10156 report.
+
 ## When to check this file
 
 Before writing a new `for i = 0 to array.size(x) - 1` loop, a new `type`
