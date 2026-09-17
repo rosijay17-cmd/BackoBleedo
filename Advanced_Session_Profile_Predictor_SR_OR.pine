@@ -65,6 +65,7 @@ srLookbackInput = input.int(20, "Lookback Period", minval=1, group="SR Settings"
 volumeFilterLengthInput = input.int(2, "Delta Volume Filter Length", tooltip="Higher input filters low volume boxes", group="SR Settings")
 boxWidthMultInput = input.float(1, "Adjust Box Width", maxval=1000, minval=0, step=0.1, group="SR Settings")
 volumePivotDivisorInput = input.float(2.5, "Volume Pivot Divisor", minval=0.1, step=0.1, tooltip="Was a hardcoded /2.5 in the delta-volume high/low filter. Default unchanged.", group="SR Settings")
+srBoxTransparencyInput = input.int(70, "SR Box Transparency", minval=0, maxval=100, tooltip="0 = fully solid, 100 = fully invisible. Was hardcoded to 30 (fairly opaque).", group="SR Settings")
 
 
 // ============================================================================
@@ -402,8 +403,8 @@ f_calcSupportResistance(srSource, srLookback) =>
     var float resistanceBreakLevel = na
     var box supportBox = na
     var box resistanceBox = na
-    var color resistanceColor = color.new(color.red, 30)
-    var color supportColor = color.new(color.green, 30)
+    var color resistanceColor = color.new(color.red, srBoxTransparencyInput)
+    var color supportColor = color.new(color.green, srBoxTransparencyInput)
 
     // Pine v6 will not accept plain `na` as a `var bool` initial value
     // (CE10173 -- see pine-proven-patterns skill gotcha #3). `false` is
@@ -505,8 +506,8 @@ var label shortLabel = na
 var label longLabel = na
 if barstate.islast
     if na(profileLabel)
-        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r5] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
-    label.set_text(profileLabel, "[r5] Session Profil: " + nextProfile)
+        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r6] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(profileLabel, "[r6] Session Profil: " + nextProfile)
     label.set_x(profileLabel, bar_index)
     label.set_y(profileLabel, high * 1.005)
 
