@@ -505,8 +505,8 @@ var label shortLabel = na
 var label longLabel = na
 if barstate.islast
     if na(profileLabel)
-        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r1] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
-    label.set_text(profileLabel, "[r1] Session Profil: " + nextProfile)
+        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r2] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(profileLabel, "[r2] Session Profil: " + nextProfile)
     label.set_x(profileLabel, bar_index)
     label.set_y(profileLabel, high * 1.005)
 
@@ -601,8 +601,20 @@ bool tdiConfirmsLong = tdiBullishMove and momentumRising
 // below it, waiting to rise up to it.
 // ============================================================================
 
-bool shortTouchNow = not na(shortTriggerPrice) and ta.crossunder(close, shortTriggerPrice)
-bool longTouchNow = not na(longTriggerPrice) and ta.crossover(close, longTriggerPrice)
+// Race-condition fix: shortTriggerPrice/longTriggerPrice are recomputed
+// fresh every bar from THIS bar's own close-vs-level comparison, which
+// means the exact bar a crossunder/crossover should register is also the
+// bar where the branch that set the trigger price flips to "No
+// Short"/"No Long" and resets it to na -- checking ta.crossunder/crossover
+// against the live (already-reset) value made this always false, so the
+// tracker below never accumulated ANY outcomes even after real touches
+// happened on the chart. Fixed by comparing against the PREVIOUS bar's
+// trigger price explicitly (the level that was actually being watched
+// coming into this bar) instead of the just-reset current one.
+float shortTriggerPricePrev = shortTriggerPrice[1]
+float longTriggerPricePrev = longTriggerPrice[1]
+bool shortTouchNow = not na(shortTriggerPricePrev) and close < shortTriggerPricePrev and close[1] >= shortTriggerPricePrev
+bool longTouchNow = not na(longTriggerPricePrev) and close > longTriggerPricePrev and close[1] <= longTriggerPricePrev
 bool shortTouchConfirmedNow = shortTouchNow and tdiConfirmsShort
 bool longTouchConfirmedNow = longTouchNow and tdiConfirmsLong
 
