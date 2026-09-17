@@ -505,8 +505,8 @@ var label shortLabel = na
 var label longLabel = na
 if barstate.islast
     if na(profileLabel)
-        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r2] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
-    label.set_text(profileLabel, "[r2] Session Profil: " + nextProfile)
+        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r3] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(profileLabel, "[r3] Session Profil: " + nextProfile)
     label.set_x(profileLabel, bar_index)
     label.set_y(profileLabel, high * 1.005)
 
@@ -666,6 +666,16 @@ var array<int> statWins = array.new_int(8, 0)
 var array<int> statLosses = array.new_int(8, 0)
 var array<int> statExpired = array.new_int(8, 0)
 
+// Diagnostic: increments the instant ANY touch is registered, well before
+// it resolves to a win/loss/expiry. Watch this number specifically while
+// stepping Replay forward -- if it climbs, the tracker is alive and simply
+// hasn't had a NEW touch to register yet (this profile's trigger price is a
+// single fixed Asia/London level per day, not a re-arming ladder, so at
+// most one touch per direction can ever fire per calendar day). If it never
+// climbs despite visible crosses of the stated trigger price on the chart,
+// that is a real bug still to chase.
+var int totalTouchesRegistered = 0
+
 var int confirmedWins = 0
 var int confirmedLosses = 0
 var int unconfirmedWins = 0
@@ -687,6 +697,7 @@ if barstate.isconfirmed and not na(outcomeAtr)
         array.push(pendingEntryBar, bar_index)
         array.push(pendingTargetPrice, close - outcomeTargetAtrInput * outcomeAtr)
         array.push(pendingStopPrice, close + outcomeTargetAtrInput * outcomeAtr)
+        totalTouchesRegistered += 1
 
     if longTouchNow and currentProfileCode >= 0
         array.push(pendingProfileCode, currentProfileCode)
@@ -695,6 +706,7 @@ if barstate.isconfirmed and not na(outcomeAtr)
         array.push(pendingEntryBar, bar_index)
         array.push(pendingTargetPrice, close + outcomeTargetAtrInput * outcomeAtr)
         array.push(pendingStopPrice, close - outcomeTargetAtrInput * outcomeAtr)
+        totalTouchesRegistered += 1
 
 if array.size(pendingEntryBar) > 0
     for i = array.size(pendingEntryBar) - 1 to 0
@@ -799,7 +811,7 @@ if barstate.islast and showOutcomeTrackerInput
     outcomeTextSize = f_tableTextSize(outcomeTableSizeInput)
 
     table.cell(outcomeTable, 0, 0, "OUTCOME TRACKER", text_color=color.white, bgcolor=color.rgb(22, 52, 86), text_size=outcomeTextSize)
-    table.cell(outcomeTable, 1, 0, "", text_color=color.white, bgcolor=color.rgb(22, 52, 86), text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 0, "Touches: " + str.tostring(totalTouchesRegistered), text_color=color.white, bgcolor=color.rgb(22, 52, 86), text_size=outcomeTextSize)
 
     table.cell(outcomeTable, 0, 1, "Profile 1", text_color=color.white, text_size=outcomeTextSize)
     table.cell(outcomeTable, 1, 1, f_profileStatCell(0), text_color=color.gray, text_size=outcomeTextSize)
