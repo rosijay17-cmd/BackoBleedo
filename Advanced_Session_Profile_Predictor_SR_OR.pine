@@ -55,6 +55,8 @@ londonSessionInput = input.session("0800-1600", "London Session")
 newYorkSessionInput = input.session("1300-2100", "New York Session")
 trendThresholdInput = input.float(1.5, "Trend Tærskel", minval=1.0, step=0.1)
 orWindowMinutesInput = input.int(15, "Opening Range Window (Minutes)", minval=1, maxval=120, tooltip="Was hardcoded to 15 minutes. Default unchanged.")
+orBoxTransparencyInput = input.int(90, "Opening Range Box Transparency", minval=0, maxval=100, tooltip="0 = fully solid, 100 = fully invisible. Applies to the Asia/London/New York opening-range boxes (yellow/red/blue). Was hardcoded to 90. Default unchanged.")
+sessionBgTransparencyInput = input.int(90, "Session Background Tint Transparency", minval=0, maxval=100, tooltip="0 = fully solid, 100 = fully invisible. The faint yellow/red/blue background shading behind price during each session. Was hardcoded to 90. Default unchanged.")
 
 
 // ============================================================================
@@ -187,7 +189,7 @@ if asiaInSession and time >= asiaSessionStartTime and time <= asiaSessionStartTi
     asiaOrHigh := math.max(high, nz(asiaOrHigh, high))
     asiaOrLow := math.min(low, nz(asiaOrLow, low))
     if na(asiaOrBox)
-        asiaOrBox := box.new(left=bar_index, top=high, right=bar_index+1, bottom=low, bgcolor=color.new(color.yellow, 90), border_color=color.yellow)
+        asiaOrBox := box.new(left=bar_index, top=high, right=bar_index+1, bottom=low, bgcolor=color.new(color.yellow, orBoxTransparencyInput), border_color=color.yellow)
     else
         box.set_top(asiaOrBox, asiaOrHigh)
         box.set_bottom(asiaOrBox, asiaOrLow)
@@ -199,7 +201,7 @@ if londonInSession and time >= londonSessionStartTime and time <= londonSessionS
     londonOrHigh := math.max(high, nz(londonOrHigh, high))
     londonOrLow := math.min(low, nz(londonOrLow, low))
     if na(londonOrBox)
-        londonOrBox := box.new(left=bar_index, top=high, right=bar_index+1, bottom=low, bgcolor=color.new(color.red, 90), border_color=color.red)
+        londonOrBox := box.new(left=bar_index, top=high, right=bar_index+1, bottom=low, bgcolor=color.new(color.red, orBoxTransparencyInput), border_color=color.red)
     else
         box.set_top(londonOrBox, londonOrHigh)
         box.set_bottom(londonOrBox, londonOrLow)
@@ -211,7 +213,7 @@ if nyInSession and time >= nySessionStartTime and time <= nySessionStartTime + o
     nyOrHigh := math.max(high, nz(nyOrHigh, high))
     nyOrLow := math.min(low, nz(nyOrLow, low))
     if na(nyOrBox)
-        nyOrBox := box.new(left=bar_index, top=high, right=bar_index+1, bottom=low, bgcolor=color.new(color.blue, 90), border_color=color.blue)
+        nyOrBox := box.new(left=bar_index, top=high, right=bar_index+1, bottom=low, bgcolor=color.new(color.blue, orBoxTransparencyInput), border_color=color.blue)
     else
         box.set_top(nyOrBox, nyOrHigh)
         box.set_bottom(nyOrBox, nyOrLow)
@@ -224,9 +226,9 @@ else if time > nySessionStartTime + orWindowMs and not na(nyOrBox)
 // SESSION BACKGROUND HIGHLIGHT
 // ============================================================================
 
-bgcolor(asiaInSession ? color.new(color.yellow, 90) : na, title="Asien Session")
-bgcolor(londonInSession ? color.new(color.red, 90) : na, title="London Session")
-bgcolor(nyInSession ? color.new(color.blue, 90) : na, title="New York Session")
+bgcolor(asiaInSession ? color.new(color.yellow, sessionBgTransparencyInput) : na, title="Asien Session")
+bgcolor(londonInSession ? color.new(color.red, sessionBgTransparencyInput) : na, title="London Session")
+bgcolor(nyInSession ? color.new(color.blue, sessionBgTransparencyInput) : na, title="New York Session")
 
 
 // ============================================================================
@@ -506,8 +508,8 @@ var label shortLabel = na
 var label longLabel = na
 if barstate.islast
     if na(profileLabel)
-        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r6] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
-    label.set_text(profileLabel, "[r6] Session Profil: " + nextProfile)
+        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r7] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(profileLabel, "[r7] Session Profil: " + nextProfile)
     label.set_x(profileLabel, bar_index)
     label.set_y(profileLabel, high * 1.005)
 
