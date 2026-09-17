@@ -505,8 +505,8 @@ var label shortLabel = na
 var label longLabel = na
 if barstate.islast
     if na(profileLabel)
-        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r4] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
-    label.set_text(profileLabel, "[r4] Session Profil: " + nextProfile)
+        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r5] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(profileLabel, "[r5] Session Profil: " + nextProfile)
     label.set_x(profileLabel, bar_index)
     label.set_y(profileLabel, high * 1.005)
 
@@ -653,6 +653,21 @@ f_profileCode(string profile) =>
 
 float outcomeAtr = ta.atr(14)
 int currentProfileCode = f_profileCode(nextProfile)
+
+// Diagnostic: counts, once per calendar day, which profile actually got
+// classified that day -- separates "this profile genuinely hasn't occurred
+// yet in the tested window" from "it occurred but the tracker didn't
+// remember it." statWins/statLosses/statExpired are var arrays and are
+// never reset, so if a profile's row stays at 0-0 (--) while this counter
+// shows it HAS occurred more than zero times, that is a real memory bug to
+// chase; if this counter also reads 0 for that profile, it simply hasn't
+// happened yet.
+var array<int> profileOccurrences = array.new_int(4, 0)
+var bool profileCountedToday = false
+
+if barstate.islast and not profileCountedToday and currentProfileCode >= 0
+    array.set(profileOccurrences, currentProfileCode, array.get(profileOccurrences, currentProfileCode) + 1)
+    profileCountedToday := true
 
 var array<int> pendingProfileCode = array.new_int()
 var array<bool> pendingIsShort = array.new_bool()
@@ -805,7 +820,7 @@ f_profileStatCell(int profileCode) =>
      " / L " + f_winRateCell(array.get(statWins, profileCode * 2 + 1), array.get(statLosses, profileCode * 2 + 1))
     )
 
-var table outcomeTable = table.new(f_tablePosition(outcomeTablePositionInput), 2, 8, bgcolor=color.new(color.rgb(15, 20, 27), 10), border_width=1)
+var table outcomeTable = table.new(f_tablePosition(outcomeTablePositionInput), 2, 9, bgcolor=color.new(color.rgb(15, 20, 27), 10), border_width=1)
 
 if barstate.islast and showOutcomeTrackerInput
     outcomeTextSize = f_tableTextSize(outcomeTableSizeInput)
@@ -841,6 +856,9 @@ if barstate.islast and showOutcomeTrackerInput
     table.cell(outcomeTable, 0, 7, "Calc Bar", text_color=color.yellow, text_size=outcomeTextSize)
     table.cell(outcomeTable, 1, 7, str.tostring(bar_index) + " @ " + str.format_time(time, "MM-dd HH:mm", timezoneInput), text_color=color.yellow, text_size=outcomeTextSize)
 
+    table.cell(outcomeTable, 0, 8, "Profiles Seen", text_color=color.yellow, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 8, "P1:" + str.tostring(array.get(profileOccurrences, 0)) + " P2:" + str.tostring(array.get(profileOccurrences, 1)) + " P3:" + str.tostring(array.get(profileOccurrences, 2)) + " P4:" + str.tostring(array.get(profileOccurrences, 3)), text_color=color.yellow, text_size=outcomeTextSize)
+
 
 // ============================================================================
 // RESET ON NEW DAY
@@ -861,6 +879,7 @@ if barstate.islast and showOutcomeTrackerInput
 bool newDay = ta.change(time("D", timezoneInput)) != 0
 
 if newDay
+    profileCountedToday := false
     asiaOpen := na
     asiaClose := na
     asiaHigh := na
