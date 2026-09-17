@@ -505,8 +505,8 @@ var label shortLabel = na
 var label longLabel = na
 if barstate.islast
     if na(profileLabel)
-        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r3] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
-    label.set_text(profileLabel, "[r3] Session Profil: " + nextProfile)
+        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r4] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(profileLabel, "[r4] Session Profil: " + nextProfile)
     label.set_x(profileLabel, bar_index)
     label.set_y(profileLabel, high * 1.005)
 
@@ -805,7 +805,7 @@ f_profileStatCell(int profileCode) =>
      " / L " + f_winRateCell(array.get(statWins, profileCode * 2 + 1), array.get(statLosses, profileCode * 2 + 1))
     )
 
-var table outcomeTable = table.new(f_tablePosition(outcomeTablePositionInput), 2, 7, bgcolor=color.new(color.rgb(15, 20, 27), 10), border_width=1)
+var table outcomeTable = table.new(f_tablePosition(outcomeTablePositionInput), 2, 8, bgcolor=color.new(color.rgb(15, 20, 27), 10), border_width=1)
 
 if barstate.islast and showOutcomeTrackerInput
     outcomeTextSize = f_tableTextSize(outcomeTableSizeInput)
@@ -830,6 +830,16 @@ if barstate.islast and showOutcomeTrackerInput
 
     table.cell(outcomeTable, 0, 6, "TDI Unconfirmed", text_color=color.orange, text_size=outcomeTextSize)
     table.cell(outcomeTable, 1, 6, f_winRateCell(unconfirmedWins, unconfirmedLosses), text_color=color.orange, text_size=outcomeTextSize)
+
+    // Diagnostic: settles whether this table is actually calculating on the
+    // Bar Replay cursor's current position, or only on the chart's true
+    // real-time last bar (which would sit still while Replay is scrubbed).
+    // Compare the printed time here against wherever the Replay cursor
+    // visually sits on the chart -- if they don't match, the whole
+    // barstate.islast-gated block is not running where Replay's cursor is,
+    // and none of this table can track Replay at all.
+    table.cell(outcomeTable, 0, 7, "Calc Bar", text_color=color.yellow, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 7, str.tostring(bar_index) + " @ " + str.format_time(time, "MM-dd HH:mm", timezoneInput), text_color=color.yellow, text_size=outcomeTextSize)
 
 
 // ============================================================================
