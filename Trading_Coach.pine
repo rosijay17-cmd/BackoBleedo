@@ -219,6 +219,47 @@ if nyInSession
     nyHigh := math.max(high, nz(nyHigh, low))
     nyLow := math.min(low, nz(nyLow, high))
 
+// -- Session boxes: one box per session spanning its actual running
+// high/low over its full time window, labeled with the session's own
+// name via the box's own `text` parameter. Same create-once/update-in-
+// place/freeze-at-session-end lifecycle as the template's Opening Range
+// boxes: a session's box stops growing the moment that session ends
+// (nothing updates it once asiaInSession etc. goes false), so it stays
+// as a frozen historical marker of that session's completed range until
+// the next day's version replaces it. --
+showSessionBoxesInput = input.bool(true, "Show Session Boxes", group = G_SESSION)
+
+var box asiaSessionBox = na
+var box londonSessionBox = na
+var box nySessionBox = na
+
+if asiaSessionStart and showSessionBoxesInput
+    if not na(asiaSessionBox)
+        box.delete(asiaSessionBox)
+    asiaSessionBox := box.new(left = bar_index, top = high, bottom = low, right = bar_index + 1, xloc = xloc.bar_index, bgcolor = color.new(color.yellow, 88), border_color = color.yellow, text = "ASIA", text_color = color.black, text_size = size.tiny)
+else if asiaInSession and showSessionBoxesInput and not na(asiaSessionBox)
+    box.set_top(asiaSessionBox, asiaHigh)
+    box.set_bottom(asiaSessionBox, asiaLow)
+    box.set_right(asiaSessionBox, bar_index + 1)
+
+if londonSessionStart and showSessionBoxesInput
+    if not na(londonSessionBox)
+        box.delete(londonSessionBox)
+    londonSessionBox := box.new(left = bar_index, top = high, bottom = low, right = bar_index + 1, xloc = xloc.bar_index, bgcolor = color.new(color.red, 88), border_color = color.red, text = "LONDON", text_color = color.white, text_size = size.tiny)
+else if londonInSession and showSessionBoxesInput and not na(londonSessionBox)
+    box.set_top(londonSessionBox, londonHigh)
+    box.set_bottom(londonSessionBox, londonLow)
+    box.set_right(londonSessionBox, bar_index + 1)
+
+if nySessionStart and showSessionBoxesInput
+    if not na(nySessionBox)
+        box.delete(nySessionBox)
+    nySessionBox := box.new(left = bar_index, top = high, bottom = low, right = bar_index + 1, xloc = xloc.bar_index, bgcolor = color.new(color.blue, 88), border_color = color.blue, text = "NEW YORK", text_color = color.white, text_size = size.tiny)
+else if nyInSession and showSessionBoxesInput and not na(nySessionBox)
+    box.set_top(nySessionBox, nyHigh)
+    box.set_bottom(nySessionBox, nyLow)
+    box.set_right(nySessionBox, bar_index + 1)
+
 // -- Zone break / role-reversal tracking --
 var bool asiaHighBroken = false
 var bool asiaLowBroken = false
