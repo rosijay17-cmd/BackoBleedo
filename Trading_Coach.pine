@@ -1,0 +1,694 @@
+//@version=6
+indicator(
+     "Trading Coach - Setup Identifier",
+     shorttitle = "Trading Coach",
+     overlay = true,
+     max_boxes_count = 50,
+     max_lines_count = 100,
+     max_labels_count = 200
+)
+
+// ============================================================================
+// TRADING COACH - SETUP IDENTIFIER
+// ----------------------------------------------------------------------------
+// Built using Advanced_Session_Profile_Predictor_SR_OR.pine as a template --
+// reuses that file's proven session-tracking, TDI/momentum, and outcome-
+// tracking/dashboard patterns, adapted into a coherent LONG/SHORT setup
+// identifier with risk-management guidance and market-structure awareness
+// bolted on as new logic.
+//
+// ONE DELIBERATE DEPARTURE FROM THE TEMPLATE: the template's entire
+// prediction system only computes on barstate.islast, which is exactly what
+// made its Outcome Tracker behave inconsistently under Bar Replay (a whole
+// debugging thread earlier this session). This script's setup detection,
+// market structure, cooldown, and outcome tracking all run UNCONDITIONALLY
+// every confirmed bar instead -- the same pattern already proven in
+// delta_break_retest/Stage8-9. Only the DASHBOARD DRAW itself is gated by
+// barstate.islast, which is the normal, correct, Replay-safe use of that
+// flag (you only want to draw one current table, not one per historical
+// bar).
+//
+// COACHING PHILOSOPHY:
+// This is deliberately NOT a black box. Every gate that blocks a setup is
+// named explicitly in the dashboard's "Coach Says" row, so the point is to
+// teach you to read structure/session/momentum/risk yourself over time, not
+// just to blink an arrow at you.
+//
+// ENTRY MODEL (a single, teachable, explicit model -- pullback-in-trend):
+// HTF STRUCTURE (UP/DOWN/RANGE)
+// -> PRICE PULLS BACK TO A RECENT SWING LEVEL
+// -> A REVERSAL CANDLE CONFIRMS
+// -> TDI MOMENTUM AGREES
+// -> SESSION IS FAVORABLE
+// -> COOLDOWN ALLOWS IT
+// -> SETUP FIRES, WITH A STRUCTURE-BASED STOP, AN R-MULTIPLE TARGET, AND A
+//    SUGGESTED POSITION SIZE FROM YOUR OWN ACCOUNT-RISK INPUTS
+//
+// IMPORTANT: this is an indicator, not a strategy -- it never places real
+// orders. It marks down what a disciplined entry would look like and lets
+// its own Outcome Tracker keep an honest running score of how often that
+// actually worked out, exactly like the template's Outcome Tracker does for
+// its session-profile predictions.
+// ============================================================================
+
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+f_clamp(float v, float lo, float hi) =>
+    math.max(lo, math.min(hi, v))
+
+f_delta(float o, float h, float l, float c, float v) =>
+    float safeRange = math.max(h - l, syminfo.mintick)
+    float pressure = f_clamp((c - o) / safeRange, -1.0, 1.0)
+    v * pressure
+
+f_tablePosition(string label) =>
+    switch label
+        "Top Left" => position.top_left
+        "Top Center" => position.top_center
+        "Top Right" => position.top_right
+        "Middle Left" => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right" => position.middle_right
+        "Bottom Left" => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Bottom Right" => position.bottom_right
+        => position.bottom_right
+
+f_tableTextSize(string label) =>
+    switch label
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        => size.small
+
+
+// ============================================================================
+// 00 - SESSIONS & TIMEZONE
+// ----------------------------------------------------------------------------
+// Ported from the template, independent-if-blocks version (its own [r]-round
+// fix -- the original had an if/else-if chain that silently dropped New
+// York's own tracking during its overlap with London).
+// ============================================================================
+
+string G_SESSION = "00 - Sessions & Timezone"
+
+timezoneInput = input.string("UTC", "Timezone", options = ["UTC", "Europe/London", "America/New_York"], group = G_SESSION)
+asiaSessionInput = input.session("0000-0800", "Asia Session", group = G_SESSION)
+londonSessionInput = input.session("0800-1600", "London Session", group = G_SESSION)
+newYorkSessionInput = input.session("1300-2100", "New York Session", group = G_SESSION)
+favorForLondonInput = input.bool(true, "Favorable Session: London", group = G_SESSION)
+favorForNyInput = input.bool(true, "Favorable Session: New York", group = G_SESSION)
+favorForAsiaInput = input.bool(false, "Favorable Session: Asia", tooltip = "Off by default -- Asia is typically the lowest-liquidity session for most index/FX instruments. Turn on if your instrument actually trades well there.", group = G_SESSION)
+requireFavorableSessionInput = input.bool(true, "Require Favorable Session For Setups", group = G_SESSION)
+
+asiaInSession = nz(time(timeframe.period, asiaSessionInput, timezoneInput), 0) != 0
+londonInSession = nz(time(timeframe.period, londonSessionInput, timezoneInput), 0) != 0
+nyInSession = nz(time(timeframe.period, newYorkSessionInput, timezoneInput), 0) != 0
+
+bool sessionFavorable = (
+     (asiaInSession and favorForAsiaInput) or
+     (londonInSession and favorForLondonInput) or
+     (nyInSession and favorForNyInput)
+)
+
+string activeSessionLabel = (
+     asiaInSession and londonInSession ?
+     "Asia+London" :
+     londonInSession and nyInSession ?
+     "London+NY" :
+     asiaInSession ?
+     "Asia" :
+     londonInSession ?
+     "London" :
+     nyInSession ?
+     "New York" :
+     "Off-Session"
+)
+
+bgcolor(asiaInSession ? color.new(color.yellow, 92) : na, title = "Asia Session")
+bgcolor(londonInSession ? color.new(color.red, 92) : na, title = "London Session")
+bgcolor(nyInSession ? color.new(color.blue, 92) : na, title = "New York Session")
+
+
+// ============================================================================
+// 01 - MARKET STRUCTURE
+// ----------------------------------------------------------------------------
+// HTF structure classification via the proven two-layer request.security +
+// [1]-offset pattern (mtf-confirmed-pivot-pull.md / pine-proven-patterns
+// skill), same shape as delta_break_retest's f_get4hContext(). Native-
+// timeframe swing pivots are tracked separately below for stop placement --
+// the HTF pull tells you the REGIME, the native pivots tell you WHERE.
+// ============================================================================
+
+string G_STRUCTURE = "01 - Market Structure"
+
+structureTimeframeInput = input.timeframe("60", "Structure Timeframe", tooltip = "Higher timeframe used to classify trend direction (HH/HL = up, LH/LL = down, neither = ranging).", group = G_STRUCTURE)
+structurePivotLeftInput = input.int(3, "Structure Pivot Left", minval = 1, maxval = 20, group = G_STRUCTURE)
+structurePivotRightInput = input.int(3, "Structure Pivot Right", minval = 1, maxval = 20, group = G_STRUCTURE)
+nativePivotLeftInput = input.int(3, "Native Swing Pivot Left", minval = 1, maxval = 20, tooltip = "Pivot lookback on the CHART's own timeframe, used to find the nearest recent swing high/low for pullback detection and stop placement.", group = G_STRUCTURE)
+nativePivotRightInput = input.int(3, "Native Swing Pivot Right", minval = 1, maxval = 20, group = G_STRUCTURE)
+
+f_getStructureContextRaw() =>
+    float ph = ta.pivothigh(high, structurePivotLeftInput, structurePivotRightInput)
+    float pl = ta.pivotlow(low, structurePivotLeftInput, structurePivotRightInput)
+    float latestHigh = ta.valuewhen(not na(ph), ph, 0)
+    float previousHigh = ta.valuewhen(not na(ph), ph, 1)
+    float latestLow = ta.valuewhen(not na(pl), pl, 0)
+    float previousLow = ta.valuewhen(not na(pl), pl, 1)
+    [latestHigh, previousHigh, latestLow, previousLow]
+
+f_getStructureContext() =>
+    [lh, ph, ll, pl] = f_getStructureContextRaw()
+    [lh[1], ph[1], ll[1], pl[1]]
+
+[htfLastHigh, htfPrevHigh, htfLastLow, htfPrevLow] = request.security(
+     syminfo.tickerid,
+     structureTimeframeInput,
+     f_getStructureContext(),
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_on
+)
+
+bool structureHaveEnoughPivots = (
+     not na(htfLastHigh) and
+     not na(htfPrevHigh) and
+     not na(htfLastLow) and
+     not na(htfPrevLow)
+)
+
+bool structureHigherHigh = structureHaveEnoughPivots and htfLastHigh > htfPrevHigh
+bool structureHigherLow = structureHaveEnoughPivots and htfLastLow > htfPrevLow
+bool structureLowerHigh = structureHaveEnoughPivots and htfLastHigh < htfPrevHigh
+bool structureLowerLow = structureHaveEnoughPivots and htfLastLow < htfPrevLow
+
+string structureTrend = (
+     structureHigherHigh and structureHigherLow ?
+     "UP" :
+     structureLowerHigh and structureLowerLow ?
+     "DOWN" :
+     "RANGE"
+)
+
+// Native-timeframe swing tracking -- the "WHERE" to this script's pullback
+// entry model. A plain, direct pivot-confirmation read (not MTF-pulled, so
+// no offset/confirmation trick is needed the way the HTF pull above needed
+// one): ta.pivothigh/low only resolves non-na once genuinely confirmed
+// (structurePivotRightInput/nativePivotRightInput bars after the actual
+// peak), so this is already look-ahead-safe by construction.
+float nativePivotHigh = ta.pivothigh(high, nativePivotLeftInput, nativePivotRightInput)
+float nativePivotLow = ta.pivotlow(low, nativePivotLeftInput, nativePivotRightInput)
+
+var float recentSwingHigh = na
+var float recentSwingLow = na
+
+if not na(nativePivotHigh)
+    recentSwingHigh := nativePivotHigh
+if not na(nativePivotLow)
+    recentSwingLow := nativePivotLow
+
+
+// ============================================================================
+// 02 - MOMENTUM (TDI)
+// ----------------------------------------------------------------------------
+// Ported from the template's Traders Dynamic Index block, unchanged math.
+// ============================================================================
+
+string G_TDI = "02 - Momentum (TDI)"
+
+tdiSourceInput = input.source(close, "TDI Source", group = G_TDI)
+tdiRsiPeriodInput = input.int(21, "RSI Period", minval = 1, group = G_TDI)
+tdiBandLengthInput = input.int(34, "Band Length", minval = 1, group = G_TDI)
+tdiFastMaLengthInput = input.int(2, "Fast MA on RSI", minval = 1, group = G_TDI)
+momentumLengthInput = input.int(12, "Momentum Length", minval = 1, group = G_TDI)
+
+tdiRsi = ta.rsi(tdiSourceInput, tdiRsiPeriodInput)
+tdiMa = ta.sma(tdiRsi, tdiBandLengthInput)
+tdiOffset = 1.6185 * ta.stdev(tdiRsi, tdiBandLengthInput)
+tdiUpperBand = tdiMa + tdiOffset
+tdiLowerBand = tdiMa - tdiOffset
+tdiFastMa = ta.sma(tdiRsi, tdiFastMaLengthInput)
+momentum = tdiSourceInput - tdiSourceInput[momentumLengthInput]
+momentumRising = momentum > momentum[1]
+momentumFalling = momentum < momentum[1]
+tdiBullishMove = tdiFastMa > tdiUpperBand and tdiFastMa > 68
+tdiBearishMove = tdiFastMa < tdiLowerBand and tdiFastMa < 32
+
+bool tdiConfirmsLong = tdiBullishMove and momentumRising
+bool tdiConfirmsShort = tdiBearishMove and momentumFalling
+
+
+// ============================================================================
+// 03 - VOLUME PRESSURE
+// ----------------------------------------------------------------------------
+// Ported from delta_break_retest's f_delta/execution-pressure engine --
+// same candle-pressure estimate proven across Stage 1-9, reused here as an
+// optional extra confirmation layer.
+// ============================================================================
+
+string G_VOLUME = "03 - Volume Pressure"
+
+executionDeltaWindowInput = input.int(3, "Execution Pressure Window", minval = 1, maxval = 8, group = G_VOLUME)
+requireVolumePressureInput = input.bool(false, "Require Volume Pressure Agreement", tooltip = "OFF by default. Stage 8's own funnel diagnostics (delta_break_retest) proved a strict pressure gate can smother signal count on a noisy instrument -- left off here so you see setups even without it, and can turn it on deliberately once you've watched how often it would have agreed.", group = G_VOLUME)
+minimumVolumePressureInput = input.float(5.0, "Minimum Volume Pressure %", minval = 0.0, maxval = 60.0, step = 1.0, group = G_VOLUME)
+
+float executionDeltaSum = 0.0
+float executionVolumeSum = 0.0
+
+for i = 0 to executionDeltaWindowInput - 1
+    float execVolume = nz(volume[i], 0.0)
+    executionDeltaSum += f_delta(open[i], high[i], low[i], close[i], execVolume)
+    executionVolumeSum += execVolume
+
+float executionDeltaPressure = (
+     executionVolumeSum > 0 ?
+     executionDeltaSum / executionVolumeSum * 100.0 :
+     0.0
+)
+
+bool pressureOkLong = not requireVolumePressureInput or executionDeltaPressure >= minimumVolumePressureInput
+bool pressureOkShort = not requireVolumePressureInput or executionDeltaPressure <= -minimumVolumePressureInput
+
+
+// ============================================================================
+// 04 - ENTRY SETUP
+// ----------------------------------------------------------------------------
+// The pullback-in-trend model described in the header comment. Every gate
+// is a separate, named boolean so the "Coach Says" dashboard row can point
+// at exactly which one is currently unmet.
+// ============================================================================
+
+string G_ENTRY = "04 - Entry Setup"
+
+pullbackToleranceAtrInput = input.float(0.30, "Pullback Tolerance To Swing (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, tooltip = "How close price needs to get to the recent swing level to count as a genuine pullback.", group = G_ENTRY)
+minimumReversalBodyFractionInput = input.float(0.30, "Minimum Reversal Candle Body / Range", minval = 0.0, maxval = 1.0, step = 0.05, group = G_ENTRY)
+minimumReversalCloseLocationInput = input.float(0.60, "Minimum Reversal Close Location", minval = 0.50, maxval = 0.95, step = 0.05, tooltip = "For a long reversal candle, how close to the bar's own high the close must be (mirrored near the low for a short). 0.60 means the close must sit in at least the top 40% of the bar's range.", group = G_ENTRY)
+cooldownBarsInput = input.int(12, "Cooldown Bars Between Setups (Per Direction)", minval = 0, group = G_ENTRY)
+
+float atrCoach = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
+float coachRange = math.max(high - low, syminfo.mintick)
+float coachBodyFraction = math.abs(close - open) / coachRange
+float coachCloseLocation = (close - low) / coachRange
+
+bool nearSupportPullback = (
+     not na(recentSwingLow) and
+     low <= recentSwingLow + pullbackToleranceAtrInput * atrCoach and
+     close > recentSwingLow
+)
+
+bool nearResistancePullback = (
+     not na(recentSwingHigh) and
+     high >= recentSwingHigh - pullbackToleranceAtrInput * atrCoach and
+     close < recentSwingHigh
+)
+
+bool bullishReversalCandle = (
+     close > open and
+     coachBodyFraction >= minimumReversalBodyFractionInput and
+     coachCloseLocation >= minimumReversalCloseLocationInput
+)
+
+bool bearishReversalCandle = (
+     close < open and
+     coachBodyFraction >= minimumReversalBodyFractionInput and
+     coachCloseLocation <= 1.0 - minimumReversalCloseLocationInput
+)
+
+bool sessionOkForLong = not requireFavorableSessionInput or sessionFavorable
+bool sessionOkForShort = not requireFavorableSessionInput or sessionFavorable
+
+var int lastLongSetupBar = na
+var int lastShortSetupBar = na
+
+bool longCooldownOk = na(lastLongSetupBar) or (bar_index - lastLongSetupBar) > cooldownBarsInput
+bool shortCooldownOk = na(lastShortSetupBar) or (bar_index - lastShortSetupBar) > cooldownBarsInput
+
+bool longStructureOk = structureTrend == "UP"
+bool shortStructureOk = structureTrend == "DOWN"
+
+bool longSetupNow = (
+     barstate.isconfirmed and
+     longStructureOk and
+     nearSupportPullback and
+     bullishReversalCandle and
+     tdiConfirmsLong and
+     pressureOkLong and
+     sessionOkForLong and
+     longCooldownOk
+)
+
+bool shortSetupNow = (
+     barstate.isconfirmed and
+     shortStructureOk and
+     nearResistancePullback and
+     bearishReversalCandle and
+     tdiConfirmsShort and
+     pressureOkShort and
+     sessionOkForShort and
+     shortCooldownOk
+)
+
+if longSetupNow
+    lastLongSetupBar := bar_index
+if shortSetupNow
+    lastShortSetupBar := bar_index
+
+// -- "Coach Says" -- names the single most relevant blocker/status right
+// now, in the order a trader would actually check them: structure first
+// (is there even a trend to trade with), then location (are we at a level),
+// then confirmation (candle + momentum), then session/cooldown last (the
+// setup is real, just gated by timing/pacing). --
+string coachMessage = (
+     structureTrend == "RANGE" ?
+     "Structure ranging -- no clear trend, stand aside" :
+     structureTrend == "UP" and not nearSupportPullback ?
+     "Uptrend -- waiting for a pullback to recent support" :
+     structureTrend == "UP" and nearSupportPullback and not bullishReversalCandle ?
+     "At support -- waiting for a bullish reversal candle" :
+     structureTrend == "UP" and nearSupportPullback and bullishReversalCandle and not tdiConfirmsLong ?
+     "Reversal candle formed -- waiting for momentum confirmation" :
+     structureTrend == "UP" and nearSupportPullback and bullishReversalCandle and tdiConfirmsLong and not pressureOkLong ?
+     "Momentum confirms -- waiting for volume pressure agreement" :
+     structureTrend == "UP" and nearSupportPullback and bullishReversalCandle and tdiConfirmsLong and pressureOkLong and not sessionOkForLong ?
+     "Setup ready -- outside a favorable session, consider waiting" :
+     structureTrend == "UP" and nearSupportPullback and bullishReversalCandle and tdiConfirmsLong and pressureOkLong and sessionOkForLong and not longCooldownOk ?
+     "Setup ready -- cooling down after a recent long signal" :
+     longSetupNow ?
+     "LONG SETUP ACTIVE" :
+     structureTrend == "DOWN" and not nearResistancePullback ?
+     "Downtrend -- waiting for a pullback to recent resistance" :
+     structureTrend == "DOWN" and nearResistancePullback and not bearishReversalCandle ?
+     "At resistance -- waiting for a bearish reversal candle" :
+     structureTrend == "DOWN" and nearResistancePullback and bearishReversalCandle and not tdiConfirmsShort ?
+     "Reversal candle formed -- waiting for momentum confirmation" :
+     structureTrend == "DOWN" and nearResistancePullback and bearishReversalCandle and tdiConfirmsShort and not pressureOkShort ?
+     "Momentum confirms -- waiting for volume pressure agreement" :
+     structureTrend == "DOWN" and nearResistancePullback and bearishReversalCandle and tdiConfirmsShort and pressureOkShort and not sessionOkForShort ?
+     "Setup ready -- outside a favorable session, consider waiting" :
+     structureTrend == "DOWN" and nearResistancePullback and bearishReversalCandle and tdiConfirmsShort and pressureOkShort and sessionOkForShort and not shortCooldownOk ?
+     "Setup ready -- cooling down after a recent short signal" :
+     shortSetupNow ?
+     "SHORT SETUP ACTIVE" :
+     "No clear setup forming"
+)
+
+
+// ============================================================================
+// 05 - RISK MANAGEMENT
+// ----------------------------------------------------------------------------
+// Structure-based stop (beyond the actual swing level, not an arbitrary
+// distance), an R-multiple target, and a suggested position size derived
+// directly from your own account-risk inputs -- the "coaching" is in
+// showing the arithmetic, not hiding it.
+// ============================================================================
+
+string G_RISK = "05 - Risk Management"
+
+accountSizeInput = input.float(10000.0, "Account Size ($)", minval = 0.0, group = G_RISK)
+riskPercentInput = input.float(1.0, "Risk Per Trade (%)", minval = 0.0, maxval = 100.0, step = 0.1, group = G_RISK)
+pointValueInput = input.float(2.0, "Dollar Value Per Point (Per Contract/Share)", minval = 0.0, tooltip = "How much $1 of price movement is worth per contract/share of your instrument (e.g. Micro Nasdaq MNQ = 2, E-mini S&P ES = 50, a single stock share = 1). Get this wrong and every position-size suggestion below is wrong -- check your instrument's actual point value.", group = G_RISK)
+stopBufferAtrMultInput = input.float(0.15, "Stop Buffer Beyond Swing (x ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = G_RISK)
+rMultipleInput = input.float(2.0, "Target R-Multiple", minval = 0.5, maxval = 10.0, step = 0.5, group = G_RISK)
+maximumEntryRiskAtrInput = input.float(1.5, "Maximum Entry Risk (x ATR)", minval = 0.25, maxval = 5.0, step = 0.05, tooltip = "Caps how far the stop is allowed to sit from entry, in ATR terms -- a structure-based stop that's simply too far away for the current volatility gets flagged rather than silently sized down to nothing.", group = G_RISK)
+
+float longStopPrice = na
+float longTargetPrice = na
+float longRiskPerUnit = na
+float longRiskAtr = na
+bool longRiskOk = false
+
+float shortStopPrice = na
+float shortTargetPrice = na
+float shortRiskPerUnit = na
+float shortRiskAtr = na
+bool shortRiskOk = false
+
+if longSetupNow and not na(recentSwingLow)
+    longStopPrice := recentSwingLow - stopBufferAtrMultInput * atrCoach
+    longRiskPerUnit := math.abs(close - longStopPrice)
+    longRiskAtr := atrCoach > 0 ? longRiskPerUnit / atrCoach : 999.0
+    longRiskOk := longRiskAtr <= maximumEntryRiskAtrInput
+    longTargetPrice := close + longRiskPerUnit * rMultipleInput
+
+if shortSetupNow and not na(recentSwingHigh)
+    shortStopPrice := recentSwingHigh + stopBufferAtrMultInput * atrCoach
+    shortRiskPerUnit := math.abs(close - shortStopPrice)
+    shortRiskAtr := atrCoach > 0 ? shortRiskPerUnit / atrCoach : 999.0
+    shortRiskOk := shortRiskAtr <= maximumEntryRiskAtrInput
+    shortTargetPrice := close - shortRiskPerUnit * rMultipleInput
+
+float riskDollars = accountSizeInput * (riskPercentInput / 100.0)
+
+f_suggestedSize(float riskPerUnit) =>
+    float riskPerContract = riskPerUnit * pointValueInput
+    riskPerContract > 0 ? riskDollars / riskPerContract : na
+
+float longSuggestedSize = longSetupNow ? f_suggestedSize(longRiskPerUnit) : na
+float shortSuggestedSize = shortSetupNow ? f_suggestedSize(shortRiskPerUnit) : na
+
+bool actualLongSignal = longSetupNow and longRiskOk
+bool actualShortSignal = shortSetupNow and shortRiskOk
+
+
+// ============================================================================
+// 06 - OUTCOME TRACKING
+// ----------------------------------------------------------------------------
+// Same pattern proven in Advanced_Session_Profile_Predictor_SR_OR.pine's
+// Outcome Tracker: a simple 1:1 race to outcomeTargetAtrInput ATR in the
+// predicted direction (Win) vs. against it (Loss), or Expired if neither
+// happens within the horizon. Registration gated behind barstate.isconfirmed
+// (native-timeframe-confirmation-gating pattern) -- resolution is not,
+// since a bar's real high/low reaching a level is a real event regardless
+// of whether that bar has closed yet. Deliberately never reset -- this is
+// meant to accumulate a running record of how good this script's OWN
+// setups actually are.
+// ============================================================================
+
+string G_OUTCOME = "06 - Outcome Tracking"
+
+showOutcomeTrackerInput = input.bool(true, "Show Outcome Tracker Table", group = G_OUTCOME)
+outcomeHorizonBarsInput = input.int(20, "Outcome Tracking Horizon (Bars)", minval = 1, maxval = 500, group = G_OUTCOME)
+outcomeTablePositionInput = input.string("Bottom Right", "Outcome Table Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_OUTCOME)
+outcomeTableSizeInput = input.string("Small", "Outcome Table Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_OUTCOME)
+
+var array<bool> pendingIsLong = array.new_bool()
+var array<int> pendingEntryBar = array.new_int()
+var array<float> pendingTargetPrice = array.new_float()
+var array<float> pendingStopPrice = array.new_float()
+
+var int longWins = 0
+var int longLosses = 0
+var int longExpired = 0
+var int shortWins = 0
+var int shortLosses = 0
+var int shortExpired = 0
+var int totalSetupsRegistered = 0
+
+if actualLongSignal
+    array.push(pendingIsLong, true)
+    array.push(pendingEntryBar, bar_index)
+    array.push(pendingTargetPrice, longTargetPrice)
+    array.push(pendingStopPrice, longStopPrice)
+    totalSetupsRegistered += 1
+
+if actualShortSignal
+    array.push(pendingIsLong, false)
+    array.push(pendingEntryBar, bar_index)
+    array.push(pendingTargetPrice, shortTargetPrice)
+    array.push(pendingStopPrice, shortStopPrice)
+    totalSetupsRegistered += 1
+
+if array.size(pendingEntryBar) > 0
+    for i = array.size(pendingEntryBar) - 1 to 0
+        bool isLongPending = array.get(pendingIsLong, i)
+        float targetPending = array.get(pendingTargetPrice, i)
+        float stopPending = array.get(pendingStopPrice, i)
+        int entryBarPending = array.get(pendingEntryBar, i)
+
+        bool hitTarget = isLongPending ? high >= targetPending : low <= targetPending
+        bool hitStop = isLongPending ? low <= stopPending : high >= stopPending
+        bool expiredNow = bar_index - entryBarPending >= outcomeHorizonBarsInput
+
+        bool resolvedNow = false
+        bool wasWin = false
+
+        if hitTarget and hitStop
+            // Ambiguous same-bar case -- conservatively scored as a loss
+            // rather than guessing which was actually touched first
+            // intrabar (same convention as the template's Outcome Tracker).
+            resolvedNow := true
+            wasWin := false
+        else if hitTarget
+            resolvedNow := true
+            wasWin := true
+        else if hitStop
+            resolvedNow := true
+            wasWin := false
+
+        if resolvedNow
+            if isLongPending
+                if wasWin
+                    longWins += 1
+                else
+                    longLosses += 1
+            else
+                if wasWin
+                    shortWins += 1
+                else
+                    shortLosses += 1
+            array.remove(pendingIsLong, i)
+            array.remove(pendingEntryBar, i)
+            array.remove(pendingTargetPrice, i)
+            array.remove(pendingStopPrice, i)
+        else if expiredNow
+            if isLongPending
+                longExpired += 1
+            else
+                shortExpired += 1
+            array.remove(pendingIsLong, i)
+            array.remove(pendingEntryBar, i)
+            array.remove(pendingTargetPrice, i)
+            array.remove(pendingStopPrice, i)
+
+
+// ============================================================================
+// 07 - VISUALS
+// ============================================================================
+
+string G_VISUALS = "07 - Visuals"
+
+showStructureLineInput = input.bool(true, "Show Structure Trend Color On Bars", group = G_VISUALS)
+showSwingLevelsInput = input.bool(true, "Show Recent Swing High/Low Lines", group = G_VISUALS)
+showEntryMarkersInput = input.bool(true, "Show Entry Markers", group = G_VISUALS)
+showRiskLabelsInput = input.bool(true, "Show Risk Management Labels", group = G_VISUALS)
+longColorInput = input.color(color.aqua, "Long Color", group = G_VISUALS)
+shortColorInput = input.color(color.orange, "Short Color", group = G_VISUALS)
+
+barcolor(
+     showStructureLineInput and structureTrend == "UP" ?
+     color.new(longColorInput, 70) :
+     showStructureLineInput and structureTrend == "DOWN" ?
+     color.new(shortColorInput, 70) :
+     na
+)
+
+plot(showSwingLevelsInput ? recentSwingHigh : na, "Recent Swing High", color = color.new(shortColorInput, 40), style = plot.style_circles)
+plot(showSwingLevelsInput ? recentSwingLow : na, "Recent Swing Low", color = color.new(longColorInput, 40), style = plot.style_circles)
+
+plotshape(showEntryMarkersInput and actualLongSignal, title = "Long Setup", style = shape.triangleup, location = location.belowbar, size = size.small, color = longColorInput, text = "LONG", textcolor = color.white)
+plotshape(showEntryMarkersInput and actualShortSignal, title = "Short Setup", style = shape.triangledown, location = location.abovebar, size = size.small, color = shortColorInput, text = "SHORT", textcolor = color.white)
+
+// Each signal gets its own new label (a running history of past entries on
+// the chart), not a single repositioned one -- so the return value is never
+// read back, just fired and left in place. Pine allows a bare
+// label.new(...) call with nothing capturing it.
+if actualLongSignal and showRiskLabelsInput
+    string longRiskText = (
+         "LONG @ " + str.tostring(close, format.mintick) +
+         "\nStop " + str.tostring(longStopPrice, format.mintick) +
+         " | Target " + str.tostring(longTargetPrice, format.mintick) +
+         "\nRisk $" + str.tostring(riskDollars, "#.##") +
+         " | Size ~" + (na(longSuggestedSize) ? "n/a" : str.tostring(longSuggestedSize, "#.##"))
+    )
+    label.new(bar_index, low, text = longRiskText, style = label.style_label_up, color = longColorInput, textcolor = color.black, size = size.small)
+
+if actualShortSignal and showRiskLabelsInput
+    string shortRiskText = (
+         "SHORT @ " + str.tostring(close, format.mintick) +
+         "\nStop " + str.tostring(shortStopPrice, format.mintick) +
+         " | Target " + str.tostring(shortTargetPrice, format.mintick) +
+         "\nRisk $" + str.tostring(riskDollars, "#.##") +
+         " | Size ~" + (na(shortSuggestedSize) ? "n/a" : str.tostring(shortSuggestedSize, "#.##"))
+    )
+    label.new(bar_index, high, text = shortRiskText, style = label.style_label_down, color = shortColorInput, textcolor = color.black, size = size.small)
+
+alertcondition(actualLongSignal, title = "Trading Coach: Long Setup", message = "Trading Coach LONG setup -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(actualShortSignal, title = "Trading Coach: Short Setup", message = "Trading Coach SHORT setup -- {{ticker}} {{interval}} @ {{close}}")
+
+
+// ============================================================================
+// 08 - COACHING DASHBOARD
+// ============================================================================
+
+string G_DASH = "08 - Dashboard"
+
+showDashboardInput = input.bool(true, "Show Coaching Dashboard", group = G_DASH)
+dashboardPositionInput = input.string("Top Right", "Dashboard Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_DASH)
+dashboardSizeInput = input.string("Small", "Dashboard Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_DASH)
+
+f_winRateCell(int wins, int losses) =>
+    int total = wins + losses
+    total > 0 ? str.tostring(wins) + "-" + str.tostring(losses) + " (" + str.tostring(math.round(wins / total * 100)) + "%)" : "0-0 (--)"
+
+var table coachTable = table.new(f_tablePosition(dashboardPositionInput), 2, 11, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast and showDashboardInput
+    dashTextSize = f_tableTextSize(dashboardSizeInput)
+
+    table.cell(coachTable, 0, 0, "TRADING COACH", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = dashTextSize)
+    table.cell(coachTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 1, "Session", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 1, activeSessionLabel + (sessionFavorable ? " (favorable)" : " (caution)"), text_color = sessionFavorable ? color.aqua : color.orange, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 2, "Structure", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 2, structureTrend, text_color = structureTrend == "UP" ? longColorInput : structureTrend == "DOWN" ? shortColorInput : color.gray, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 3, "Momentum", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 3, tdiConfirmsLong ? "BULLISH" : tdiConfirmsShort ? "BEARISH" : "NEUTRAL", text_color = tdiConfirmsLong ? longColorInput : tdiConfirmsShort ? shortColorInput : color.gray, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 4, "Pressure", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 4, str.tostring(executionDeltaPressure, "#.0") + "%", text_color = executionDeltaPressure >= 0 ? longColorInput : shortColorInput, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 5, "Swing High/Low", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 5, (na(recentSwingHigh) ? "--" : str.tostring(recentSwingHigh, format.mintick)) + " / " + (na(recentSwingLow) ? "--" : str.tostring(recentSwingLow, format.mintick)), text_color = color.gray, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 6, "Coach Says", text_color = color.yellow, text_size = dashTextSize)
+    table.cell(coachTable, 1, 6, coachMessage, text_color = (actualLongSignal or actualShortSignal) ? color.white : color.yellow, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 7, "Cooldown", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 7, "L " + (longCooldownOk ? "OK" : "wait") + " / S " + (shortCooldownOk ? "OK" : "wait"), text_color = color.gray, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 8, "Setups Registered", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 8, str.tostring(totalSetupsRegistered), text_color = color.gray, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 9, "Long Record", text_color = longColorInput, text_size = dashTextSize)
+    table.cell(coachTable, 1, 9, f_winRateCell(longWins, longLosses) + " (Exp " + str.tostring(longExpired) + ")", text_color = longColorInput, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 10, "Short Record", text_color = shortColorInput, text_size = dashTextSize)
+    table.cell(coachTable, 1, 10, f_winRateCell(shortWins, shortLosses) + " (Exp " + str.tostring(shortExpired) + ")", text_color = shortColorInput, text_size = dashTextSize)
+
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+
+plot(structureHigherHigh ? 1 : structureLowerHigh ? -1 : 0, title = "Structure HH/LH Flag", display = display.data_window)
+plot(atrCoach, title = "ATR", display = display.data_window)
+plot(executionDeltaPressure, title = "Execution Pressure %", display = display.data_window)
+plot(actualLongSignal ? 1 : 0, title = "Actual Long Signal", display = display.data_window)
+plot(actualShortSignal ? 1 : 0, title = "Actual Short Signal", display = display.data_window)
+
+
+// ============================================================================
+// STARTING SETTINGS
+// ----------------------------------------------------------------------------
+// A first build, not yet validated against real setup outcomes -- run the
+// Outcome Tracker for a real stretch before trusting the win rate on any
+// of this, the same discipline the template's own tuning needed.
+//
+// Structure Timeframe:            60
+// Native Swing Pivot L/R:         3 / 3
+// Pullback Tolerance:             0.30 ATR
+// Min Reversal Body/Range:        0.30
+// Min Reversal Close Location:    0.60
+// Require Volume Pressure:        OFF initially
+// Cooldown Bars:                  12
+// Stop Buffer:                    0.15 ATR
+// Target R-Multiple:              2.0
+// Max Entry Risk:                 1.5 ATR
+// Risk Per Trade:                 1.0% of Account Size
+// ============================================================================
