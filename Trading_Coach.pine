@@ -535,6 +535,8 @@ string G_ENTRY = "05 - Entry Setup"
 
 entryModeInput = input.string("Both", "Entry Mode", options = ["Pullback Only", "Breakout Only", "Both"], tooltip = "Pullback: buy a dip to recent support / sell a rally to recent resistance, then a reversal candle. Breakout: buy a decisive push above recent resistance / sell a decisive push below recent support, continuing the trend.", group = G_ENTRY)
 pullbackToleranceAtrInput = input.float(0.30, "Pullback Tolerance To Swing (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, tooltip = "How close price needs to get to the recent swing level to count as a genuine pullback.", group = G_ENTRY)
+minBarsAtRetestInput = input.int(0, "Min Bars After Zone Touch Before Reversal", minval = 0, maxval = 20, tooltip = "0 (default) allows the reversal candle to be the SAME bar as the zone touch -- the original behavior. Raise this to require the reversal to develop over at least this many bars after price first tags the zone.", group = G_ENTRY)
+maxBarsAtRetestInput = input.int(5, "Max Bars After Zone Touch To Confirm Reversal", minval = 1, maxval = 50, tooltip = "How many bars price has to still produce a valid reversal candle after tagging the zone before that touch is considered stale and no longer counts.", group = G_ENTRY)
 breakoutDistanceAtrInput = input.float(0.25, "Breakout Distance Beyond Swing (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, tooltip = "How far beyond the recent swing level price must CLOSE to count as a decisive breakout, not just a marginal poke through it.", group = G_ENTRY)
 minimumReversalBodyFractionInput = input.float(0.30, "Minimum Candle Body / Range", minval = 0.0, maxval = 1.0, step = 0.05, tooltip = "Applies to both the pullback reversal candle and the breakout candle.", group = G_ENTRY)
 minimumReversalCloseLocationInput = input.float(0.60, "Minimum Candle Close Location", minval = 0.50, maxval = 0.95, step = 0.05, tooltip = "For a bullish candle, how close to the bar's own high the close must be (mirrored near the low for a bearish candle). 0.60 means the close must sit in at least the top 40% of the bar's range.", group = G_ENTRY)
@@ -545,17 +547,50 @@ float coachRange = math.max(high - low, syminfo.mintick)
 float coachBodyFraction = math.abs(close - open) / coachRange
 float coachCloseLocation = (close - low) / coachRange
 
-bool nearSupportPullback = (
-     not na(recentSwingLow) and
-     low <= recentSwingLow + pullbackToleranceAtrInput * atrCoach and
-     close > recentSwingLow
+// -- Retest window (Pullback mode) --
+// A touch of the zone no longer has to reverse on the SAME bar -- price
+// can wick/tag the zone, drift for a few bars, and still count as a
+// valid pullback as long as a reversal candle shows up somewhere inside
+// [minBarsAtRetestInput, maxBarsAtRetestInput] bars of that touch. Same
+// "touch -> bar-index window -> trigger" shape already proven in
+// delta_break_retest/Stage8's retest state machine (barsAfterRetest vs.
+// minBarsAfterRetestInput/maxBarsAfterRetestInput), applied here to a
+// pullback against a native swing zone instead of a break event.
+// KNOWN EDGE CASE: if the native swing pivot itself updates mid-window
+// (a new, more recent pivot forms before the reversal bar arrives), the
+// reclaim check below reads whatever recentSwingLow/High is CURRENT on
+// the reversal bar, not the level that was actually touched -- rare in
+// practice since pivots need nativePivotRightInput bars to confirm, but
+// worth knowing if a retest looks like it fired against the "wrong" level.
+bool touchSupportNow = not na(recentSwingLow) and low <= recentSwingLow + pullbackToleranceAtrInput * atrCoach
+bool touchResistanceNow = not na(recentSwingHigh) and high >= recentSwingHigh - pullbackToleranceAtrInput * atrCoach
+
+var int lastSupportTouchBar = na
+var int lastResistanceTouchBar = na
+
+if touchSupportNow
+    lastSupportTouchBar := bar_index
+if touchResistanceNow
+    lastResistanceTouchBar := bar_index
+
+int barsSinceSupportTouch = na(lastSupportTouchBar) ? na : bar_index - lastSupportTouchBar
+int barsSinceResistanceTouch = na(lastResistanceTouchBar) ? na : bar_index - lastResistanceTouchBar
+
+bool supportRetestWindowOk = (
+     not na(barsSinceSupportTouch) and
+     barsSinceSupportTouch >= minBarsAtRetestInput and
+     barsSinceSupportTouch <= maxBarsAtRetestInput
 )
 
-bool nearResistancePullback = (
-     not na(recentSwingHigh) and
-     high >= recentSwingHigh - pullbackToleranceAtrInput * atrCoach and
-     close < recentSwingHigh
+bool resistanceRetestWindowOk = (
+     not na(barsSinceResistanceTouch) and
+     barsSinceResistanceTouch >= minBarsAtRetestInput and
+     barsSinceResistanceTouch <= maxBarsAtRetestInput
 )
+
+bool nearSupportPullback = supportRetestWindowOk and close > recentSwingLow
+
+bool nearResistancePullback = resistanceRetestWindowOk and close < recentSwingHigh
 
 bool breakoutAboveResistance = (
      not na(recentSwingHigh) and
@@ -1294,6 +1329,8 @@ plot(not na(recentSwingHigh) ? recentSwingHigh + breakoutDistanceAtrInput * atrC
 plot(not na(recentSwingLow) ? recentSwingLow - breakoutDistanceAtrInput * atrCoach : na, title = "Short Breakout Threshold Price", display = display.data_window)
 plot(breakoutAboveResistance ? 1 : 0, title = "Breakout Above Resistance (Confirmed Bar)", display = display.data_window)
 plot(breakoutBelowSupport ? 1 : 0, title = "Breakout Below Support (Confirmed Bar)", display = display.data_window)
+plot(barsSinceSupportTouch, title = "Bars Since Support Touch", display = display.data_window)
+plot(barsSinceResistanceTouch, title = "Bars Since Resistance Touch", display = display.data_window)
 
 
 // ============================================================================
