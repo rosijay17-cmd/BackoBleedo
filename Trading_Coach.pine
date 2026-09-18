@@ -104,6 +104,9 @@ favorForLondonInput = input.bool(true, "Favorable Session: London", group = G_SE
 favorForNyInput = input.bool(true, "Favorable Session: New York", group = G_SESSION)
 favorForAsiaInput = input.bool(false, "Favorable Session: Asia", tooltip = "Off by default -- Asia is typically the lowest-liquidity session for most index/FX instruments. Turn on if your instrument actually trades well there.", group = G_SESSION)
 requireFavorableSessionInput = input.bool(true, "Require Favorable Session For Setups", group = G_SESSION)
+sessionBgTransparencyInput = input.int(85, "Session Background Tint Transparency", minval = 0, maxval = 100, tooltip = "0 = fully solid, 100 = fully invisible. Was hardcoded to 92 (barely visible).", group = G_SESSION)
+showSessionStartLinesInput = input.bool(true, "Show Session Start Lines", group = G_SESSION)
+showSessionLabelsInput = input.bool(true, "Show Session Name Labels", group = G_SESSION)
 
 asiaInSession = nz(time(timeframe.period, asiaSessionInput, timezoneInput), 0) != 0
 londonInSession = nz(time(timeframe.period, londonSessionInput, timezoneInput), 0) != 0
@@ -129,9 +132,31 @@ string activeSessionLabel = (
      "Off-Session"
 )
 
-bgcolor(asiaInSession ? color.new(color.yellow, 92) : na, title = "Asia Session")
-bgcolor(londonInSession ? color.new(color.red, 92) : na, title = "London Session")
-bgcolor(nyInSession ? color.new(color.blue, 92) : na, title = "New York Session")
+bgcolor(asiaInSession ? color.new(color.yellow, sessionBgTransparencyInput) : na, title = "Asia Session")
+bgcolor(londonInSession ? color.new(color.red, sessionBgTransparencyInput) : na, title = "London Session")
+bgcolor(nyInSession ? color.new(color.blue, sessionBgTransparencyInput) : na, title = "New York Session")
+
+// -- Explicit session markers: a vertical line + name label at the exact
+// bar each session starts, on top of the background tint above. `and not
+// X[1]` reads as false (not na) on bar 0 since there's no prior bar to
+// compare against, so this can't misfire at the very start of history. --
+bool asiaSessionStart = asiaInSession and not asiaInSession[1]
+bool londonSessionStart = londonInSession and not londonInSession[1]
+bool nySessionStart = nyInSession and not nyInSession[1]
+
+if asiaSessionStart and showSessionStartLinesInput
+    line.new(bar_index, low, bar_index, high, xloc = xloc.bar_index, extend = extend.both, color = color.new(color.yellow, 40), style = line.style_dashed, width = 1)
+if londonSessionStart and showSessionStartLinesInput
+    line.new(bar_index, low, bar_index, high, xloc = xloc.bar_index, extend = extend.both, color = color.new(color.red, 40), style = line.style_dashed, width = 1)
+if nySessionStart and showSessionStartLinesInput
+    line.new(bar_index, low, bar_index, high, xloc = xloc.bar_index, extend = extend.both, color = color.new(color.blue, 40), style = line.style_dashed, width = 1)
+
+if asiaSessionStart and showSessionLabelsInput
+    label.new(bar_index, high, text = "ASIA", style = label.style_label_down, color = color.new(color.yellow, 20), textcolor = color.black, size = size.tiny)
+if londonSessionStart and showSessionLabelsInput
+    label.new(bar_index, high, text = "LONDON", style = label.style_label_down, color = color.new(color.red, 20), textcolor = color.white, size = size.tiny)
+if nySessionStart and showSessionLabelsInput
+    label.new(bar_index, high, text = "NEW YORK", style = label.style_label_down, color = color.new(color.blue, 20), textcolor = color.white, size = size.tiny)
 
 
 // ============================================================================
