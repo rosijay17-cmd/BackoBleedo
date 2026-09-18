@@ -274,8 +274,8 @@ pdhColorInput = input.color(color.orange, "PDH Color", group = G_ZONES, inline =
 pdlColorInput = input.color(color.aqua, "PDL Color", group = G_ZONES, inline = "pdhpdl")
 pdhPdlLabelOffsetInput = input.int(15, "PDH/PDL Label Offset (Bars Left)", minval = 0, maxval = 200, tooltip = "Shifts the PDH/PDL probability labels back from the current bar/price scale so they don't clutter live price action. The dashed lines themselves still extend all the way to the current bar.", group = G_ZONES)
 
-string pdhLabelText = "PDH " + str.tostring(prevDayHigh, format.mintick) + "  Sweep " + (na(pdhSweepRate) ? "--" : str.tostring(pdhSweepRate, "#") + "%")
-string pdlLabelText = "PDL " + str.tostring(prevDayLow, format.mintick) + "  Sweep " + (na(pdlSweepRate) ? "--" : str.tostring(pdlSweepRate, "#") + "%")
+string pdhLabelText = "PDH " + str.tostring(prevDayHigh, format.mintick) + (sweptPdhToday ? "  SWEPT" : "  Sweep " + (na(pdhSweepRate) ? "--" : str.tostring(pdhSweepRate, "#") + "%"))
+string pdlLabelText = "PDL " + str.tostring(prevDayLow, format.mintick) + (sweptPdlToday ? "  SWEPT" : "  Sweep " + (na(pdlSweepRate) ? "--" : str.tostring(pdlSweepRate, "#") + "%"))
 int pdhPdlLabelBar = math.max(bar_index - pdhPdlLabelOffsetInput, 0)
 
 var line pdhLine = na
@@ -295,6 +295,7 @@ if showPdhPdlInput and not na(prevDayHigh)
         line.set_x2(pdhLine, bar_index + 1)
         label.set_x(pdhLabel, pdhPdlLabelBar)
         label.set_text(pdhLabel, pdhLabelText)
+        label.set_color(pdhLabel, sweptPdhToday ? color.new(pdhColorInput, 20) : color.new(color.gray, 10))
 
 if showPdhPdlInput and not na(prevDayLow)
     if newDayCoach or na(pdlLine)
@@ -308,6 +309,7 @@ if showPdhPdlInput and not na(prevDayLow)
         line.set_x2(pdlLine, bar_index + 1)
         label.set_x(pdlLabel, pdhPdlLabelBar)
         label.set_text(pdlLabel, pdlLabelText)
+        label.set_color(pdlLabel, sweptPdlToday ? color.new(pdlColorInput, 20) : color.new(color.gray, 10))
 
 // -- Session boxes: one box per session spanning its actual running
 // high/low over its full time window, labeled with the session's own
