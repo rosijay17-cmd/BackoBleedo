@@ -534,9 +534,11 @@ float executionDeltaPressure = (
 // for the raw Z-Score oscillator line itself to live in (a -100..100
 // value plotted directly into a price-scaled pane would visually break
 // the chart). Everything that IS naturally price-scaled or bar-relative
-// -- the range channel lines, the Z-Score bar coloring, and the
-// crossover/weak-signal shapes -- is ported and plotted exactly as
-// designed. The raw oscillator values are exposed via Data Window plots
+// -- the range channel lines and the crossover/weak-signal shapes -- is
+// ported and plotted exactly as designed. Candle/bar recoloring (both
+// this Z-Score's own and the pre-existing Structure Trend one) was
+// removed by request -- neither barcolor() call exists in this file
+// anymore. The raw oscillator values are exposed via Data Window plots
 // (see DATA WINDOW section) and folded into the Setup Grade bonus scoring
 // below instead of a broken on-chart oscillator line -- this is the
 // "skill upgrade": Z-Score mean-reversion agreement becomes a THIRD
@@ -549,10 +551,8 @@ rangePerceptionLengthInput = input.int(20, "Range Perception Length", group = G_
 rangeAnalysisLengthInput = input.int(100, "Range Analysis Length", group = G_ZSCORE)
 rangeAtrMultInput = input.float(2.0, "Range ATR Factor", minval = 1, step = 0.25, group = G_ZSCORE)
 zscoreObThresholdInput = input.int(70, "Z-Score OB/OS Threshold", group = G_ZSCORE)
-zscoreTrendFilterInput = input.bool(false, "Z-Score Bar Color Uses Range Trend", tooltip = "OFF: bar color follows the raw Z-Score gradient (matches the original script's default). ON: bar color instead follows the Range Trend direction, gradiented by Z-Score within that trend.", group = G_ZSCORE)
 rangeFillZonesInput = input.bool(false, "Fill Range Zones", group = G_ZSCORE)
 showRangeChannelInput = input.bool(true, "Show Range Channel Lines", group = G_ZSCORE)
-showZscoreBarColorInput = input.bool(false, "Use Z-Score Bar Coloring", tooltip = "OFF by default -- Trading Coach already colors bars by Structure Trend (Visuals group). Turning this on lets Z-Score coloring take over instead, same as the original script's own bar coloring.", group = G_ZSCORE)
 showZscoreSignalsInput = input.bool(true, "Show Z-Score Signal Shapes", group = G_ZSCORE)
 zscoreBullColorInput = input.color(#2962ff, "Bullish", group = G_ZSCORE, inline = "zc")
 zscoreBearColorInput = input.color(#e91e63, "Bearish", group = G_ZSCORE, inline = "zc")
@@ -592,14 +592,6 @@ f_tradingRanges(int rangeLen, int rangeLen2, float rangeMult) =>
 
     [holdUpper2, holdUpper1, holdAvg, holdLower1, holdLower2]
 
-f_tripleGrad(float src, float minV, float midV, float maxV, color col1, color col2, color col3) =>
-    color col = na
-    if src < midV
-        col := color.from_gradient(src, minV, midV, col1, col2)
-    else
-        col := color.from_gradient(src, midV, maxV, col2, col3)
-    col
-
 // -- Z-Score --
 var array<float> zscoreUpDiff = array.new_float()
 var array<float> zscoreDnDiff = array.new_float()
@@ -618,8 +610,6 @@ float rawZscore = math.max(math.min((close - zscoreMa) / (close > zscoreMa ? zsc
 float rawZscoreFast = math.max(math.min((close - zscoreMa) / ta.stdev(close, 21), 4), -4)
 float normZscore = ((rawZscore - ta.lowest(rawZscore, 1000)) / (ta.highest(rawZscore, 1000) - ta.lowest(rawZscore, 1000)) * 200) - 100
 float normZscoreFast = ((rawZscoreFast - ta.lowest(rawZscoreFast, 300)) / (ta.highest(rawZscoreFast, 300) - ta.lowest(rawZscoreFast, 300)) * 200) - 100
-
-color zscoreColor = f_tripleGrad(normZscore, -zscoreObThresholdInput, 0, zscoreObThresholdInput, zscoreBullColorInput, zscoreNeutralColorInput, zscoreBearColorInput)
 
 bool zscoreOversold = normZscore <= -zscoreObThresholdInput
 bool zscoreOverbought = normZscore >= zscoreObThresholdInput
@@ -652,11 +642,6 @@ if showRangeChannelInput
             linefill.new(rangeLineUpper1, rangeLineMid, rangeMid == rangeMid[1] ? (rangeTrend == -1 ? color.new(zscoreBearColorInput, 80) : color.new(zscoreBearColorInput, 95)) : na)
             linefill.new(rangeLineLower2, rangeLineLower1, rangeMid == rangeMid[1] ? (rangeTrend == 1 ? color.new(zscoreBullColorInput, 70) : color.new(zscoreBullColorInput, 85)) : na)
             linefill.new(rangeLineLower1, rangeLineMid, rangeMid == rangeMid[1] ? (rangeTrend == 1 ? color.new(zscoreBullColorInput, 80) : color.new(zscoreBullColorInput, 95)) : na)
-
-color zscoreBarColor = zscoreTrendFilterInput ? (rangeTrend == 1 ? color.from_gradient(normZscore, -zscoreObThresholdInput, 0, zscoreBullColorInput, zscoreNeutralColorInput) : color.from_gradient(normZscore, 0, zscoreObThresholdInput, zscoreNeutralColorInput, zscoreBearColorInput)) : zscoreColor
-
-if showZscoreBarColorInput
-    barcolor(zscoreBarColor, title = "Z-Score Bar Color")
 
 plotshape(showZscoreSignalsInput and ta.crossover(normZscore, -zscoreObThresholdInput), title = "Z-Score Long Signal", style = shape.diamond, location = location.belowbar, color = zscoreBullColorInput)
 plotshape(showZscoreSignalsInput and ta.crossunder(normZscore, zscoreObThresholdInput), title = "Z-Score Short Signal", style = shape.diamond, location = location.abovebar, color = zscoreBearColorInput)
@@ -1301,23 +1286,11 @@ if array.size(pendingEntryBar) > 0
 
 string G_VISUALS = "08 - Visuals"
 
-showStructureLineInput = input.bool(true, "Show Structure Trend Color On Bars", group = G_VISUALS)
-structureBarColorTransparencyInput = input.int(25, "Structure Bar Color Transparency", minval = 0, maxval = 100, tooltip = "0 = fully solid, 100 = fully invisible. Was hardcoded to 70 (too faint to read confidently on a small screen). This reads the exact same Structure value shown in the dashboard -- there is no separate logic for the two.", group = G_VISUALS)
 showSwingZonesInput = input.bool(true, "Show Native Swing Zone Boxes", group = G_VISUALS)
 showEntryMarkersInput = input.bool(true, "Show Entry Markers", group = G_VISUALS)
 showRiskLabelsInput = input.bool(true, "Show Risk Management Labels", group = G_VISUALS)
 longColorInput = input.color(color.aqua, "Long Color", group = G_VISUALS)
 shortColorInput = input.color(color.orange, "Short Color", group = G_VISUALS)
-
-barcolor(
-     showZscoreBarColorInput ? na :
-     showStructureLineInput and structureTrend == "UP" ?
-     color.new(longColorInput, structureBarColorTransparencyInput) :
-     showStructureLineInput and structureTrend == "DOWN" ?
-     color.new(shortColorInput, structureBarColorTransparencyInput) :
-     na,
-     title = "Structure Trend Bar Color"
-)
 
 // Zone Reaction color -- same branch order as zoneReactionMessage above so
 // text and color never disagree; deferred to here because it needs
