@@ -522,16 +522,22 @@ bool pressureOkShort = not requireVolumePressureInput or executionDeltaPressure 
 // ============================================================================
 // 05 - ENTRY SETUP
 // ----------------------------------------------------------------------------
-// The pullback-in-trend model described in the header comment. Every gate
-// is a separate, named boolean so the "Coach Says" dashboard row can point
-// at exactly which one is currently unmet.
+// Two entry models against the same native swing support/resistance zones,
+// selectable independently or together: Pullback (buy a dip to support /
+// sell a rally to resistance, then a reversal candle) and Breakout (buy a
+// decisive push through resistance / sell a decisive push through support,
+// continuing the trend). Every gate is a separate, named boolean so the
+// "Coach Says" dashboard row can point at exactly which one is currently
+// unmet.
 // ============================================================================
 
 string G_ENTRY = "05 - Entry Setup"
 
+entryModeInput = input.string("Both", "Entry Mode", options = ["Pullback Only", "Breakout Only", "Both"], tooltip = "Pullback: buy a dip to recent support / sell a rally to recent resistance, then a reversal candle. Breakout: buy a decisive push above recent resistance / sell a decisive push below recent support, continuing the trend.", group = G_ENTRY)
 pullbackToleranceAtrInput = input.float(0.30, "Pullback Tolerance To Swing (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, tooltip = "How close price needs to get to the recent swing level to count as a genuine pullback.", group = G_ENTRY)
-minimumReversalBodyFractionInput = input.float(0.30, "Minimum Reversal Candle Body / Range", minval = 0.0, maxval = 1.0, step = 0.05, group = G_ENTRY)
-minimumReversalCloseLocationInput = input.float(0.60, "Minimum Reversal Close Location", minval = 0.50, maxval = 0.95, step = 0.05, tooltip = "For a long reversal candle, how close to the bar's own high the close must be (mirrored near the low for a short). 0.60 means the close must sit in at least the top 40% of the bar's range.", group = G_ENTRY)
+breakoutDistanceAtrInput = input.float(0.25, "Breakout Distance Beyond Swing (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, tooltip = "How far beyond the recent swing level price must CLOSE to count as a decisive breakout, not just a marginal poke through it.", group = G_ENTRY)
+minimumReversalBodyFractionInput = input.float(0.30, "Minimum Candle Body / Range", minval = 0.0, maxval = 1.0, step = 0.05, tooltip = "Applies to both the pullback reversal candle and the breakout candle.", group = G_ENTRY)
+minimumReversalCloseLocationInput = input.float(0.60, "Minimum Candle Close Location", minval = 0.50, maxval = 0.95, step = 0.05, tooltip = "For a bullish candle, how close to the bar's own high the close must be (mirrored near the low for a bearish candle). 0.60 means the close must sit in at least the top 40% of the bar's range.", group = G_ENTRY)
 cooldownBarsInput = input.int(12, "Cooldown Bars Between Setups (Per Direction)", minval = 0, group = G_ENTRY)
 
 float atrCoach = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
@@ -551,6 +557,16 @@ bool nearResistancePullback = (
      close < recentSwingHigh
 )
 
+bool breakoutAboveResistance = (
+     not na(recentSwingHigh) and
+     close > recentSwingHigh + breakoutDistanceAtrInput * atrCoach
+)
+
+bool breakoutBelowSupport = (
+     not na(recentSwingLow) and
+     close < recentSwingLow - breakoutDistanceAtrInput * atrCoach
+)
+
 bool bullishReversalCandle = (
      close > open and
      coachBodyFraction >= minimumReversalBodyFractionInput and
@@ -561,6 +577,36 @@ bool bearishReversalCandle = (
      close < open and
      coachBodyFraction >= minimumReversalBodyFractionInput and
      coachCloseLocation <= 1.0 - minimumReversalCloseLocationInput
+)
+
+// -- Per-mode location flags, and which mode(s) are actually armed --
+bool longInLocation = (
+     entryModeInput == "Breakout Only" ? breakoutAboveResistance :
+     entryModeInput == "Pullback Only" ? nearSupportPullback :
+     nearSupportPullback or breakoutAboveResistance
+)
+
+bool shortInLocation = (
+     entryModeInput == "Breakout Only" ? breakoutBelowSupport :
+     entryModeInput == "Pullback Only" ? nearResistancePullback :
+     nearResistancePullback or breakoutBelowSupport
+)
+
+bool longPullbackReady = nearSupportPullback and bullishReversalCandle
+bool longBreakoutReady = breakoutAboveResistance and bullishReversalCandle
+bool shortPullbackReady = nearResistancePullback and bearishReversalCandle
+bool shortBreakoutReady = breakoutBelowSupport and bearishReversalCandle
+
+bool longEntryModeOk = (
+     entryModeInput == "Pullback Only" ? longPullbackReady :
+     entryModeInput == "Breakout Only" ? longBreakoutReady :
+     longPullbackReady or longBreakoutReady
+)
+
+bool shortEntryModeOk = (
+     entryModeInput == "Pullback Only" ? shortPullbackReady :
+     entryModeInput == "Breakout Only" ? shortBreakoutReady :
+     shortPullbackReady or shortBreakoutReady
 )
 
 bool sessionOkForLong = not requireFavorableSessionInput or sessionFavorable
@@ -578,8 +624,7 @@ bool shortStructureOk = structureTrend == "DOWN"
 bool longSetupNow = (
      barstate.isconfirmed and
      longStructureOk and
-     nearSupportPullback and
-     bullishReversalCandle and
+     longEntryModeOk and
      tdiConfirmsLong and
      pressureOkLong and
      sessionOkForLong and
@@ -589,8 +634,7 @@ bool longSetupNow = (
 bool shortSetupNow = (
      barstate.isconfirmed and
      shortStructureOk and
-     nearResistancePullback and
-     bearishReversalCandle and
+     shortEntryModeOk and
      tdiConfirmsShort and
      pressureOkShort and
      sessionOkForShort and
@@ -672,37 +716,62 @@ string shortGradeNote = (
 
 // -- "Coach Says" -- names the single most relevant blocker/status right
 // now, in the order a trader would actually check them: structure first
-// (is there even a trend to trade with), then location (are we at a level),
-// then confirmation (candle + momentum), then session/cooldown last (the
-// setup is real, just gated by timing/pacing). --
+// (is there even a trend to trade with), then location (are we at a level,
+// under whichever entry mode(s) are armed), then confirmation (candle +
+// momentum), then session/cooldown last (the setup is real, just gated by
+// timing/pacing). --
+string longLocationText = (
+     entryModeInput == "Breakout Only" ? "Uptrend -- waiting for a breakout above recent resistance" :
+     entryModeInput == "Pullback Only" ? "Uptrend -- waiting for a pullback to recent support" :
+     "Uptrend -- waiting for a pullback to support or a breakout above resistance"
+)
+
+string longCandleWaitText = (
+     breakoutAboveResistance and not nearSupportPullback ?
+     "Breaking resistance -- waiting for a strong bullish candle" :
+     "At support -- waiting for a bullish reversal candle"
+)
+
+string shortLocationText = (
+     entryModeInput == "Breakout Only" ? "Downtrend -- waiting for a breakout below recent support" :
+     entryModeInput == "Pullback Only" ? "Downtrend -- waiting for a pullback to recent resistance" :
+     "Downtrend -- waiting for a pullback to resistance or a breakout below support"
+)
+
+string shortCandleWaitText = (
+     breakoutBelowSupport and not nearResistancePullback ?
+     "Breaking support -- waiting for a strong bearish candle" :
+     "At resistance -- waiting for a bearish reversal candle"
+)
+
 string coachMessage = (
      structureTrend == "RANGE" ?
      "Structure ranging -- no clear trend, stand aside" :
-     structureTrend == "UP" and not nearSupportPullback ?
-     "Uptrend -- waiting for a pullback to recent support" :
-     structureTrend == "UP" and nearSupportPullback and not bullishReversalCandle ?
-     "At support -- waiting for a bullish reversal candle" :
-     structureTrend == "UP" and nearSupportPullback and bullishReversalCandle and not tdiConfirmsLong ?
-     "Reversal candle formed -- waiting for momentum confirmation" :
-     structureTrend == "UP" and nearSupportPullback and bullishReversalCandle and tdiConfirmsLong and not pressureOkLong ?
+     structureTrend == "UP" and not longInLocation ?
+     longLocationText :
+     structureTrend == "UP" and longInLocation and not bullishReversalCandle ?
+     longCandleWaitText :
+     structureTrend == "UP" and longInLocation and bullishReversalCandle and not tdiConfirmsLong ?
+     "Signal candle formed -- waiting for momentum confirmation" :
+     structureTrend == "UP" and longInLocation and bullishReversalCandle and tdiConfirmsLong and not pressureOkLong ?
      "Momentum confirms -- waiting for volume pressure agreement" :
-     structureTrend == "UP" and nearSupportPullback and bullishReversalCandle and tdiConfirmsLong and pressureOkLong and not sessionOkForLong ?
+     structureTrend == "UP" and longInLocation and bullishReversalCandle and tdiConfirmsLong and pressureOkLong and not sessionOkForLong ?
      "Setup ready -- outside a favorable session, consider waiting" :
-     structureTrend == "UP" and nearSupportPullback and bullishReversalCandle and tdiConfirmsLong and pressureOkLong and sessionOkForLong and not longCooldownOk ?
+     structureTrend == "UP" and longInLocation and bullishReversalCandle and tdiConfirmsLong and pressureOkLong and sessionOkForLong and not longCooldownOk ?
      "Setup ready -- cooling down after a recent long signal" :
      longSetupNow ?
      "LONG SETUP ACTIVE [Grade " + longSetupGrade + longGradeNote + "]" :
-     structureTrend == "DOWN" and not nearResistancePullback ?
-     "Downtrend -- waiting for a pullback to recent resistance" :
-     structureTrend == "DOWN" and nearResistancePullback and not bearishReversalCandle ?
-     "At resistance -- waiting for a bearish reversal candle" :
-     structureTrend == "DOWN" and nearResistancePullback and bearishReversalCandle and not tdiConfirmsShort ?
-     "Reversal candle formed -- waiting for momentum confirmation" :
-     structureTrend == "DOWN" and nearResistancePullback and bearishReversalCandle and tdiConfirmsShort and not pressureOkShort ?
+     structureTrend == "DOWN" and not shortInLocation ?
+     shortLocationText :
+     structureTrend == "DOWN" and shortInLocation and not bearishReversalCandle ?
+     shortCandleWaitText :
+     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and not tdiConfirmsShort ?
+     "Signal candle formed -- waiting for momentum confirmation" :
+     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and tdiConfirmsShort and not pressureOkShort ?
      "Momentum confirms -- waiting for volume pressure agreement" :
-     structureTrend == "DOWN" and nearResistancePullback and bearishReversalCandle and tdiConfirmsShort and pressureOkShort and not sessionOkForShort ?
+     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and tdiConfirmsShort and pressureOkShort and not sessionOkForShort ?
      "Setup ready -- outside a favorable session, consider waiting" :
-     structureTrend == "DOWN" and nearResistancePullback and bearishReversalCandle and tdiConfirmsShort and pressureOkShort and sessionOkForShort and not shortCooldownOk ?
+     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and tdiConfirmsShort and pressureOkShort and sessionOkForShort and not shortCooldownOk ?
      "Setup ready -- cooling down after a recent short signal" :
      shortSetupNow ?
      "SHORT SETUP ACTIVE [Grade " + shortSetupGrade + shortGradeNote + "]" :
@@ -814,15 +883,24 @@ float shortRiskPerUnit = na
 float shortRiskAtr = na
 bool shortRiskOk = false
 
-if longSetupNow and not na(recentSwingLow)
-    longStopPrice := recentSwingLow - stopBufferAtrMultInput * atrCoach
+// Stop anchor depends on which mode actually fired: a pullback stop sits
+// below the support just bought (recentSwingLow); a breakout stop sits
+// below the resistance just cleared (recentSwingHigh), since that broken
+// level is now the nearest thing acting as support -- anchoring a breakout
+// stop off the old, far-away recentSwingLow would make the stop
+// needlessly wide. Mirrored for shorts.
+float longStopAnchor = longBreakoutReady ? recentSwingHigh : recentSwingLow
+float shortStopAnchor = shortBreakoutReady ? recentSwingLow : recentSwingHigh
+
+if longSetupNow and not na(longStopAnchor)
+    longStopPrice := longStopAnchor - stopBufferAtrMultInput * atrCoach
     longRiskPerUnit := math.abs(close - longStopPrice)
     longRiskAtr := atrCoach > 0 ? longRiskPerUnit / atrCoach : 999.0
     longRiskOk := longRiskAtr <= maximumEntryRiskAtrInput
     longTargetPrice := close + longRiskPerUnit * rMultipleInput
 
-if shortSetupNow and not na(recentSwingHigh)
-    shortStopPrice := recentSwingHigh + stopBufferAtrMultInput * atrCoach
+if shortSetupNow and not na(shortStopAnchor)
+    shortStopPrice := shortStopAnchor + stopBufferAtrMultInput * atrCoach
     shortRiskPerUnit := math.abs(close - shortStopPrice)
     shortRiskAtr := atrCoach > 0 ? shortRiskPerUnit / atrCoach : 999.0
     shortRiskOk := shortRiskAtr <= maximumEntryRiskAtrInput
