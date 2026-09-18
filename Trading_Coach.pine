@@ -1721,6 +1721,22 @@ plot(breakoutBelowSupport ? 1 : 0, title = "Breakout Below Support (Confirmed Ba
 plot(barsSinceSupportTouch, title = "Bars Since Support Touch", display = display.data_window)
 plot(barsSinceResistanceTouch, title = "Bars Since Resistance Touch", display = display.data_window)
 
+// TDI Momentum diagnostics -- tdiConfirmsLong/Short is TWO separate
+// conditions ANDed together (tdiBullishMove/tdiBearishMove needs the
+// Fast MA above/below its own dynamic band AND past the fixed 68/32
+// absolute level; momentumRising/momentumFalling needs the raw
+// momentum value to have ticked up/down bar-over-bar). "Momentum:
+// NEUTRAL" on the dashboard just means neither combo is true -- these
+// let you check WHICH half failed instead of guessing from one word.
+plot(tdiFastMa, title = "TDI Fast MA", display = display.data_window)
+plot(tdiUpperBand, title = "TDI Upper Band", display = display.data_window)
+plot(tdiLowerBand, title = "TDI Lower Band", display = display.data_window)
+plot(momentum, title = "TDI Momentum Value", display = display.data_window)
+plot(tdiBullishMove ? 1 : 0, title = "TDI Bullish Move (Fast MA vs Band+68)", display = display.data_window)
+plot(tdiBearishMove ? 1 : 0, title = "TDI Bearish Move (Fast MA vs Band+32)", display = display.data_window)
+plot(momentumRising ? 1 : 0, title = "TDI Momentum Rising", display = display.data_window)
+plot(momentumFalling ? 1 : 0, title = "TDI Momentum Falling", display = display.data_window)
+
 // Z-Score oscillator values -- these lived in their own pane in the
 // original standalone script; Trading Coach is overlay-only, so a
 // -100..100 value can't be plotted on the price pane without breaking
