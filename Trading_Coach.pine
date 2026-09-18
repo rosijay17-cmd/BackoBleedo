@@ -1382,7 +1382,6 @@ string G_VISUALS = "08 - Visuals"
 
 showSwingZonesInput = input.bool(true, "Show Native Swing Zone Boxes", group = G_VISUALS)
 showEntryMarkersInput = input.bool(true, "Show Entry Markers", group = G_VISUALS)
-showRiskLabelsInput = input.bool(true, "Show Risk Management Labels", group = G_VISUALS)
 longColorInput = input.color(color.aqua, "Long Color", group = G_VISUALS)
 shortColorInput = input.color(color.orange, "Short Color", group = G_VISUALS)
 
@@ -1488,30 +1487,6 @@ if barstate.islast
 
 plotshape(showEntryMarkersInput and actualLongSignal, title = "Long Setup", style = shape.triangleup, location = location.belowbar, size = size.small, color = longColorInput, text = "LONG", textcolor = color.white)
 plotshape(showEntryMarkersInput and actualShortSignal, title = "Short Setup", style = shape.triangledown, location = location.abovebar, size = size.small, color = shortColorInput, text = "SHORT", textcolor = color.white)
-
-// Each signal gets its own new label (a running history of past entries on
-// the chart), not a single repositioned one -- so the return value is never
-// read back, just fired and left in place. Pine allows a bare
-// label.new(...) call with nothing capturing it.
-if actualLongSignal and showRiskLabelsInput
-    string longRiskText = (
-         "LONG @ " + str.tostring(close, format.mintick) +
-         "\nStop " + str.tostring(longStopPrice, format.mintick) +
-         " | Target " + str.tostring(longTargetPrice, format.mintick) +
-         "\nRisk $" + str.tostring(riskDollars, "#.##") +
-         " | Size ~" + (na(longSuggestedSize) ? "n/a" : str.tostring(longSuggestedSize, "#.##"))
-    )
-    label.new(bar_index, low, text = longRiskText, style = label.style_label_up, color = longColorInput, textcolor = color.black, size = size.small)
-
-if actualShortSignal and showRiskLabelsInput
-    string shortRiskText = (
-         "SHORT @ " + str.tostring(close, format.mintick) +
-         "\nStop " + str.tostring(shortStopPrice, format.mintick) +
-         " | Target " + str.tostring(shortTargetPrice, format.mintick) +
-         "\nRisk $" + str.tostring(riskDollars, "#.##") +
-         " | Size ~" + (na(shortSuggestedSize) ? "n/a" : str.tostring(shortSuggestedSize, "#.##"))
-    )
-    label.new(bar_index, high, text = shortRiskText, style = label.style_label_down, color = shortColorInput, textcolor = color.black, size = size.small)
 
 alertcondition(actualLongSignal, title = "Trading Coach: Long Setup", message = "Trading Coach LONG setup -- {{ticker}} {{interval}} @ {{close}}")
 alertcondition(actualShortSignal, title = "Trading Coach: Short Setup", message = "Trading Coach SHORT setup -- {{ticker}} {{interval}} @ {{close}}")
