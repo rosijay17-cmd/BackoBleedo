@@ -523,6 +523,148 @@ float executionDeltaPressure = (
 
 
 // ============================================================================
+// 04c - RANGE & Z-SCORE (MEAN REVERSION)
+// ----------------------------------------------------------------------------
+// Ported with perfect parity (same math, same array/line/na handling,
+// only identifiers renamed to this file's own convention) from the
+// user-supplied "Trading Ranges + ZScore" indicator (c) MyCoqch. That
+// script is overlay=false (its own oscillator pane) with force_overlay
+// used selectively to punch specific plots onto the main chart --
+// Trading_Coach is overlay=true throughout, so there is no separate pane
+// for the raw Z-Score oscillator line itself to live in (a -100..100
+// value plotted directly into a price-scaled pane would visually break
+// the chart). Everything that IS naturally price-scaled or bar-relative
+// -- the range channel lines, the Z-Score bar coloring, and the
+// crossover/weak-signal shapes -- is ported and plotted exactly as
+// designed. The raw oscillator values are exposed via Data Window plots
+// (see DATA WINDOW section) and folded into the Setup Grade bonus scoring
+// below instead of a broken on-chart oscillator line -- this is the
+// "skill upgrade": Z-Score mean-reversion agreement becomes a THIRD
+// grading factor alongside zone confluence and volume pressure.
+// ============================================================================
+
+string G_ZSCORE = "04c - Range & Z-Score"
+
+rangePerceptionLengthInput = input.int(20, "Range Perception Length", group = G_ZSCORE)
+rangeAnalysisLengthInput = input.int(100, "Range Analysis Length", group = G_ZSCORE)
+rangeAtrMultInput = input.float(2.0, "Range ATR Factor", minval = 1, step = 0.25, group = G_ZSCORE)
+zscoreObThresholdInput = input.int(70, "Z-Score OB/OS Threshold", group = G_ZSCORE)
+zscoreTrendFilterInput = input.bool(false, "Z-Score Bar Color Uses Range Trend", tooltip = "OFF: bar color follows the raw Z-Score gradient (matches the original script's default). ON: bar color instead follows the Range Trend direction, gradiented by Z-Score within that trend.", group = G_ZSCORE)
+rangeFillZonesInput = input.bool(false, "Fill Range Zones", group = G_ZSCORE)
+showRangeChannelInput = input.bool(true, "Show Range Channel Lines", group = G_ZSCORE)
+showZscoreBarColorInput = input.bool(false, "Use Z-Score Bar Coloring", tooltip = "OFF by default -- Trading Coach already colors bars by Structure Trend (Visuals group). Turning this on lets Z-Score coloring take over instead, same as the original script's own bar coloring.", group = G_ZSCORE)
+showZscoreSignalsInput = input.bool(true, "Show Z-Score Signal Shapes", group = G_ZSCORE)
+zscoreBullColorInput = input.color(#2962ff, "Bullish", group = G_ZSCORE, inline = "zc")
+zscoreBearColorInput = input.color(#e91e63, "Bearish", group = G_ZSCORE, inline = "zc")
+zscoreNeutralColorInput = input.color(color.gray, "Neutral", group = G_ZSCORE, inline = "zc")
+
+f_contSig(bool longCond, bool shortCond, float val) =>
+    float toolVal = 0.0
+    toolVal := if longCond == true
+        val
+    else if shortCond == true
+        -val
+    else
+        toolVal[1]
+
+f_tradingRanges(int rangeLen, int rangeLen2, float rangeMult) =>
+    float highVal = ta.highest(high, rangeLen)
+    float lowVal = ta.lowest(low, rangeLen)
+    float atrVal = ta.sma(math.abs(close - ta.sma(close, rangeLen)), rangeLen2) * rangeMult
+
+    var float holdAvg = na
+    var float holdUpper1 = na
+    var float holdUpper2 = na
+    var float holdLower1 = na
+    var float holdLower2 = na
+    var float holdAtr = na
+
+    holdAtr := na(holdAtr) ? atrVal : holdAtr
+    float upperThreshold = holdUpper2
+    float lowerThreshold = holdLower2
+    bool rangeChanged = close > upperThreshold or close < lowerThreshold
+    holdAvg := (na(holdAvg) or (rangeChanged and close > upperThreshold)) ? highVal[3] : (rangeChanged and close < lowerThreshold) ? lowVal[3] : holdAvg
+    holdAtr := (na(holdAtr) or rangeChanged) ? atrVal : holdAtr
+    holdUpper2 := (na(holdUpper2) or rangeChanged) ? holdAvg + 2 * holdAtr : holdUpper2
+    holdUpper1 := (na(holdUpper1) or rangeChanged) ? holdAvg + holdAtr : holdUpper1
+    holdLower1 := (na(holdLower1) or rangeChanged) ? holdAvg - holdAtr : holdLower1
+    holdLower2 := (na(holdLower2) or rangeChanged) ? holdAvg - 2 * holdAtr : holdLower2
+
+    [holdUpper2, holdUpper1, holdAvg, holdLower1, holdLower2]
+
+f_tripleGrad(float src, float minV, float midV, float maxV, color col1, color col2, color col3) =>
+    color col = na
+    if src < midV
+        col := color.from_gradient(src, minV, midV, col1, col2)
+    else
+        col := color.from_gradient(src, midV, maxV, col2, col3)
+    col
+
+// -- Z-Score --
+var array<float> zscoreUpDiff = array.new_float()
+var array<float> zscoreDnDiff = array.new_float()
+float zscoreMa = ta.sma(close, 21)
+if close >= zscoreMa
+    array.push(zscoreUpDiff, close - zscoreMa)
+else if close <= zscoreMa
+    array.push(zscoreDnDiff, math.abs(close - zscoreMa))
+if array.size(zscoreUpDiff) > 300
+    array.remove(zscoreUpDiff, 0)
+if array.size(zscoreDnDiff) > 300
+    array.remove(zscoreDnDiff, 0)
+float zscoreDevUp = array.avg(zscoreUpDiff)
+float zscoreDevDn = array.avg(zscoreDnDiff)
+float rawZscore = math.max(math.min((close - zscoreMa) / (close > zscoreMa ? zscoreDevUp : zscoreDevDn), 4), -4)
+float rawZscoreFast = math.max(math.min((close - zscoreMa) / ta.stdev(close, 21), 4), -4)
+float normZscore = ((rawZscore - ta.lowest(rawZscore, 1000)) / (ta.highest(rawZscore, 1000) - ta.lowest(rawZscore, 1000)) * 200) - 100
+float normZscoreFast = ((rawZscoreFast - ta.lowest(rawZscoreFast, 300)) / (ta.highest(rawZscoreFast, 300) - ta.lowest(rawZscoreFast, 300)) * 200) - 100
+
+color zscoreColor = f_tripleGrad(normZscore, -zscoreObThresholdInput, 0, zscoreObThresholdInput, zscoreBullColorInput, zscoreNeutralColorInput, zscoreBearColorInput)
+
+bool zscoreOversold = normZscore <= -zscoreObThresholdInput
+bool zscoreOverbought = normZscore >= zscoreObThresholdInput
+
+// -- Trading Ranges --
+[rangeUpper2, rangeUpper1, rangeMid, rangeLower1, rangeLower2] = f_tradingRanges(rangePerceptionLengthInput, rangeAnalysisLengthInput, rangeAtrMultInput)
+float rangeTrend = f_contSig(rangeMid > rangeMid[1], rangeMid < rangeMid[1], 1)
+
+var line rangeLineUpper2 = na
+var line rangeLineUpper1 = na
+var line rangeLineMid = na
+var line rangeLineLower1 = na
+var line rangeLineLower2 = na
+
+if showRangeChannelInput
+    if rangeMid[1] != rangeMid[2] and rangeMid == rangeMid[1]
+        rangeLineUpper2 := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = rangeUpper2, y2 = rangeUpper2, color = zscoreBearColorInput, force_overlay = true)
+        rangeLineUpper1 := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = rangeUpper1, y2 = rangeUpper1, color = zscoreBearColorInput, force_overlay = true, style = line.style_dotted)
+        rangeLineMid := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = rangeMid, y2 = rangeMid, color = zscoreNeutralColorInput, force_overlay = true)
+        rangeLineLower1 := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = rangeLower1, y2 = rangeLower1, color = zscoreBullColorInput, force_overlay = true, style = line.style_dotted)
+        rangeLineLower2 := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = rangeLower2, y2 = rangeLower2, color = zscoreBullColorInput, force_overlay = true)
+    else if rangeMid == rangeMid[1]
+        line.set_x2(rangeLineUpper2, bar_index)
+        line.set_x2(rangeLineUpper1, bar_index)
+        line.set_x2(rangeLineMid, bar_index)
+        line.set_x2(rangeLineLower1, bar_index)
+        line.set_x2(rangeLineLower2, bar_index)
+        if rangeFillZonesInput
+            linefill.new(rangeLineUpper2, rangeLineUpper1, rangeMid == rangeMid[1] ? (rangeTrend == -1 ? color.new(zscoreBearColorInput, 70) : color.new(zscoreBearColorInput, 85)) : na)
+            linefill.new(rangeLineUpper1, rangeLineMid, rangeMid == rangeMid[1] ? (rangeTrend == -1 ? color.new(zscoreBearColorInput, 80) : color.new(zscoreBearColorInput, 95)) : na)
+            linefill.new(rangeLineLower2, rangeLineLower1, rangeMid == rangeMid[1] ? (rangeTrend == 1 ? color.new(zscoreBullColorInput, 70) : color.new(zscoreBullColorInput, 85)) : na)
+            linefill.new(rangeLineLower1, rangeLineMid, rangeMid == rangeMid[1] ? (rangeTrend == 1 ? color.new(zscoreBullColorInput, 80) : color.new(zscoreBullColorInput, 95)) : na)
+
+color zscoreBarColor = zscoreTrendFilterInput ? (rangeTrend == 1 ? color.from_gradient(normZscore, -zscoreObThresholdInput, 0, zscoreBullColorInput, zscoreNeutralColorInput) : color.from_gradient(normZscore, 0, zscoreObThresholdInput, zscoreNeutralColorInput, zscoreBearColorInput)) : zscoreColor
+
+if showZscoreBarColorInput
+    barcolor(zscoreBarColor, title = "Z-Score Bar Color")
+
+plotshape(showZscoreSignalsInput and ta.crossover(normZscore, -zscoreObThresholdInput), title = "Z-Score Long Signal", style = shape.diamond, location = location.belowbar, color = zscoreBullColorInput)
+plotshape(showZscoreSignalsInput and ta.crossunder(normZscore, zscoreObThresholdInput), title = "Z-Score Short Signal", style = shape.diamond, location = location.abovebar, color = zscoreBearColorInput)
+plotshape(showZscoreSignalsInput and normZscoreFast < -zscoreObThresholdInput, title = "Z-Score Weak Long", style = shape.xcross, location = location.belowbar, color = color.new(zscoreNeutralColorInput, 50))
+plotshape(showZscoreSignalsInput and normZscoreFast > zscoreObThresholdInput, title = "Z-Score Weak Short", style = shape.xcross, location = location.abovebar, color = color.new(zscoreNeutralColorInput, 50))
+
+
+// ============================================================================
 // 05 - ENTRY SETUP
 // ----------------------------------------------------------------------------
 // Two entry models against the same native swing support/resistance zones,
@@ -798,19 +940,30 @@ bool shortZoneConfluence = shortZoneConfluenceOriginal or shortZoneConfluenceRev
 bool longPressureBonus = executionDeltaPressure >= minimumVolumePressureInput
 bool shortPressureBonus = executionDeltaPressure <= -minimumVolumePressureInput
 
-int longBonusPoints = (longZoneConfluence ? 1 : 0) + (longPressureBonus ? 1 : 0)
-int shortBonusPoints = (shortZoneConfluence ? 1 : 0) + (shortPressureBonus ? 1 : 0)
+// Z-Score mean-reversion AGREEMENT -- the "skill upgrade" from the
+// ported Range & Z-Score section (04c): a long earns the bonus when
+// price is statistically stretched to the downside (oversold) right as
+// the pullback/breakout resolves, same reasoning as pressure and zone
+// confluence -- a bonus factor, never a hard gate, per this file's own
+// funnel-diagnostics lesson.
+bool longZscoreBonus = zscoreOversold
+bool shortZscoreBonus = zscoreOverbought
 
-string longSetupGrade = longBonusPoints >= 2 ? "A" : longBonusPoints == 1 ? "B" : "C"
-string shortSetupGrade = shortBonusPoints >= 2 ? "A" : shortBonusPoints == 1 ? "B" : "C"
+int longBonusPoints = (longZoneConfluence ? 1 : 0) + (longPressureBonus ? 1 : 0) + (longZscoreBonus ? 1 : 0)
+int shortBonusPoints = (shortZoneConfluence ? 1 : 0) + (shortPressureBonus ? 1 : 0) + (shortZscoreBonus ? 1 : 0)
+
+string longSetupGrade = longBonusPoints >= 3 ? "A" : longBonusPoints >= 1 ? "B" : "C"
+string shortSetupGrade = shortBonusPoints >= 3 ? "A" : shortBonusPoints >= 1 ? "B" : "C"
 
 string longGradeNote = (
      (longZoneConfluenceReversed and not longZoneConfluenceOriginal ? ", broken-zone flip" : longZoneConfluence ? ", zone confluence" : "") +
+     (longZscoreBonus ? ", z-score oversold" : "") +
      (dayShowsManipulation ? ", manipulation day" : "")
 )
 
 string shortGradeNote = (
      (shortZoneConfluenceReversed and not shortZoneConfluenceOriginal ? ", broken-zone flip" : shortZoneConfluence ? ", zone confluence" : "") +
+     (shortZscoreBonus ? ", z-score overbought" : "") +
      (dayShowsManipulation ? ", manipulation day" : "")
 )
 
@@ -1157,6 +1310,7 @@ longColorInput = input.color(color.aqua, "Long Color", group = G_VISUALS)
 shortColorInput = input.color(color.orange, "Short Color", group = G_VISUALS)
 
 barcolor(
+     showZscoreBarColorInput ? na :
      showStructureLineInput and structureTrend == "UP" ?
      color.new(longColorInput, structureBarColorTransparencyInput) :
      showStructureLineInput and structureTrend == "DOWN" ?
@@ -1500,6 +1654,15 @@ plot(breakoutAboveResistance ? 1 : 0, title = "Breakout Above Resistance (Confir
 plot(breakoutBelowSupport ? 1 : 0, title = "Breakout Below Support (Confirmed Bar)", display = display.data_window)
 plot(barsSinceSupportTouch, title = "Bars Since Support Touch", display = display.data_window)
 plot(barsSinceResistanceTouch, title = "Bars Since Resistance Touch", display = display.data_window)
+
+// Z-Score oscillator values -- these lived in their own pane in the
+// original standalone script; Trading Coach is overlay-only, so a
+// -100..100 value can't be plotted on the price pane without breaking
+// the chart's scale. Available here in the Data Window instead (and
+// folded into the Setup Grade bonus above).
+plot(normZscore, title = "Z-Score", display = display.data_window)
+plot(normZscoreFast, title = "Z-Score Fast", display = display.data_window)
+plot(rangeTrend, title = "Range Trend (1=UP, -1=DOWN)", display = display.data_window)
 
 
 // ============================================================================
