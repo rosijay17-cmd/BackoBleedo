@@ -219,21 +219,93 @@ if nyInSession
     nyHigh := math.max(high, nz(nyHigh, low))
     nyLow := math.min(low, nz(nyLow, high))
 
-// -- Liquidity Sweep Tracker: does London sweep the PRIOR DAY's NY
-// session high? -- a real, backtested count instead of a guess.
-// priorDayNyHigh is snapshotted at each daily reset (see RESET ON NEW
-// DAY below) from the just-completed day's nyHigh, before that gets
-// wiped for the new day. This checks every London bar for a wick above
-// it, at most once per day; that day's outcome (hit or not) is counted
-// into londonSweepDaysTotal/Hit at the NEXT day's reset, using these
-// same two vars, right before they get overwritten for the new day.
-var float priorDayNyHigh = na
-var bool londonSweptPriorNyHigh = false
-var int londonSweepDaysTotal = 0
-var int londonSweepDaysHit = 0
+// -- PDH/PDL Sweep Probability -- plotted directly on chart at the
+// actual PDH/PDL price levels instead of a separate dashboard table.
+// prevDayHigh/prevDayLow are the just-completed calendar day's whole-day
+// high/low (any session, not session-specific like the old NY-high
+// tracker was). newDayCoach is computed here (not down in RESET ON NEW
+// DAY) because dayHigh/dayLow must be reset to na and re-seeded with the
+// SAME bar's high/low in one atomic step -- doing the reset later in
+// the script would let this section's own unconditional accumulation
+// below contaminate yesterday's final range with today's first bar
+// before the snapshot ever happens.
+bool newDayCoach = ta.change(time("D", timezoneInput)) != 0
 
-if londonInSession and not na(priorDayNyHigh) and not londonSweptPriorNyHigh and high >= priorDayNyHigh
-    londonSweptPriorNyHigh := true
+var float dayHigh = na
+var float dayLow = na
+var float prevDayHigh = na
+var float prevDayLow = na
+var bool sweptPdhToday = false
+var bool sweptPdlToday = false
+var int pdhSweepDaysTotal = 0
+var int pdhSweepDaysHit = 0
+var int pdlSweepDaysTotal = 0
+var int pdlSweepDaysHit = 0
+
+if newDayCoach
+    if not na(prevDayHigh)
+        pdhSweepDaysTotal += 1
+        if sweptPdhToday
+            pdhSweepDaysHit += 1
+    if not na(prevDayLow)
+        pdlSweepDaysTotal += 1
+        if sweptPdlToday
+            pdlSweepDaysHit += 1
+    prevDayHigh := dayHigh
+    prevDayLow := dayLow
+    sweptPdhToday := false
+    sweptPdlToday := false
+    dayHigh := na
+    dayLow := na
+
+dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+dayLow := na(dayLow) ? low : math.min(dayLow, low)
+
+if not na(prevDayHigh) and not sweptPdhToday and high >= prevDayHigh
+    sweptPdhToday := true
+if not na(prevDayLow) and not sweptPdlToday and low <= prevDayLow
+    sweptPdlToday := true
+
+float pdhSweepRate = pdhSweepDaysTotal > 0 ? pdhSweepDaysHit / pdhSweepDaysTotal * 100.0 : na
+float pdlSweepRate = pdlSweepDaysTotal > 0 ? pdlSweepDaysHit / pdlSweepDaysTotal * 100.0 : na
+
+showPdhPdlInput = input.bool(true, "Show PDH/PDL Sweep Probability", group = G_ZONES)
+pdhColorInput = input.color(color.orange, "PDH Color", group = G_ZONES, inline = "pdhpdl")
+pdlColorInput = input.color(color.aqua, "PDL Color", group = G_ZONES, inline = "pdhpdl")
+
+string pdhLabelText = "PDH " + str.tostring(prevDayHigh, format.mintick) + "  Sweep " + (na(pdhSweepRate) ? "--" : str.tostring(pdhSweepRate, "#") + "%")
+string pdlLabelText = "PDL " + str.tostring(prevDayLow, format.mintick) + "  Sweep " + (na(pdlSweepRate) ? "--" : str.tostring(pdlSweepRate, "#") + "%")
+
+var line pdhLine = na
+var line pdlLine = na
+var label pdhLabel = na
+var label pdlLabel = na
+
+if showPdhPdlInput and not na(prevDayHigh)
+    if newDayCoach or na(pdhLine)
+        if not na(pdhLine)
+            line.delete(pdhLine)
+        if not na(pdhLabel)
+            label.delete(pdhLabel)
+        pdhLine := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = prevDayHigh, y2 = prevDayHigh, color = pdhColorInput, style = line.style_dashed)
+        pdhLabel := label.new(bar_index + 1, prevDayHigh, text = pdhLabelText, style = label.style_label_up, color = color.new(pdhColorInput, 80), textcolor = pdhColorInput, size = size.small)
+    else
+        line.set_x2(pdhLine, bar_index + 1)
+        label.set_x(pdhLabel, bar_index + 1)
+        label.set_text(pdhLabel, pdhLabelText)
+
+if showPdhPdlInput and not na(prevDayLow)
+    if newDayCoach or na(pdlLine)
+        if not na(pdlLine)
+            line.delete(pdlLine)
+        if not na(pdlLabel)
+            label.delete(pdlLabel)
+        pdlLine := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = prevDayLow, y2 = prevDayLow, color = pdlColorInput, style = line.style_dashed)
+        pdlLabel := label.new(bar_index + 1, prevDayLow, text = pdlLabelText, style = label.style_label_down, color = color.new(pdlColorInput, 80), textcolor = pdlColorInput, size = size.small)
+    else
+        line.set_x2(pdlLine, bar_index + 1)
+        label.set_x(pdlLabel, bar_index + 1)
+        label.set_text(pdlLabel, pdlLabelText)
 
 // -- Session boxes: one box per session spanning its actual running
 // high/low over its full time window, labeled with the session's own
@@ -1584,50 +1656,6 @@ if barstate.islast and showFunnelInput
 
 
 // ============================================================================
-// 11 - LIQUIDITY SWEEP TRACKER
-// ----------------------------------------------------------------------------
-// Answers "how often does London actually sweep the prior day's NY
-// session high" with a real count from the chart's own loaded history,
-// instead of a guess -- see the Liquidity Sweep Tracker block in
-// section 01 (where priorDayNyHigh/londonSweptPriorNyHigh are tracked)
-// and the finalize step in RESET ON NEW DAY below (where each day's
-// outcome gets counted into londonSweepDaysHit/Total).
-// ============================================================================
-
-string G_SWEEP = "11 - Liquidity Sweep Tracker"
-
-showSweepTrackerInput = input.bool(true, "Show Liquidity Sweep Tracker Table", group = G_SWEEP)
-sweepTrackerPositionInput = input.string("Bottom Right", "Sweep Tracker Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_SWEEP)
-sweepTrackerSizeInput = input.string("Small", "Sweep Tracker Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_SWEEP)
-
-var table sweepTable = table.new(f_tablePosition(sweepTrackerPositionInput), 2, 3, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
-
-if barstate.islast and showSweepTrackerInput
-    sweepTextSize = f_tableTextSize(sweepTrackerSizeInput)
-
-    table.cell(sweepTable, 0, 0, "LIQUIDITY SWEEP", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = sweepTextSize)
-    table.cell(sweepTable, 1, 0, "London vs Prior NY High", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = sweepTextSize)
-
-    string sweepHistoryText = (
-         londonSweepDaysTotal > 0 ?
-         str.tostring(londonSweepDaysHit) + " / " + str.tostring(londonSweepDaysTotal) + " (" + str.tostring(math.round(londonSweepDaysHit / londonSweepDaysTotal * 100)) + "%)" :
-         "No completed days yet"
-    )
-    table.cell(sweepTable, 0, 1, "Historical", text_color = color.white, text_size = sweepTextSize)
-    table.cell(sweepTable, 1, 1, sweepHistoryText, text_color = color.gray, text_size = sweepTextSize)
-
-    string sweepTodayText = (
-         na(priorDayNyHigh) ?
-         "No prior NY high yet" :
-         londonSweptPriorNyHigh ?
-         "SWEPT " + str.tostring(priorDayNyHigh, format.mintick) :
-         "Not yet (target " + str.tostring(priorDayNyHigh, format.mintick) + ")"
-    )
-    table.cell(sweepTable, 0, 2, "Today", text_color = color.white, text_size = sweepTextSize)
-    table.cell(sweepTable, 1, 2, sweepTodayText, text_color = londonSweptPriorNyHigh ? longColorInput : color.gray, text_size = sweepTextSize)
-
-
-// ============================================================================
 // RESET ON NEW DAY
 // ----------------------------------------------------------------------------
 // Session OHLC, zone-broken flags, and the day's Profile classification
@@ -1637,21 +1665,12 @@ if barstate.islast and showSweepTrackerInput
 // delta_break_retest/Stage8-9. The Outcome Tracker's win/loss/expired
 // counts are deliberately NOT included here -- those are meant to
 // accumulate a running record across the whole history loaded, same as
-// the template's own Outcome Tracker.
+// the template's own Outcome Tracker. newDayCoach itself is computed up
+// in section 01 (needed there for the PDH/PDL day-boundary reset) and
+// reused here as-is.
 // ============================================================================
 
-bool newDayCoach = ta.change(time("D", timezoneInput)) != 0
-
 if newDayCoach
-    // Finalize the Liquidity Sweep Tracker for the day that's ending,
-    // using the OLD priorDayNyHigh/londonSweptPriorNyHigh, before they
-    // get overwritten below for the new day.
-    if not na(priorDayNyHigh)
-        londonSweepDaysTotal += 1
-        if londonSweptPriorNyHigh
-            londonSweepDaysHit += 1
-    priorDayNyHigh := nyHigh
-    londonSweptPriorNyHigh := false
     asiaOpen := na
     asiaClose := na
     asiaHigh := na
@@ -1705,9 +1724,12 @@ plot(barsSinceResistanceTouch, title = "Bars Since Resistance Touch", display = 
 plot(normZscore, title = "Z-Score", display = display.data_window)
 plot(normZscoreFast, title = "Z-Score Fast", display = display.data_window)
 plot(rangeTrend, title = "Range Trend (1=UP, -1=DOWN)", display = display.data_window)
-plot(priorDayNyHigh, title = "Prior Day NY High", display = display.data_window)
-plot(londonSweptPriorNyHigh ? 1 : 0, title = "London Swept Prior NY High (Today)", display = display.data_window)
-plot(londonSweepDaysTotal > 0 ? londonSweepDaysHit / londonSweepDaysTotal * 100.0 : na, title = "London Sweep Rate %", display = display.data_window)
+plot(prevDayHigh, title = "Prior Day High (PDH)", display = display.data_window)
+plot(prevDayLow, title = "Prior Day Low (PDL)", display = display.data_window)
+plot(sweptPdhToday ? 1 : 0, title = "PDH Swept (Today)", display = display.data_window)
+plot(sweptPdlToday ? 1 : 0, title = "PDL Swept (Today)", display = display.data_window)
+plot(pdhSweepRate, title = "PDH Sweep Rate %", display = display.data_window)
+plot(pdlSweepRate, title = "PDL Sweep Rate %", display = display.data_window)
 
 
 // ============================================================================
