@@ -180,8 +180,7 @@ if nySessionStart and showSessionLabelsInput
 
 string G_ZONES = "01 - Session Zones & Day Profile"
 
-showSessionZonesInput = input.bool(true, "Show Session Zone Boxes", group = G_ZONES)
-zoneBoxWidthBarsInput = input.int(20, "Zone Box Width (Bars Back)", minval = 3, maxval = 200, tooltip = "How far back each support/resistance zone box extends visually. Purely cosmetic -- does not affect the confluence check itself.", group = G_ZONES)
+zoneBoxWidthBarsInput = input.int(20, "Zone Box Width (Bars Back)", minval = 3, maxval = 200, tooltip = "How far back the native swing support/resistance zone box extends visually. Purely cosmetic -- does not affect the confluence check itself.", group = G_ZONES)
 zoneToleranceAtrInput = input.float(0.30, "Zone Confluence Tolerance (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, tooltip = "How close a pullback needs to get to a session zone to count as confluence with it. Also sets each zone box's height.", group = G_ZONES)
 profileTrendThresholdInput = input.float(1.5, "Day Profile Trend Threshold", minval = 1.0, step = 0.1, tooltip = "Same trend-vs-consolidation threshold the template's Profile classification uses.", group = G_ZONES)
 
@@ -915,14 +914,20 @@ f_zoneBox(float level, bool broken, bool isHighRole, int leftX, int rightX, floa
     if not na(level)
         bool effectiveIsSupport = isHighRole ? broken : not broken
         color zoneColor = effectiveIsSupport ? longColorInput : shortColorInput
+        // Only the native swing box uses this now (the redundant session-
+        // level version was removed) -- made bolder (thicker border, less
+        // transparent fill) since it's the one box that actually matters
+        // for the Entry Setup logic and needs to stand out on its own,
+        // not blend into the bigger, bolder session boxes around it.
         result := box.new(
              left = leftX,
              top = level + halfWidth,
              bottom = level - halfWidth,
              right = rightX,
              xloc = xloc.bar_index,
-             bgcolor = color.new(zoneColor, 85),
-             border_color = zoneColor
+             bgcolor = color.new(zoneColor, 75),
+             border_color = zoneColor,
+             border_width = 2
         )
     result
 
@@ -946,26 +951,17 @@ if barstate.islast
         if not na(swingLowBox)
             array.push(zoneBoxes, swingLowBox)
 
-    if showSessionZonesInput
-        int sessionLeft = bar_index - zoneBoxWidthBarsInput
-        box asiaHighBox = f_zoneBox(asiaHigh, asiaHighBroken, true, sessionLeft, zoneRight, zoneHalf)
-        box asiaLowBox = f_zoneBox(asiaLow, asiaLowBroken, false, sessionLeft, zoneRight, zoneHalf)
-        box londonHighBox = f_zoneBox(londonHigh, londonHighBroken, true, sessionLeft, zoneRight, zoneHalf)
-        box londonLowBox = f_zoneBox(londonLow, londonLowBroken, false, sessionLeft, zoneRight, zoneHalf)
-        box nyHighBox = f_zoneBox(nyHigh, nyHighBroken, true, sessionLeft, zoneRight, zoneHalf)
-        box nyLowBox = f_zoneBox(nyLow, nyLowBroken, false, sessionLeft, zoneRight, zoneHalf)
-        if not na(asiaHighBox)
-            array.push(zoneBoxes, asiaHighBox)
-        if not na(asiaLowBox)
-            array.push(zoneBoxes, asiaLowBox)
-        if not na(londonHighBox)
-            array.push(zoneBoxes, londonHighBox)
-        if not na(londonLowBox)
-            array.push(zoneBoxes, londonLowBox)
-        if not na(nyHighBox)
-            array.push(zoneBoxes, nyHighBox)
-        if not na(nyLowBox)
-            array.push(zoneBoxes, nyLowBox)
+    // NOTE: the six session highs/lows are NOT also drawn as thin
+    // confluence boxes here anymore -- they used to be, and sat directly
+    // on top of the same levels the full Session Boxes (Asia/London/New
+    // York, with their own name + price labels) already draw, at a much
+    // bigger, bolder size. The thin version was getting visually
+    // swallowed by the bigger one and made the actual support/resistance
+    // zone (the native swing box below, which is what the Entry Setup
+    // logic actually trades off of) harder to pick out. Session-level
+    // confluence is still checked in the longZoneConfluence/
+    // shortZoneConfluence logic above -- this only removes the
+    // redundant duplicate box.
 
 
 plotshape(showEntryMarkersInput and actualLongSignal, title = "Long Setup", style = shape.triangleup, location = location.belowbar, size = size.small, color = longColorInput, text = "LONG", textcolor = color.white)
