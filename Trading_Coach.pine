@@ -1379,13 +1379,33 @@ funnelTableSizeInput = input.string("Tiny", "Funnel Table Text Size", options = 
 
 // counts[0] = bars evaluated, [1] = +structure, [2] = +ready (location &
 // candle), [3] = +momentum, [4] = +pressure, [5] = +session,
-// [6] = +cooldown (== that mode's SetupNow actually firing).
-var array<int> fLongPullback = array.new_int(7, 0)
-var array<int> fLongBreakout = array.new_int(7, 0)
-var array<int> fShortPullback = array.new_int(7, 0)
-var array<int> fShortBreakout = array.new_int(7, 0)
+// [6] = +cooldown (that mode's own SetupNow), [7] = +risk OK (this is
+// what ACTUALLY reaches actualLongSignal/actualShortSignal and gets
+// registered -- Risk Management's maximumEntryRiskAtrInput cap is a
+// SEPARATE, LATER gate than the entry model itself, easy to miss when
+// "SetupNow" already sounds like the final word).
+var array<int> fLongPullback = array.new_int(8, 0)
+var array<int> fLongBreakout = array.new_int(8, 0)
+var array<int> fShortPullback = array.new_int(8, 0)
+var array<int> fShortBreakout = array.new_int(8, 0)
 
-f_incrFunnel(array<int> counts, bool structureOk, bool readyOk, bool momentumOk, bool pressureOk, bool sessionOk, bool cooldownOk) =>
+// Per-mode risk-in-ATR-terms, using each mode's own natural stop anchor
+// (same as Risk Management's longStopAnchor/shortStopAnchor above) --
+// duplicated here (not reused from Risk Management's longRiskOk/
+// shortRiskOk) because those are only ever computed for whichever mode
+// Entry Mode actually selected, and this funnel needs all 4 independently
+// regardless of Entry Mode.
+float longPullbackRiskAtr = not na(recentSwingLow) ? math.abs(close - (recentSwingLow - stopBufferAtrMultInput * atrCoach)) / atrCoach : na
+float longBreakoutRiskAtr = not na(recentSwingHigh) ? math.abs(close - (recentSwingHigh - stopBufferAtrMultInput * atrCoach)) / atrCoach : na
+float shortPullbackRiskAtr = not na(recentSwingHigh) ? math.abs(close - (recentSwingHigh + stopBufferAtrMultInput * atrCoach)) / atrCoach : na
+float shortBreakoutRiskAtr = not na(recentSwingLow) ? math.abs(close - (recentSwingLow + stopBufferAtrMultInput * atrCoach)) / atrCoach : na
+
+bool longPullbackRiskOk = not na(longPullbackRiskAtr) and longPullbackRiskAtr <= maximumEntryRiskAtrInput
+bool longBreakoutRiskOk = not na(longBreakoutRiskAtr) and longBreakoutRiskAtr <= maximumEntryRiskAtrInput
+bool shortPullbackRiskOk = not na(shortPullbackRiskAtr) and shortPullbackRiskAtr <= maximumEntryRiskAtrInput
+bool shortBreakoutRiskOk = not na(shortBreakoutRiskAtr) and shortBreakoutRiskAtr <= maximumEntryRiskAtrInput
+
+f_incrFunnel(array<int> counts, bool structureOk, bool readyOk, bool momentumOk, bool pressureOk, bool sessionOk, bool cooldownOk, bool riskOk) =>
     array.set(counts, 0, array.get(counts, 0) + 1)
     if structureOk
         array.set(counts, 1, array.get(counts, 1) + 1)
@@ -1399,21 +1419,23 @@ f_incrFunnel(array<int> counts, bool structureOk, bool readyOk, bool momentumOk,
                         array.set(counts, 5, array.get(counts, 5) + 1)
                         if cooldownOk
                             array.set(counts, 6, array.get(counts, 6) + 1)
+                            if riskOk
+                                array.set(counts, 7, array.get(counts, 7) + 1)
     true
 
 if barstate.isconfirmed
-    f_incrFunnel(fLongPullback, longStructureOk, longPullbackReady, momentumOkLongPullback, pressureOkLongPullback, sessionOkPullback, longPullbackCooldownOk)
-    f_incrFunnel(fLongBreakout, longStructureOk, longBreakoutReady, momentumOkLongBreakout, pressureOkLongBreakout, sessionOkBreakout, longBreakoutCooldownOk)
-    f_incrFunnel(fShortPullback, shortStructureOk, shortPullbackReady, momentumOkShortPullback, pressureOkShortPullback, sessionOkPullback, shortPullbackCooldownOk)
-    f_incrFunnel(fShortBreakout, shortStructureOk, shortBreakoutReady, momentumOkShortBreakout, pressureOkShortBreakout, sessionOkBreakout, shortBreakoutCooldownOk)
+    f_incrFunnel(fLongPullback, longStructureOk, longPullbackReady, momentumOkLongPullback, pressureOkLongPullback, sessionOkPullback, longPullbackCooldownOk, longPullbackRiskOk)
+    f_incrFunnel(fLongBreakout, longStructureOk, longBreakoutReady, momentumOkLongBreakout, pressureOkLongBreakout, sessionOkBreakout, longBreakoutCooldownOk, longBreakoutRiskOk)
+    f_incrFunnel(fShortPullback, shortStructureOk, shortPullbackReady, momentumOkShortPullback, pressureOkShortPullback, sessionOkPullback, shortPullbackCooldownOk, shortPullbackRiskOk)
+    f_incrFunnel(fShortBreakout, shortStructureOk, shortBreakoutReady, momentumOkShortBreakout, pressureOkShortBreakout, sessionOkBreakout, shortBreakoutCooldownOk, shortBreakoutRiskOk)
 
-var table funnelTable = table.new(f_tablePosition(funnelTablePositionInput), 5, 8, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+var table funnelTable = table.new(f_tablePosition(funnelTablePositionInput), 5, 9, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
 
 if barstate.islast and showFunnelInput
     funnelTextSize = f_tableTextSize(funnelTableSizeInput)
-    array<string> funnelLabels = array.from("ENTRY FUNNEL", "Bars Evaluated", "+ Structure", "+ Ready (Loc+Candle)", "+ Momentum", "+ Pressure", "+ Session", "+ Cooldown (Fired)")
+    array<string> funnelLabels = array.from("ENTRY FUNNEL", "Bars Evaluated", "+ Structure", "+ Ready (Loc+Candle)", "+ Momentum", "+ Pressure", "+ Session", "+ Cooldown", "+ Risk OK (Registered)")
 
-    for row = 0 to 7
+    for row = 0 to 8
         table.cell(funnelTable, 0, row, array.get(funnelLabels, row), text_color = color.white, bgcolor = row == 0 ? color.rgb(22, 52, 86) : na, text_size = funnelTextSize)
 
     table.cell(funnelTable, 1, 0, "LP", text_color = longColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
@@ -1421,7 +1443,7 @@ if barstate.islast and showFunnelInput
     table.cell(funnelTable, 3, 0, "SP", text_color = shortColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
     table.cell(funnelTable, 4, 0, "SB", text_color = shortColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
 
-    for row = 1 to 7
+    for row = 1 to 8
         table.cell(funnelTable, 1, row, str.tostring(array.get(fLongPullback, row - 1)), text_color = color.gray, text_size = funnelTextSize)
         table.cell(funnelTable, 2, row, str.tostring(array.get(fLongBreakout, row - 1)), text_color = color.gray, text_size = funnelTextSize)
         table.cell(funnelTable, 3, row, str.tostring(array.get(fShortPullback, row - 1)), text_color = color.gray, text_size = funnelTextSize)
