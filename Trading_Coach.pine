@@ -564,6 +564,7 @@ tdiRsiPeriodInput = input.int(21, "RSI Period", minval = 1, group = G_TDI)
 tdiBandLengthInput = input.int(34, "Band Length", minval = 1, group = G_TDI)
 tdiFastMaLengthInput = input.int(2, "Fast MA on RSI", minval = 1, group = G_TDI)
 momentumLengthInput = input.int(12, "Momentum Length", minval = 1, group = G_TDI)
+requireTdiAbsoluteLevelInput = input.bool(false, "Require Additional Fixed 68/32 Level", tooltip = "OFF by default. On-device Data Window checks confirmed the ON version (Fast MA past its own dynamic band AND past a fixed 68/32 absolute level, both at once) left Momentum stale/NEUTRAL almost permanently -- the same double-AND funnel-diagnostics lesson as delta_break_retest/Stage8. OFF reads the standard TDI signal (Fast MA crosses its own volatility-adjusted band) alone; turn this back on only if you've watched it and still want the extra strictness.", group = G_TDI)
 
 tdiRsi = ta.rsi(tdiSourceInput, tdiRsiPeriodInput)
 tdiMa = ta.sma(tdiRsi, tdiBandLengthInput)
@@ -574,8 +575,8 @@ tdiFastMa = ta.sma(tdiRsi, tdiFastMaLengthInput)
 momentum = tdiSourceInput - tdiSourceInput[momentumLengthInput]
 momentumRising = momentum > momentum[1]
 momentumFalling = momentum < momentum[1]
-tdiBullishMove = tdiFastMa > tdiUpperBand and tdiFastMa > 68
-tdiBearishMove = tdiFastMa < tdiLowerBand and tdiFastMa < 32
+tdiBullishMove = tdiFastMa > tdiUpperBand and (not requireTdiAbsoluteLevelInput or tdiFastMa > 68)
+tdiBearishMove = tdiFastMa < tdiLowerBand and (not requireTdiAbsoluteLevelInput or tdiFastMa < 32)
 
 bool tdiConfirmsLong = tdiBullishMove and momentumRising
 bool tdiConfirmsShort = tdiBearishMove and momentumFalling
