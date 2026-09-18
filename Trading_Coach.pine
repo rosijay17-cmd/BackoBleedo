@@ -336,6 +336,15 @@ if not na(nyHigh) and close > nyHigh
 if not na(nyLow) and close < nyLow
     nyLowBroken := true
 
+int zonesBrokenCount = (
+     (asiaHighBroken ? 1 : 0) +
+     (asiaLowBroken ? 1 : 0) +
+     (londonHighBroken ? 1 : 0) +
+     (londonLowBroken ? 1 : 0) +
+     (nyHighBroken ? 1 : 0) +
+     (nyLowBroken ? 1 : 0)
+)
+
 // -- Day Profile classification (ported from the template, same math) --
 // Deliberately run every confirmed bar, not gated by barstate.islast the
 // way the template gates it -- this classifies EVERY historical day
@@ -1297,11 +1306,11 @@ showDashboardInput = input.bool(true, "Show Coaching Dashboard", group = G_DASH)
 dashboardPositionInput = input.string("Top Right", "Dashboard Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_DASH)
 dashboardSizeInput = input.string("Small", "Dashboard Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_DASH)
 
-// Trimmed to exactly the 6 rows requested: Coach Observation, Reaction,
-// Session Profile, Structure, Volume Pressure, Momentum. Session (name +
-// favorable/caution) and Day Profile were previously two separate rows --
-// merged into one "Session Profile" row here since that's the only slot
-// left for session context. Zones Broken, Swing High/Low, Cooldown,
+// Trimmed to exactly the 7 rows requested: Coach Observation, Reaction,
+// Session Profile, Structure, Volume Pressure, Momentum, Zone Broken.
+// Session (name + favorable/caution) and Day Profile were previously two
+// separate rows -- merged into one "Session Profile" row here since only
+// one slot was requested for session context. Swing High/Low, Cooldown,
 // Setups Registered, and Long/Short Record are no longer shown on this
 // table (the Outcome Tracker's underlying counters still accumulate in
 // the background -- see Entry Funnel Diagnostics for anything needing
@@ -1309,7 +1318,7 @@ dashboardSizeInput = input.string("Small", "Dashboard Text Size", options = ["Ti
 string sessionProfileText = activeSessionLabel + " -- " + dayProfile + (dayShowsManipulation ? " (!)" : "")
 color sessionProfileColor = dayShowsManipulation ? color.orange : sessionFavorable ? color.aqua : color.gray
 
-var table coachTable = table.new(f_tablePosition(dashboardPositionInput), 2, 7, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+var table coachTable = table.new(f_tablePosition(dashboardPositionInput), 2, 8, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
 
 if barstate.islast and showDashboardInput
     dashTextSize = f_tableTextSize(dashboardSizeInput)
@@ -1334,6 +1343,9 @@ if barstate.islast and showDashboardInput
 
     table.cell(coachTable, 0, 6, "Momentum", text_color = color.white, text_size = dashTextSize)
     table.cell(coachTable, 1, 6, tdiConfirmsLong ? "BULLISH" : tdiConfirmsShort ? "BEARISH" : "NEUTRAL", text_color = tdiConfirmsLong ? longColorInput : tdiConfirmsShort ? shortColorInput : color.gray, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 7, "Zone Broken", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 7, str.tostring(zonesBrokenCount) + " / 6", text_color = zonesBrokenCount > 0 ? color.orange : color.gray, text_size = dashTextSize)
 
 
 // ============================================================================
