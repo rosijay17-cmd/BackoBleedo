@@ -103,7 +103,8 @@ newYorkSessionInput = input.session("1300-2100", "New York Session", group = G_S
 favorForLondonInput = input.bool(true, "Favorable Session: London", group = G_SESSION)
 favorForNyInput = input.bool(true, "Favorable Session: New York", group = G_SESSION)
 favorForAsiaInput = input.bool(false, "Favorable Session: Asia", tooltip = "Off by default -- Asia is typically the lowest-liquidity session for most index/FX instruments. Turn on if your instrument actually trades well there.", group = G_SESSION)
-requireFavorableSessionInput = input.bool(true, "Require Favorable Session For Setups", group = G_SESSION)
+// "Require Favorable Session" moved to the Pullback/Breakout Filters
+// groups below (05a/05b) -- each mode now sets this independently.
 sessionBgTransparencyInput = input.int(85, "Session Background Tint Transparency", minval = 0, maxval = 100, tooltip = "0 = fully solid, 100 = fully invisible. Was hardcoded to 92 (barely visible).", group = G_SESSION)
 showSessionStartLinesInput = input.bool(true, "Show Session Start Lines", group = G_SESSION)
 showSessionLabelsInput = input.bool(true, "Show Session Name Labels", group = G_SESSION)
@@ -498,8 +499,13 @@ bool tdiConfirmsShort = tdiBearishMove and momentumFalling
 string G_VOLUME = "04 - Volume Pressure"
 
 executionDeltaWindowInput = input.int(3, "Execution Pressure Window", minval = 1, maxval = 8, group = G_VOLUME)
-requireVolumePressureInput = input.bool(false, "Require Volume Pressure Agreement", tooltip = "OFF by default. Stage 8's own funnel diagnostics (delta_break_retest) proved a strict pressure gate can smother signal count on a noisy instrument -- left off here so you see setups even without it, and can turn it on deliberately once you've watched how often it would have agreed.", group = G_VOLUME)
-minimumVolumePressureInput = input.float(5.0, "Minimum Volume Pressure %", minval = 0.0, maxval = 60.0, step = 1.0, group = G_VOLUME)
+// The "Require Volume Pressure Agreement" gate itself moved to the
+// Pullback/Breakout Filters groups below (05a/05b) so each mode can
+// require it (or not) and threshold it independently. This input stays
+// here only as the threshold the Setup Grade bonus (grading, not
+// gating -- see "Zone confluence & Setup Grade" below) checks agreement
+// against, regardless of which mode's own gate is armed.
+minimumVolumePressureInput = input.float(5.0, "Volume Pressure Bonus Threshold %", minval = 0.0, maxval = 60.0, step = 1.0, tooltip = "Used only by the Setup Grade bonus scoring -- the actual entry gate's own threshold is set per-mode in the Pullback/Breakout Filters groups.", group = G_VOLUME)
 
 float executionDeltaSum = 0.0
 float executionVolumeSum = 0.0
@@ -514,9 +520,6 @@ float executionDeltaPressure = (
      executionDeltaSum / executionVolumeSum * 100.0 :
      0.0
 )
-
-bool pressureOkLong = not requireVolumePressureInput or executionDeltaPressure >= minimumVolumePressureInput
-bool pressureOkShort = not requireVolumePressureInput or executionDeltaPressure <= -minimumVolumePressureInput
 
 
 // ============================================================================
@@ -540,7 +543,27 @@ maxBarsAtRetestInput = input.int(5, "Max Bars After Zone Touch To Confirm Revers
 breakoutDistanceAtrInput = input.float(0.25, "Breakout Distance Beyond Swing (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, tooltip = "How far beyond the recent swing level price must CLOSE to count as a decisive breakout, not just a marginal poke through it.", group = G_ENTRY)
 minimumReversalBodyFractionInput = input.float(0.30, "Minimum Candle Body / Range", minval = 0.0, maxval = 1.0, step = 0.05, tooltip = "Applies to both the pullback reversal candle and the breakout candle.", group = G_ENTRY)
 minimumReversalCloseLocationInput = input.float(0.60, "Minimum Candle Close Location", minval = 0.50, maxval = 0.95, step = 0.05, tooltip = "For a bullish candle, how close to the bar's own high the close must be (mirrored near the low for a bearish candle). 0.60 means the close must sit in at least the top 40% of the bar's range.", group = G_ENTRY)
-cooldownBarsInput = input.int(12, "Cooldown Bars Between Setups (Per Direction)", minval = 0, group = G_ENTRY)
+
+// -- Independent per-mode filters --
+// Momentum/pressure/session/cooldown used to be one shared set of gates
+// applied no matter which model fired. Pullback and Breakout now each
+// get their own copy, so (for example) a breakout can require volume
+// pressure agreement while a pullback doesn't, or the two can run
+// different cooldown lengths -- tune them completely independently.
+string G_PULLBACK_FILTERS = "05a - Pullback Filters"
+string G_BREAKOUT_FILTERS = "05b - Breakout Filters"
+
+requireMomentumPullbackInput = input.bool(true, "Require Momentum Confirmation", group = G_PULLBACK_FILTERS)
+requireVolumePressurePullbackInput = input.bool(false, "Require Volume Pressure Agreement", tooltip = "OFF by default -- Stage 8's own funnel diagnostics (delta_break_retest) proved a strict pressure gate can smother signal count on a noisy instrument. Turn on deliberately once you've watched how often Pullback setups would have agreed.", group = G_PULLBACK_FILTERS)
+minimumVolumePressurePullbackInput = input.float(5.0, "Minimum Volume Pressure %", minval = 0.0, maxval = 60.0, step = 1.0, group = G_PULLBACK_FILTERS)
+requireFavorableSessionPullbackInput = input.bool(true, "Require Favorable Session", group = G_PULLBACK_FILTERS)
+cooldownBarsPullbackInput = input.int(12, "Cooldown Bars Between Setups (Per Direction)", minval = 0, group = G_PULLBACK_FILTERS)
+
+requireMomentumBreakoutInput = input.bool(true, "Require Momentum Confirmation", group = G_BREAKOUT_FILTERS)
+requireVolumePressureBreakoutInput = input.bool(false, "Require Volume Pressure Agreement", tooltip = "OFF by default -- same funnel-diagnostics reasoning as the Pullback filter. Breakouts often benefit MORE from volume confirmation than pullbacks do, so it's worth testing on independently rather than assuming the same answer as Pullback.", group = G_BREAKOUT_FILTERS)
+minimumVolumePressureBreakoutInput = input.float(5.0, "Minimum Volume Pressure %", minval = 0.0, maxval = 60.0, step = 1.0, group = G_BREAKOUT_FILTERS)
+requireFavorableSessionBreakoutInput = input.bool(true, "Require Favorable Session", group = G_BREAKOUT_FILTERS)
+cooldownBarsBreakoutInput = input.int(12, "Cooldown Bars Between Setups (Per Direction)", minval = 0, group = G_BREAKOUT_FILTERS)
 
 float atrCoach = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
 float coachRange = math.max(high - low, syminfo.mintick)
@@ -632,54 +655,96 @@ bool longBreakoutReady = breakoutAboveResistance and bullishReversalCandle
 bool shortPullbackReady = nearResistancePullback and bearishReversalCandle
 bool shortBreakoutReady = breakoutBelowSupport and bearishReversalCandle
 
-bool longEntryModeOk = (
-     entryModeInput == "Pullback Only" ? longPullbackReady :
-     entryModeInput == "Breakout Only" ? longBreakoutReady :
-     longPullbackReady or longBreakoutReady
-)
+// -- Per-mode gates, built from each mode's own filter inputs above --
+bool momentumOkLongPullback = not requireMomentumPullbackInput or tdiConfirmsLong
+bool momentumOkLongBreakout = not requireMomentumBreakoutInput or tdiConfirmsLong
+bool momentumOkShortPullback = not requireMomentumPullbackInput or tdiConfirmsShort
+bool momentumOkShortBreakout = not requireMomentumBreakoutInput or tdiConfirmsShort
 
-bool shortEntryModeOk = (
-     entryModeInput == "Pullback Only" ? shortPullbackReady :
-     entryModeInput == "Breakout Only" ? shortBreakoutReady :
-     shortPullbackReady or shortBreakoutReady
-)
+bool pressureOkLongPullback = not requireVolumePressurePullbackInput or executionDeltaPressure >= minimumVolumePressurePullbackInput
+bool pressureOkLongBreakout = not requireVolumePressureBreakoutInput or executionDeltaPressure >= minimumVolumePressureBreakoutInput
+bool pressureOkShortPullback = not requireVolumePressurePullbackInput or executionDeltaPressure <= -minimumVolumePressurePullbackInput
+bool pressureOkShortBreakout = not requireVolumePressureBreakoutInput or executionDeltaPressure <= -minimumVolumePressureBreakoutInput
 
-bool sessionOkForLong = not requireFavorableSessionInput or sessionFavorable
-bool sessionOkForShort = not requireFavorableSessionInput or sessionFavorable
+bool sessionOkPullback = not requireFavorableSessionPullbackInput or sessionFavorable
+bool sessionOkBreakout = not requireFavorableSessionBreakoutInput or sessionFavorable
 
-var int lastLongSetupBar = na
-var int lastShortSetupBar = na
+var int lastLongPullbackSetupBar = na
+var int lastLongBreakoutSetupBar = na
+var int lastShortPullbackSetupBar = na
+var int lastShortBreakoutSetupBar = na
 
-bool longCooldownOk = na(lastLongSetupBar) or (bar_index - lastLongSetupBar) > cooldownBarsInput
-bool shortCooldownOk = na(lastShortSetupBar) or (bar_index - lastShortSetupBar) > cooldownBarsInput
+bool longPullbackCooldownOk = na(lastLongPullbackSetupBar) or (bar_index - lastLongPullbackSetupBar) > cooldownBarsPullbackInput
+bool longBreakoutCooldownOk = na(lastLongBreakoutSetupBar) or (bar_index - lastLongBreakoutSetupBar) > cooldownBarsBreakoutInput
+bool shortPullbackCooldownOk = na(lastShortPullbackSetupBar) or (bar_index - lastShortPullbackSetupBar) > cooldownBarsPullbackInput
+bool shortBreakoutCooldownOk = na(lastShortBreakoutSetupBar) or (bar_index - lastShortBreakoutSetupBar) > cooldownBarsBreakoutInput
 
 bool longStructureOk = structureTrend == "UP"
 bool shortStructureOk = structureTrend == "DOWN"
 
-bool longSetupNow = (
+bool longPullbackSetupNow = (
      barstate.isconfirmed and
      longStructureOk and
-     longEntryModeOk and
-     tdiConfirmsLong and
-     pressureOkLong and
-     sessionOkForLong and
-     longCooldownOk
+     longPullbackReady and
+     momentumOkLongPullback and
+     pressureOkLongPullback and
+     sessionOkPullback and
+     longPullbackCooldownOk
+)
+
+bool longBreakoutSetupNow = (
+     barstate.isconfirmed and
+     longStructureOk and
+     longBreakoutReady and
+     momentumOkLongBreakout and
+     pressureOkLongBreakout and
+     sessionOkBreakout and
+     longBreakoutCooldownOk
+)
+
+bool shortPullbackSetupNow = (
+     barstate.isconfirmed and
+     shortStructureOk and
+     shortPullbackReady and
+     momentumOkShortPullback and
+     pressureOkShortPullback and
+     sessionOkPullback and
+     shortPullbackCooldownOk
+)
+
+bool shortBreakoutSetupNow = (
+     barstate.isconfirmed and
+     shortStructureOk and
+     shortBreakoutReady and
+     momentumOkShortBreakout and
+     pressureOkShortBreakout and
+     sessionOkBreakout and
+     shortBreakoutCooldownOk
+)
+
+// -- Mode selection: which of the per-mode setups actually count, given
+// the Entry Mode input -- and the combined signal used everywhere else
+// in the file (risk management, outcome tracking, alerts). --
+bool longSetupNow = (
+     entryModeInput == "Pullback Only" ? longPullbackSetupNow :
+     entryModeInput == "Breakout Only" ? longBreakoutSetupNow :
+     longPullbackSetupNow or longBreakoutSetupNow
 )
 
 bool shortSetupNow = (
-     barstate.isconfirmed and
-     shortStructureOk and
-     shortEntryModeOk and
-     tdiConfirmsShort and
-     pressureOkShort and
-     sessionOkForShort and
-     shortCooldownOk
+     entryModeInput == "Pullback Only" ? shortPullbackSetupNow :
+     entryModeInput == "Breakout Only" ? shortBreakoutSetupNow :
+     shortPullbackSetupNow or shortBreakoutSetupNow
 )
 
-if longSetupNow
-    lastLongSetupBar := bar_index
-if shortSetupNow
-    lastShortSetupBar := bar_index
+if longPullbackSetupNow
+    lastLongPullbackSetupBar := bar_index
+if longBreakoutSetupNow
+    lastLongBreakoutSetupBar := bar_index
+if shortPullbackSetupNow
+    lastShortPullbackSetupBar := bar_index
+if shortBreakoutSetupNow
+    lastShortBreakoutSetupBar := bar_index
 
 // -- Zone confluence & Setup Grade --
 // Zone confluence does NOT gate longSetupNow/shortSetupNow above -- it
@@ -726,10 +791,10 @@ bool shortZoneConfluenceReversed = (
 bool longZoneConfluence = longZoneConfluenceOriginal or longZoneConfluenceReversed
 bool shortZoneConfluence = shortZoneConfluenceOriginal or shortZoneConfluenceReversed
 
-// Pressure AGREEMENT for grading purposes, independent of
-// requireVolumePressureInput (which only gates whether it's REQUIRED to
-// fire at all) -- a setup can still earn the grading bonus for pressure
-// agreeing even when the gate itself is switched off.
+// Pressure AGREEMENT for grading purposes, independent of either mode's
+// own Require Volume Pressure Agreement gate (05a/05b) -- a setup can
+// still earn the grading bonus for pressure agreeing even when neither
+// mode's own gate requires it.
 bool longPressureBonus = executionDeltaPressure >= minimumVolumePressureInput
 bool shortPressureBonus = executionDeltaPressure <= -minimumVolumePressureInput
 
@@ -749,23 +814,38 @@ string shortGradeNote = (
      (dayShowsManipulation ? ", manipulation day" : "")
 )
 
+// Which mode this signal actually came from -- both can independently
+// qualify on the same bar (rare, but possible), in which case it's both.
+string longActiveMode = longPullbackSetupNow and longBreakoutSetupNow ? "Pullback+Breakout" : longBreakoutSetupNow ? "Breakout" : "Pullback"
+string shortActiveMode = shortPullbackSetupNow and shortBreakoutSetupNow ? "Pullback+Breakout" : shortBreakoutSetupNow ? "Breakout" : "Pullback"
+
 // -- "Coach Says" -- names the single most relevant blocker/status right
 // now, in the order a trader would actually check them: structure first
 // (is there even a trend to trade with), then location (are we at a level,
 // under whichever entry mode(s) are armed), then confirmation (candle +
 // momentum), then session/cooldown last (the setup is real, just gated by
-// timing/pacing). --
+// timing/pacing). Momentum/pressure/session/cooldown are now independent
+// per mode, so once a candle has formed the message tracks whichever
+// mode (Pullback or Breakout) is actually the one in play -- same
+// discriminator already used for the location/candle-wait text below. --
 string longLocationText = (
      entryModeInput == "Breakout Only" ? "Uptrend -- waiting for a breakout above recent resistance" :
      entryModeInput == "Pullback Only" ? "Uptrend -- waiting for a pullback to recent support" :
      "Uptrend -- waiting for a pullback to support or a breakout above resistance"
 )
 
+bool longMessageIsBreakout = entryModeInput == "Breakout Only" or (entryModeInput == "Both" and breakoutAboveResistance and not nearSupportPullback)
+
 string longCandleWaitText = (
-     breakoutAboveResistance and not nearSupportPullback ?
+     longMessageIsBreakout ?
      "Breaking resistance -- waiting for a strong bullish candle" :
      "At support -- waiting for a bullish reversal candle"
 )
+
+bool longMessageMomentumOk = longMessageIsBreakout ? momentumOkLongBreakout : momentumOkLongPullback
+bool longMessagePressureOk = longMessageIsBreakout ? pressureOkLongBreakout : pressureOkLongPullback
+bool longMessageSessionOk = longMessageIsBreakout ? sessionOkBreakout : sessionOkPullback
+bool longMessageCooldownOk = longMessageIsBreakout ? longBreakoutCooldownOk : longPullbackCooldownOk
 
 string shortLocationText = (
      entryModeInput == "Breakout Only" ? "Downtrend -- waiting for a breakout below recent support" :
@@ -773,11 +853,18 @@ string shortLocationText = (
      "Downtrend -- waiting for a pullback to resistance or a breakout below support"
 )
 
+bool shortMessageIsBreakout = entryModeInput == "Breakout Only" or (entryModeInput == "Both" and breakoutBelowSupport and not nearResistancePullback)
+
 string shortCandleWaitText = (
-     breakoutBelowSupport and not nearResistancePullback ?
+     shortMessageIsBreakout ?
      "Breaking support -- waiting for a strong bearish candle" :
      "At resistance -- waiting for a bearish reversal candle"
 )
+
+bool shortMessageMomentumOk = shortMessageIsBreakout ? momentumOkShortBreakout : momentumOkShortPullback
+bool shortMessagePressureOk = shortMessageIsBreakout ? pressureOkShortBreakout : pressureOkShortPullback
+bool shortMessageSessionOk = shortMessageIsBreakout ? sessionOkBreakout : sessionOkPullback
+bool shortMessageCooldownOk = shortMessageIsBreakout ? shortBreakoutCooldownOk : shortPullbackCooldownOk
 
 string coachMessage = (
      structureTrend == "RANGE" ?
@@ -786,30 +873,30 @@ string coachMessage = (
      longLocationText :
      structureTrend == "UP" and longInLocation and not bullishReversalCandle ?
      longCandleWaitText :
-     structureTrend == "UP" and longInLocation and bullishReversalCandle and not tdiConfirmsLong ?
+     structureTrend == "UP" and longInLocation and bullishReversalCandle and not longMessageMomentumOk ?
      "Signal candle formed -- waiting for momentum confirmation" :
-     structureTrend == "UP" and longInLocation and bullishReversalCandle and tdiConfirmsLong and not pressureOkLong ?
+     structureTrend == "UP" and longInLocation and bullishReversalCandle and longMessageMomentumOk and not longMessagePressureOk ?
      "Momentum confirms -- waiting for volume pressure agreement" :
-     structureTrend == "UP" and longInLocation and bullishReversalCandle and tdiConfirmsLong and pressureOkLong and not sessionOkForLong ?
+     structureTrend == "UP" and longInLocation and bullishReversalCandle and longMessageMomentumOk and longMessagePressureOk and not longMessageSessionOk ?
      "Setup ready -- outside a favorable session, consider waiting" :
-     structureTrend == "UP" and longInLocation and bullishReversalCandle and tdiConfirmsLong and pressureOkLong and sessionOkForLong and not longCooldownOk ?
+     structureTrend == "UP" and longInLocation and bullishReversalCandle and longMessageMomentumOk and longMessagePressureOk and longMessageSessionOk and not longMessageCooldownOk ?
      "Setup ready -- cooling down after a recent long signal" :
      longSetupNow ?
-     "LONG SETUP ACTIVE [Grade " + longSetupGrade + longGradeNote + "]" :
+     "LONG SETUP ACTIVE [" + longActiveMode + ", Grade " + longSetupGrade + longGradeNote + "]" :
      structureTrend == "DOWN" and not shortInLocation ?
      shortLocationText :
      structureTrend == "DOWN" and shortInLocation and not bearishReversalCandle ?
      shortCandleWaitText :
-     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and not tdiConfirmsShort ?
+     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and not shortMessageMomentumOk ?
      "Signal candle formed -- waiting for momentum confirmation" :
-     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and tdiConfirmsShort and not pressureOkShort ?
+     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and shortMessageMomentumOk and not shortMessagePressureOk ?
      "Momentum confirms -- waiting for volume pressure agreement" :
-     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and tdiConfirmsShort and pressureOkShort and not sessionOkForShort ?
+     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and shortMessageMomentumOk and shortMessagePressureOk and not shortMessageSessionOk ?
      "Setup ready -- outside a favorable session, consider waiting" :
-     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and tdiConfirmsShort and pressureOkShort and sessionOkForShort and not shortCooldownOk ?
+     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and shortMessageMomentumOk and shortMessagePressureOk and shortMessageSessionOk and not shortMessageCooldownOk ?
      "Setup ready -- cooling down after a recent short signal" :
      shortSetupNow ?
-     "SHORT SETUP ACTIVE [Grade " + shortSetupGrade + shortGradeNote + "]" :
+     "SHORT SETUP ACTIVE [" + shortActiveMode + ", Grade " + shortSetupGrade + shortGradeNote + "]" :
      "No clear setup forming"
 )
 
@@ -924,8 +1011,8 @@ bool shortRiskOk = false
 // level is now the nearest thing acting as support -- anchoring a breakout
 // stop off the old, far-away recentSwingLow would make the stop
 // needlessly wide. Mirrored for shorts.
-float longStopAnchor = longBreakoutReady ? recentSwingHigh : recentSwingLow
-float shortStopAnchor = shortBreakoutReady ? recentSwingLow : recentSwingHigh
+float longStopAnchor = longBreakoutSetupNow ? recentSwingHigh : recentSwingLow
+float shortStopAnchor = shortBreakoutSetupNow ? recentSwingLow : recentSwingHigh
 
 if longSetupNow and not na(longStopAnchor)
     longStopPrice := longStopAnchor - stopBufferAtrMultInput * atrCoach
@@ -1258,8 +1345,8 @@ if barstate.islast and showDashboardInput
     table.cell(coachTable, 0, 9, "Zone Reaction", text_color = color.white, text_size = dashTextSize)
     table.cell(coachTable, 1, 9, zoneReactionMessage, text_color = zoneReactionColor, text_size = dashTextSize)
 
-    table.cell(coachTable, 0, 10, "Cooldown", text_color = color.white, text_size = dashTextSize)
-    table.cell(coachTable, 1, 10, "L " + (longCooldownOk ? "OK" : "wait") + " / S " + (shortCooldownOk ? "OK" : "wait"), text_color = color.gray, text_size = dashTextSize)
+    table.cell(coachTable, 0, 10, "Cooldown (P/B)", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 10, "L " + (longPullbackCooldownOk ? "OK" : "wait") + "/" + (longBreakoutCooldownOk ? "OK" : "wait") + " -- S " + (shortPullbackCooldownOk ? "OK" : "wait") + "/" + (shortBreakoutCooldownOk ? "OK" : "wait"), text_color = color.gray, text_size = dashTextSize)
 
     table.cell(coachTable, 0, 11, "Setups Registered", text_color = color.white, text_size = dashTextSize)
     table.cell(coachTable, 1, 11, str.tostring(totalSetupsRegistered), text_color = color.gray, text_size = dashTextSize)
