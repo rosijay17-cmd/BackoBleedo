@@ -336,15 +336,6 @@ if not na(nyHigh) and close > nyHigh
 if not na(nyLow) and close < nyLow
     nyLowBroken := true
 
-int zonesBrokenCount = (
-     (asiaHighBroken ? 1 : 0) +
-     (asiaLowBroken ? 1 : 0) +
-     (londonHighBroken ? 1 : 0) +
-     (londonLowBroken ? 1 : 0) +
-     (nyHighBroken ? 1 : 0) +
-     (nyLowBroken ? 1 : 0)
-)
-
 // -- Day Profile classification (ported from the template, same math) --
 // Deliberately run every confirmed bar, not gated by barstate.islast the
 // way the template gates it -- this classifies EVERY historical day
@@ -1306,11 +1297,19 @@ showDashboardInput = input.bool(true, "Show Coaching Dashboard", group = G_DASH)
 dashboardPositionInput = input.string("Top Right", "Dashboard Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_DASH)
 dashboardSizeInput = input.string("Small", "Dashboard Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_DASH)
 
-f_winRateCell(int wins, int losses) =>
-    int total = wins + losses
-    total > 0 ? str.tostring(wins) + "-" + str.tostring(losses) + " (" + str.tostring(math.round(wins / total * 100)) + "%)" : "0-0 (--)"
+// Trimmed to exactly the 6 rows requested: Coach Observation, Reaction,
+// Session Profile, Structure, Volume Pressure, Momentum. Session (name +
+// favorable/caution) and Day Profile were previously two separate rows --
+// merged into one "Session Profile" row here since that's the only slot
+// left for session context. Zones Broken, Swing High/Low, Cooldown,
+// Setups Registered, and Long/Short Record are no longer shown on this
+// table (the Outcome Tracker's underlying counters still accumulate in
+// the background -- see Entry Funnel Diagnostics for anything needing
+// that level of detail).
+string sessionProfileText = activeSessionLabel + " -- " + dayProfile + (dayShowsManipulation ? " (!)" : "")
+color sessionProfileColor = dayShowsManipulation ? color.orange : sessionFavorable ? color.aqua : color.gray
 
-var table coachTable = table.new(f_tablePosition(dashboardPositionInput), 2, 14, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+var table coachTable = table.new(f_tablePosition(dashboardPositionInput), 2, 7, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
 
 if barstate.islast and showDashboardInput
     dashTextSize = f_tableTextSize(dashboardSizeInput)
@@ -1318,44 +1317,23 @@ if barstate.islast and showDashboardInput
     table.cell(coachTable, 0, 0, "TRADING COACH", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = dashTextSize)
     table.cell(coachTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = dashTextSize)
 
-    table.cell(coachTable, 0, 1, "Session", text_color = color.white, text_size = dashTextSize)
-    table.cell(coachTable, 1, 1, activeSessionLabel + (sessionFavorable ? " (favorable)" : " (caution)"), text_color = sessionFavorable ? color.aqua : color.orange, text_size = dashTextSize)
+    table.cell(coachTable, 0, 1, "Coach Observation", text_color = color.yellow, text_size = dashTextSize)
+    table.cell(coachTable, 1, 1, coachMessage, text_color = (actualLongSignal or actualShortSignal) ? color.white : color.yellow, text_size = dashTextSize)
 
-    table.cell(coachTable, 0, 2, "Day Profile", text_color = color.white, text_size = dashTextSize)
-    table.cell(coachTable, 1, 2, dayProfile + (dayShowsManipulation ? " (!)" : ""), text_color = dayShowsManipulation ? color.orange : color.gray, text_size = dashTextSize)
+    table.cell(coachTable, 0, 2, "Reaction", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 2, zoneReactionMessage, text_color = zoneReactionColor, text_size = dashTextSize)
 
-    table.cell(coachTable, 0, 3, "Zones Broken", text_color = color.white, text_size = dashTextSize)
-    table.cell(coachTable, 1, 3, str.tostring(zonesBrokenCount) + " / 6", text_color = color.gray, text_size = dashTextSize)
+    table.cell(coachTable, 0, 3, "Session Profile", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 3, sessionProfileText, text_color = sessionProfileColor, text_size = dashTextSize)
 
     table.cell(coachTable, 0, 4, "Structure", text_color = color.white, text_size = dashTextSize)
     table.cell(coachTable, 1, 4, structureTrend, text_color = structureTrend == "UP" ? longColorInput : structureTrend == "DOWN" ? shortColorInput : color.gray, text_size = dashTextSize)
 
-    table.cell(coachTable, 0, 5, "Momentum", text_color = color.white, text_size = dashTextSize)
-    table.cell(coachTable, 1, 5, tdiConfirmsLong ? "BULLISH" : tdiConfirmsShort ? "BEARISH" : "NEUTRAL", text_color = tdiConfirmsLong ? longColorInput : tdiConfirmsShort ? shortColorInput : color.gray, text_size = dashTextSize)
+    table.cell(coachTable, 0, 5, "Volume Pressure", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 5, str.tostring(executionDeltaPressure, "#.0") + "%", text_color = executionDeltaPressure >= 0 ? longColorInput : shortColorInput, text_size = dashTextSize)
 
-    table.cell(coachTable, 0, 6, "Pressure", text_color = color.white, text_size = dashTextSize)
-    table.cell(coachTable, 1, 6, str.tostring(executionDeltaPressure, "#.0") + "%", text_color = executionDeltaPressure >= 0 ? longColorInput : shortColorInput, text_size = dashTextSize)
-
-    table.cell(coachTable, 0, 7, "Swing High/Low", text_color = color.white, text_size = dashTextSize)
-    table.cell(coachTable, 1, 7, (na(recentSwingHigh) ? "--" : str.tostring(recentSwingHigh, format.mintick)) + " / " + (na(recentSwingLow) ? "--" : str.tostring(recentSwingLow, format.mintick)), text_color = color.gray, text_size = dashTextSize)
-
-    table.cell(coachTable, 0, 8, "Coach Says", text_color = color.yellow, text_size = dashTextSize)
-    table.cell(coachTable, 1, 8, coachMessage, text_color = (actualLongSignal or actualShortSignal) ? color.white : color.yellow, text_size = dashTextSize)
-
-    table.cell(coachTable, 0, 9, "Zone Reaction", text_color = color.white, text_size = dashTextSize)
-    table.cell(coachTable, 1, 9, zoneReactionMessage, text_color = zoneReactionColor, text_size = dashTextSize)
-
-    table.cell(coachTable, 0, 10, "Cooldown (P/B)", text_color = color.white, text_size = dashTextSize)
-    table.cell(coachTable, 1, 10, "L " + (longPullbackCooldownOk ? "OK" : "wait") + "/" + (longBreakoutCooldownOk ? "OK" : "wait") + " -- S " + (shortPullbackCooldownOk ? "OK" : "wait") + "/" + (shortBreakoutCooldownOk ? "OK" : "wait"), text_color = color.gray, text_size = dashTextSize)
-
-    table.cell(coachTable, 0, 11, "Setups Registered", text_color = color.white, text_size = dashTextSize)
-    table.cell(coachTable, 1, 11, str.tostring(totalSetupsRegistered), text_color = color.gray, text_size = dashTextSize)
-
-    table.cell(coachTable, 0, 12, "Long Record", text_color = longColorInput, text_size = dashTextSize)
-    table.cell(coachTable, 1, 12, f_winRateCell(longWins, longLosses) + " (Exp " + str.tostring(longExpired) + ")", text_color = longColorInput, text_size = dashTextSize)
-
-    table.cell(coachTable, 0, 13, "Short Record", text_color = shortColorInput, text_size = dashTextSize)
-    table.cell(coachTable, 1, 13, f_winRateCell(shortWins, shortLosses) + " (Exp " + str.tostring(shortExpired) + ")", text_color = shortColorInput, text_size = dashTextSize)
+    table.cell(coachTable, 0, 6, "Momentum", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 6, tdiConfirmsLong ? "BULLISH" : tdiConfirmsShort ? "BEARISH" : "NEUTRAL", text_color = tdiConfirmsLong ? longColorInput : tdiConfirmsShort ? shortColorInput : color.gray, text_size = dashTextSize)
 
 
 // ============================================================================
