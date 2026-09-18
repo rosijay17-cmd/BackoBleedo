@@ -875,6 +875,7 @@ if array.size(pendingEntryBar) > 0
 string G_VISUALS = "08 - Visuals"
 
 showStructureLineInput = input.bool(true, "Show Structure Trend Color On Bars", group = G_VISUALS)
+structureBarColorTransparencyInput = input.int(25, "Structure Bar Color Transparency", minval = 0, maxval = 100, tooltip = "0 = fully solid, 100 = fully invisible. Was hardcoded to 70 (too faint to read confidently on a small screen). This reads the exact same Structure value shown in the dashboard -- there is no separate logic for the two.", group = G_VISUALS)
 showSwingZonesInput = input.bool(true, "Show Native Swing Zone Boxes", group = G_VISUALS)
 showEntryMarkersInput = input.bool(true, "Show Entry Markers", group = G_VISUALS)
 showRiskLabelsInput = input.bool(true, "Show Risk Management Labels", group = G_VISUALS)
@@ -883,10 +884,11 @@ shortColorInput = input.color(color.orange, "Short Color", group = G_VISUALS)
 
 barcolor(
      showStructureLineInput and structureTrend == "UP" ?
-     color.new(longColorInput, 70) :
+     color.new(longColorInput, structureBarColorTransparencyInput) :
      showStructureLineInput and structureTrend == "DOWN" ?
-     color.new(shortColorInput, 70) :
-     na
+     color.new(shortColorInput, structureBarColorTransparencyInput) :
+     na,
+     title = "Structure Trend Bar Color"
 )
 
 // ============================================================================
@@ -1095,6 +1097,7 @@ if newDayCoach
 // DATA WINDOW
 // ============================================================================
 
+plot(structureTrend == "UP" ? 1 : structureTrend == "DOWN" ? -1 : 0, title = "Structure Trend (1=UP, -1=DOWN, 0=RANGE)", display = display.data_window)
 plot(structureHigherHigh ? 1 : structureLowerHigh ? -1 : 0, title = "Structure HH/LH Flag", display = display.data_window)
 plot(atrCoach, title = "ATR", display = display.data_window)
 plot(executionDeltaPressure, title = "Execution Pressure %", display = display.data_window)
