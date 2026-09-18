@@ -219,6 +219,22 @@ if nyInSession
     nyHigh := math.max(high, nz(nyHigh, low))
     nyLow := math.min(low, nz(nyLow, high))
 
+// -- Liquidity Sweep Tracker: does London sweep the PRIOR DAY's NY
+// session high? -- a real, backtested count instead of a guess.
+// priorDayNyHigh is snapshotted at each daily reset (see RESET ON NEW
+// DAY below) from the just-completed day's nyHigh, before that gets
+// wiped for the new day. This checks every London bar for a wick above
+// it, at most once per day; that day's outcome (hit or not) is counted
+// into londonSweepDaysTotal/Hit at the NEXT day's reset, using these
+// same two vars, right before they get overwritten for the new day.
+var float priorDayNyHigh = na
+var bool londonSweptPriorNyHigh = false
+var int londonSweepDaysTotal = 0
+var int londonSweepDaysHit = 0
+
+if londonInSession and not na(priorDayNyHigh) and not londonSweptPriorNyHigh and high >= priorDayNyHigh
+    londonSweptPriorNyHigh := true
+
 // -- Session boxes: one box per session spanning its actual running
 // high/low over its full time window, labeled with the session's own
 // name via the box's own `text` parameter. Same create-once/update-in-
@@ -1568,6 +1584,50 @@ if barstate.islast and showFunnelInput
 
 
 // ============================================================================
+// 11 - LIQUIDITY SWEEP TRACKER
+// ----------------------------------------------------------------------------
+// Answers "how often does London actually sweep the prior day's NY
+// session high" with a real count from the chart's own loaded history,
+// instead of a guess -- see the Liquidity Sweep Tracker block in
+// section 01 (where priorDayNyHigh/londonSweptPriorNyHigh are tracked)
+// and the finalize step in RESET ON NEW DAY below (where each day's
+// outcome gets counted into londonSweepDaysHit/Total).
+// ============================================================================
+
+string G_SWEEP = "11 - Liquidity Sweep Tracker"
+
+showSweepTrackerInput = input.bool(true, "Show Liquidity Sweep Tracker Table", group = G_SWEEP)
+sweepTrackerPositionInput = input.string("Bottom Right", "Sweep Tracker Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_SWEEP)
+sweepTrackerSizeInput = input.string("Small", "Sweep Tracker Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_SWEEP)
+
+var table sweepTable = table.new(f_tablePosition(sweepTrackerPositionInput), 2, 3, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast and showSweepTrackerInput
+    sweepTextSize = f_tableTextSize(sweepTrackerSizeInput)
+
+    table.cell(sweepTable, 0, 0, "LIQUIDITY SWEEP", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = sweepTextSize)
+    table.cell(sweepTable, 1, 0, "London vs Prior NY High", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = sweepTextSize)
+
+    string sweepHistoryText = (
+         londonSweepDaysTotal > 0 ?
+         str.tostring(londonSweepDaysHit) + " / " + str.tostring(londonSweepDaysTotal) + " (" + str.tostring(math.round(londonSweepDaysHit / londonSweepDaysTotal * 100)) + "%)" :
+         "No completed days yet"
+    )
+    table.cell(sweepTable, 0, 1, "Historical", text_color = color.white, text_size = sweepTextSize)
+    table.cell(sweepTable, 1, 1, sweepHistoryText, text_color = color.gray, text_size = sweepTextSize)
+
+    string sweepTodayText = (
+         na(priorDayNyHigh) ?
+         "No prior NY high yet" :
+         londonSweptPriorNyHigh ?
+         "SWEPT " + str.tostring(priorDayNyHigh, format.mintick) :
+         "Not yet (target " + str.tostring(priorDayNyHigh, format.mintick) + ")"
+    )
+    table.cell(sweepTable, 0, 2, "Today", text_color = color.white, text_size = sweepTextSize)
+    table.cell(sweepTable, 1, 2, sweepTodayText, text_color = londonSweptPriorNyHigh ? longColorInput : color.gray, text_size = sweepTextSize)
+
+
+// ============================================================================
 // RESET ON NEW DAY
 // ----------------------------------------------------------------------------
 // Session OHLC, zone-broken flags, and the day's Profile classification
@@ -1583,6 +1643,15 @@ if barstate.islast and showFunnelInput
 bool newDayCoach = ta.change(time("D", timezoneInput)) != 0
 
 if newDayCoach
+    // Finalize the Liquidity Sweep Tracker for the day that's ending,
+    // using the OLD priorDayNyHigh/londonSweptPriorNyHigh, before they
+    // get overwritten below for the new day.
+    if not na(priorDayNyHigh)
+        londonSweepDaysTotal += 1
+        if londonSweptPriorNyHigh
+            londonSweepDaysHit += 1
+    priorDayNyHigh := nyHigh
+    londonSweptPriorNyHigh := false
     asiaOpen := na
     asiaClose := na
     asiaHigh := na
@@ -1636,6 +1705,9 @@ plot(barsSinceResistanceTouch, title = "Bars Since Resistance Touch", display = 
 plot(normZscore, title = "Z-Score", display = display.data_window)
 plot(normZscoreFast, title = "Z-Score Fast", display = display.data_window)
 plot(rangeTrend, title = "Range Trend (1=UP, -1=DOWN)", display = display.data_window)
+plot(priorDayNyHigh, title = "Prior Day NY High", display = display.data_window)
+plot(londonSweptPriorNyHigh ? 1 : 0, title = "London Swept Prior NY High (Today)", display = display.data_window)
+plot(londonSweepDaysTotal > 0 ? londonSweepDaysHit / londonSweepDaysTotal * 100.0 : na, title = "London Sweep Rate %", display = display.data_window)
 
 
 // ============================================================================
