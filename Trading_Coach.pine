@@ -260,6 +260,61 @@ else if nyInSession and showSessionBoxesInput and not na(nySessionBox)
     box.set_bottom(nySessionBox, nyLow)
     box.set_right(nySessionBox, bar_index + 1)
 
+// -- Session high/low price labels: one pair per session, positioned at
+// the box's right edge and tracking the running high/low live, frozen the
+// same way the box itself freezes once that session ends. --
+var label asiaHighLabel = na
+var label asiaLowLabel = na
+var label londonHighLabel = na
+var label londonLowLabel = na
+var label nyHighLabel = na
+var label nyLowLabel = na
+
+if asiaSessionStart and showSessionBoxesInput
+    if not na(asiaHighLabel)
+        label.delete(asiaHighLabel)
+    if not na(asiaLowLabel)
+        label.delete(asiaLowLabel)
+    asiaHighLabel := label.new(bar_index + 1, high, text = str.tostring(high, format.mintick), style = label.style_label_left, color = color.new(color.yellow, 0), textcolor = color.black, size = size.tiny)
+    asiaLowLabel := label.new(bar_index + 1, low, text = str.tostring(low, format.mintick), style = label.style_label_left, color = color.new(color.yellow, 0), textcolor = color.black, size = size.tiny)
+else if asiaInSession and showSessionBoxesInput and not na(asiaHighLabel)
+    label.set_x(asiaHighLabel, bar_index + 1)
+    label.set_y(asiaHighLabel, asiaHigh)
+    label.set_text(asiaHighLabel, str.tostring(asiaHigh, format.mintick))
+    label.set_x(asiaLowLabel, bar_index + 1)
+    label.set_y(asiaLowLabel, asiaLow)
+    label.set_text(asiaLowLabel, str.tostring(asiaLow, format.mintick))
+
+if londonSessionStart and showSessionBoxesInput
+    if not na(londonHighLabel)
+        label.delete(londonHighLabel)
+    if not na(londonLowLabel)
+        label.delete(londonLowLabel)
+    londonHighLabel := label.new(bar_index + 1, high, text = str.tostring(high, format.mintick), style = label.style_label_left, color = color.new(color.red, 0), textcolor = color.white, size = size.tiny)
+    londonLowLabel := label.new(bar_index + 1, low, text = str.tostring(low, format.mintick), style = label.style_label_left, color = color.new(color.red, 0), textcolor = color.white, size = size.tiny)
+else if londonInSession and showSessionBoxesInput and not na(londonHighLabel)
+    label.set_x(londonHighLabel, bar_index + 1)
+    label.set_y(londonHighLabel, londonHigh)
+    label.set_text(londonHighLabel, str.tostring(londonHigh, format.mintick))
+    label.set_x(londonLowLabel, bar_index + 1)
+    label.set_y(londonLowLabel, londonLow)
+    label.set_text(londonLowLabel, str.tostring(londonLow, format.mintick))
+
+if nySessionStart and showSessionBoxesInput
+    if not na(nyHighLabel)
+        label.delete(nyHighLabel)
+    if not na(nyLowLabel)
+        label.delete(nyLowLabel)
+    nyHighLabel := label.new(bar_index + 1, high, text = str.tostring(high, format.mintick), style = label.style_label_left, color = color.new(color.blue, 0), textcolor = color.white, size = size.tiny)
+    nyLowLabel := label.new(bar_index + 1, low, text = str.tostring(low, format.mintick), style = label.style_label_left, color = color.new(color.blue, 0), textcolor = color.white, size = size.tiny)
+else if nyInSession and showSessionBoxesInput and not na(nyHighLabel)
+    label.set_x(nyHighLabel, bar_index + 1)
+    label.set_y(nyHighLabel, nyHigh)
+    label.set_text(nyHighLabel, str.tostring(nyHigh, format.mintick))
+    label.set_x(nyLowLabel, bar_index + 1)
+    label.set_y(nyLowLabel, nyLow)
+    label.set_text(nyLowLabel, str.tostring(nyLow, format.mintick))
+
 // -- Zone break / role-reversal tracking --
 var bool asiaHighBroken = false
 var bool asiaLowBroken = false
