@@ -1359,6 +1359,76 @@ if barstate.islast and showDashboardInput
 
 
 // ============================================================================
+// 10 - ENTRY FUNNEL DIAGNOSTICS
+// ----------------------------------------------------------------------------
+// Same reasoning as delta_break_retest/Stage8's own funnel diagnostics:
+// when a script reports zero signals over real chart history, the useful
+// question isn't "is it broken" -- it's "which single gate is actually
+// killing every attempt." Each of the 4 direction x mode combinations
+// gets its own cumulative funnel: a bar only counts at stage N if it
+// already passed every stage before it, so the gap between any two
+// consecutive stage counts IS the number of bars that specific gate
+// blocked (once the earlier stages were already satisfied).
+// ============================================================================
+
+string G_FUNNEL = "10 - Entry Funnel Diagnostics"
+
+showFunnelInput = input.bool(true, "Show Entry Funnel Diagnostics Table", group = G_FUNNEL)
+funnelTablePositionInput = input.string("Bottom Left", "Funnel Table Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_FUNNEL)
+funnelTableSizeInput = input.string("Tiny", "Funnel Table Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_FUNNEL)
+
+// counts[0] = bars evaluated, [1] = +structure, [2] = +ready (location &
+// candle), [3] = +momentum, [4] = +pressure, [5] = +session,
+// [6] = +cooldown (== that mode's SetupNow actually firing).
+var array<int> fLongPullback = array.new_int(7, 0)
+var array<int> fLongBreakout = array.new_int(7, 0)
+var array<int> fShortPullback = array.new_int(7, 0)
+var array<int> fShortBreakout = array.new_int(7, 0)
+
+f_incrFunnel(array<int> counts, bool structureOk, bool readyOk, bool momentumOk, bool pressureOk, bool sessionOk, bool cooldownOk) =>
+    array.set(counts, 0, array.get(counts, 0) + 1)
+    if structureOk
+        array.set(counts, 1, array.get(counts, 1) + 1)
+        if readyOk
+            array.set(counts, 2, array.get(counts, 2) + 1)
+            if momentumOk
+                array.set(counts, 3, array.get(counts, 3) + 1)
+                if pressureOk
+                    array.set(counts, 4, array.get(counts, 4) + 1)
+                    if sessionOk
+                        array.set(counts, 5, array.get(counts, 5) + 1)
+                        if cooldownOk
+                            array.set(counts, 6, array.get(counts, 6) + 1)
+    true
+
+if barstate.isconfirmed
+    f_incrFunnel(fLongPullback, longStructureOk, longPullbackReady, momentumOkLongPullback, pressureOkLongPullback, sessionOkPullback, longPullbackCooldownOk)
+    f_incrFunnel(fLongBreakout, longStructureOk, longBreakoutReady, momentumOkLongBreakout, pressureOkLongBreakout, sessionOkBreakout, longBreakoutCooldownOk)
+    f_incrFunnel(fShortPullback, shortStructureOk, shortPullbackReady, momentumOkShortPullback, pressureOkShortPullback, sessionOkPullback, shortPullbackCooldownOk)
+    f_incrFunnel(fShortBreakout, shortStructureOk, shortBreakoutReady, momentumOkShortBreakout, pressureOkShortBreakout, sessionOkBreakout, shortBreakoutCooldownOk)
+
+var table funnelTable = table.new(f_tablePosition(funnelTablePositionInput), 5, 8, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast and showFunnelInput
+    funnelTextSize = f_tableTextSize(funnelTableSizeInput)
+    array<string> funnelLabels = array.from("ENTRY FUNNEL", "Bars Evaluated", "+ Structure", "+ Ready (Loc+Candle)", "+ Momentum", "+ Pressure", "+ Session", "+ Cooldown (Fired)")
+
+    for row = 0 to 7
+        table.cell(funnelTable, 0, row, array.get(funnelLabels, row), text_color = color.white, bgcolor = row == 0 ? color.rgb(22, 52, 86) : na, text_size = funnelTextSize)
+
+    table.cell(funnelTable, 1, 0, "LP", text_color = longColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
+    table.cell(funnelTable, 2, 0, "LB", text_color = longColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
+    table.cell(funnelTable, 3, 0, "SP", text_color = shortColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
+    table.cell(funnelTable, 4, 0, "SB", text_color = shortColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
+
+    for row = 1 to 7
+        table.cell(funnelTable, 1, row, str.tostring(array.get(fLongPullback, row - 1)), text_color = color.gray, text_size = funnelTextSize)
+        table.cell(funnelTable, 2, row, str.tostring(array.get(fLongBreakout, row - 1)), text_color = color.gray, text_size = funnelTextSize)
+        table.cell(funnelTable, 3, row, str.tostring(array.get(fShortPullback, row - 1)), text_color = color.gray, text_size = funnelTextSize)
+        table.cell(funnelTable, 4, row, str.tostring(array.get(fShortBreakout, row - 1)), text_color = color.gray, text_size = funnelTextSize)
+
+
+// ============================================================================
 // RESET ON NEW DAY
 // ----------------------------------------------------------------------------
 // Session OHLC, zone-broken flags, and the day's Profile classification
