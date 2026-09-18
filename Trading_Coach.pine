@@ -709,6 +709,80 @@ string coachMessage = (
      "No clear setup forming"
 )
 
+// -- Zone Reaction --
+// Live read of how price is behaving inside the nearest native
+// support/resistance zone -- separate from "Coach Says" above (which is
+// about entry-setup gating, not moment-to-moment price action). A
+// persistent state per zone: Untested -> Testing -> Holding/Rejected.
+// Resets to Untested whenever the underlying swing pivot itself changes
+// (a new zone to test), using the na()-safe change check from gotcha #6
+// (recentSwingLow can start life as na, so a plain != would misread it).
+float zoneHalfCoach = zoneToleranceAtrInput * atrCoach
+
+var float lastSupportZoneLevel = na
+var float lastResistanceZoneLevel = na
+var string supportZoneStatus = "Untested"
+var string resistanceZoneStatus = "Untested"
+
+bool supportZoneChanged = not na(recentSwingLow) and (na(lastSupportZoneLevel) or recentSwingLow != lastSupportZoneLevel)
+bool resistanceZoneChanged = not na(recentSwingHigh) and (na(lastResistanceZoneLevel) or recentSwingHigh != lastResistanceZoneLevel)
+
+float supportZoneTop = recentSwingLow + zoneHalfCoach
+float supportZoneBottom = recentSwingLow - zoneHalfCoach
+float resistanceZoneTop = recentSwingHigh + zoneHalfCoach
+float resistanceZoneBottom = recentSwingHigh - zoneHalfCoach
+
+bool testingSupportNow = not na(recentSwingLow) and low <= supportZoneTop and high >= supportZoneBottom
+bool testingResistanceNow = not na(recentSwingHigh) and low <= resistanceZoneTop and high >= resistanceZoneBottom
+
+if barstate.isconfirmed
+    if supportZoneChanged
+        lastSupportZoneLevel := recentSwingLow
+        supportZoneStatus := "Untested"
+    else if testingSupportNow
+        supportZoneStatus := "Testing"
+    else if supportZoneStatus == "Testing" and close > supportZoneTop
+        supportZoneStatus := "Holding"
+    else if supportZoneStatus == "Testing" and close < supportZoneBottom
+        supportZoneStatus := "Rejected"
+
+    if resistanceZoneChanged
+        lastResistanceZoneLevel := recentSwingHigh
+        resistanceZoneStatus := "Untested"
+    else if testingResistanceNow
+        resistanceZoneStatus := "Testing"
+    else if resistanceZoneStatus == "Testing" and close < resistanceZoneBottom
+        resistanceZoneStatus := "Holding"
+    else if resistanceZoneStatus == "Testing" and close > resistanceZoneTop
+        resistanceZoneStatus := "Rejected"
+
+// One engaging line combining both zones' live reads, same branch order
+// reused for the color ternary below so text and color never disagree.
+string zoneReactionMessage = (
+     supportZoneStatus == "Testing" and resistanceZoneStatus == "Testing" ?
+     "Price caught between support and resistance -- watch both" :
+     supportZoneStatus == "Testing" ?
+     "Testing support " + str.tostring(recentSwingLow, format.mintick) + " -- watch for bounce or break" :
+     resistanceZoneStatus == "Testing" ?
+     "Testing resistance " + str.tostring(recentSwingHigh, format.mintick) + " -- watch for rejection or break" :
+     supportZoneStatus == "Rejected" and resistanceZoneStatus == "Holding" ?
+     "Support broke, resistance still capping -- bearish read" :
+     resistanceZoneStatus == "Rejected" and supportZoneStatus == "Holding" ?
+     "Resistance broke, support still underneath -- bullish read" :
+     supportZoneStatus == "Holding" ?
+     "Support holding -- buyers defended the level" :
+     supportZoneStatus == "Rejected" ?
+     "Support rejected -- level failed, price broke through" :
+     resistanceZoneStatus == "Holding" ?
+     "Resistance holding -- sellers defended the level" :
+     resistanceZoneStatus == "Rejected" ?
+     "Resistance rejected -- level failed, price broke through" :
+     "No active zone test right now"
+)
+// zoneReactionColor (needs longColorInput/shortColorInput) is computed
+// further down once the Visuals section brings those inputs into scope --
+// see "Zone Reaction color" near the dashboard build below.
+
 
 // ============================================================================
 // 06 - RISK MANAGEMENT
@@ -891,6 +965,31 @@ barcolor(
      title = "Structure Trend Bar Color"
 )
 
+// Zone Reaction color -- same branch order as zoneReactionMessage above so
+// text and color never disagree; deferred to here because it needs
+// longColorInput/shortColorInput, which only exist from this point on.
+color zoneReactionColor = (
+     supportZoneStatus == "Testing" and resistanceZoneStatus == "Testing" ?
+     color.gray :
+     supportZoneStatus == "Testing" ?
+     color.yellow :
+     resistanceZoneStatus == "Testing" ?
+     color.yellow :
+     supportZoneStatus == "Rejected" and resistanceZoneStatus == "Holding" ?
+     shortColorInput :
+     resistanceZoneStatus == "Rejected" and supportZoneStatus == "Holding" ?
+     longColorInput :
+     supportZoneStatus == "Holding" ?
+     longColorInput :
+     supportZoneStatus == "Rejected" ?
+     shortColorInput :
+     resistanceZoneStatus == "Holding" ?
+     shortColorInput :
+     resistanceZoneStatus == "Rejected" ?
+     longColorInput :
+     color.gray
+)
+
 // ============================================================================
 // SUPPORT / RESISTANCE ZONE BOXES
 // ----------------------------------------------------------------------------
@@ -1011,7 +1110,7 @@ f_winRateCell(int wins, int losses) =>
     int total = wins + losses
     total > 0 ? str.tostring(wins) + "-" + str.tostring(losses) + " (" + str.tostring(math.round(wins / total * 100)) + "%)" : "0-0 (--)"
 
-var table coachTable = table.new(f_tablePosition(dashboardPositionInput), 2, 13, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+var table coachTable = table.new(f_tablePosition(dashboardPositionInput), 2, 14, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
 
 if barstate.islast and showDashboardInput
     dashTextSize = f_tableTextSize(dashboardSizeInput)
@@ -1043,17 +1142,20 @@ if barstate.islast and showDashboardInput
     table.cell(coachTable, 0, 8, "Coach Says", text_color = color.yellow, text_size = dashTextSize)
     table.cell(coachTable, 1, 8, coachMessage, text_color = (actualLongSignal or actualShortSignal) ? color.white : color.yellow, text_size = dashTextSize)
 
-    table.cell(coachTable, 0, 9, "Cooldown", text_color = color.white, text_size = dashTextSize)
-    table.cell(coachTable, 1, 9, "L " + (longCooldownOk ? "OK" : "wait") + " / S " + (shortCooldownOk ? "OK" : "wait"), text_color = color.gray, text_size = dashTextSize)
+    table.cell(coachTable, 0, 9, "Zone Reaction", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 9, zoneReactionMessage, text_color = zoneReactionColor, text_size = dashTextSize)
 
-    table.cell(coachTable, 0, 10, "Setups Registered", text_color = color.white, text_size = dashTextSize)
-    table.cell(coachTable, 1, 10, str.tostring(totalSetupsRegistered), text_color = color.gray, text_size = dashTextSize)
+    table.cell(coachTable, 0, 10, "Cooldown", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 10, "L " + (longCooldownOk ? "OK" : "wait") + " / S " + (shortCooldownOk ? "OK" : "wait"), text_color = color.gray, text_size = dashTextSize)
 
-    table.cell(coachTable, 0, 11, "Long Record", text_color = longColorInput, text_size = dashTextSize)
-    table.cell(coachTable, 1, 11, f_winRateCell(longWins, longLosses) + " (Exp " + str.tostring(longExpired) + ")", text_color = longColorInput, text_size = dashTextSize)
+    table.cell(coachTable, 0, 11, "Setups Registered", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 11, str.tostring(totalSetupsRegistered), text_color = color.gray, text_size = dashTextSize)
 
-    table.cell(coachTable, 0, 12, "Short Record", text_color = shortColorInput, text_size = dashTextSize)
-    table.cell(coachTable, 1, 12, f_winRateCell(shortWins, shortLosses) + " (Exp " + str.tostring(shortExpired) + ")", text_color = shortColorInput, text_size = dashTextSize)
+    table.cell(coachTable, 0, 12, "Long Record", text_color = longColorInput, text_size = dashTextSize)
+    table.cell(coachTable, 1, 12, f_winRateCell(longWins, longLosses) + " (Exp " + str.tostring(longExpired) + ")", text_color = longColorInput, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 13, "Short Record", text_color = shortColorInput, text_size = dashTextSize)
+    table.cell(coachTable, 1, 13, f_winRateCell(shortWins, shortLosses) + " (Exp " + str.tostring(shortExpired) + ")", text_color = shortColorInput, text_size = dashTextSize)
 
 
 // ============================================================================
