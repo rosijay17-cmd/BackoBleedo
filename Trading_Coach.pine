@@ -1284,6 +1284,17 @@ plot(executionDeltaPressure, title = "Execution Pressure %", display = display.d
 plot(actualLongSignal ? 1 : 0, title = "Actual Long Signal", display = display.data_window)
 plot(actualShortSignal ? 1 : 0, title = "Actual Short Signal", display = display.data_window)
 
+// Breakout diagnostics -- lets you check the exact price a decisive
+// breakout requires on the LAST CONFIRMED bar, instead of guessing from
+// the live/unconfirmed ticking price shown on the chart itself (Coach
+// Says, Zone Reaction, and every entry signal only ever evaluate on
+// barstate.isconfirmed, by design -- so the current forming candle's
+// price can run ahead of what the dashboard reports until it closes).
+plot(not na(recentSwingHigh) ? recentSwingHigh + breakoutDistanceAtrInput * atrCoach : na, title = "Long Breakout Threshold Price", display = display.data_window)
+plot(not na(recentSwingLow) ? recentSwingLow - breakoutDistanceAtrInput * atrCoach : na, title = "Short Breakout Threshold Price", display = display.data_window)
+plot(breakoutAboveResistance ? 1 : 0, title = "Breakout Above Resistance (Confirmed Bar)", display = display.data_window)
+plot(breakoutBelowSupport ? 1 : 0, title = "Breakout Below Support (Confirmed Bar)", display = display.data_window)
+
 
 // ============================================================================
 // STARTING SETTINGS
