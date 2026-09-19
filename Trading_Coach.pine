@@ -3,10 +3,11 @@ indicator(
      "Trading Coach - Setup Identifier",
      shorttitle = "Trading Coach",
      overlay = true,
-     max_boxes_count = 50,
+     max_boxes_count = 150,
      max_lines_count = 100,
      max_labels_count = 200
 )
+import TradingView/ta/9
 
 // ============================================================================
 // TRADING COACH - SETUP IDENTIFIER
@@ -34,15 +35,19 @@ indicator(
 // teach you to read structure/session/momentum/risk yourself over time, not
 // just to blink an arrow at you.
 //
-// ENTRY MODEL (a single, teachable, explicit model -- pullback-in-trend):
+// ENTRY MODEL (section 05 -- Breakout & Retest, ported from the user-
+// supplied "Breakout and Retest Signals [AlgoAlpha]" indicator, replacing
+// the file's original pullback-in-trend model entirely):
 // HTF STRUCTURE (UP/DOWN/RANGE)
-// -> PRICE PULLS BACK TO A RECENT SWING LEVEL
-// -> A REVERSAL CANDLE CONFIRMS
+// -> A NEW SWING PIVOT FORMS AND MATCHES AN ALREADY-BROKEN OPPOSITE-SIDE
+//    SWING POINT STILL IN MEMORY (WITHIN AN ATR-SCALED TOLERANCE) --
+//    A BREAKOUT-AND-RETEST EVENT
 // -> TDI MOMENTUM AGREES
 // -> SESSION IS FAVORABLE
 // -> COOLDOWN ALLOWS IT
-// -> SETUP FIRES, WITH A STRUCTURE-BASED STOP, AN R-MULTIPLE TARGET, AND A
-//    SUGGESTED POSITION SIZE FROM YOUR OWN ACCOUNT-RISK INPUTS
+// -> SETUP FIRES, WITH A STOP AT THE MATCHED SWING POINT, AN R-MULTIPLE
+//    TARGET, AND A SUGGESTED POSITION SIZE FROM YOUR OWN ACCOUNT-RISK
+//    INPUTS
 //
 // IMPORTANT: this is an indicator, not a strategy -- it never places real
 // orders. It marks down what a disciplined entry would look like and lets
@@ -55,14 +60,6 @@ indicator(
 // ============================================================================
 // HELPERS
 // ============================================================================
-
-f_clamp(float v, float lo, float hi) =>
-    math.max(lo, math.min(hi, v))
-
-f_delta(float o, float h, float l, float c, float v) =>
-    float safeRange = math.max(h - l, syminfo.mintick)
-    float pressure = f_clamp((c - o) / safeRange, -1.0, 1.0)
-    v * pressure
 
 f_tablePosition(string label) =>
     switch label
@@ -103,8 +100,8 @@ newYorkSessionInput = input.session("1300-2100", "New York Session", group = G_S
 favorForLondonInput = input.bool(true, "Favorable Session: London", group = G_SESSION)
 favorForNyInput = input.bool(true, "Favorable Session: New York", group = G_SESSION)
 favorForAsiaInput = input.bool(false, "Favorable Session: Asia", tooltip = "Off by default -- Asia is typically the lowest-liquidity session for most index/FX instruments. Turn on if your instrument actually trades well there.", group = G_SESSION)
-// "Require Favorable Session" moved to the Pullback/Breakout Filters
-// groups below (05a/05b) -- each mode now sets this independently.
+// "Require Favorable Session" lives in the Entry Setup group (05) below,
+// next to the rest of the entry gating.
 sessionBgTransparencyInput = input.int(85, "Session Background Tint Transparency", minval = 0, maxval = 100, tooltip = "0 = fully solid, 100 = fully invisible. Was hardcoded to 92 (barely visible).", group = G_SESSION)
 showSessionStartLinesInput = input.bool(true, "Show Session Start Lines", group = G_SESSION)
 showSessionLabelsInput = input.bool(true, "Show Session Name Labels", group = G_SESSION)
@@ -533,12 +530,15 @@ string structureTrend = (
      "RANGE"
 )
 
-// Native-timeframe swing tracking -- the "WHERE" to this script's pullback
-// entry model. A plain, direct pivot-confirmation read (not MTF-pulled, so
-// no offset/confirmation trick is needed the way the HTF pull above needed
-// one): ta.pivothigh/low only resolves non-na once genuinely confirmed
-// (structurePivotRightInput/nativePivotRightInput bars after the actual
-// peak), so this is already look-ahead-safe by construction.
+// Native-timeframe swing tracking. No longer feeds the entry model itself
+// (section 05 now runs its own separate, asymmetric swing detection for
+// the Breakout & Retest signal) -- this pair now exists for Zone Reaction
+// and the native swing zone boxes (Visuals) only. A plain, direct pivot-
+// confirmation read (not MTF-pulled, so no offset/confirmation trick is
+// needed the way the HTF pull above needed one): ta.pivothigh/low only
+// resolves non-na once genuinely confirmed (nativePivotRightInput bars
+// after the actual peak), so this is already look-ahead-safe by
+// construction.
 float nativePivotHigh = ta.pivothigh(high, nativePivotLeftInput, nativePivotRightInput)
 float nativePivotLow = ta.pivotlow(low, nativePivotLeftInput, nativePivotRightInput)
 
@@ -585,35 +585,42 @@ bool tdiConfirmsShort = tdiBearishMove and momentumFalling
 // ============================================================================
 // 04 - VOLUME PRESSURE
 // ----------------------------------------------------------------------------
-// Ported from delta_break_retest's f_delta/execution-pressure engine --
-// same candle-pressure estimate proven across Stage 1-9, reused here as an
-// optional extra confirmation layer.
+// Was an OHLCV-estimated candle-pressure heuristic (f_delta, proven across
+// delta_break_retest Stage 1-9). Replaced with REAL lower-timeframe buy/sell
+// volume via ta.requestUpAndDownVolume() -- the same source the AlgoAlpha
+// "Breakout and Retest Signals" entry model (section 05) uses for its own
+// box coloring/delta label -- so there is one consistent, more accurate
+// volume-delta source feeding both the entry model's visuals AND every
+// existing consumer of executionDeltaPressure (Setup Grade bonus, the
+// pressure gate, the dashboard's Volume Pressure row). Nothing downstream
+// needed to change -- same variable name, same shape (a rolling-window %),
+// just a better-sourced number underneath it.
 // ============================================================================
 
 string G_VOLUME = "04 - Volume Pressure"
 
 executionDeltaWindowInput = input.int(3, "Execution Pressure Window", minval = 1, maxval = 8, group = G_VOLUME)
-// The "Require Volume Pressure Agreement" gate itself moved to the
-// Pullback/Breakout Filters groups below (05a/05b) so each mode can
-// require it (or not) and threshold it independently. This input stays
-// here only as the threshold the Setup Grade bonus (grading, not
-// gating -- see "Zone confluence & Setup Grade" below) checks agreement
-// against, regardless of which mode's own gate is armed.
-minimumVolumePressureInput = input.float(5.0, "Volume Pressure Bonus Threshold %", minval = 0.0, maxval = 60.0, step = 1.0, tooltip = "Used only by the Setup Grade bonus scoring -- the actual entry gate's own threshold is set per-mode in the Pullback/Breakout Filters groups.", group = G_VOLUME)
+executionLtfInput = input.timeframe("5", "Lower Timeframe For Volume", tooltip = "Timeframe ta.requestUpAndDownVolume() aggregates real buy/sell volume from. Matches the AlgoAlpha entry model's own Lower Timeframe Value input.", group = G_VOLUME)
+requireVolumePressureInput = input.bool(false, "Require Volume Pressure Agreement", tooltip = "OFF by default -- same funnel-diagnostics reasoning as elsewhere in this file: a strict pressure gate can smother signal count on a noisy instrument. Turn on deliberately once you've watched how often it would have agreed.", group = G_VOLUME)
+minimumVolumePressureInput = input.float(5.0, "Minimum Volume Pressure %", minval = 0.0, maxval = 60.0, step = 1.0, tooltip = "Used both by the entry gate (when required above) and by the Setup Grade bonus scoring.", group = G_VOLUME)
+
+[executionUpVolume, executionDownVolume, executionDeltaVolume] = ta.requestUpAndDownVolume(executionLtfInput)
 
 float executionDeltaSum = 0.0
 float executionVolumeSum = 0.0
 
 for i = 0 to executionDeltaWindowInput - 1
-    float execVolume = nz(volume[i], 0.0)
-    executionDeltaSum += f_delta(open[i], high[i], low[i], close[i], execVolume)
-    executionVolumeSum += execVolume
+    executionDeltaSum += nz(executionDeltaVolume[i], 0.0)
+    executionVolumeSum += nz(executionUpVolume[i], 0.0) + nz(executionDownVolume[i], 0.0)
 
 float executionDeltaPressure = (
      executionVolumeSum > 0 ?
      executionDeltaSum / executionVolumeSum * 100.0 :
      0.0
 )
+
+bool pressureOkLong = not requireVolumePressureInput or executionDeltaPressure >= minimumVolumePressureInput
+bool pressureOkShort = not requireVolumePressureInput or executionDeltaPressure <= -minimumVolumePressureInput
 
 
 // ============================================================================
@@ -744,228 +751,184 @@ plotshape(showZscoreSignalsInput and normZscoreFast > zscoreObThresholdInput, ti
 
 
 // ============================================================================
-// 05 - ENTRY SETUP
+// 05 - ENTRY SETUP (Breakout & Retest -- AlgoAlpha)
 // ----------------------------------------------------------------------------
-// Two entry models against the same native swing support/resistance zones,
-// selectable independently or together: Pullback (buy a dip to support /
-// sell a rally to resistance, then a reversal candle) and Breakout (buy a
-// decisive push through resistance / sell a decisive push through support,
-// continuing the trend). Every gate is a separate, named boolean so the
-// "Coach Says" dashboard row can point at exactly which one is currently
-// unmet.
+// Replaces the prior Pullback/Breakout dual-mode entry model entirely, per
+// explicit request, with the user-supplied "Breakout and Retest Signals
+// [AlgoAlpha]" algorithm, ported with parity (same swing-matching math,
+// same "always consume the matched pivot" behavior, same box/line/label
+// shapes -- only identifiers renamed to this file's convention, colors
+// moved to dedicated inputs here since longColorInput/shortColorInput
+// aren't declared until the Visuals section, and the Unicode up/down
+// triangles swapped for plain "LONG"/"SHORT" text to match this file's
+// existing ASCII-label convention).
+//
+// MECHANISM: keeps the most recent arSwingMemoryInput swing highs/lows
+// (asymmetric pivots -- the confirmation length is Pivot Period divided by
+// Confirmation Multiplier, shorter than the detection length, so it
+// confirms faster than a symmetric pivot would). Whenever a NEW swing high
+// forms, it's matched against the closest-priced swing LOW still in
+// memory; if that low is within an ATR-scaled tolerance of the new high
+// AND price already closed below it (old support already broken), that's
+// a bearish breakout-retest -- old support broken, now being
+// retested/rejected from below as resistance. Mirrored for a new swing low
+// matched against stored swing highs (bullish breakout-retest, old
+// resistance broken and now support). The matched pivot is always removed
+// from memory once checked, signal or not, exactly as the source does.
+//
+// Structure/Momentum/Pressure/Session/Cooldown still gate the raw signal
+// into an actual LONG/SHORT setup -- those are general-purpose coaching
+// layers, not specific to the old dual-mode model, so they carry over.
 // ============================================================================
 
-string G_ENTRY = "05 - Entry Setup"
+string G_ENTRY = "05 - Entry Setup (Breakout & Retest)"
 
-entryModeInput = input.string("Both", "Entry Mode", options = ["Pullback Only", "Breakout Only", "Both"], tooltip = "Pullback: buy a dip to recent support / sell a rally to recent resistance, then a reversal candle. Breakout: buy a decisive push above recent resistance / sell a decisive push below recent support, continuing the trend.", group = G_ENTRY)
-pullbackToleranceAtrInput = input.float(0.30, "Pullback Tolerance To Swing (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, tooltip = "How close price needs to get to the recent swing level to count as a genuine pullback.", group = G_ENTRY)
-minBarsAtRetestInput = input.int(0, "Min Bars After Zone Touch Before Reversal", minval = 0, maxval = 20, tooltip = "0 (default) allows the reversal candle to be the SAME bar as the zone touch -- the original behavior. Raise this to require the reversal to develop over at least this many bars after price first tags the zone.", group = G_ENTRY)
-maxBarsAtRetestInput = input.int(5, "Max Bars After Zone Touch To Confirm Reversal", minval = 1, maxval = 50, tooltip = "How many bars price has to still produce a valid reversal candle after tagging the zone before that touch is considered stale and no longer counts.", group = G_ENTRY)
-breakoutDistanceAtrInput = input.float(0.25, "Breakout Distance Beyond Swing (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, tooltip = "How far beyond the recent swing level price must CLOSE to count as a decisive breakout, not just a marginal poke through it.", group = G_ENTRY)
-minimumReversalBodyFractionInput = input.float(0.30, "Minimum Candle Body / Range", minval = 0.0, maxval = 1.0, step = 0.05, tooltip = "Applies to both the pullback reversal candle and the breakout candle.", group = G_ENTRY)
-minimumReversalCloseLocationInput = input.float(0.60, "Minimum Candle Close Location", minval = 0.50, maxval = 0.95, step = 0.05, tooltip = "For a bullish candle, how close to the bar's own high the close must be (mirrored near the low for a bearish candle). 0.60 means the close must sit in at least the top 40% of the bar's range.", group = G_ENTRY)
-
-// -- Independent per-mode filters --
-// Momentum/pressure/session/cooldown used to be one shared set of gates
-// applied no matter which model fired. Pullback and Breakout now each
-// get their own copy, so (for example) a breakout can require volume
-// pressure agreement while a pullback doesn't, or the two can run
-// different cooldown lengths -- tune them completely independently.
-string G_PULLBACK_FILTERS = "05a - Pullback Filters"
-string G_BREAKOUT_FILTERS = "05b - Breakout Filters"
-
-requireMomentumPullbackInput = input.bool(true, "Require Momentum Confirmation", group = G_PULLBACK_FILTERS)
-requireVolumePressurePullbackInput = input.bool(false, "Require Volume Pressure Agreement", tooltip = "OFF by default -- Stage 8's own funnel diagnostics (delta_break_retest) proved a strict pressure gate can smother signal count on a noisy instrument. Turn on deliberately once you've watched how often Pullback setups would have agreed.", group = G_PULLBACK_FILTERS)
-minimumVolumePressurePullbackInput = input.float(5.0, "Minimum Volume Pressure %", minval = 0.0, maxval = 60.0, step = 1.0, group = G_PULLBACK_FILTERS)
-requireFavorableSessionPullbackInput = input.bool(true, "Require Favorable Session", group = G_PULLBACK_FILTERS)
-cooldownBarsPullbackInput = input.int(12, "Cooldown Bars Between Setups (Per Direction)", minval = 0, group = G_PULLBACK_FILTERS)
-
-requireMomentumBreakoutInput = input.bool(true, "Require Momentum Confirmation", group = G_BREAKOUT_FILTERS)
-requireVolumePressureBreakoutInput = input.bool(false, "Require Volume Pressure Agreement", tooltip = "OFF by default -- same funnel-diagnostics reasoning as the Pullback filter. Breakouts often benefit MORE from volume confirmation than pullbacks do, so it's worth testing on independently rather than assuming the same answer as Pullback.", group = G_BREAKOUT_FILTERS)
-minimumVolumePressureBreakoutInput = input.float(5.0, "Minimum Volume Pressure %", minval = 0.0, maxval = 60.0, step = 1.0, group = G_BREAKOUT_FILTERS)
-requireFavorableSessionBreakoutInput = input.bool(true, "Require Favorable Session", group = G_BREAKOUT_FILTERS)
-cooldownBarsBreakoutInput = input.int(12, "Cooldown Bars Between Setups (Per Direction)", minval = 0, group = G_BREAKOUT_FILTERS)
+arPeriodInput = input.int(7, "Pivot Period", minval = 1, tooltip = "Number of bars to look back for identifying swing points.", group = G_ENTRY)
+arConfirmMultiplierInput = input.int(2, "Confirmation Multiplier", minval = 1, maxval = 10, tooltip = "Pivot Period divided by this gives the confirmation (right-side) length -- higher gives earlier, less-confirmed signals.", group = G_ENTRY)
+arSwingMemoryInput = input.int(3, "Swing Points Memory", minval = 1, tooltip = "Number of recent opposite-side swing points kept in memory to match a new pivot against.", group = G_ENTRY)
+arAtrLengthInput = input.int(40, "Match Tolerance ATR Length", minval = 1, group = G_ENTRY)
+arAtrMultiplierInput = input.float(2.0, "Match Tolerance ATR Multiplier", minval = 0.1, group = G_ENTRY)
+cooldownBarsInput = input.int(12, "Cooldown Bars Between Setups (Per Direction)", minval = 0, group = G_ENTRY)
+requireMomentumInput = input.bool(true, "Require Momentum Confirmation", group = G_ENTRY)
+requireFavorableSessionInput = input.bool(true, "Require Favorable Session", group = G_ENTRY)
+showBreakoutRetestBoxesInput = input.bool(true, "Show Breakout & Retest Boxes", group = G_ENTRY)
+showBreakoutRetestLabelsInput = input.bool(true, "Show Breakout & Retest Delta Labels", group = G_ENTRY)
+arBullColorInput = input.color(#00ffbb, "Bullish Color", group = G_ENTRY, inline = "arcolor")
+arBearColorInput = input.color(#ff1100, "Bearish Color", group = G_ENTRY, inline = "arcolor")
 
 float atrCoach = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
-float coachRange = math.max(high - low, syminfo.mintick)
-float coachBodyFraction = math.abs(close - open) / coachRange
-float coachCloseLocation = (close - low) / coachRange
 
-// -- Retest window (Pullback mode) --
-// A touch of the zone no longer has to reverse on the SAME bar -- price
-// can wick/tag the zone, drift for a few bars, and still count as a
-// valid pullback as long as a reversal candle shows up somewhere inside
-// [minBarsAtRetestInput, maxBarsAtRetestInput] bars of that touch. Same
-// "touch -> bar-index window -> trigger" shape already proven in
-// delta_break_retest/Stage8's retest state machine (barsAfterRetest vs.
-// minBarsAfterRetestInput/maxBarsAfterRetestInput), applied here to a
-// pullback against a native swing zone instead of a break event.
-// KNOWN EDGE CASE: if the native swing pivot itself updates mid-window
-// (a new, more recent pivot forms before the reversal bar arrives), the
-// reclaim check below reads whatever recentSwingLow/High is CURRENT on
-// the reversal bar, not the level that was actually touched -- rare in
-// practice since pivots need nativePivotRightInput bars to confirm, but
-// worth knowing if a retest looks like it fired against the "wrong" level.
-bool touchSupportNow = not na(recentSwingLow) and low <= recentSwingLow + pullbackToleranceAtrInput * atrCoach
-bool touchResistanceNow = not na(recentSwingHigh) and high >= recentSwingHigh - pullbackToleranceAtrInput * atrCoach
+float arAtrVal = ta.atr(arAtrLengthInput)
+float arTolerance = arAtrVal * arAtrMultiplierInput
+int arConfirmLen = int(arPeriodInput / arConfirmMultiplierInput)
 
-var int lastSupportTouchBar = na
-var int lastResistanceTouchBar = na
+type ArPivot
+    int idx
+    float price
 
-if touchSupportNow
-    lastSupportTouchBar := bar_index
-if touchResistanceNow
-    lastResistanceTouchBar := bar_index
+var array<ArPivot> arSwingHighs = array.new<ArPivot>()
+var array<ArPivot> arSwingLows = array.new<ArPivot>()
 
-int barsSinceSupportTouch = na(lastSupportTouchBar) ? na : bar_index - lastSupportTouchBar
-int barsSinceResistanceTouch = na(lastResistanceTouchBar) ? na : bar_index - lastResistanceTouchBar
+float arPh = ta.pivothigh(high, arPeriodInput, arConfirmLen)
+float arPl = ta.pivotlow(low, arPeriodInput, arConfirmLen)
 
-bool supportRetestWindowOk = (
-     not na(barsSinceSupportTouch) and
-     barsSinceSupportTouch >= minBarsAtRetestInput and
-     barsSinceSupportTouch <= maxBarsAtRetestInput
-)
+if not na(arPh)
+    int arPhBar = bar_index - arConfirmLen
+    array.unshift(arSwingHighs, ArPivot.new(arPhBar, arPh))
+    if array.size(arSwingHighs) > arSwingMemoryInput
+        array.pop(arSwingHighs)
+if not na(arPl)
+    int arPlBar = bar_index - arConfirmLen
+    array.unshift(arSwingLows, ArPivot.new(arPlBar, arPl))
+    if array.size(arSwingLows) > arSwingMemoryInput
+        array.pop(arSwingLows)
 
-bool resistanceRetestWindowOk = (
-     not na(barsSinceResistanceTouch) and
-     barsSinceResistanceTouch >= minBarsAtRetestInput and
-     barsSinceResistanceTouch <= maxBarsAtRetestInput
-)
+bool shortSignalNow = false
+bool longSignalNow = false
 
-bool nearSupportPullback = supportRetestWindowOk and close > recentSwingLow
+if not na(arPh) and array.size(arSwingLows) > 0
+    int arMinIndex = 0
+    float arMinDist = math.abs(array.get(arSwingLows, 0).price - arPh)
+    for i = 0 to array.size(arSwingLows) - 1
+        float arCurrentDist = math.abs(array.get(arSwingLows, i).price - arPh)
+        if arCurrentDist < arMinDist
+            arMinDist := arCurrentDist
+            arMinIndex := i
 
-bool nearResistancePullback = resistanceRetestWindowOk and close < recentSwingHigh
+    ArPivot arMatchedLow = array.get(arSwingLows, arMinIndex)
 
-bool breakoutAboveResistance = (
-     not na(recentSwingHigh) and
-     close > recentSwingHigh + breakoutDistanceAtrInput * atrCoach
-)
+    if arMinDist < arTolerance and low[arConfirmLen] < arMatchedLow.price
+        if showBreakoutRetestBoxesInput
+            box.new(arMatchedLow.idx, math.max(arPh, arMatchedLow.price), bar_index - arConfirmLen, math.min(arPh, arMatchedLow.price), color.new(color.gray, 100), bgcolor = color.new(chart.fg_color, 85))
 
-bool breakoutBelowSupport = (
-     not na(recentSwingLow) and
-     close < recentSwingLow - breakoutDistanceAtrInput * atrCoach
-)
+            float arRatio = math.abs(executionUpVolume[arConfirmLen] / executionDownVolume[arConfirmLen])
+            float arRatio_ = math.abs(executionDownVolume[arConfirmLen] / executionUpVolume[arConfirmLen])
+            int arMidpoint = int(math.avg(arMatchedLow.idx, bar_index - arConfirmLen))
+            int arDistance = math.abs(arMidpoint - arMatchedLow.idx)
 
-bool bullishReversalCandle = (
-     close > open and
-     coachBodyFraction >= minimumReversalBodyFractionInput and
-     coachCloseLocation >= minimumReversalCloseLocationInput
-)
+            box.new(arMatchedLow.idx, math.max(arPh, arMatchedLow.price), arRatio > 1 ? arMidpoint : int(arMatchedLow.idx + arDistance * arRatio), math.avg(arPh, arMatchedLow.price), color.new(color.gray, 100), bgcolor = color.new(arBearColorInput, 50))
+            box.new(arMatchedLow.idx, math.avg(arPh, arMatchedLow.price), arRatio < 1 ? arMidpoint : int(arMatchedLow.idx + arDistance * arRatio_), math.min(arPh, arMatchedLow.price), color.new(color.gray, 100), bgcolor = color.new(arBullColorInput, 50))
 
-bool bearishReversalCandle = (
-     close < open and
-     coachBodyFraction >= minimumReversalBodyFractionInput and
-     coachCloseLocation <= 1.0 - minimumReversalCloseLocationInput
-)
+            line.new(arMatchedLow.idx, math.avg(arPh, arMatchedLow.price), bar_index - arConfirmLen, math.avg(arPh, arMatchedLow.price), color = chart.fg_color, style = line.style_dashed)
 
-// -- Per-mode location flags, and which mode(s) are actually armed --
-bool longInLocation = (
-     entryModeInput == "Breakout Only" ? breakoutAboveResistance :
-     entryModeInput == "Pullback Only" ? nearSupportPullback :
-     nearSupportPullback or breakoutAboveResistance
-)
+        if showBreakoutRetestLabelsInput
+            label.new(bar_index - arConfirmLen, math.max(arPh, arMatchedLow.price), "SHORT\nDelta: " + str.tostring(executionDeltaVolume[arConfirmLen], format.volume), xloc.bar_index, yloc.price, color.new(arBearColorInput, 70), label.style_label_down, size = size.tiny)
 
-bool shortInLocation = (
-     entryModeInput == "Breakout Only" ? breakoutBelowSupport :
-     entryModeInput == "Pullback Only" ? nearResistancePullback :
-     nearResistancePullback or breakoutBelowSupport
-)
+        shortSignalNow := true
 
-bool longPullbackReady = nearSupportPullback and bullishReversalCandle
-bool longBreakoutReady = breakoutAboveResistance and bullishReversalCandle
-bool shortPullbackReady = nearResistancePullback and bearishReversalCandle
-bool shortBreakoutReady = breakoutBelowSupport and bearishReversalCandle
+    array.remove(arSwingLows, arMinIndex)
 
-// -- Per-mode gates, built from each mode's own filter inputs above --
-bool momentumOkLongPullback = not requireMomentumPullbackInput or tdiConfirmsLong
-bool momentumOkLongBreakout = not requireMomentumBreakoutInput or tdiConfirmsLong
-bool momentumOkShortPullback = not requireMomentumPullbackInput or tdiConfirmsShort
-bool momentumOkShortBreakout = not requireMomentumBreakoutInput or tdiConfirmsShort
+if not na(arPl) and array.size(arSwingHighs) > 0
+    int arMinIndex2 = 0
+    float arMinDist2 = math.abs(array.get(arSwingHighs, 0).price - arPl)
+    for i = 0 to array.size(arSwingHighs) - 1
+        float arCurrentDist2 = math.abs(array.get(arSwingHighs, i).price - arPl)
+        if arCurrentDist2 < arMinDist2
+            arMinDist2 := arCurrentDist2
+            arMinIndex2 := i
 
-bool pressureOkLongPullback = not requireVolumePressurePullbackInput or executionDeltaPressure >= minimumVolumePressurePullbackInput
-bool pressureOkLongBreakout = not requireVolumePressureBreakoutInput or executionDeltaPressure >= minimumVolumePressureBreakoutInput
-bool pressureOkShortPullback = not requireVolumePressurePullbackInput or executionDeltaPressure <= -minimumVolumePressurePullbackInput
-bool pressureOkShortBreakout = not requireVolumePressureBreakoutInput or executionDeltaPressure <= -minimumVolumePressureBreakoutInput
+    ArPivot arMatchedHigh = array.get(arSwingHighs, arMinIndex2)
 
-bool sessionOkPullback = not requireFavorableSessionPullbackInput or sessionFavorable
-bool sessionOkBreakout = not requireFavorableSessionBreakoutInput or sessionFavorable
+    if arMinDist2 < arTolerance and high[arConfirmLen] > arMatchedHigh.price
+        if showBreakoutRetestBoxesInput
+            box.new(arMatchedHigh.idx, math.max(arPl, arMatchedHigh.price), bar_index - arConfirmLen, math.min(arPl, arMatchedHigh.price), color.new(color.gray, 100), bgcolor = color.new(chart.fg_color, 85))
 
-var int lastLongPullbackSetupBar = na
-var int lastLongBreakoutSetupBar = na
-var int lastShortPullbackSetupBar = na
-var int lastShortBreakoutSetupBar = na
+            float arRatio2 = math.abs(executionUpVolume[arConfirmLen] / executionDownVolume[arConfirmLen])
+            float arRatio2_ = math.abs(executionDownVolume[arConfirmLen] / executionUpVolume[arConfirmLen])
+            int arMidpoint2 = int(math.avg(arMatchedHigh.idx, bar_index - arConfirmLen))
+            int arDistance2 = math.abs(arMidpoint2 - arMatchedHigh.idx)
 
-bool longPullbackCooldownOk = na(lastLongPullbackSetupBar) or (bar_index - lastLongPullbackSetupBar) > cooldownBarsPullbackInput
-bool longBreakoutCooldownOk = na(lastLongBreakoutSetupBar) or (bar_index - lastLongBreakoutSetupBar) > cooldownBarsBreakoutInput
-bool shortPullbackCooldownOk = na(lastShortPullbackSetupBar) or (bar_index - lastShortPullbackSetupBar) > cooldownBarsPullbackInput
-bool shortBreakoutCooldownOk = na(lastShortBreakoutSetupBar) or (bar_index - lastShortBreakoutSetupBar) > cooldownBarsBreakoutInput
+            box.new(arMatchedHigh.idx, math.max(arPl, arMatchedHigh.price), arRatio2 > 1 ? arMidpoint2 : int(arMatchedHigh.idx + arDistance2 * arRatio2), math.avg(arPl, arMatchedHigh.price), color.new(color.gray, 100), bgcolor = color.new(arBullColorInput, 50))
+            box.new(arMatchedHigh.idx, math.avg(arPl, arMatchedHigh.price), arRatio2 < 1 ? arMidpoint2 : int(arMatchedHigh.idx + arDistance2 * arRatio2_), math.min(arPl, arMatchedHigh.price), color.new(color.gray, 100), bgcolor = color.new(arBearColorInput, 50))
+
+            line.new(arMatchedHigh.idx, math.avg(arPl, arMatchedHigh.price), bar_index - arConfirmLen, math.avg(arPl, arMatchedHigh.price), color = chart.fg_color, style = line.style_dashed)
+
+        if showBreakoutRetestLabelsInput
+            label.new(bar_index - arConfirmLen, math.min(arPl, arMatchedHigh.price), "LONG\nDelta: " + str.tostring(executionDeltaVolume[arConfirmLen], format.volume), xloc.bar_index, yloc.price, color.new(arBullColorInput, 70), label.style_label_up, size = size.tiny)
+
+        longSignalNow := true
+
+    array.remove(arSwingHighs, arMinIndex2)
 
 bool longStructureOk = structureTrend == "UP"
 bool shortStructureOk = structureTrend == "DOWN"
 
-bool longPullbackSetupNow = (
-     barstate.isconfirmed and
-     longStructureOk and
-     longPullbackReady and
-     momentumOkLongPullback and
-     pressureOkLongPullback and
-     sessionOkPullback and
-     longPullbackCooldownOk
-)
+bool momentumOkLong = not requireMomentumInput or tdiConfirmsLong
+bool momentumOkShort = not requireMomentumInput or tdiConfirmsShort
 
-bool longBreakoutSetupNow = (
-     barstate.isconfirmed and
-     longStructureOk and
-     longBreakoutReady and
-     momentumOkLongBreakout and
-     pressureOkLongBreakout and
-     sessionOkBreakout and
-     longBreakoutCooldownOk
-)
+bool sessionOkForLong = not requireFavorableSessionInput or sessionFavorable
+bool sessionOkForShort = not requireFavorableSessionInput or sessionFavorable
 
-bool shortPullbackSetupNow = (
-     barstate.isconfirmed and
-     shortStructureOk and
-     shortPullbackReady and
-     momentumOkShortPullback and
-     pressureOkShortPullback and
-     sessionOkPullback and
-     shortPullbackCooldownOk
-)
+var int lastLongSetupBar = na
+var int lastShortSetupBar = na
 
-bool shortBreakoutSetupNow = (
-     barstate.isconfirmed and
-     shortStructureOk and
-     shortBreakoutReady and
-     momentumOkShortBreakout and
-     pressureOkShortBreakout and
-     sessionOkBreakout and
-     shortBreakoutCooldownOk
-)
+bool longCooldownOk = na(lastLongSetupBar) or (bar_index - lastLongSetupBar) > cooldownBarsInput
+bool shortCooldownOk = na(lastShortSetupBar) or (bar_index - lastShortSetupBar) > cooldownBarsInput
 
-// -- Mode selection: which of the per-mode setups actually count, given
-// the Entry Mode input -- and the combined signal used everywhere else
-// in the file (risk management, outcome tracking, alerts). --
 bool longSetupNow = (
-     entryModeInput == "Pullback Only" ? longPullbackSetupNow :
-     entryModeInput == "Breakout Only" ? longBreakoutSetupNow :
-     longPullbackSetupNow or longBreakoutSetupNow
+     barstate.isconfirmed and
+     longSignalNow and
+     longStructureOk and
+     momentumOkLong and
+     pressureOkLong and
+     sessionOkForLong and
+     longCooldownOk
 )
 
 bool shortSetupNow = (
-     entryModeInput == "Pullback Only" ? shortPullbackSetupNow :
-     entryModeInput == "Breakout Only" ? shortBreakoutSetupNow :
-     shortPullbackSetupNow or shortBreakoutSetupNow
+     barstate.isconfirmed and
+     shortSignalNow and
+     shortStructureOk and
+     momentumOkShort and
+     pressureOkShort and
+     sessionOkForShort and
+     shortCooldownOk
 )
 
-if longPullbackSetupNow
-    lastLongPullbackSetupBar := bar_index
-if longBreakoutSetupNow
-    lastLongBreakoutSetupBar := bar_index
-if shortPullbackSetupNow
-    lastShortPullbackSetupBar := bar_index
-if shortBreakoutSetupNow
-    lastShortBreakoutSetupBar := bar_index
+if longSetupNow
+    lastLongSetupBar := bar_index
+if shortSetupNow
+    lastShortSetupBar := bar_index
 
 // -- Zone confluence & Setup Grade --
 // Zone confluence does NOT gate longSetupNow/shortSetupNow above -- it
@@ -1012,17 +975,17 @@ bool shortZoneConfluenceReversed = (
 bool longZoneConfluence = longZoneConfluenceOriginal or longZoneConfluenceReversed
 bool shortZoneConfluence = shortZoneConfluenceOriginal or shortZoneConfluenceReversed
 
-// Pressure AGREEMENT for grading purposes, independent of either mode's
-// own Require Volume Pressure Agreement gate (05a/05b) -- a setup can
-// still earn the grading bonus for pressure agreeing even when neither
-// mode's own gate requires it.
+// Pressure AGREEMENT for grading purposes, independent of the Volume
+// Pressure group's own Require Volume Pressure Agreement gate -- a setup
+// can still earn the grading bonus for pressure agreeing even when that
+// gate itself isn't required.
 bool longPressureBonus = executionDeltaPressure >= minimumVolumePressureInput
 bool shortPressureBonus = executionDeltaPressure <= -minimumVolumePressureInput
 
 // Z-Score mean-reversion AGREEMENT -- the "skill upgrade" from the
 // ported Range & Z-Score section (04c): a long earns the bonus when
 // price is statistically stretched to the downside (oversold) right as
-// the pullback/breakout resolves, same reasoning as pressure and zone
+// the breakout-retest signal fires, same reasoning as pressure and zone
 // confluence -- a bonus factor, never a hard gate, per this file's own
 // funnel-diagnostics lesson.
 bool longZscoreBonus = zscoreOversold
@@ -1046,89 +1009,40 @@ string shortGradeNote = (
      (dayShowsManipulation ? ", manipulation day" : "")
 )
 
-// Which mode this signal actually came from -- both can independently
-// qualify on the same bar (rare, but possible), in which case it's both.
-string longActiveMode = longPullbackSetupNow and longBreakoutSetupNow ? "Pullback+Breakout" : longBreakoutSetupNow ? "Breakout" : "Pullback"
-string shortActiveMode = shortPullbackSetupNow and shortBreakoutSetupNow ? "Pullback+Breakout" : shortBreakoutSetupNow ? "Breakout" : "Pullback"
-
 // -- "Coach Says" -- names the single most relevant blocker/status right
 // now, in the order a trader would actually check them: structure first
-// (is there even a trend to trade with), then location (are we at a level,
-// under whichever entry mode(s) are armed), then confirmation (candle +
-// momentum), then session/cooldown last (the setup is real, just gated by
-// timing/pacing). Momentum/pressure/session/cooldown are now independent
-// per mode, so once a candle has formed the message tracks whichever
-// mode (Pullback or Breakout) is actually the one in play -- same
-// discriminator already used for the location/candle-wait text below. --
-string longLocationText = (
-     entryModeInput == "Breakout Only" ? "Uptrend -- waiting for a breakout above recent resistance" :
-     entryModeInput == "Pullback Only" ? "Uptrend -- waiting for a pullback to recent support" :
-     "Uptrend -- waiting for a pullback to support or a breakout above resistance"
-)
-
-bool longMessageIsBreakout = entryModeInput == "Breakout Only" or (entryModeInput == "Both" and breakoutAboveResistance and not nearSupportPullback)
-
-string longCandleWaitText = (
-     longMessageIsBreakout ?
-     "Breaking resistance -- waiting for a strong bullish candle" :
-     "At support -- waiting for a bullish reversal candle"
-)
-
-bool longMessageMomentumOk = longMessageIsBreakout ? momentumOkLongBreakout : momentumOkLongPullback
-bool longMessagePressureOk = longMessageIsBreakout ? pressureOkLongBreakout : pressureOkLongPullback
-bool longMessageSessionOk = longMessageIsBreakout ? sessionOkBreakout : sessionOkPullback
-bool longMessageCooldownOk = longMessageIsBreakout ? longBreakoutCooldownOk : longPullbackCooldownOk
-
-string shortLocationText = (
-     entryModeInput == "Breakout Only" ? "Downtrend -- waiting for a breakout below recent support" :
-     entryModeInput == "Pullback Only" ? "Downtrend -- waiting for a pullback to recent resistance" :
-     "Downtrend -- waiting for a pullback to resistance or a breakout below support"
-)
-
-bool shortMessageIsBreakout = entryModeInput == "Breakout Only" or (entryModeInput == "Both" and breakoutBelowSupport and not nearResistancePullback)
-
-string shortCandleWaitText = (
-     shortMessageIsBreakout ?
-     "Breaking support -- waiting for a strong bearish candle" :
-     "At resistance -- waiting for a bearish reversal candle"
-)
-
-bool shortMessageMomentumOk = shortMessageIsBreakout ? momentumOkShortBreakout : momentumOkShortPullback
-bool shortMessagePressureOk = shortMessageIsBreakout ? pressureOkShortBreakout : pressureOkShortPullback
-bool shortMessageSessionOk = shortMessageIsBreakout ? sessionOkBreakout : sessionOkPullback
-bool shortMessageCooldownOk = shortMessageIsBreakout ? shortBreakoutCooldownOk : shortPullbackCooldownOk
-
+// (is there even a trend to trade with), then the breakout-retest signal
+// itself (an instantaneous event, not a persistent zone state like the
+// old model had -- so "waiting" here just means no signal has fired yet
+// this bar), then momentum/pressure/session/cooldown, same order as
+// before. --
 string coachMessage = (
      structureTrend == "RANGE" ?
      "Structure ranging -- no clear trend, stand aside" :
-     structureTrend == "UP" and not longInLocation ?
-     longLocationText :
-     structureTrend == "UP" and longInLocation and not bullishReversalCandle ?
-     longCandleWaitText :
-     structureTrend == "UP" and longInLocation and bullishReversalCandle and not longMessageMomentumOk ?
-     "Signal candle formed -- waiting for momentum confirmation" :
-     structureTrend == "UP" and longInLocation and bullishReversalCandle and longMessageMomentumOk and not longMessagePressureOk ?
+     structureTrend == "UP" and not longSignalNow ?
+     "Uptrend -- watching for a bullish breakout & retest signal" :
+     structureTrend == "UP" and longSignalNow and not momentumOkLong ?
+     "Breakout & retest signal fired -- waiting for momentum confirmation" :
+     structureTrend == "UP" and longSignalNow and momentumOkLong and not pressureOkLong ?
      "Momentum confirms -- waiting for volume pressure agreement" :
-     structureTrend == "UP" and longInLocation and bullishReversalCandle and longMessageMomentumOk and longMessagePressureOk and not longMessageSessionOk ?
+     structureTrend == "UP" and longSignalNow and momentumOkLong and pressureOkLong and not sessionOkForLong ?
      "Setup ready -- outside a favorable session, consider waiting" :
-     structureTrend == "UP" and longInLocation and bullishReversalCandle and longMessageMomentumOk and longMessagePressureOk and longMessageSessionOk and not longMessageCooldownOk ?
+     structureTrend == "UP" and longSignalNow and momentumOkLong and pressureOkLong and sessionOkForLong and not longCooldownOk ?
      "Setup ready -- cooling down after a recent long signal" :
      longSetupNow ?
-     "LONG SETUP ACTIVE [" + longActiveMode + ", Grade " + longSetupGrade + longGradeNote + "]" :
-     structureTrend == "DOWN" and not shortInLocation ?
-     shortLocationText :
-     structureTrend == "DOWN" and shortInLocation and not bearishReversalCandle ?
-     shortCandleWaitText :
-     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and not shortMessageMomentumOk ?
-     "Signal candle formed -- waiting for momentum confirmation" :
-     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and shortMessageMomentumOk and not shortMessagePressureOk ?
+     "LONG SETUP ACTIVE [Grade " + longSetupGrade + longGradeNote + "]" :
+     structureTrend == "DOWN" and not shortSignalNow ?
+     "Downtrend -- watching for a bearish breakout & retest signal" :
+     structureTrend == "DOWN" and shortSignalNow and not momentumOkShort ?
+     "Breakout & retest signal fired -- waiting for momentum confirmation" :
+     structureTrend == "DOWN" and shortSignalNow and momentumOkShort and not pressureOkShort ?
      "Momentum confirms -- waiting for volume pressure agreement" :
-     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and shortMessageMomentumOk and shortMessagePressureOk and not shortMessageSessionOk ?
+     structureTrend == "DOWN" and shortSignalNow and momentumOkShort and pressureOkShort and not sessionOkForShort ?
      "Setup ready -- outside a favorable session, consider waiting" :
-     structureTrend == "DOWN" and shortInLocation and bearishReversalCandle and shortMessageMomentumOk and shortMessagePressureOk and shortMessageSessionOk and not shortMessageCooldownOk ?
+     structureTrend == "DOWN" and shortSignalNow and momentumOkShort and pressureOkShort and sessionOkForShort and not shortCooldownOk ?
      "Setup ready -- cooling down after a recent short signal" :
      shortSetupNow ?
-     "SHORT SETUP ACTIVE [" + shortActiveMode + ", Grade " + shortSetupGrade + shortGradeNote + "]" :
+     "SHORT SETUP ACTIVE [Grade " + shortSetupGrade + shortGradeNote + "]" :
      "No clear setup forming"
 )
 
@@ -1237,14 +1151,15 @@ float shortRiskPerUnit = na
 float shortRiskAtr = na
 bool shortRiskOk = false
 
-// Stop anchor depends on which mode actually fired: a pullback stop sits
-// below the support just bought (recentSwingLow); a breakout stop sits
-// below the resistance just cleared (recentSwingHigh), since that broken
-// level is now the nearest thing acting as support -- anchoring a breakout
-// stop off the old, far-away recentSwingLow would make the stop
-// needlessly wide. Mirrored for shorts.
-float longStopAnchor = longBreakoutSetupNow ? recentSwingHigh : recentSwingLow
-float shortStopAnchor = shortBreakoutSetupNow ? recentSwingLow : recentSwingHigh
+// Stop anchor is the swing point the breakout-retest signal actually
+// matched against on this bar: a bullish signal (arPl just confirmed)
+// stops below that fresh swing low; a bearish signal (arPh just
+// confirmed) stops above that fresh swing high -- the same structural
+// point the signal itself is built on, available same-bar since
+// longSetupNow/shortSetupNow can only be true on the bar arPl/arPh
+// resolves non-na.
+float longStopAnchor = arPl
+float shortStopAnchor = arPh
 
 if longSetupNow and not na(longStopAnchor)
     longStopPrice := longStopAnchor - stopBufferAtrMultInput * atrCoach
@@ -1563,39 +1478,25 @@ showFunnelInput = input.bool(true, "Show Entry Funnel Diagnostics Table", group 
 funnelTablePositionInput = input.string("Bottom Left", "Funnel Table Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_FUNNEL)
 funnelTableSizeInput = input.string("Tiny", "Funnel Table Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_FUNNEL)
 
-// counts[0] = bars evaluated, [1] = +structure, [2] = +ready (location &
-// candle), [3] = +momentum, [4] = +pressure, [5] = +session,
-// [6] = +cooldown (that mode's own SetupNow), [7] = +risk OK (this is
-// what ACTUALLY reaches actualLongSignal/actualShortSignal and gets
-// registered -- Risk Management's maximumEntryRiskAtrInput cap is a
-// SEPARATE, LATER gate than the entry model itself, easy to miss when
-// "SetupNow" already sounds like the final word).
-var array<int> fLongPullback = array.new_int(8, 0)
-var array<int> fLongBreakout = array.new_int(8, 0)
-var array<int> fShortPullback = array.new_int(8, 0)
-var array<int> fShortBreakout = array.new_int(8, 0)
+// counts[0] = bars evaluated, [1] = +structure, [2] = +signal (the
+// breakout-retest event itself fired), [3] = +momentum, [4] = +pressure,
+// [5] = +session, [6] = +cooldown (== longSetupNow/shortSetupNow),
+// [7] = +risk OK (this is what ACTUALLY reaches actualLongSignal/
+// actualShortSignal and gets registered -- Risk Management's
+// maximumEntryRiskAtrInput cap is a SEPARATE, LATER gate than the entry
+// signal itself). Only 2 columns now (Long/Short) since there is a single
+// entry model -- longRiskOk/shortRiskOk are reused directly from Risk
+// Management rather than recomputed, since they're already only ever
+// true on a bar where every earlier stage (through cooldown) already
+// held, which is exactly the condition this funnel measures too.
+var array<int> fLong = array.new_int(8, 0)
+var array<int> fShort = array.new_int(8, 0)
 
-// Per-mode risk-in-ATR-terms, using each mode's own natural stop anchor
-// (same as Risk Management's longStopAnchor/shortStopAnchor above) --
-// duplicated here (not reused from Risk Management's longRiskOk/
-// shortRiskOk) because those are only ever computed for whichever mode
-// Entry Mode actually selected, and this funnel needs all 4 independently
-// regardless of Entry Mode.
-float longPullbackRiskAtr = not na(recentSwingLow) ? math.abs(close - (recentSwingLow - stopBufferAtrMultInput * atrCoach)) / atrCoach : na
-float longBreakoutRiskAtr = not na(recentSwingHigh) ? math.abs(close - (recentSwingHigh - stopBufferAtrMultInput * atrCoach)) / atrCoach : na
-float shortPullbackRiskAtr = not na(recentSwingHigh) ? math.abs(close - (recentSwingHigh + stopBufferAtrMultInput * atrCoach)) / atrCoach : na
-float shortBreakoutRiskAtr = not na(recentSwingLow) ? math.abs(close - (recentSwingLow + stopBufferAtrMultInput * atrCoach)) / atrCoach : na
-
-bool longPullbackRiskOk = not na(longPullbackRiskAtr) and longPullbackRiskAtr <= maximumEntryRiskAtrInput
-bool longBreakoutRiskOk = not na(longBreakoutRiskAtr) and longBreakoutRiskAtr <= maximumEntryRiskAtrInput
-bool shortPullbackRiskOk = not na(shortPullbackRiskAtr) and shortPullbackRiskAtr <= maximumEntryRiskAtrInput
-bool shortBreakoutRiskOk = not na(shortBreakoutRiskAtr) and shortBreakoutRiskAtr <= maximumEntryRiskAtrInput
-
-f_incrFunnel(array<int> counts, bool structureOk, bool readyOk, bool momentumOk, bool pressureOk, bool sessionOk, bool cooldownOk, bool riskOk) =>
+f_incrFunnel(array<int> counts, bool structureOk, bool signalOk, bool momentumOk, bool pressureOk, bool sessionOk, bool cooldownOk, bool riskOk) =>
     array.set(counts, 0, array.get(counts, 0) + 1)
     if structureOk
         array.set(counts, 1, array.get(counts, 1) + 1)
-        if readyOk
+        if signalOk
             array.set(counts, 2, array.get(counts, 2) + 1)
             if momentumOk
                 array.set(counts, 3, array.get(counts, 3) + 1)
@@ -1610,30 +1511,24 @@ f_incrFunnel(array<int> counts, bool structureOk, bool readyOk, bool momentumOk,
     true
 
 if barstate.isconfirmed
-    f_incrFunnel(fLongPullback, longStructureOk, longPullbackReady, momentumOkLongPullback, pressureOkLongPullback, sessionOkPullback, longPullbackCooldownOk, longPullbackRiskOk)
-    f_incrFunnel(fLongBreakout, longStructureOk, longBreakoutReady, momentumOkLongBreakout, pressureOkLongBreakout, sessionOkBreakout, longBreakoutCooldownOk, longBreakoutRiskOk)
-    f_incrFunnel(fShortPullback, shortStructureOk, shortPullbackReady, momentumOkShortPullback, pressureOkShortPullback, sessionOkPullback, shortPullbackCooldownOk, shortPullbackRiskOk)
-    f_incrFunnel(fShortBreakout, shortStructureOk, shortBreakoutReady, momentumOkShortBreakout, pressureOkShortBreakout, sessionOkBreakout, shortBreakoutCooldownOk, shortBreakoutRiskOk)
+    f_incrFunnel(fLong, longStructureOk, longSignalNow, momentumOkLong, pressureOkLong, sessionOkForLong, longCooldownOk, longRiskOk)
+    f_incrFunnel(fShort, shortStructureOk, shortSignalNow, momentumOkShort, pressureOkShort, sessionOkForShort, shortCooldownOk, shortRiskOk)
 
-var table funnelTable = table.new(f_tablePosition(funnelTablePositionInput), 5, 9, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+var table funnelTable = table.new(f_tablePosition(funnelTablePositionInput), 3, 9, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
 
 if barstate.islast and showFunnelInput
     funnelTextSize = f_tableTextSize(funnelTableSizeInput)
-    array<string> funnelLabels = array.from("ENTRY FUNNEL", "Bars Evaluated", "+ Structure", "+ Ready (Loc+Candle)", "+ Momentum", "+ Pressure", "+ Session", "+ Cooldown", "+ Risk OK (Registered)")
+    array<string> funnelLabels = array.from("ENTRY FUNNEL", "Bars Evaluated", "+ Structure", "+ Signal", "+ Momentum", "+ Pressure", "+ Session", "+ Cooldown", "+ Risk OK (Registered)")
 
     for row = 0 to 8
         table.cell(funnelTable, 0, row, array.get(funnelLabels, row), text_color = color.white, bgcolor = row == 0 ? color.rgb(22, 52, 86) : na, text_size = funnelTextSize)
 
-    table.cell(funnelTable, 1, 0, "LP", text_color = longColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
-    table.cell(funnelTable, 2, 0, "LB", text_color = longColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
-    table.cell(funnelTable, 3, 0, "SP", text_color = shortColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
-    table.cell(funnelTable, 4, 0, "SB", text_color = shortColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
+    table.cell(funnelTable, 1, 0, "LONG", text_color = longColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
+    table.cell(funnelTable, 2, 0, "SHORT", text_color = shortColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
 
     for row = 1 to 8
-        table.cell(funnelTable, 1, row, str.tostring(array.get(fLongPullback, row - 1)), text_color = color.gray, text_size = funnelTextSize)
-        table.cell(funnelTable, 2, row, str.tostring(array.get(fLongBreakout, row - 1)), text_color = color.gray, text_size = funnelTextSize)
-        table.cell(funnelTable, 3, row, str.tostring(array.get(fShortPullback, row - 1)), text_color = color.gray, text_size = funnelTextSize)
-        table.cell(funnelTable, 4, row, str.tostring(array.get(fShortBreakout, row - 1)), text_color = color.gray, text_size = funnelTextSize)
+        table.cell(funnelTable, 1, row, str.tostring(array.get(fLong, row - 1)), text_color = color.gray, text_size = funnelTextSize)
+        table.cell(funnelTable, 2, row, str.tostring(array.get(fShort, row - 1)), text_color = color.gray, text_size = funnelTextSize)
 
 
 // ============================================================================
@@ -1684,18 +1579,14 @@ plot(executionDeltaPressure, title = "Execution Pressure %", display = display.d
 plot(actualLongSignal ? 1 : 0, title = "Actual Long Signal", display = display.data_window)
 plot(actualShortSignal ? 1 : 0, title = "Actual Short Signal", display = display.data_window)
 
-// Breakout diagnostics -- lets you check the exact price a decisive
-// breakout requires on the LAST CONFIRMED bar, instead of guessing from
-// the live/unconfirmed ticking price shown on the chart itself (Coach
-// Says, Zone Reaction, and every entry signal only ever evaluate on
-// barstate.isconfirmed, by design -- so the current forming candle's
-// price can run ahead of what the dashboard reports until it closes).
-plot(not na(recentSwingHigh) ? recentSwingHigh + breakoutDistanceAtrInput * atrCoach : na, title = "Long Breakout Threshold Price", display = display.data_window)
-plot(not na(recentSwingLow) ? recentSwingLow - breakoutDistanceAtrInput * atrCoach : na, title = "Short Breakout Threshold Price", display = display.data_window)
-plot(breakoutAboveResistance ? 1 : 0, title = "Breakout Above Resistance (Confirmed Bar)", display = display.data_window)
-plot(breakoutBelowSupport ? 1 : 0, title = "Breakout Below Support (Confirmed Bar)", display = display.data_window)
-plot(barsSinceSupportTouch, title = "Bars Since Support Touch", display = display.data_window)
-plot(barsSinceResistanceTouch, title = "Bars Since Resistance Touch", display = display.data_window)
+// Breakout & Retest diagnostics -- the swing points actually matched on
+// the LAST CONFIRMED bar, and whether each direction's raw signal fired.
+plot(arPh, title = "Confirmed Swing High (arPh)", display = display.data_window)
+plot(arPl, title = "Confirmed Swing Low (arPl)", display = display.data_window)
+plot(longSignalNow ? 1 : 0, title = "Bullish Breakout & Retest Signal (Confirmed Bar)", display = display.data_window)
+plot(shortSignalNow ? 1 : 0, title = "Bearish Breakout & Retest Signal (Confirmed Bar)", display = display.data_window)
+plot(array.size(arSwingHighs), title = "Swing Highs In Memory", display = display.data_window)
+plot(array.size(arSwingLows), title = "Swing Lows In Memory", display = display.data_window)
 
 // TDI Momentum diagnostics -- tdiConfirmsLong/Short is TWO separate
 // conditions ANDed together (tdiBullishMove/tdiBearishMove needs the
@@ -1737,10 +1628,12 @@ plot(pdlSweepRate, title = "PDL Sweep Rate %", display = display.data_window)
 // of this, the same discipline the template's own tuning needed.
 //
 // Structure Timeframe:            60
-// Native Swing Pivot L/R:         3 / 3
-// Pullback Tolerance:             0.30 ATR
-// Min Reversal Body/Range:        0.30
-// Min Reversal Close Location:    0.60
+// Native Swing Pivot L/R:         3 / 3 (Zone Reaction / swing zone boxes)
+// Entry Model:                    Breakout & Retest (AlgoAlpha), section 05
+// Pivot Period / Confirm Mult:    7 / 2
+// Swing Points Memory:            3
+// Match Tolerance:                40-bar ATR x 2.0
+// Require Momentum:               ON initially
 // Require Volume Pressure:        OFF initially
 // Cooldown Bars:                  12
 // Stop Buffer:                    0.15 ATR
