@@ -54,22 +54,11 @@ strategy(
 // • Value non-migration.
 // • Weak new-location volume.
 //
-// ENTRY LOGIC (replaces the old Acceptance/Rejection P0-score entry
-// trigger entirely, ported with parity from the user-supplied "High
-// Volume S/R + VPA Entries + Broken Level Cleanup v2" indicator):
-// VOLUME-CONFIRMED SYMMETRIC PIVOT FORMS
-// -> A PERSISTENT, FIFO-CAPPED S/R LINE IS DRAWN
-// -> PRICE APPROACHES THAT LINE ON QUIET (LOW) VOLUME, THEN REVERSES ON
-//    A HIGH-VOLUME CANDLE -- A VOLUME PRICE ANALYSIS (VPA) RETEST EVENT
-// -> STRUCTURAL FILTER / COOLDOWN / FRESH-STATE GUARDS STILL APPLY
-// -> VPA LONG / VPA SHORT ENTRY, STOP AT ATR DISTANCE, TARGET AT R-MULTIPLE
-//    (OPTIONALLY CAPPED AT THE NEAREST STRUCTURAL LEVEL)
-//
-// The Dynamic P0 / Acceptance / Rejection scoring machinery below (P0
-// migration, catch-up, new-location volume, value-area migration, delta
-// alignment, dwell, efficiency, absorption) NO LONGER GATES ANY ENTRY --
-// it remains fully computed and displayed on the Architecture dashboard
-// as live market-structure context only.
+// ENTRY TYPES
+// BULL | LONG ENTRY | ACCEPTANCE CONTINUATION
+// BEAR | SHORT ENTRY | ACCEPTANCE CONTINUATION
+// BULL | LONG ENTRY | REJECTION TO P0
+// BEAR | SHORT ENTRY | REJECTION TO P0
 //
 // IMPORTANT:
 // Pine does not expose native bid/ask aggressor volume here.
@@ -367,175 +356,98 @@ float minimumCoherence = input.float(
      group = G_METRICS
 )
 
-// The four inputs below no longer gate any entry (the VPA S/R retest
-// signal in section 04 does that now) -- they only tune when the
-// Architecture dashboard's ACCEPT/REJECT/READ columns and marketState
-// read "dominant" for display purposes. Kept here, not in the Entry
-// Engine group, since they're informational-only.
-
-float acceptanceThresholdLong = input.float(
-     65.0,
-     "Acceptance Score Threshold (Long, Informational)",
-     minval = 40.0,
-     maxval = 95.0,
-     step = 1.0,
-     tooltip = "Minimum acceptanceScore for the dashboard/marketState to read a BULLISH acceptance as dominant. No longer gates any entry.",
-     group = G_METRICS
-)
-
-float acceptanceThresholdShort = input.float(
-     65.0,
-     "Acceptance Score Threshold (Short, Informational)",
-     minval = 40.0,
-     maxval = 95.0,
-     step = 1.0,
-     tooltip = "Minimum acceptanceScore for the dashboard/marketState to read a BEARISH acceptance as dominant. No longer gates any entry.",
-     group = G_METRICS
-)
-
-float rejectionThresholdLong = input.float(
-     50.0,
-     "Rejection Score Threshold (Long, Informational)",
-     minval = 40.0,
-     maxval = 95.0,
-     step = 1.0,
-     tooltip = "Minimum rejectionScore for the dashboard/marketState to read a BULLISH rejection as dominant. No longer gates any entry.",
-     group = G_METRICS
-)
-
-float rejectionThresholdShort = input.float(
-     50.0,
-     "Rejection Score Threshold (Short, Informational)",
-     minval = 40.0,
-     maxval = 95.0,
-     step = 1.0,
-     tooltip = "Minimum rejectionScore for the dashboard/marketState to read a BEARISH rejection as dominant. No longer gates any entry.",
-     group = G_METRICS
-)
-
-float scoreDominanceLong = input.float(
-     24.0,
-     "Required Score Dominance (Long, Informational)",
-     minval = 0.0,
-     maxval = 40.0,
-     step = 1.0,
-     tooltip = "How far acceptanceScore (or rejectionScore, for a bullish rejection) must lead the opposing score before the dashboard reads a LONG side as dominant. No longer gates any entry.",
-     group = G_METRICS
-)
-
-float scoreDominanceShort = input.float(
-     24.0,
-     "Required Score Dominance (Short, Informational)",
-     minval = 0.0,
-     maxval = 40.0,
-     step = 1.0,
-     tooltip = "How far acceptanceScore (or rejectionScore, for a bearish rejection) must lead the opposing score before the dashboard reads a SHORT side as dominant. No longer gates any entry.",
-     group = G_METRICS
-)
-
-float signalStabilityMargin = input.float(
-     0.0,
-     "Signal Stability Margin (Informational)",
-     minval = 0.0,
-     maxval = 20.0,
-     step = 0.5,
-     tooltip = "Extra headroom added above the raw score thresholds above before the dashboard/marketState reads a side as dominant. No longer gates any entry.",
-     group = G_METRICS
-)
-
 
 //=============================================================================
 // 04 — ENTRY ENGINE
 //=============================================================================
 
-string G_ENTRY = "04 — Entry Engine (High Volume S/R + VPA)"
+string G_ENTRY = "04 — Entry Engine"
 
-int vpaPivotLengthInput = input.int(
-     8,
-     "Pivot Lookback",
-     minval = 1,
+string entryMode = input.string(
+     "Acceptance Only",
+     "Entry Mode",
+     options = [
+          "Both",
+          "Rejection Only",
+          "Acceptance Only"
+     ],
      group = G_ENTRY
 )
 
-int vpaVolMaLengthInput = input.int(
-     20,
-     "Volume EMA Length",
-     minval = 1,
+// Bull (long) and bear (short) sides get independent score requirements
+// instead of one shared threshold/dominance pair for both directions --
+// e.g. NQ/MNQ often has different long vs. short character, so the bar
+// for "accept this displacement" doesn't have to be identical on both
+// sides. Defaults below match the previously shared values so behavior
+// is unchanged until you actually diverge long vs. short.
+
+float acceptanceThresholdLong = input.float(
+     65.0,
+     "Acceptance Score Threshold (Long)",
+     minval = 40.0,
+     maxval = 95.0,
+     step = 1.0,
+     tooltip = "Minimum acceptanceScore required for a BULLISH acceptance (long) setup.",
      group = G_ENTRY
 )
 
-float vpaVolFactorInput = input.float(
-     1.5,
-     "Volume Factor",
-     minval = 1.0,
-     step = 0.1,
-     tooltip = "A bar counts as high-volume once its volume exceeds this multiple of its own volume EMA.",
+float acceptanceThresholdShort = input.float(
+     65.0,
+     "Acceptance Score Threshold (Short)",
+     minval = 40.0,
+     maxval = 95.0,
+     step = 1.0,
+     tooltip = "Minimum acceptanceScore required for a BEARISH acceptance (short) setup.",
      group = G_ENTRY
 )
 
-int vpaVolClusterBarsInput = input.int(
-     1,
-     "Min Consecutive High-Vol Bars",
-     minval = 1,
+float rejectionThresholdLong = input.float(
+     50.0,
+     "Rejection Score Threshold (Long)",
+     minval = 40.0,
+     maxval = 95.0,
+     step = 1.0,
+     tooltip = "Minimum rejectionScore required for a BULLISH rejection (long, bounce back to P0) setup.",
      group = G_ENTRY
 )
 
-int vpaMaxLinesInput = input.int(
-     15,
-     "Max S/R Lines Per Side",
-     minval = 1,
-     tooltip = "FIFO cap -- the oldest line on each side (support/resistance) is dropped once a new one would exceed this.",
+float rejectionThresholdShort = input.float(
+     50.0,
+     "Rejection Score Threshold (Short)",
+     minval = 40.0,
+     maxval = 95.0,
+     step = 1.0,
+     tooltip = "Minimum rejectionScore required for a BEARISH rejection (short, bounce back to P0) setup.",
      group = G_ENTRY
 )
 
-float vpaAtrMultInput = input.float(
-     0.75,
-     "Retest Zone (ATR Multiple)",
-     minval = 0.1,
-     step = 0.1,
-     group = G_ENTRY
-)
-
-int vpaEntryLookbackInput = input.int(
-     3,
-     "Entry Confirmation Bars",
-     minval = 1,
-     tooltip = "How many prior bars are checked for a quiet (low-volume) approach before a high-volume reversal candle can count as a retest entry.",
-     group = G_ENTRY
-)
-
-float vpaBreakAtrBufferInput = input.float(
-     0.2,
-     "Break Buffer (ATR x)",
+float scoreDominanceLong = input.float(
+     24.0,
+     "Required Score Dominance (Long)",
      minval = 0.0,
-     step = 0.05,
+     maxval = 40.0,
+     step = 1.0,
+     tooltip = "How far acceptanceScore (or rejectionScore, for a bullish rejection) must lead the opposing score before a LONG setup is allowed to dominate.",
      group = G_ENTRY
 )
 
-float vpaBreakVolMultInput = input.float(
-     1.0,
-     "Break Volume (x EMA)",
-     minval = 1.0,
-     step = 0.1,
+float scoreDominanceShort = input.float(
+     24.0,
+     "Required Score Dominance (Short)",
+     minval = 0.0,
+     maxval = 40.0,
+     step = 1.0,
+     tooltip = "How far acceptanceScore (or rejectionScore, for a bearish rejection) must lead the opposing score before a SHORT setup is allowed to dominate.",
      group = G_ENTRY
 )
 
-bool showVpaDebugInput = input.bool(
-     true,
-     "Show S/R Line Debug Labels",
-     group = G_ENTRY
-)
-
-bool showVpaBreakDebugInput = input.bool(
-     true,
-     "Show 'Broken & Removed' Labels",
-     group = G_ENTRY
-)
-
-bool showVpaRawSignalInput = input.bool(
-     true,
-     "Show Raw VPA Signal Triangles",
-     tooltip = "Small triangles mark every bar the VPA retest condition itself fires, whether or not it goes on to become an actual strategy entry (cooldown/structural filter/flat-position gates still apply). Larger solid triangles further down mark actual entries only.",
+float signalStabilityMargin = input.float(
+     0.0,
+     "Signal Stability Margin",
+     minval = 0.0,
+     maxval = 20.0,
+     step = 0.5,
+     tooltip = "Extra headroom required above the raw score threshold before a signal counts as qualified. On a continuous/back-adjusted futures symbol (e.g. NQ1!), small historical revisions can nudge a score by a point or two -- a bar sitting right at the bare threshold can flip between qualifying and not on reload. This margin keeps borderline bars from ever counting as signals in the first place, so a small revision has nothing to flip. It does not fix the underlying data revision itself (that requires trading a fixed-expiry contract) -- it only makes the strategy's own output more stable against it.",
      group = G_ENTRY
 )
 
@@ -549,14 +461,25 @@ bool useStructuralFilterInput = input.bool(
 bool useStructuralTargetInput = input.bool(
      true,
      "Cap Target At Nearest Structural Level",
-     tooltip = "If Structural Resistance (longs) / Structural Support (shorts) sits between entry and the flat R-multiple target, take profit AT that structural level instead of pushing the target past a real overhead/underfoot wall. Falls back to the plain R-multiple target when no closer structural level exists. Same live-only caveat as the filter above.",
+     tooltip = "For Acceptance entries, if Structural Resistance (longs) / Structural Support (shorts) sits between entry and the flat Acceptance Target (R) multiple, take profit AT that structural level instead of pushing the target past a real overhead/underfoot wall. Falls back to the plain R-multiple target when no closer structural level exists. Same live-only caveat as the filter above.",
+     group = G_ENTRY
+)
+
+bool requireDirectionalCandle = input.bool(
+     true,
+     "Require Directional Confirmation Candle",
+     group = G_ENTRY
+)
+
+bool requireReturnTowardP0 = input.bool(
+     true,
+     "Rejection Must Move Back Toward P0",
      group = G_ENTRY
 )
 
 bool requireFreshState = input.bool(
      true,
-     "Require Fresh VPA Signal State",
-     tooltip = "Debounces a single continuous VPA signal (raw[1]) so it only counts once per new occurrence, rather than re-arming on every bar the raw condition happens to still be true.",
+     "Require Fresh Acceptance / Rejection State",
      group = G_ENTRY
 )
 
@@ -602,11 +525,20 @@ float stopATR = input.float(
      group = G_RISK
 )
 
-float targetRR = input.float(
+float acceptanceRR = input.float(
      1.75,
-     "Target (R)",
+     "Acceptance Target (R)",
      minval = 0.50,
      maxval = 5.0,
+     step = 0.05,
+     group = G_RISK
+)
+
+float rejectionMinimumRR = input.float(
+     0.75,
+     "Minimum Rejection R:R To Frozen P0",
+     minval = 0.25,
+     maxval = 3.0,
      step = 0.05,
      group = G_RISK
 )
@@ -1493,128 +1425,21 @@ if bearishRejection
 
 
 //=============================================================================
-// HIGH VOLUME S/R + VPA ENTRY SIGNAL
-//-----------------------------------------------------------------------------
-// Ported with parity from the user-supplied "High Volume S/R + VPA
-// Entries + Broken Level Cleanup v2" indicator -- same symmetric pivot +
-// volume-cluster confirmation, same FIFO-capped S/R line arrays, same
-// broken-level cleanup (reverse iteration while removing), same VPA
-// retest condition (a quiet low-volume approach followed by a high-
-// volume reversal candle near a live S/R line). Identifiers renamed to
-// this file's "vpa" prefix; vpaLongRaw/vpaShortRaw are this file's
-// equivalent of the source's bullish_entry/bearish_entry, and
-// vpaLongLevel/vpaShortLevel additionally capture the exact S/R price
-// each signal matched against, for the Data Window and for context.
-//
-// This ENTIRELY REPLACES the old Dynamic P0 Acceptance/Rejection score
-// as the strategy's entry trigger -- bullishAcceptance/bearishAcceptance/
-// bullishRejection/bearishRejection (declared above, under MARKET STATE)
-// are no longer read by anything below this point; they remain fully
-// computed and displayed on the Architecture dashboard as live market-
-// structure context only.
-//=============================================================================
-
-float vpaAtr = ta.atr(14)
-float vpaVolMa = ta.ema(volume, vpaVolMaLengthInput)
-bool vpaHighVol = volume > vpaVolMa * vpaVolFactorInput
-
-bool vpaVolClusterHigh = true
-for i = vpaPivotLengthInput to vpaPivotLengthInput + vpaVolClusterBarsInput - 1
-    vpaVolClusterHigh := vpaVolClusterHigh and vpaHighVol[i]
-
-bool vpaVolClusterLow = true
-for i = vpaPivotLengthInput to vpaPivotLengthInput + vpaVolClusterBarsInput - 1
-    vpaVolClusterLow := vpaVolClusterLow and vpaHighVol[i]
-
-float vpaPh = ta.pivothigh(high, vpaPivotLengthInput, vpaPivotLengthInput)
-float vpaPl = ta.pivotlow(low, vpaPivotLengthInput, vpaPivotLengthInput)
-
-bool vpaPivotHighVol = not na(vpaPh) and vpaVolClusterHigh
-bool vpaPivotLowVol = not na(vpaPl) and vpaVolClusterLow
-
-var array<line> vpaResLines = array.new_line()
-var array<line> vpaSupLines = array.new_line()
-
-f_vpaDrawHline(array<line> arr, int offset, float price, color col, string tag) =>
-    int x1 = bar_index - offset
-    line ln = line.new(x1 = x1, y1 = price, x2 = bar_index + 50, y2 = price, extend = extend.right, color = color.new(col, 25), width = 2, style = line.style_solid)
-    array.push(arr, ln)
-    if showVpaDebugInput
-        label.new(x = x1, y = price, text = tag + "\n" + str.tostring(price, "#.#####"), color = col, textcolor = color.white, style = label.style_label_down, size = size.small)
-    if array.size(arr) > vpaMaxLinesInput
-        line.delete(array.shift(arr))
-
-if vpaPivotHighVol
-    f_vpaDrawHline(vpaResLines, vpaPivotLengthInput, vpaPh, color.red, "Res")
-
-if vpaPivotLowVol
-    f_vpaDrawHline(vpaSupLines, vpaPivotLengthInput, vpaPl, color.green, "Sup")
-
-plotshape(vpaPivotHighVol, title = "HighVol PH", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny)
-plotshape(vpaPivotLowVol, title = "HighVol PL", style = shape.triangleup, location = location.belowbar, color = color.green, size = size.tiny)
-
-if array.size(vpaSupLines) > 0
-    for i = array.size(vpaSupLines) - 1 to 0 by 1
-        float vpaSupLvl = line.get_y1(array.get(vpaSupLines, i))
-        bool vpaSupBroken = close < vpaSupLvl - vpaAtr * vpaBreakAtrBufferInput and volume > vpaVolMa * vpaBreakVolMultInput
-        if vpaSupBroken
-            line.delete(array.get(vpaSupLines, i))
-            array.remove(vpaSupLines, i)
-            if showVpaBreakDebugInput
-                label.new(bar_index, vpaSupLvl, "Broken Down - Removed", yloc = yloc.price, color = color.red, textcolor = color.white, style = label.style_label_down, size = size.tiny)
-
-if array.size(vpaResLines) > 0
-    for i = array.size(vpaResLines) - 1 to 0 by 1
-        float vpaResLvl = line.get_y1(array.get(vpaResLines, i))
-        bool vpaResBroken = close > vpaResLvl + vpaAtr * vpaBreakAtrBufferInput and volume > vpaVolMa * vpaBreakVolMultInput
-        if vpaResBroken
-            line.delete(array.get(vpaResLines, i))
-            array.remove(vpaResLines, i)
-            if showVpaBreakDebugInput
-                label.new(bar_index, vpaResLvl, "Broken Up - Removed", yloc = yloc.price, color = color.red, textcolor = color.white, style = label.style_label_up, size = size.tiny)
-
-f_vpaIsNear(float lvl) =>
-    math.abs(close - lvl) <= vpaAtr * vpaAtrMultInput
-
-bool vpaLowVolApproach = ta.lowest(volume[1], vpaEntryLookbackInput) < vpaVolMa[1]
-bool vpaHighVolReversalUp = volume > vpaVolMa and close > open
-bool vpaHighVolReversalDown = volume > vpaVolMa and close < open
-
-bool vpaLongRaw = false
-float vpaLongLevel = na
-if vpaLowVolApproach and vpaHighVolReversalUp and array.size(vpaSupLines) > 0
-    for i = 0 to array.size(vpaSupLines) - 1
-        float vpaSup = line.get_y1(array.get(vpaSupLines, i))
-        if f_vpaIsNear(vpaSup)
-            vpaLongRaw := true
-            vpaLongLevel := vpaSup
-            break
-
-bool vpaShortRaw = false
-float vpaShortLevel = na
-if vpaLowVolApproach and vpaHighVolReversalDown and array.size(vpaResLines) > 0
-    for i = 0 to array.size(vpaResLines) - 1
-        float vpaRes = line.get_y1(array.get(vpaResLines, i))
-        if f_vpaIsNear(vpaRes)
-            vpaShortRaw := true
-            vpaShortLevel := vpaRes
-            break
-
-// Plain triangles, no text -- shows every bar the raw VPA condition
-// fires, whether or not it goes on to become an actual strategy entry.
-plotshape(showVpaRawSignalInput and vpaLongRaw, title = "VPA Raw Long Signal", style = shape.triangleup, location = location.belowbar, color = color.blue, size = size.tiny)
-plotshape(showVpaRawSignalInput and vpaShortRaw, title = "VPA Raw Short Signal", style = shape.triangledown, location = location.abovebar, color = color.orange, size = size.tiny)
-
-
-//=============================================================================
 // ENTRY ENGINE
 //=============================================================================
 
-var int lastLongExitBar = -10000
-var int lastShortExitBar = -10000
+// Decoupled per ENTRY TYPE, not just per direction -- an Acceptance exit
+// no longer puts Rejection on cooldown (or vice versa), and each type's
+// own cooldown timer only resets when a trade of THAT specific type closes.
+var int lastAcceptanceLongExitBar = -10000
+var int lastAcceptanceShortExitBar = -10000
+var int lastRejectionLongExitBar = -10000
+var int lastRejectionShortExitBar = -10000
 
-bool cooldownOkLong = bar_index - lastLongExitBar >= cooldownBarsLongInput
-bool cooldownOkShort = bar_index - lastShortExitBar >= cooldownBarsShortInput
+bool cooldownOkAcceptanceLong = bar_index - lastAcceptanceLongExitBar >= cooldownBarsLongInput
+bool cooldownOkAcceptanceShort = bar_index - lastAcceptanceShortExitBar >= cooldownBarsShortInput
+bool cooldownOkRejectionLong = bar_index - lastRejectionLongExitBar >= cooldownBarsLongInput
+bool cooldownOkRejectionShort = bar_index - lastRejectionShortExitBar >= cooldownBarsShortInput
 bool flat = strategy.position_size == 0
 
 // Cumulative position-size change log -- unlike a live snapshot, this
@@ -1634,26 +1459,78 @@ if strategy.position_size != strategy.position_size[1]
     if array.size(positionChangeLog) > 6
         array.pop(positionChangeLog)
 
+bool bullishCandleOK = not requireDirectionalCandle or close > open
+bool bearishCandleOK = not requireDirectionalCandle or close < open
+
+bool rejectionReturnOK = not requireReturnTowardP0 or returningTowardP0
+
+bool allowAcceptance = (
+     entryMode == "Both" or
+     entryMode == "Acceptance Only")
+
+bool allowRejection = (
+     entryMode == "Both" or
+     entryMode == "Rejection Only")
+
+bool acceptanceLongRaw = (
+     allowAcceptance and
+     bullishAcceptance and
+     bullishCandleOK)
+
+bool acceptanceShortRaw = (
+     allowAcceptance and
+     bearishAcceptance and
+     bearishCandleOK)
+
+bool rejectionLongRaw = (
+     allowRejection and
+     bullishRejection and
+     bullishCandleOK and
+     rejectionReturnOK and
+     deltaPercent > 0)
+
+bool rejectionShortRaw = (
+     allowRejection and
+     bearishRejection and
+     bearishCandleOK and
+     rejectionReturnOK and
+     deltaPercent < 0)
+
 //=============================================================================
 // STALE-SIGNAL COOLDOWN GUARD
 //-----------------------------------------------------------------------------
 // A pure bar-count cooldown only delays a re-entry -- it says nothing about
 // whether the SAME raw setup that triggered the last trade is still sitting
 // there unchanged the whole time. If price parks at a range edge for longer
-// than the cooldown window, the raw VPA condition can stay (or flicker
-// back) true throughout, and the instant bar_index - lastExitBar clears
-// the cooldown threshold, that same stale setup fires again immediately --
-// which looks exactly like clustering even though the bar-count minimum
-// was technically honored. requireFreshState's own longFresh-style checks
-// only debounce a SINGLE continuous signal (raw[1]), which does nothing to
-// stop the raw condition from going true, false, true again multiple times
-// across a 20+ bar cooldown window.
+// than the cooldown window, the raw acceptance/rejection condition can stay
+// (or flicker back) true throughout, and the instant bar_index - lastExitBar
+// clears the cooldown threshold, that same stale setup fires again
+// immediately -- which looks exactly like clustering even though the
+// bar-count minimum was technically honored. requireFreshState's own
+// acceptanceLongFresh-style checks only debounce a SINGLE continuous signal
+// (raw[1]), which does nothing to stop the raw condition from going true,
+// false, true again multiple times across a 20+ bar cooldown window.
 //
 // This mirrors the fix already proven in Trend_Following_Strategy_v6_Cooldown
-// .pine: a per-direction armed flag that disarms the instant a trade
-// closes and only re-arms once the raw condition has genuinely gone false
-// at least once since then -- proof the old setup actually ended, not
-// just a tick count.
+// .pine: a per-type armed flag that disarms the instant a trade of that
+// type closes and only re-arms once the underlying condition has genuinely
+// gone false at least once since then -- proof the old setup actually
+// ended, not just a tick count. Decoupled per ENTRY TYPE (Acceptance vs.
+// Rejection), not just per direction, so closing one type never affects
+// the other's cooldown.
+//
+// FIX: the first version of this guard rearmed on the full *Raw condition
+// (e.g. acceptanceLongRaw), which ANDs in bullishCandleOK/bearishCandleOK --
+// a single-bar candle-color check that flips on roughly every other bar
+// regardless of the broader trend. That meant the guard rearmed almost
+// immediately after any disarm (the instant one red bar occurred inside an
+// uptrend, say), providing essentially no real protection -- reported as
+// "cooldown not working at all". Rearming on the underlying
+// bullishAcceptance/bearishAcceptance/bullishRejection/bearishRejection
+// booleans instead (displacement + dominance only, no per-bar candle
+// noise) actually requires the acceptance/rejection dominance itself to
+// have genuinely lapsed, not just one red candle inside a still-valid
+// setup.
 //
 // The rearm check below runs BEFORE the entry engine reads these flags;
 // the disarm-on-exit writes (EXIT DETECTION / COOLDOWN, further down this
@@ -1661,52 +1538,111 @@ if strategy.position_size != strategy.position_size[1]
 // same-bar rearm.
 //=============================================================================
 
-var bool longCooldownArmed = true
-var bool shortCooldownArmed = true
+var bool acceptanceLongCooldownArmed = true
+var bool acceptanceShortCooldownArmed = true
+var bool rejectionLongCooldownArmed = true
+var bool rejectionShortCooldownArmed = true
 
-if not vpaLongRaw
-    longCooldownArmed := true
+if not bullishAcceptance
+    acceptanceLongCooldownArmed := true
 
-if not vpaShortRaw
-    shortCooldownArmed := true
+if not bearishAcceptance
+    acceptanceShortCooldownArmed := true
 
-bool longFresh = (
+if not bullishRejection
+    rejectionLongCooldownArmed := true
+
+if not bearishRejection
+    rejectionShortCooldownArmed := true
+
+bool acceptanceLongFresh = (
      not requireFreshState or
-     not vpaLongRaw[1])
+     not acceptanceLongRaw[1])
 
-bool shortFresh = (
+bool acceptanceShortFresh = (
      not requireFreshState or
-     not vpaShortRaw[1])
+     not acceptanceShortRaw[1])
+
+bool rejectionLongFresh = (
+     not requireFreshState or
+     not rejectionLongRaw[1])
+
+bool rejectionShortFresh = (
+     not requireFreshState or
+     not rejectionShortRaw[1])
+
+float rejectionPlannedRisk = atr * stopATR
+float rejectionLongReward = dynamicP0 - close
+float rejectionShortReward = close - dynamicP0
+
+float rejectionLongRR = (rejectionPlannedRisk > 0 ?
+     rejectionLongReward / rejectionPlannedRisk :
+     0.0)
+
+float rejectionShortRR = (rejectionPlannedRisk > 0 ?
+     rejectionShortReward / rejectionPlannedRisk :
+     0.0)
 
 bool structuralFilterLongOk = not useStructuralFilterInput or na(structuralResistance) or close < structuralResistance
 bool structuralFilterShortOk = not useStructuralFilterInput or na(structuralSupport) or close > structuralSupport
 
-bool longArmed = (
+bool acceptanceLongArmed = (
      flat and
-     cooldownOkLong and
-     longCooldownArmed and
-     vpaLongRaw and
-     longFresh and
+     cooldownOkAcceptanceLong and
+     acceptanceLongCooldownArmed and
+     acceptanceLongRaw and
+     acceptanceLongFresh and
      structuralFilterLongOk)
 
-bool shortArmed = (
+bool acceptanceShortArmed = (
      flat and
-     cooldownOkShort and
-     shortCooldownArmed and
-     vpaShortRaw and
-     shortFresh and
+     cooldownOkAcceptanceShort and
+     acceptanceShortCooldownArmed and
+     acceptanceShortRaw and
+     acceptanceShortFresh and
      structuralFilterShortOk)
 
-bool longSetupArmed = longArmed
-bool shortSetupArmed = shortArmed
+bool rejectionLongArmed = (
+     flat and
+     cooldownOkRejectionLong and
+     rejectionLongCooldownArmed and
+     rejectionLongRaw and
+     rejectionLongFresh and
+     dynamicP0 > close and
+     rejectionLongRR >= rejectionMinimumRR)
 
-bool longSignal = (
-     barstate.isconfirmed and
-     longArmed)
+bool rejectionShortArmed = (
+     flat and
+     cooldownOkRejectionShort and
+     rejectionShortCooldownArmed and
+     rejectionShortRaw and
+     rejectionShortFresh and
+     dynamicP0 < close and
+     rejectionShortRR >= rejectionMinimumRR)
 
-bool shortSignal = (
+bool longSetupArmed = (
+     acceptanceLongArmed or
+     rejectionLongArmed)
+
+bool shortSetupArmed = (
+     acceptanceShortArmed or
+     rejectionShortArmed)
+
+bool acceptanceLongSignal = (
      barstate.isconfirmed and
-     shortArmed)
+     acceptanceLongArmed)
+
+bool acceptanceShortSignal = (
+     barstate.isconfirmed and
+     acceptanceShortArmed)
+
+bool rejectionLongCandidate = (
+     barstate.isconfirmed and
+     rejectionLongArmed)
+
+bool rejectionShortCandidate = (
+     barstate.isconfirmed and
+     rejectionShortArmed)
 
 
 //=============================================================================
@@ -1731,18 +1667,21 @@ var bool breakEvenActive = false
 if strategy.position_size != strategy.position_size[1]
     log.info("POS CHANGE bar=" + str.tostring(bar_index) + " prev=" + str.tostring(strategy.position_size[1]) + " now=" + str.tostring(strategy.position_size) + " activeTradeType(incoming)='" + activeTradeType + "'")
 
-if longSignal
+bool rejectionLongSignal = false
+bool rejectionShortSignal = false
+
+if acceptanceLongSignal
     activeEntry := close
     activeRisk := atr * stopATR
     activeStop := activeEntry - activeRisk
-    float longRMultipleTarget = activeEntry + activeRisk * targetRR
-    bool structuralLongTargetValid = not na(structuralResistance) and structuralResistance > activeEntry and structuralResistance < longRMultipleTarget
-    activeTarget := useStructuralTargetInput and structuralLongTargetValid ? structuralResistance : longRMultipleTarget
-    activeTradeType := "VPA LONG"
+    float acceptanceLongRMultipleTarget = activeEntry + activeRisk * acceptanceRR
+    bool structuralLongTargetValid = not na(structuralResistance) and structuralResistance > activeEntry and structuralResistance < acceptanceLongRMultipleTarget
+    activeTarget := useStructuralTargetInput and structuralLongTargetValid ? structuralResistance : acceptanceLongRMultipleTarget
+    activeTradeType := "ACCEPTANCE LONG"
     breakEvenActive := false
 
     string message = f_entryMessage(
-         "BULL | LONG ENTRY | VPA S/R RETEST",
+         "BULL | LONG ENTRY | ACCEPTANCE CONTINUATION",
          activeEntry,
          activeStop,
          activeTarget,
@@ -1755,33 +1694,33 @@ if longSignal
     )
 
     strategy.entry(
-         id = "VPA Long",
+         id = "Acceptance Long",
          direction = strategy.long,
          qty = contracts,
-         comment = "VPA LONG",
+         comment = "ACCEPTANCE LONG",
          alert_message = message
     )
 
     if showCooldownGapLabelsInput
-        int barsSinceLastLongExit = bar_index - lastLongExitBar
-        label.new(bar_index, high, "Δ" + str.tostring(barsSinceLastLongExit), style = label.style_label_down, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
+        int barsSinceLastAcceptanceLongExit = bar_index - lastAcceptanceLongExitBar
+        label.new(bar_index, high, "Δ" + str.tostring(barsSinceLastAcceptanceLongExit), style = label.style_label_down, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
 
     if enableDynamicAlerts and alertEntries
         alert(message, alert.freq_once_per_bar_close)
 
 
-if shortSignal
+if acceptanceShortSignal
     activeEntry := close
     activeRisk := atr * stopATR
     activeStop := activeEntry + activeRisk
-    float shortRMultipleTarget = activeEntry - activeRisk * targetRR
-    bool structuralShortTargetValid = not na(structuralSupport) and structuralSupport < activeEntry and structuralSupport > shortRMultipleTarget
-    activeTarget := useStructuralTargetInput and structuralShortTargetValid ? structuralSupport : shortRMultipleTarget
-    activeTradeType := "VPA SHORT"
+    float acceptanceShortRMultipleTarget = activeEntry - activeRisk * acceptanceRR
+    bool structuralShortTargetValid = not na(structuralSupport) and structuralSupport < activeEntry and structuralSupport > acceptanceShortRMultipleTarget
+    activeTarget := useStructuralTargetInput and structuralShortTargetValid ? structuralSupport : acceptanceShortRMultipleTarget
+    activeTradeType := "ACCEPTANCE SHORT"
     breakEvenActive := false
 
     string message = f_entryMessage(
-         "BEAR | SHORT ENTRY | VPA S/R RETEST",
+         "BEAR | SHORT ENTRY | ACCEPTANCE CONTINUATION",
          activeEntry,
          activeStop,
          activeTarget,
@@ -1794,16 +1733,104 @@ if shortSignal
     )
 
     strategy.entry(
-         id = "VPA Short",
+         id = "Acceptance Short",
          direction = strategy.short,
          qty = contracts,
-         comment = "VPA SHORT",
+         comment = "ACCEPTANCE SHORT",
          alert_message = message
     )
 
     if showCooldownGapLabelsInput
-        int barsSinceLastShortExit = bar_index - lastShortExitBar
-        label.new(bar_index, low, "Δ" + str.tostring(barsSinceLastShortExit), style = label.style_label_up, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
+        int barsSinceLastAcceptanceShortExit = bar_index - lastAcceptanceShortExitBar
+        label.new(bar_index, low, "Δ" + str.tostring(barsSinceLastAcceptanceShortExit), style = label.style_label_up, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
+
+    if enableDynamicAlerts and alertEntries
+        alert(message, alert.freq_once_per_bar_close)
+
+
+//=============================================================================
+// REJECTION ENTRIES — TARGET IS FROZEN P0
+//=============================================================================
+
+if rejectionLongCandidate
+    float plannedRisk = rejectionPlannedRisk
+    float plannedStop = close - plannedRisk
+    float plannedTarget = dynamicP0
+
+    rejectionLongSignal := true
+    activeEntry := close
+    activeRisk := plannedRisk
+    activeStop := plannedStop
+    activeTarget := plannedTarget
+    activeTradeType := "REJECTION LONG"
+    breakEvenActive := false
+
+    string message = f_entryMessage(
+         "BULL | LONG ENTRY | REJECTION TO P0",
+         activeEntry,
+         activeStop,
+         activeTarget,
+         dynamicP0,
+         distanceFromP0ATR,
+         deltaPercent,
+         acceptanceScore,
+         rejectionScore,
+         profileCoherence
+    )
+
+    strategy.entry(
+         id = "Rejection Long",
+         direction = strategy.long,
+         qty = contracts,
+         comment = "REJECTION LONG",
+         alert_message = message
+    )
+
+    if showCooldownGapLabelsInput
+        int barsSinceLastRejectionLongExit = bar_index - lastRejectionLongExitBar
+        label.new(bar_index, high, "Δ" + str.tostring(barsSinceLastRejectionLongExit), style = label.style_label_down, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
+
+    if enableDynamicAlerts and alertEntries
+        alert(message, alert.freq_once_per_bar_close)
+
+
+if rejectionShortCandidate
+    float plannedRisk = rejectionPlannedRisk
+    float plannedStop = close + plannedRisk
+    float plannedTarget = dynamicP0
+
+    rejectionShortSignal := true
+    activeEntry := close
+    activeRisk := plannedRisk
+    activeStop := plannedStop
+    activeTarget := plannedTarget
+    activeTradeType := "REJECTION SHORT"
+    breakEvenActive := false
+
+    string message = f_entryMessage(
+         "BEAR | SHORT ENTRY | REJECTION TO P0",
+         activeEntry,
+         activeStop,
+         activeTarget,
+         dynamicP0,
+         distanceFromP0ATR,
+         deltaPercent,
+         acceptanceScore,
+         rejectionScore,
+         profileCoherence
+    )
+
+    strategy.entry(
+         id = "Rejection Short",
+         direction = strategy.short,
+         qty = contracts,
+         comment = "REJECTION SHORT",
+         alert_message = message
+    )
+
+    if showCooldownGapLabelsInput
+        int barsSinceLastRejectionShortExit = bar_index - lastRejectionShortExitBar
+        label.new(bar_index, low, "Δ" + str.tostring(barsSinceLastRejectionShortExit), style = label.style_label_up, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
 
     if enableDynamicAlerts and alertEntries
         alert(message, alert.freq_once_per_bar_close)
@@ -1818,13 +1845,22 @@ if strategy.position_size > 0
         activeStop := math.max(activeStop, activeEntry)
         breakEvenActive := true
 
-    if activeTradeType == "VPA LONG"
+    if activeTradeType == "ACCEPTANCE LONG"
         strategy.exit(
-             id = "VPA Long Exit",
-             from_entry = "VPA Long",
+             id = "Acceptance Long Exit",
+             from_entry = "Acceptance Long",
              stop = activeStop,
              limit = activeTarget,
-             alert_message = "LONG EXIT | VPA LONG"
+             alert_message = "LONG EXIT | ACCEPTANCE LONG"
+        )
+
+    if activeTradeType == "REJECTION LONG"
+        strategy.exit(
+             id = "Rejection Long Exit",
+             from_entry = "Rejection Long",
+             stop = activeStop,
+             limit = activeTarget,
+             alert_message = "LONG EXIT | REJECTION LONG"
         )
 
 
@@ -1833,13 +1869,22 @@ if strategy.position_size < 0
         activeStop := math.min(activeStop, activeEntry)
         breakEvenActive := true
 
-    if activeTradeType == "VPA SHORT"
+    if activeTradeType == "ACCEPTANCE SHORT"
         strategy.exit(
-             id = "VPA Short Exit",
-             from_entry = "VPA Short",
+             id = "Acceptance Short Exit",
+             from_entry = "Acceptance Short",
              stop = activeStop,
              limit = activeTarget,
-             alert_message = "SHORT EXIT | VPA SHORT"
+             alert_message = "SHORT EXIT | ACCEPTANCE SHORT"
+        )
+
+    if activeTradeType == "REJECTION SHORT"
+        strategy.exit(
+             id = "Rejection Short Exit",
+             from_entry = "Rejection Short",
+             stop = activeStop,
+             limit = activeTarget,
+             alert_message = "SHORT EXIT | REJECTION SHORT"
         )
 
 
@@ -1863,8 +1908,10 @@ var int processedClosedTrades = 0
 var string closedEntryIdThisUpdate = ""
 var int closedExitBarThisUpdate = na
 
-bool longClosed = false
-bool shortClosed = false
+bool acceptanceLongClosedNow = false
+bool acceptanceShortClosedNow = false
+bool rejectionLongClosedNow = false
+bool rejectionShortClosedNow = false
 
 bool closedTradeThisUpdate = strategy.closedtrades > processedClosedTrades
 
@@ -1874,17 +1921,30 @@ if closedTradeThisUpdate
     closedEntryIdThisUpdate := strategy.closedtrades.entry_id(closedTradeNumber)
     closedExitBarThisUpdate := strategy.closedtrades.exit_bar_index(closedTradeNumber)
 
-    if closedEntryIdThisUpdate == "VPA Long"
-        lastLongExitBar := closedExitBarThisUpdate
-        longCooldownArmed := false
-        longClosed := true
+    if closedEntryIdThisUpdate == "Acceptance Long"
+        lastAcceptanceLongExitBar := closedExitBarThisUpdate
+        acceptanceLongCooldownArmed := false
+        acceptanceLongClosedNow := true
 
-    if closedEntryIdThisUpdate == "VPA Short"
-        lastShortExitBar := closedExitBarThisUpdate
-        shortCooldownArmed := false
-        shortClosed := true
+    if closedEntryIdThisUpdate == "Acceptance Short"
+        lastAcceptanceShortExitBar := closedExitBarThisUpdate
+        acceptanceShortCooldownArmed := false
+        acceptanceShortClosedNow := true
+
+    if closedEntryIdThisUpdate == "Rejection Long"
+        lastRejectionLongExitBar := closedExitBarThisUpdate
+        rejectionLongCooldownArmed := false
+        rejectionLongClosedNow := true
+
+    if closedEntryIdThisUpdate == "Rejection Short"
+        lastRejectionShortExitBar := closedExitBarThisUpdate
+        rejectionShortCooldownArmed := false
+        rejectionShortClosedNow := true
 
     processedClosedTrades := strategy.closedtrades
+
+bool longClosed = acceptanceLongClosedNow or rejectionLongClosedNow
+bool shortClosed = acceptanceShortClosedNow or rejectionShortClosedNow
 
 // Rolling exit log, shown on the dashboard (guaranteed visible on
 // mobile, unlike Pine Logs / Strategy Tester / Data Window custom
@@ -1976,8 +2036,13 @@ fill(
 // SETUP ARMED + ACTUAL ENTRY SIGNALS
 //=============================================================================
 
-bool actualLongEntry = longSignal
-bool actualShortEntry = shortSignal
+bool actualLongEntry = (
+     acceptanceLongSignal or
+     rejectionLongSignal)
+
+bool actualShortEntry = (
+     acceptanceShortSignal or
+     rejectionShortSignal)
 
 barcolor(showEntryBarColorInput and actualLongEntry ? entryLongBarColor : showEntryBarColorInput and actualShortEntry ? entryShortBarColor : na, title = "Entry Bar Highlight")
 
@@ -2692,14 +2757,18 @@ if barstate.islast
             table.cell(architectureTable, 3, 9, f_pct(profileCoherence), text_color = color.white)
         table.cell(architectureTable, readCol, 9, profileCoherence >= minimumCoherence ? "STRUCTURED" : "NOISY", text_color = profileCoherence >= minimumCoherence ? acceptanceColor : color.gray)
 
-        // Cooldown bar, per side. Two gates feed into readiness: the plain
-        // bar-count cooldown AND the stale-signal guard -- READY requires
-        // both, STALE means the bar count is done but the underlying VPA
-        // condition never actually lapsed yet, COOLING means the bar count
-        // itself hasn't elapsed.
-        bool longCooldownOkForRead = cooldownOkLong
-        bool longCooldownArmedForRead = longCooldownArmed
-        int lastLongExitBarForRead = lastLongExitBar
+        // Cooldown bar, per side. Cooldown is now decoupled per ENTRY TYPE
+        // (Acceptance vs. Rejection), so the dashboard shows whichever
+        // type is actually enabled by Entry Mode -- Acceptance's timer
+        // when Acceptance is allowed (covers "Both" and "Acceptance
+        // Only"), otherwise Rejection's. Two gates feed into readiness:
+        // the plain bar-count cooldown AND the stale-signal guard --
+        // READY requires both, STALE means the bar count is done but the
+        // underlying condition never actually lapsed yet, COOLING means
+        // the bar count itself hasn't elapsed.
+        bool longCooldownOkForRead = allowAcceptance ? cooldownOkAcceptanceLong : cooldownOkRejectionLong
+        bool longCooldownArmedForRead = allowAcceptance ? acceptanceLongCooldownArmed : rejectionLongCooldownArmed
+        int lastLongExitBarForRead = allowAcceptance ? lastAcceptanceLongExitBar : lastRejectionLongExitBar
 
         float longCooldownElapsed = bar_index - lastLongExitBarForRead
         float longCooldownProgressPct = f_clamp(100.0 * longCooldownElapsed / math.max(cooldownBarsLongInput, 1), 0.0, 100.0)
@@ -2717,9 +2786,9 @@ if barstate.islast
             table.cell(architectureTable, 3, 10, str.tostring(longCooldownBarsLeft) + " left", text_color = color.white)
         table.cell(architectureTable, readCol, 10, readLongCooldown, text_color = readLongCooldown == "READY" ? acceptanceColor : readLongCooldown == "STALE" ? color.orange : rejectionColor)
 
-        bool shortCooldownOkForRead = cooldownOkShort
-        bool shortCooldownArmedForRead = shortCooldownArmed
-        int lastShortExitBarForRead = lastShortExitBar
+        bool shortCooldownOkForRead = allowAcceptance ? cooldownOkAcceptanceShort : cooldownOkRejectionShort
+        bool shortCooldownArmedForRead = allowAcceptance ? acceptanceShortCooldownArmed : rejectionShortCooldownArmed
+        int lastShortExitBarForRead = allowAcceptance ? lastAcceptanceShortExitBar : lastRejectionShortExitBar
 
         float shortCooldownElapsed = bar_index - lastShortExitBarForRead
         float shortCooldownProgressPct = f_clamp(100.0 * shortCooldownElapsed / math.max(cooldownBarsShortInput, 1), 0.0, 100.0)
@@ -2794,15 +2863,27 @@ if barstate.islast
 //=============================================================================
 
 alertcondition(
-     longSignal,
-     title = "VPA Long",
-     message = "BULL | LONG ENTRY | VPA S/R RETEST | {{ticker}} {{interval}} @ {{close}}"
+     acceptanceLongSignal,
+     title = "Bull Acceptance Long",
+     message = "BULL | LONG ENTRY | ACCEPTANCE CONTINUATION | {{ticker}} {{interval}} @ {{close}}"
 )
 
 alertcondition(
-     shortSignal,
-     title = "VPA Short",
-     message = "BEAR | SHORT ENTRY | VPA S/R RETEST | {{ticker}} {{interval}} @ {{close}}"
+     acceptanceShortSignal,
+     title = "Bear Acceptance Short",
+     message = "BEAR | SHORT ENTRY | ACCEPTANCE CONTINUATION | {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     rejectionLongSignal,
+     title = "Bull Rejection Long",
+     message = "BULL | LONG ENTRY | REJECTION TO P0 | {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     rejectionShortSignal,
+     title = "Bear Rejection Short",
+     message = "BEAR | SHORT ENTRY | REJECTION TO P0 | {{ticker}} {{interval}} @ {{close}}"
 )
 
 alertcondition(
@@ -2851,12 +2932,10 @@ plot(structuralResistance, title = "Structural Delta Resistance", display = disp
 plot(strategy.position_size, title = "Position Size", display = display.data_window)
 plot(longClosed ? 1 : 0, title = "Long Closed Event", display = display.data_window)
 plot(shortClosed ? 1 : 0, title = "Short Closed Event", display = display.data_window)
-plot(lastLongExitBar, title = "Last Long Exit Bar", display = display.data_window)
-plot(lastShortExitBar, title = "Last Short Exit Bar", display = display.data_window)
-plot(vpaLongRaw ? 1 : 0, title = "VPA Raw Long Signal", display = display.data_window)
-plot(vpaShortRaw ? 1 : 0, title = "VPA Raw Short Signal", display = display.data_window)
-plot(array.size(vpaResLines), title = "VPA Resistance Lines Live", display = display.data_window)
-plot(array.size(vpaSupLines), title = "VPA Support Lines Live", display = display.data_window)
+plot(lastAcceptanceLongExitBar, title = "Last Accept Long Exit Bar", display = display.data_window)
+plot(lastAcceptanceShortExitBar, title = "Last Accept Short Exit Bar", display = display.data_window)
+plot(lastRejectionLongExitBar, title = "Last Reject Long Exit Bar", display = display.data_window)
+plot(lastRejectionShortExitBar, title = "Last Reject Short Exit Bar", display = display.data_window)
 
 // REALTIME VISUALS:
 // Dashboard, dynamic P0, value area, structural levels, and the right-side
