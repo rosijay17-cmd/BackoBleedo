@@ -756,12 +756,14 @@ plotshape(showZscoreSignalsInput and normZscoreFast > zscoreObThresholdInput, ti
 // Replaces the prior Pullback/Breakout dual-mode entry model entirely, per
 // explicit request, with the user-supplied "Breakout and Retest Signals
 // [AlgoAlpha]" algorithm, ported with parity (same swing-matching math,
-// same "always consume the matched pivot" behavior, same box/line/label
-// shapes -- only identifiers renamed to this file's convention, colors
-// moved to dedicated inputs here since longColorInput/shortColorInput
-// aren't declared until the Visuals section, and the Unicode up/down
-// triangles swapped for plain "LONG"/"SHORT" text to match this file's
-// existing ASCII-label convention).
+// same "always consume the matched pivot" behavior, same zone/split-box
+// and dashed-line visuals) -- identifiers renamed to this file's
+// convention, colors moved to dedicated inputs here since
+// longColorInput/shortColorInput aren't declared until the Visuals
+// section, and the source's Unicode up/down triangle text labels swapped
+// for actual triangleup/triangledown plotshape markers, matching this
+// file's existing entry-marker convention (Visuals' showEntryMarkersInput)
+// instead of a floating text box per signal.
 //
 // MECHANISM: keeps the most recent arSwingMemoryInput swing highs/lows
 // (asymmetric pivots -- the confirmation length is Pivot Period divided by
@@ -792,7 +794,7 @@ cooldownBarsInput = input.int(12, "Cooldown Bars Between Setups (Per Direction)"
 requireMomentumInput = input.bool(true, "Require Momentum Confirmation", group = G_ENTRY)
 requireFavorableSessionInput = input.bool(true, "Require Favorable Session", group = G_ENTRY)
 showBreakoutRetestBoxesInput = input.bool(true, "Show Breakout & Retest Boxes", group = G_ENTRY)
-showBreakoutRetestLabelsInput = input.bool(true, "Show Breakout & Retest Delta Labels", group = G_ENTRY)
+showBreakoutRetestLabelsInput = input.bool(true, "Show Breakout & Retest Entry Triangles", group = G_ENTRY)
 arBullColorInput = input.color(#00ffbb, "Bullish Color", group = G_ENTRY, inline = "arcolor")
 arBearColorInput = input.color(#ff1100, "Bearish Color", group = G_ENTRY, inline = "arcolor")
 
@@ -852,7 +854,7 @@ if not na(arPh) and array.size(arSwingLows) > 0
             line.new(arMatchedLow.idx, math.avg(arPh, arMatchedLow.price), bar_index - arConfirmLen, math.avg(arPh, arMatchedLow.price), color = chart.fg_color, style = line.style_dashed)
 
         if showBreakoutRetestLabelsInput
-            label.new(bar_index - arConfirmLen, math.max(arPh, arMatchedLow.price), "SHORT\nDelta: " + str.tostring(executionDeltaVolume[arConfirmLen], format.volume), xloc.bar_index, yloc.price, color.new(arBearColorInput, 70), label.style_label_down, size = size.tiny)
+            plotshape(true, title = "Bearish Breakout & Retest Entry", style = shape.triangledown, location = location.abovebar, offset = -arConfirmLen, color = arBearColorInput, size = size.tiny)
 
         shortSignalNow := true
 
@@ -884,7 +886,7 @@ if not na(arPl) and array.size(arSwingHighs) > 0
             line.new(arMatchedHigh.idx, math.avg(arPl, arMatchedHigh.price), bar_index - arConfirmLen, math.avg(arPl, arMatchedHigh.price), color = chart.fg_color, style = line.style_dashed)
 
         if showBreakoutRetestLabelsInput
-            label.new(bar_index - arConfirmLen, math.min(arPl, arMatchedHigh.price), "LONG\nDelta: " + str.tostring(executionDeltaVolume[arConfirmLen], format.volume), xloc.bar_index, yloc.price, color.new(arBullColorInput, 70), label.style_label_up, size = size.tiny)
+            plotshape(true, title = "Bullish Breakout & Retest Entry", style = shape.triangleup, location = location.belowbar, offset = -arConfirmLen, color = arBullColorInput, size = size.tiny)
 
         longSignalNow := true
 
