@@ -1,0 +1,466 @@
+//@version=6
+//@strategy_alert_message {{strategy.order.alert_message}} | {{ticker}} | {{interval}} | Fill: {{strategy.order.price}}
+
+//=============================================================================
+// OVERVIEW
+//=============================================================================
+// Uses the same adaptive Hull-smoothed volatility-band trend engine as
+// "Adaptive Trend Flow Strategy - Optimized v6" -- itself adapted from
+// "Adaptive Trend Flow [QuantAlgo]" (MPL 2.0) -- but as a REGIME
+// DETERMINANT, not a direct entry trigger. That script enters on every
+// trend flip; this one only enters on a pullback INTO the trailing level
+// with a reclaim confirmation once a direction is already established,
+// the same pullback-reclaim pattern already proven in this repo's
+// MNQ_Multi_Trigger_Trend_Continuation.pine (Trigger 1). Fewer, more
+// selective entries than trading the raw flip, at the cost of entering
+// later into any given trend leg.
+//=============================================================================
+
+strategy(
+     title="Adaptive Trend Pullback Continuation v1",
+     shorttitle="ATF PULLBACK V1",
+     overlay=true,
+     pyramiding=0,
+     initial_capital=50000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=2.50,
+     slippage=1,
+     process_orders_on_close=true,
+     calc_on_order_fills=true,
+     calc_on_every_tick=false,
+     max_labels_count=500,
+     max_lines_count=500
+)
+
+//=============================================================================
+// INPUT GROUPS
+//=============================================================================
+var string trend_settings   = "════════ Trend Engine ════════"
+var string regime_settings  = "════════ Regime Persistence ════════"
+var string entry_settings   = "════════ Pullback Entry ════════"
+var string filter_settings  = "════════ Filters ════════"
+var string risk_settings    = "════════ Risk Management ════════"
+var string safety_settings  = "════════ Daily Safety ════════"
+var string visual_settings  = "════════ Visualization ════════"
+
+//=============================================================================
+// TREND ENGINE (same math as Adaptive Trend Flow Strategy v6)
+//=============================================================================
+int length = input.int(10, "Main Length", minval=2, group=trend_settings, tooltip="Length of the trend calculation period. Higher values create smoother signals.")
+int smooth_len = input.int(14, "Smoothing Length", minval=2, group=trend_settings, tooltip="Smoothing period for volatility (Hull Moving Average).")
+float sensitivity = input.float(2.0, "Sensitivity", step=0.1, group=trend_settings, tooltip="Multiplier for volatility bands. Higher values create wider bands.")
+
+//=============================================================================
+// REGIME PERSISTENCE
+//=============================================================================
+int minTrendAgeInput = input.int(0, "Minimum Bars Since Flip", minval=0, group=regime_settings, tooltip="Requires the current trend direction to have held for at least this many bars before a pullback entry is allowed -- avoids trading a pullback into a flip that may itself still be unstable. 0 disables this filter (default -- this is a design safeguard, not something inherent to the pullback model itself; raise it if you specifically want fresh flips excluded).")
+
+//=============================================================================
+// PULLBACK ENTRY
+//=============================================================================
+float pullbackToleranceAtrInput = input.float(0.15, "Pullback Touch Tolerance / ATR", minval=0.0, step=0.05, group=entry_settings, tooltip="How close price must come to the trailing trend level to count as a pullback.")
+int pullbackLookbackInput = input.int(8, "Pullback Lookback, Bars", minval=1, maxval=50, group=entry_settings, tooltip="A pullback touch stays valid for this many bars while waiting for the reclaim confirmation.")
+float minReclaimBodyPctInput = input.float(0.40, "Minimum Reclaim Body %", minval=0.0, maxval=1.0, step=0.05, group=entry_settings, tooltip="The reclaim candle's body must be at least this fraction of its full range -- filters weak, indecisive reclaims.")
+bool allowLongs = input.bool(true, "Allow Longs", group=entry_settings)
+bool allowShorts = input.bool(true, "Allow Shorts", group=entry_settings)
+bool confirmEntriesOnClose = input.bool(true, "Confirm Entries On Bar Close", group=entry_settings, tooltip="Recommended ON. Evaluates the pullback/reclaim logic only on confirmed bars.")
+
+//=============================================================================
+// FILTERS
+//=============================================================================
+bool useSessionFilter = input.bool(false, "Use Session Filter", group=filter_settings)
+string sessionTimezone = input.string("America/New_York", "Session Timezone", group=filter_settings)
+string tradingSession = input.session("0930-1600", "Trading Session", group=filter_settings)
+bool closeAtSessionEnd = input.bool(true, "Close At Session End", group=filter_settings)
+
+bool useHTFFilter = input.bool(false, "Use Higher Timeframe Trend Filter", group=filter_settings, tooltip="Longs require HTF trend bullish. Shorts require HTF trend bearish, using the same engine on a higher timeframe.")
+string htfFilterTF = input.timeframe("60", "Higher Timeframe", group=filter_settings)
+
+//=============================================================================
+// RISK MANAGEMENT
+//=============================================================================
+float orderQuantity = input.float(1.0, "Contracts", minval=1.0, step=1.0, group=risk_settings)
+
+string stopMode = input.string("Wider of ATR / Level", "Stop Mode", options=["ATR", "Trend Level", "Wider of ATR / Level"], group=risk_settings)
+int atrLength = input.int(14, "ATR Length", minval=1, group=risk_settings)
+float atrMultiplier = input.float(1.5, "ATR Stop Multiplier", minval=0.1, step=0.1, group=risk_settings)
+float structureBufferAtrInput = input.float(0.10, "Trend Level Stop Buffer / ATR", minval=0.0, step=0.05, group=risk_settings, tooltip="Extra distance beyond the trend level, as a multiple of ATR, so the stop isn't sitting exactly on the level itself.")
+
+bool useTakeProfit = input.bool(true, "Use Take Profit", group=risk_settings)
+float rrMultiple = input.float(2.0, "Risk Reward Multiple", minval=0.1, step=0.1, group=risk_settings)
+
+bool useBreakEven = input.bool(true, "Move Stop To Breakeven", group=risk_settings)
+float breakEvenAtR = input.float(1.0, "Breakeven Activation R", minval=0.1, step=0.1, group=risk_settings)
+float breakEvenPlusTicks = input.float(0.0, "Breakeven Plus Ticks", minval=0.0, step=1.0, group=risk_settings)
+
+bool useTrailingStop = input.bool(false, "Use ATR Trailing Stop", group=risk_settings)
+float trailAtrMultiplier = input.float(1.2, "Trailing ATR Multiplier", minval=0.1, step=0.1, group=risk_settings)
+float trailStepMultiplier = input.float(0.5, "Trailing Step Multiplier", minval=0.1, step=0.1, group=risk_settings, tooltip="Only updates the trailing stop when price moves in profit by this multiple of ATR.")
+
+//=============================================================================
+// DAILY SAFETY
+//=============================================================================
+int maxTradesPerDayInput = input.int(4, "Maximum Trades Per Day", minval=1, group=safety_settings)
+int cooldownBarsInput = input.int(6, "Cooldown Bars", minval=0, group=safety_settings, tooltip="Measured from both the last signal bar and the last closed-trade bar.")
+
+//=============================================================================
+// VISUAL SETTINGS
+//=============================================================================
+color bullcolor = input.color(#00ffaa, "Bullish Color", group=visual_settings)
+color bearcolor = input.color(#ff0000, "Bearish Color", group=visual_settings)
+bool showbars = input.bool(true, "Color Bars?", group=visual_settings)
+bool showbg = input.bool(true, "Background Color?", group=visual_settings)
+bool showEntryArrows = input.bool(true, "Show Entry Arrows?", group=visual_settings)
+bool showRiskLevels = input.bool(true, "Show Active SL / TP?", group=visual_settings)
+bool showDashboard = input.bool(true, "Show Dashboard?", group=visual_settings)
+
+//=============================================================================
+// HELPERS
+//=============================================================================
+f_price(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+f_alertMsg(string label, float px) =>
+    label + " | " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(px, format.mintick)
+
+//=============================================================================
+// TREND ENGINE
+//=============================================================================
+calculate_trend_levels() =>
+    float typical = hlc3
+    float fast_ema = ta.ema(typical, length)
+    float slow_ema = ta.ema(typical, length * 2)
+    float basis = (fast_ema + slow_ema) / 2.0
+    float vol = ta.stdev(typical, length)
+    float smooth_vol = ta.hma(vol, smooth_len)
+    float upper = basis + smooth_vol * sensitivity
+    float lower = basis - smooth_vol * sensitivity
+    [basis, upper, lower]
+
+get_trend_state(float upper, float lower, float basis) =>
+    var float prev_level = na
+    var int trend = 0
+
+    if na(prev_level)
+        trend := close > basis ? 1 : -1
+        prev_level := trend == 1 ? lower : upper
+
+    if trend == 1
+        if close < lower
+            trend := -1
+            prev_level := upper
+        else
+            prev_level := lower
+    else
+        if close > upper
+            trend := 1
+            prev_level := lower
+        else
+            prev_level := upper
+
+    [trend, prev_level]
+
+[basis, upper, lower] = calculate_trend_levels()
+[trend, level] = get_trend_state(upper, lower, basis)
+
+bool bullishTrend = trend == 1
+bool bearishTrend = trend == -1
+
+//=============================================================================
+// REGIME PERSISTENCE
+//=============================================================================
+int barsSinceFlip = ta.barssince(trend != trend[1])
+bool regimeEstablished = na(barsSinceFlip) or barsSinceFlip >= minTrendAgeInput
+
+//=============================================================================
+// SESSION FILTER
+//=============================================================================
+bool inTradingSession = not useSessionFilter or not na(time(timeframe.period, tradingSession, sessionTimezone))
+
+int barCloseMOD = hour(time_close, sessionTimezone) * 60 + minute(time_close, sessionTimezone)
+int sessionEndMOD = int(str.tonumber(str.substring(tradingSession, 5, 7))) * 60 + int(str.tonumber(str.substring(tradingSession, 7, 9)))
+bool finalSessionBar = useSessionFilter and inTradingSession and barCloseMOD == sessionEndMOD
+
+//=============================================================================
+// HTF TREND FILTER (repaint-secured: [1] + lookahead_on)
+//=============================================================================
+f_htfTrendSnapshot() =>
+    [htfBasis, htfUpper, htfLower] = calculate_trend_levels()
+    [htfTrendRaw, htfLevelRaw] = get_trend_state(htfUpper, htfLower, htfBasis)
+    htfTrendRaw[1]
+
+int htfTrend = request.security(syminfo.tickerid, htfFilterTF, f_htfTrendSnapshot(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+bool htfLongOK = not useHTFFilter or htfTrend == 1
+bool htfShortOK = not useHTFFilter or htfTrend == -1
+
+//=============================================================================
+// PULLBACK + RECLAIM ENTRY
+//=============================================================================
+float atrValue = ta.atr(atrLength)
+float pullbackTolerance = atrValue * pullbackToleranceAtrInput
+
+float bodySize = math.abs(close - open)
+float candleRange = math.max(high - low, syminfo.mintick)
+float bodyPct = candleRange > 0 ? bodySize / candleRange : 0.0
+bool bullCandle = close > open
+bool bearCandle = close < open
+
+// FIX ("no entry signals"): the pullback target was "level", which is the
+// TRAILING TREND LEVEL -- prev_level in get_trend_state, set to the outer
+// volatility band (lower/upper) while a trend holds. Requiring price to
+// retrace all the way back to the opposite-side outer band during an
+// ESTABLISHED trend is asking for a retracement so deep it's nearly
+// mutually exclusive with "the trend hasn't already flipped" -- that
+// band is genuinely rarely touched except right at a flip, unlike the
+// EMA this same role uses elsewhere in this repo (MNQ_Multi_Trigger_
+// Trend_Continuation.pine's Trigger 1 pulls back to a 21-EMA, a close,
+// frequently-tested reference). Switched the pullback target to "basis"
+// -- the adaptive centerline, which tracks price much more closely --
+// while "level" stays exactly where it already was useful: the wide,
+// protective Trend Level stop reference further down.
+bool bullPullbackTouch = bullishTrend and low <= basis + pullbackTolerance
+bool bearPullbackTouch = bearishTrend and high >= basis - pullbackTolerance
+
+bool bullPullbackRecent = ta.barssince(bullPullbackTouch) <= pullbackLookbackInput
+bool bearPullbackRecent = ta.barssince(bearPullbackTouch) <= pullbackLookbackInput
+
+bool longReclaim = regimeEstablished and bullishTrend and bullPullbackRecent and close > basis and bullCandle and bodyPct >= minReclaimBodyPctInput
+bool shortReclaim = regimeEstablished and bearishTrend and bearPullbackRecent and close < basis and bearCandle and bodyPct >= minReclaimBodyPctInput
+
+bool signalConfirmed = not confirmEntriesOnClose or barstate.isconfirmed
+
+//=============================================================================
+// DAILY SAFETY
+//=============================================================================
+bool newSessionDay = barstate.isfirst or dayofmonth != dayofmonth[1]
+
+var int tradesToday = 0
+var int lastSignalBar = na
+var int lastExitBar = na
+
+if newSessionDay
+    tradesToday := 0
+
+bool tradeCountOK = tradesToday < maxTradesPerDayInput
+bool cooldownPass = (na(lastSignalBar) or bar_index - lastSignalBar > cooldownBarsInput) and (na(lastExitBar) or bar_index - lastExitBar > cooldownBarsInput)
+
+//=============================================================================
+// FINAL ENTRY CONDITIONS
+//=============================================================================
+bool commonEntryPass = signalConfirmed and inTradingSession and strategy.position_size == 0 and tradeCountOK and cooldownPass
+
+bool longEntrySignal = commonEntryPass and allowLongs and htfLongOK and longReclaim
+bool shortEntrySignal = commonEntryPass and allowShorts and htfShortOK and shortReclaim
+
+//=============================================================================
+// RISK CALCULATIONS
+//=============================================================================
+float atrRiskDistance = atrValue * atrMultiplier
+float levelLongRisk = close - (level - atrValue * structureBufferAtrInput)
+float levelShortRisk = (level + atrValue * structureBufferAtrInput) - close
+
+float longRiskDistance = stopMode == "ATR" ? atrRiskDistance : stopMode == "Trend Level" ? (levelLongRisk > 0 ? levelLongRisk : atrRiskDistance) : math.max(atrRiskDistance, levelLongRisk > 0 ? levelLongRisk : atrRiskDistance)
+float shortRiskDistance = stopMode == "ATR" ? atrRiskDistance : stopMode == "Trend Level" ? (levelShortRisk > 0 ? levelShortRisk : atrRiskDistance) : math.max(atrRiskDistance, levelShortRisk > 0 ? levelShortRisk : atrRiskDistance)
+
+var float pendingRiskDistance = na
+var int pendingDirection = 0
+
+var float activeEntryPrice = na
+var float activeRiskDistance = na
+var float activeSL = na
+var float activeTP = na
+
+var int lastExitAlertBar = na
+
+//=============================================================================
+// STRATEGY ORDERS
+//=============================================================================
+if longEntrySignal
+    pendingRiskDistance := longRiskDistance
+    pendingDirection := 1
+    lastSignalBar := bar_index
+
+    strategy.entry(id="Long", direction=strategy.long, qty=orderQuantity, comment="LONG PULLBACK", alert_message="LONG PULLBACK")
+    alert(f_alertMsg("LONG PULLBACK ENTRY", close), alert.freq_once_per_bar_close)
+
+if shortEntrySignal
+    pendingRiskDistance := shortRiskDistance
+    pendingDirection := -1
+    lastSignalBar := bar_index
+
+    strategy.entry(id="Short", direction=strategy.short, qty=orderQuantity, comment="SHORT PULLBACK", alert_message="SHORT PULLBACK")
+    alert(f_alertMsg("SHORT PULLBACK ENTRY", close), alert.freq_once_per_bar_close)
+
+//=============================================================================
+// FILL DETECTION
+//=============================================================================
+var int lastProcessedFillBar = na
+var int historicalLongTrades = 0
+var int historicalShortTrades = 0
+
+bool rawLongFill = strategy.position_size > 0 and strategy.position_size[1] <= 0
+bool rawShortFill = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+bool longFill = rawLongFill and (na(lastProcessedFillBar) or lastProcessedFillBar != bar_index)
+bool shortFill = rawShortFill and (na(lastProcessedFillBar) or lastProcessedFillBar != bar_index)
+
+if longFill
+    lastProcessedFillBar := bar_index
+    historicalLongTrades += 1
+
+    activeEntryPrice := strategy.position_avg_price
+    activeRiskDistance := pendingDirection == 1 and not na(pendingRiskDistance) ? pendingRiskDistance : longRiskDistance
+
+    if not na(activeRiskDistance)
+        activeSL := activeEntryPrice - activeRiskDistance
+        activeTP := useTakeProfit ? activeEntryPrice + activeRiskDistance * rrMultiple : na
+    else
+        activeSL := na
+        activeTP := na
+
+    pendingRiskDistance := na
+    pendingDirection := 0
+
+if shortFill
+    lastProcessedFillBar := bar_index
+    historicalShortTrades += 1
+
+    activeEntryPrice := strategy.position_avg_price
+    activeRiskDistance := pendingDirection == -1 and not na(pendingRiskDistance) ? pendingRiskDistance : shortRiskDistance
+
+    if not na(activeRiskDistance)
+        activeSL := activeEntryPrice + activeRiskDistance
+        activeTP := useTakeProfit ? activeEntryPrice - activeRiskDistance * rrMultiple : na
+    else
+        activeSL := na
+        activeTP := na
+
+    pendingRiskDistance := na
+    pendingDirection := 0
+
+//=============================================================================
+// BREAKEVEN AND STEP-TRAILING STOP
+//=============================================================================
+float breakEvenOffset = breakEvenPlusTicks * syminfo.mintick
+
+if strategy.position_size > 0 and not na(activeEntryPrice) and not na(activeRiskDistance)
+    if useBreakEven and high >= activeEntryPrice + activeRiskDistance * breakEvenAtR
+        activeSL := na(activeSL) ? activeEntryPrice + breakEvenOffset : math.max(activeSL, activeEntryPrice + breakEvenOffset)
+
+    if useTrailingStop
+        float candidateTrail = close - atrValue * trailAtrMultiplier
+        float stepThreshold = atrValue * trailStepMultiplier
+        if na(activeSL)
+            activeSL := candidateTrail
+        else if (candidateTrail - activeSL) >= stepThreshold
+            activeSL := candidateTrail
+
+if strategy.position_size < 0 and not na(activeEntryPrice) and not na(activeRiskDistance)
+    if useBreakEven and low <= activeEntryPrice - activeRiskDistance * breakEvenAtR
+        activeSL := na(activeSL) ? activeEntryPrice - breakEvenOffset : math.min(activeSL, activeEntryPrice - breakEvenOffset)
+
+    if useTrailingStop
+        float candidateTrail = close + atrValue * trailAtrMultiplier
+        float stepThreshold = atrValue * trailStepMultiplier
+        if na(activeSL)
+            activeSL := candidateTrail
+        else if (activeSL - candidateTrail) >= stepThreshold
+            activeSL := candidateTrail
+
+//=============================================================================
+// PROTECTIVE EXITS
+//=============================================================================
+bool hasLongExit = not na(activeSL) or not na(activeTP)
+bool hasShortExit = not na(activeSL) or not na(activeTP)
+
+if strategy.position_size > 0 and hasLongExit
+    strategy.exit(id="Long Exit", from_entry="Long", stop=activeSL, limit=activeTP, comment="LONG EXIT", alert_message="LONG EXIT")
+
+if strategy.position_size < 0 and hasShortExit
+    strategy.exit(id="Short Exit", from_entry="Short", stop=activeSL, limit=activeTP, comment="SHORT EXIT", alert_message="SHORT EXIT")
+
+if closeAtSessionEnd and finalSessionBar
+    strategy.close_all(immediately=true, comment="SESSION CLOSE", alert_message="SESSION CLOSE")
+    alert(f_alertMsg("SESSION CLOSE (all positions flattened)", close), alert.freq_once_per_bar_close)
+    lastExitAlertBar := bar_index
+    lastExitBar := bar_index
+
+bool positionJustClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if positionJustClosed and (na(lastExitAlertBar) or lastExitAlertBar != bar_index)
+    float exitPrice = strategy.closedtrades > 0 ? strategy.closedtrades.exit_price(strategy.closedtrades - 1) : close
+    string exitReason = not na(activeSL) and math.abs(exitPrice - activeSL) <= syminfo.mintick * 2 ? "STOP HIT" : not na(activeTP) and math.abs(exitPrice - activeTP) <= syminfo.mintick * 2 ? "TARGET HIT" : "CLOSED"
+    alert(f_alertMsg("POSITION EXIT (" + exitReason + ")", exitPrice), alert.freq_once_per_bar_close)
+
+if positionJustClosed
+    lastExitBar := bar_index
+    activeEntryPrice := na
+    activeRiskDistance := na
+    activeSL := na
+    activeTP := na
+    pendingRiskDistance := na
+    pendingDirection := 0
+
+//=============================================================================
+// VISUALIZATION
+//=============================================================================
+pBasis = plot(basis, title="Adaptive Basis", color=bullishTrend ? bullcolor : bearcolor, linewidth=2)
+pLevel = plot(level, title="Adaptive Trend Level", color=close > level ? bullcolor : bearcolor, linewidth=2, style=plot.style_linebr)
+
+fill(pLevel, pBasis, color=bullishTrend ? color.new(bullcolor, 85) : color.new(bearcolor, 85))
+
+plot(showRiskLevels and strategy.position_size != 0 ? activeSL : na, title="Active Stop Loss", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(showRiskLevels and strategy.position_size != 0 ? activeTP : na, title="Active Take Profit", color=color.lime, linewidth=2, style=plot.style_linebr)
+
+plotshape(showEntryArrows and longFill, title="LONG ENTRY", style=shape.triangleup, location=location.belowbar, color=bullcolor, size=size.small)
+plotshape(showEntryArrows and shortFill, title="SHORT ENTRY", style=shape.triangledown, location=location.abovebar, color=bearcolor, size=size.small)
+
+bgcolor(showbg ? (bullishTrend ? color.new(bullcolor, 92) : color.new(bearcolor, 92)) : na, title="Trend Background")
+barcolor(showbars ? (bullishTrend ? color.new(bullcolor, 15) : color.new(bearcolor, 15)) : na)
+
+//=============================================================================
+// DASHBOARD
+//=============================================================================
+string trendText = bullishTrend ? "BULLISH" : "BEARISH"
+string positionText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+string setupText = not regimeEstablished ? "TREND TOO NEW" : bullPullbackRecent and bullishTrend ? "BULL PULLBACK" : bearPullbackRecent and bearishTrend ? "BEAR PULLBACK" : "WAIT"
+color stateColor = strategy.position_size > 0 ? bullcolor : strategy.position_size < 0 ? bearcolor : longEntrySignal ? bullcolor : shortEntrySignal ? bearcolor : color.gray
+
+var table dashboard = table.new(position.top_right, 2, 10, border_width=1)
+
+f_dashboardCell(int row, string leftText, string rightText, color rightColor) =>
+    table.cell(dashboard, 0, row, leftText, text_color=color.white, bgcolor=color.new(color.gray, 35), text_size=size.small, text_halign=text.align_left)
+    table.cell(dashboard, 1, row, rightText, text_color=color.white, bgcolor=color.new(rightColor, 25), text_size=size.small, text_halign=text.align_right)
+
+if barstate.islast
+    table.clear(dashboard, 0, 0, 1, 9)
+
+    if showDashboard
+        f_dashboardCell(0, "ATF PULLBACK", positionText, stateColor)
+        f_dashboardCell(1, "TREND", trendText, bullishTrend ? bullcolor : bearcolor)
+        f_dashboardCell(2, "TREND AGE", str.tostring(barsSinceFlip) + " bars", regimeEstablished ? color.green : color.orange)
+        f_dashboardCell(3, "SETUP", setupText, stateColor)
+        f_dashboardCell(4, "HTF FILTER", useHTFFilter ? htfFilterTF + " / " + (htfTrend == 1 ? "BULL" : "BEAR") : "OFF", useHTFFilter ? color.green : color.gray)
+        f_dashboardCell(5, "STOP MODE", stopMode, color.gray)
+        f_dashboardCell(6, "SL / TP", f_price(activeSL) + " / " + f_price(activeTP), strategy.position_size != 0 ? color.green : color.gray)
+        f_dashboardCell(7, "TRADES TODAY", str.tostring(tradesToday) + " / " + str.tostring(maxTradesPerDayInput), tradesToday < maxTradesPerDayInput ? color.green : color.orange)
+        f_dashboardCell(8, "LONG TRADES", str.tostring(historicalLongTrades), historicalLongTrades > 0 ? bullcolor : color.gray)
+        f_dashboardCell(9, "SHORT TRADES", str.tostring(historicalShortTrades), historicalShortTrades > 0 ? bearcolor : color.gray)
+
+//=============================================================================
+// ALERTS AND DATA WINDOW
+//=============================================================================
+alertcondition(longEntrySignal, title="ATF Pullback Long", message="ATF Pullback Continuation: LONG ENTRY | {{ticker}} | {{interval}}")
+alertcondition(shortEntrySignal, title="ATF Pullback Short", message="ATF Pullback Continuation: SHORT ENTRY | {{ticker}} | {{interval}}")
+alertcondition(positionJustClosed, title="ATF Pullback Position Closed", message="ATF Pullback Continuation: position closed | {{ticker}} | {{interval}}")
+
+plot(float(trend), "Trend State", display=display.data_window)
+plot(level, "Trend Level", display=display.data_window)
+plot(float(barsSinceFlip), "Bars Since Flip", display=display.data_window)
+plot(activeSL, "Active SL", display=display.data_window)
+plot(activeTP, "Active TP", display=display.data_window)
+plot(float(historicalLongTrades), "Historical Long Trades", display=display.data_window)
+plot(float(historicalShortTrades), "Historical Short Trades", display=display.data_window)

@@ -1,0 +1,1645 @@
+//@version=6
+indicator(
+     "Trading Coach - Setup Identifier",
+     shorttitle = "Trading Coach",
+     overlay = true,
+     max_boxes_count = 150,
+     max_lines_count = 100,
+     max_labels_count = 200
+)
+import TradingView/ta/9
+
+// ============================================================================
+// TRADING COACH - SETUP IDENTIFIER
+// ----------------------------------------------------------------------------
+// Built using Advanced_Session_Profile_Predictor_SR_OR.pine as a template --
+// reuses that file's proven session-tracking, TDI/momentum, and outcome-
+// tracking/dashboard patterns, adapted into a coherent LONG/SHORT setup
+// identifier with risk-management guidance and market-structure awareness
+// bolted on as new logic.
+//
+// ONE DELIBERATE DEPARTURE FROM THE TEMPLATE: the template's entire
+// prediction system only computes on barstate.islast, which is exactly what
+// made its Outcome Tracker behave inconsistently under Bar Replay (a whole
+// debugging thread earlier this session). This script's setup detection,
+// market structure, cooldown, and outcome tracking all run UNCONDITIONALLY
+// every confirmed bar instead -- the same pattern already proven in
+// delta_break_retest/Stage8-9. Only the DASHBOARD DRAW itself is gated by
+// barstate.islast, which is the normal, correct, Replay-safe use of that
+// flag (you only want to draw one current table, not one per historical
+// bar).
+//
+// COACHING PHILOSOPHY:
+// This is deliberately NOT a black box. Every gate that blocks a setup is
+// named explicitly in the dashboard's "Coach Says" row, so the point is to
+// teach you to read structure/session/momentum/risk yourself over time, not
+// just to blink an arrow at you.
+//
+// ENTRY MODEL (section 05 -- Breakout & Retest, ported from the user-
+// supplied "Breakout and Retest Signals [AlgoAlpha]" indicator, replacing
+// the file's original pullback-in-trend model entirely):
+// HTF STRUCTURE (UP/DOWN/RANGE)
+// -> A NEW SWING PIVOT FORMS AND MATCHES AN ALREADY-BROKEN OPPOSITE-SIDE
+//    SWING POINT STILL IN MEMORY (WITHIN AN ATR-SCALED TOLERANCE) --
+//    A BREAKOUT-AND-RETEST EVENT
+// -> TDI MOMENTUM AGREES
+// -> SESSION IS FAVORABLE
+// -> COOLDOWN ALLOWS IT
+// -> SETUP FIRES, WITH A STOP AT THE MATCHED SWING POINT, AN R-MULTIPLE
+//    TARGET, AND A SUGGESTED POSITION SIZE FROM YOUR OWN ACCOUNT-RISK
+//    INPUTS
+//
+// IMPORTANT: this is an indicator, not a strategy -- it never places real
+// orders. It marks down what a disciplined entry would look like and lets
+// its own Outcome Tracker keep an honest running score of how often that
+// actually worked out, exactly like the template's Outcome Tracker does for
+// its session-profile predictions.
+// ============================================================================
+
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+f_tablePosition(string label) =>
+    switch label
+        "Top Left" => position.top_left
+        "Top Center" => position.top_center
+        "Top Right" => position.top_right
+        "Middle Left" => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right" => position.middle_right
+        "Bottom Left" => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Bottom Right" => position.bottom_right
+        => position.bottom_right
+
+f_tableTextSize(string label) =>
+    switch label
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        => size.small
+
+
+// ============================================================================
+// 00 - SESSIONS & TIMEZONE
+// ----------------------------------------------------------------------------
+// Ported from the template, independent-if-blocks version (its own [r]-round
+// fix -- the original had an if/else-if chain that silently dropped New
+// York's own tracking during its overlap with London).
+// ============================================================================
+
+string G_SESSION = "00 - Sessions & Timezone"
+
+timezoneInput = input.string("UTC", "Timezone", options = ["UTC", "Europe/London", "America/New_York"], group = G_SESSION)
+asiaSessionInput = input.session("0000-0800", "Asia Session", group = G_SESSION)
+londonSessionInput = input.session("0800-1600", "London Session", group = G_SESSION)
+newYorkSessionInput = input.session("1300-2100", "New York Session", group = G_SESSION)
+favorForLondonInput = input.bool(true, "Favorable Session: London", group = G_SESSION)
+favorForNyInput = input.bool(true, "Favorable Session: New York", group = G_SESSION)
+favorForAsiaInput = input.bool(false, "Favorable Session: Asia", tooltip = "Off by default -- Asia is typically the lowest-liquidity session for most index/FX instruments. Turn on if your instrument actually trades well there.", group = G_SESSION)
+// "Require Favorable Session" lives in the Entry Setup group (05) below,
+// next to the rest of the entry gating.
+sessionBgTransparencyInput = input.int(85, "Session Background Tint Transparency", minval = 0, maxval = 100, tooltip = "0 = fully solid, 100 = fully invisible. Was hardcoded to 92 (barely visible).", group = G_SESSION)
+showSessionStartLinesInput = input.bool(true, "Show Session Start Lines", group = G_SESSION)
+showSessionLabelsInput = input.bool(true, "Show Session Name Labels", group = G_SESSION)
+
+asiaInSession = nz(time(timeframe.period, asiaSessionInput, timezoneInput), 0) != 0
+londonInSession = nz(time(timeframe.period, londonSessionInput, timezoneInput), 0) != 0
+nyInSession = nz(time(timeframe.period, newYorkSessionInput, timezoneInput), 0) != 0
+
+bool sessionFavorable = (
+     (asiaInSession and favorForAsiaInput) or
+     (londonInSession and favorForLondonInput) or
+     (nyInSession and favorForNyInput)
+)
+
+string activeSessionLabel = (
+     asiaInSession and londonInSession ?
+     "Asia+London" :
+     londonInSession and nyInSession ?
+     "London+NY" :
+     asiaInSession ?
+     "Asia" :
+     londonInSession ?
+     "London" :
+     nyInSession ?
+     "New York" :
+     "Off-Session"
+)
+
+bgcolor(asiaInSession ? color.new(color.yellow, sessionBgTransparencyInput) : na, title = "Asia Session")
+bgcolor(londonInSession ? color.new(color.red, sessionBgTransparencyInput) : na, title = "London Session")
+bgcolor(nyInSession ? color.new(color.blue, sessionBgTransparencyInput) : na, title = "New York Session")
+
+// -- Explicit session markers: a vertical line + name label at the exact
+// bar each session starts, on top of the background tint above. `and not
+// X[1]` reads as false (not na) on bar 0 since there's no prior bar to
+// compare against, so this can't misfire at the very start of history. --
+bool asiaSessionStart = asiaInSession and not asiaInSession[1]
+bool londonSessionStart = londonInSession and not londonInSession[1]
+bool nySessionStart = nyInSession and not nyInSession[1]
+
+if asiaSessionStart and showSessionStartLinesInput
+    line.new(bar_index, low, bar_index, high, xloc = xloc.bar_index, extend = extend.both, color = color.new(color.yellow, 40), style = line.style_dashed, width = 1)
+if londonSessionStart and showSessionStartLinesInput
+    line.new(bar_index, low, bar_index, high, xloc = xloc.bar_index, extend = extend.both, color = color.new(color.red, 40), style = line.style_dashed, width = 1)
+if nySessionStart and showSessionStartLinesInput
+    line.new(bar_index, low, bar_index, high, xloc = xloc.bar_index, extend = extend.both, color = color.new(color.blue, 40), style = line.style_dashed, width = 1)
+
+if asiaSessionStart and showSessionLabelsInput
+    label.new(bar_index, high, text = "ASIA", style = label.style_label_down, color = color.new(color.yellow, 20), textcolor = color.black, size = size.tiny)
+if londonSessionStart and showSessionLabelsInput
+    label.new(bar_index, high, text = "LONDON", style = label.style_label_down, color = color.new(color.red, 20), textcolor = color.white, size = size.tiny)
+if nySessionStart and showSessionLabelsInput
+    label.new(bar_index, high, text = "NEW YORK", style = label.style_label_down, color = color.new(color.blue, 20), textcolor = color.white, size = size.tiny)
+
+
+// ============================================================================
+// 01 - SESSION ZONES & DAY PROFILE
+// ----------------------------------------------------------------------------
+// Session highs/lows act as a second, independent source of "why would
+// price react here" alongside the native swing pivot used for the entry
+// model below -- confluence between the two is what separates a real
+// setup from a coincidental one. Each zone also tracks whether it has been
+// decisively closed through (broken); once broken, a later retest from the
+// OTHER side is treated as a role-reversed zone (a broken low retested
+// from above now reads as resistance, a broken high retested from below
+// now reads as support) rather than pretending the old level still means
+// what it used to.
+//
+// The day's Profile classification (ported from the template, same math)
+// adds manipulation-vs-clean-trend context: a day that already showed a
+// liquidity sweep (Profile 2/3) should read differently than a day that's
+// trending cleanly (Profile 1).
+// ============================================================================
+
+string G_ZONES = "01 - Session Zones & Day Profile"
+
+zoneBoxWidthBarsInput = input.int(20, "Zone Box Width (Bars Back)", minval = 3, maxval = 200, tooltip = "How far back the native swing support/resistance zone box extends visually. Purely cosmetic -- does not affect the confluence check itself.", group = G_ZONES)
+zoneToleranceAtrInput = input.float(0.30, "Zone Confluence Tolerance (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, tooltip = "How close a pullback needs to get to a session zone to count as confluence with it. Also sets each zone box's height.", group = G_ZONES)
+profileTrendThresholdInput = input.float(1.5, "Day Profile Trend Threshold", minval = 1.0, step = 0.1, tooltip = "Same trend-vs-consolidation threshold the template's Profile classification uses.", group = G_ZONES)
+
+var float asiaOpen = na
+var float asiaClose = na
+var float asiaHigh = na
+var float asiaLow = na
+var float londonOpen = na
+var float londonClose = na
+var float londonHigh = na
+var float londonLow = na
+var float nyOpen = na
+var float nyClose = na
+var float nyHigh = na
+var float nyLow = na
+
+// Independent if-blocks (not if/else-if) -- the template's own [r]-round
+// fix, so New York's tracking is not silently dropped during its overlap
+// with London.
+if asiaInSession
+    asiaOpen := na(asiaOpen) ? open : asiaOpen
+    asiaClose := close
+    asiaHigh := math.max(high, nz(asiaHigh, low))
+    asiaLow := math.min(low, nz(asiaLow, high))
+
+if londonInSession
+    londonOpen := na(londonOpen) ? open : londonOpen
+    londonClose := close
+    londonHigh := math.max(high, nz(londonHigh, low))
+    londonLow := math.min(low, nz(londonLow, high))
+
+if nyInSession
+    nyOpen := na(nyOpen) ? open : nyOpen
+    nyClose := close
+    nyHigh := math.max(high, nz(nyHigh, low))
+    nyLow := math.min(low, nz(nyLow, high))
+
+// -- PDH/PDL Sweep Probability -- plotted directly on chart at the
+// actual PDH/PDL price levels instead of a separate dashboard table.
+// prevDayHigh/prevDayLow are the just-completed calendar day's whole-day
+// high/low (any session, not session-specific like the old NY-high
+// tracker was). newDayCoach is computed here (not down in RESET ON NEW
+// DAY) because dayHigh/dayLow must be reset to na and re-seeded with the
+// SAME bar's high/low in one atomic step -- doing the reset later in
+// the script would let this section's own unconditional accumulation
+// below contaminate yesterday's final range with today's first bar
+// before the snapshot ever happens.
+bool newDayCoach = ta.change(time("D", timezoneInput)) != 0
+
+var float dayHigh = na
+var float dayLow = na
+var float prevDayHigh = na
+var float prevDayLow = na
+var bool sweptPdhToday = false
+var bool sweptPdlToday = false
+var int pdhSweepDaysTotal = 0
+var int pdhSweepDaysHit = 0
+var int pdlSweepDaysTotal = 0
+var int pdlSweepDaysHit = 0
+
+if newDayCoach
+    if not na(prevDayHigh)
+        pdhSweepDaysTotal += 1
+        if sweptPdhToday
+            pdhSweepDaysHit += 1
+    if not na(prevDayLow)
+        pdlSweepDaysTotal += 1
+        if sweptPdlToday
+            pdlSweepDaysHit += 1
+    prevDayHigh := dayHigh
+    prevDayLow := dayLow
+    sweptPdhToday := false
+    sweptPdlToday := false
+    dayHigh := na
+    dayLow := na
+
+dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+dayLow := na(dayLow) ? low : math.min(dayLow, low)
+
+if not na(prevDayHigh) and not sweptPdhToday and high >= prevDayHigh
+    sweptPdhToday := true
+if not na(prevDayLow) and not sweptPdlToday and low <= prevDayLow
+    sweptPdlToday := true
+
+float pdhSweepRate = pdhSweepDaysTotal > 0 ? pdhSweepDaysHit / pdhSweepDaysTotal * 100.0 : na
+float pdlSweepRate = pdlSweepDaysTotal > 0 ? pdlSweepDaysHit / pdlSweepDaysTotal * 100.0 : na
+
+showPdhPdlInput = input.bool(true, "Show PDH/PDL Sweep Probability", group = G_ZONES)
+pdhColorInput = input.color(color.orange, "PDH Color", group = G_ZONES, inline = "pdhpdl")
+pdlColorInput = input.color(color.aqua, "PDL Color", group = G_ZONES, inline = "pdhpdl")
+pdhPdlLabelOffsetInput = input.int(15, "PDH/PDL Label Offset (Bars Left)", minval = 0, maxval = 200, tooltip = "Shifts the PDH/PDL probability labels back from the current bar/price scale so they don't clutter live price action. The dashed lines themselves still extend all the way to the current bar.", group = G_ZONES)
+
+string pdhLabelText = "PDH " + str.tostring(prevDayHigh, format.mintick) + (sweptPdhToday ? "  SWEPT" : "  Sweep " + (na(pdhSweepRate) ? "--" : str.tostring(pdhSweepRate, "#") + "%"))
+string pdlLabelText = "PDL " + str.tostring(prevDayLow, format.mintick) + (sweptPdlToday ? "  SWEPT" : "  Sweep " + (na(pdlSweepRate) ? "--" : str.tostring(pdlSweepRate, "#") + "%"))
+int pdhPdlLabelBar = math.max(bar_index - pdhPdlLabelOffsetInput, 0)
+
+var line pdhLine = na
+var line pdlLine = na
+var label pdhLabel = na
+var label pdlLabel = na
+
+if showPdhPdlInput and not na(prevDayHigh)
+    if newDayCoach or na(pdhLine)
+        if not na(pdhLine)
+            line.delete(pdhLine)
+        if not na(pdhLabel)
+            label.delete(pdhLabel)
+        pdhLine := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = prevDayHigh, y2 = prevDayHigh, color = pdhColorInput, style = line.style_dashed)
+        pdhLabel := label.new(pdhPdlLabelBar, prevDayHigh, text = pdhLabelText, style = label.style_label_up, color = color.new(color.gray, 10), textcolor = color.white, size = size.small)
+    else
+        line.set_x2(pdhLine, bar_index + 1)
+        label.set_x(pdhLabel, pdhPdlLabelBar)
+        label.set_text(pdhLabel, pdhLabelText)
+        label.set_color(pdhLabel, sweptPdhToday ? color.new(pdhColorInput, 20) : color.new(color.gray, 10))
+
+if showPdhPdlInput and not na(prevDayLow)
+    if newDayCoach or na(pdlLine)
+        if not na(pdlLine)
+            line.delete(pdlLine)
+        if not na(pdlLabel)
+            label.delete(pdlLabel)
+        pdlLine := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = prevDayLow, y2 = prevDayLow, color = pdlColorInput, style = line.style_dashed)
+        pdlLabel := label.new(pdhPdlLabelBar, prevDayLow, text = pdlLabelText, style = label.style_label_down, color = color.new(color.gray, 10), textcolor = color.white, size = size.small)
+    else
+        line.set_x2(pdlLine, bar_index + 1)
+        label.set_x(pdlLabel, pdhPdlLabelBar)
+        label.set_text(pdlLabel, pdlLabelText)
+        label.set_color(pdlLabel, sweptPdlToday ? color.new(pdlColorInput, 20) : color.new(color.gray, 10))
+
+// -- Session boxes: one box per session spanning its actual running
+// high/low over its full time window, labeled with the session's own
+// name via the box's own `text` parameter. Same create-once/update-in-
+// place/freeze-at-session-end lifecycle as the template's Opening Range
+// boxes: a session's box stops growing the moment that session ends
+// (nothing updates it once asiaInSession etc. goes false), so it stays
+// as a frozen historical marker of that session's completed range until
+// the next day's version replaces it. --
+showSessionBoxesInput = input.bool(true, "Show Session Boxes", group = G_SESSION)
+sessionBoxTransparencyInput = input.int(88, "Session Box Fill Transparency", minval = 0, maxval = 100, tooltip = "0 = fully solid, 100 = fully invisible.", group = G_SESSION)
+
+var box asiaSessionBox = na
+var box londonSessionBox = na
+var box nySessionBox = na
+
+if asiaSessionStart and showSessionBoxesInput
+    if not na(asiaSessionBox)
+        box.delete(asiaSessionBox)
+    asiaSessionBox := box.new(left = bar_index, top = high, bottom = low, right = bar_index + 1, xloc = xloc.bar_index, bgcolor = color.new(color.yellow, sessionBoxTransparencyInput), border_color = color.yellow, text = "ASIA", text_color = color.black, text_size = size.tiny)
+else if asiaInSession and showSessionBoxesInput and not na(asiaSessionBox)
+    box.set_top(asiaSessionBox, asiaHigh)
+    box.set_bottom(asiaSessionBox, asiaLow)
+    box.set_right(asiaSessionBox, bar_index + 1)
+
+if londonSessionStart and showSessionBoxesInput
+    if not na(londonSessionBox)
+        box.delete(londonSessionBox)
+    londonSessionBox := box.new(left = bar_index, top = high, bottom = low, right = bar_index + 1, xloc = xloc.bar_index, bgcolor = color.new(color.red, sessionBoxTransparencyInput), border_color = color.red, text = "LONDON", text_color = color.white, text_size = size.tiny)
+else if londonInSession and showSessionBoxesInput and not na(londonSessionBox)
+    box.set_top(londonSessionBox, londonHigh)
+    box.set_bottom(londonSessionBox, londonLow)
+    box.set_right(londonSessionBox, bar_index + 1)
+
+if nySessionStart and showSessionBoxesInput
+    if not na(nySessionBox)
+        box.delete(nySessionBox)
+    nySessionBox := box.new(left = bar_index, top = high, bottom = low, right = bar_index + 1, xloc = xloc.bar_index, bgcolor = color.new(color.blue, sessionBoxTransparencyInput), border_color = color.blue, text = "NEW YORK", text_color = color.white, text_size = size.tiny)
+else if nyInSession and showSessionBoxesInput and not na(nySessionBox)
+    box.set_top(nySessionBox, nyHigh)
+    box.set_bottom(nySessionBox, nyLow)
+    box.set_right(nySessionBox, bar_index + 1)
+
+// -- Session high/low price labels: one pair per session, positioned at
+// the box's right edge and tracking the running high/low live, frozen the
+// same way the box itself freezes once that session ends. --
+var label asiaHighLabel = na
+var label asiaLowLabel = na
+var label londonHighLabel = na
+var label londonLowLabel = na
+var label nyHighLabel = na
+var label nyLowLabel = na
+
+if asiaSessionStart and showSessionBoxesInput
+    if not na(asiaHighLabel)
+        label.delete(asiaHighLabel)
+    if not na(asiaLowLabel)
+        label.delete(asiaLowLabel)
+    asiaHighLabel := label.new(bar_index + 1, high, text = str.tostring(high, format.mintick), style = label.style_label_left, color = color.new(color.yellow, 0), textcolor = color.black, size = size.tiny)
+    asiaLowLabel := label.new(bar_index + 1, low, text = str.tostring(low, format.mintick), style = label.style_label_left, color = color.new(color.yellow, 0), textcolor = color.black, size = size.tiny)
+else if asiaInSession and showSessionBoxesInput and not na(asiaHighLabel)
+    label.set_x(asiaHighLabel, bar_index + 1)
+    label.set_y(asiaHighLabel, asiaHigh)
+    label.set_text(asiaHighLabel, str.tostring(asiaHigh, format.mintick))
+    label.set_x(asiaLowLabel, bar_index + 1)
+    label.set_y(asiaLowLabel, asiaLow)
+    label.set_text(asiaLowLabel, str.tostring(asiaLow, format.mintick))
+
+if londonSessionStart and showSessionBoxesInput
+    if not na(londonHighLabel)
+        label.delete(londonHighLabel)
+    if not na(londonLowLabel)
+        label.delete(londonLowLabel)
+    londonHighLabel := label.new(bar_index + 1, high, text = str.tostring(high, format.mintick), style = label.style_label_left, color = color.new(color.red, 0), textcolor = color.white, size = size.tiny)
+    londonLowLabel := label.new(bar_index + 1, low, text = str.tostring(low, format.mintick), style = label.style_label_left, color = color.new(color.red, 0), textcolor = color.white, size = size.tiny)
+else if londonInSession and showSessionBoxesInput and not na(londonHighLabel)
+    label.set_x(londonHighLabel, bar_index + 1)
+    label.set_y(londonHighLabel, londonHigh)
+    label.set_text(londonHighLabel, str.tostring(londonHigh, format.mintick))
+    label.set_x(londonLowLabel, bar_index + 1)
+    label.set_y(londonLowLabel, londonLow)
+    label.set_text(londonLowLabel, str.tostring(londonLow, format.mintick))
+
+if nySessionStart and showSessionBoxesInput
+    if not na(nyHighLabel)
+        label.delete(nyHighLabel)
+    if not na(nyLowLabel)
+        label.delete(nyLowLabel)
+    nyHighLabel := label.new(bar_index + 1, high, text = str.tostring(high, format.mintick), style = label.style_label_left, color = color.new(color.blue, 0), textcolor = color.white, size = size.tiny)
+    nyLowLabel := label.new(bar_index + 1, low, text = str.tostring(low, format.mintick), style = label.style_label_left, color = color.new(color.blue, 0), textcolor = color.white, size = size.tiny)
+else if nyInSession and showSessionBoxesInput and not na(nyHighLabel)
+    label.set_x(nyHighLabel, bar_index + 1)
+    label.set_y(nyHighLabel, nyHigh)
+    label.set_text(nyHighLabel, str.tostring(nyHigh, format.mintick))
+    label.set_x(nyLowLabel, bar_index + 1)
+    label.set_y(nyLowLabel, nyLow)
+    label.set_text(nyLowLabel, str.tostring(nyLow, format.mintick))
+
+// -- Zone break / role-reversal tracking --
+var bool asiaHighBroken = false
+var bool asiaLowBroken = false
+var bool londonHighBroken = false
+var bool londonLowBroken = false
+var bool nyHighBroken = false
+var bool nyLowBroken = false
+
+if not na(asiaHigh) and close > asiaHigh
+    asiaHighBroken := true
+if not na(asiaLow) and close < asiaLow
+    asiaLowBroken := true
+if not na(londonHigh) and close > londonHigh
+    londonHighBroken := true
+if not na(londonLow) and close < londonLow
+    londonLowBroken := true
+if not na(nyHigh) and close > nyHigh
+    nyHighBroken := true
+if not na(nyLow) and close < nyLow
+    nyLowBroken := true
+
+int zonesBrokenCount = (
+     (asiaHighBroken ? 1 : 0) +
+     (asiaLowBroken ? 1 : 0) +
+     (londonHighBroken ? 1 : 0) +
+     (londonLowBroken ? 1 : 0) +
+     (nyHighBroken ? 1 : 0) +
+     (nyLowBroken ? 1 : 0)
+)
+
+// -- Day Profile classification (ported from the template, same math) --
+// Deliberately run every confirmed bar, not gated by barstate.islast the
+// way the template gates it -- this classifies EVERY historical day
+// correctly as history loads/replays, not just whichever bar happened to
+// be "last" at calculation time (see this file's header comment for why
+// that distinction matters).
+float asiaRangeCoach = asiaHigh - asiaLow
+float londonRangeCoach = londonHigh - londonLow
+int asiaDirectionCoach = nz(asiaClose, 0) > nz(asiaOpen, 0) ? 1 : (nz(asiaClose, 0) < nz(asiaOpen, 0) ? -1 : 0)
+int londonDirectionCoach = nz(londonClose, 0) > nz(londonOpen, 0) ? 1 : (nz(londonClose, 0) < nz(londonOpen, 0) ? -1 : 0)
+bool asiaTrendingCoach = nz(asiaRangeCoach, 0) > nz(ta.sma(asiaRangeCoach, 5), 0) * profileTrendThresholdInput
+bool londonTrendingCoach = nz(londonRangeCoach, 0) > nz(ta.sma(londonRangeCoach, 5), 0) * profileTrendThresholdInput
+bool londonConsolidatingCoach = nz(londonRangeCoach, 0) < nz(ta.sma(londonRangeCoach, 5), 0)
+bool londonManipulatesAsiaHighCoach = nz(londonHigh, 0) > nz(asiaHigh, 0) and nz(londonLow, 0) < nz(asiaClose, 0)
+bool londonManipulatesAsiaLowCoach = nz(londonLow, 0) < nz(asiaLow, 0) and nz(londonHigh, 0) > nz(asiaClose, 0)
+
+var string dayProfile = "Unknown"
+
+if barstate.isconfirmed and not nyInSession and londonInSession and not na(asiaHigh)
+    if asiaTrendingCoach and londonTrendingCoach and asiaDirectionCoach == londonDirectionCoach
+        dayProfile := "Trend Continuation"
+    else if asiaTrendingCoach and londonConsolidatingCoach
+        dayProfile := "NY Manipulation"
+    else if not asiaTrendingCoach and (londonManipulatesAsiaHighCoach or londonManipulatesAsiaLowCoach)
+        dayProfile := londonManipulatesAsiaHighCoach ? "London+NY Manipulation" : "Consolidation+Continuation"
+    else
+        dayProfile := "No Clear Profile"
+
+bool dayShowsManipulation = dayProfile == "NY Manipulation" or dayProfile == "London+NY Manipulation"
+
+// Session zone LEVELS are drawn as actual boxes (support/resistance zones
+// of interest, sized by the confluence tolerance) further down in the
+// Visuals section, once longColorInput/shortColorInput and atrCoach are in
+// scope -- see "SUPPORT / RESISTANCE ZONE BOXES" below.
+
+
+// ============================================================================
+// 02 - MARKET STRUCTURE
+// ----------------------------------------------------------------------------
+// HTF structure classification via the proven two-layer request.security +
+// [1]-offset pattern (mtf-confirmed-pivot-pull.md / pine-proven-patterns
+// skill), same shape as delta_break_retest's f_get4hContext(). Native-
+// timeframe swing pivots are tracked separately below for stop placement --
+// the HTF pull tells you the REGIME, the native pivots tell you WHERE.
+// ============================================================================
+
+string G_STRUCTURE = "02 - Market Structure"
+
+structureTimeframeInput = input.timeframe("60", "Structure Timeframe", tooltip = "Higher timeframe used to classify trend direction (HH/HL = up, LH/LL = down, neither = ranging).", group = G_STRUCTURE)
+structurePivotLeftInput = input.int(3, "Structure Pivot Left", minval = 1, maxval = 20, group = G_STRUCTURE)
+structurePivotRightInput = input.int(3, "Structure Pivot Right", minval = 1, maxval = 20, group = G_STRUCTURE)
+nativePivotLeftInput = input.int(3, "Native Swing Pivot Left", minval = 1, maxval = 20, tooltip = "Pivot lookback on the CHART's own timeframe, used to find the nearest recent swing high/low for pullback detection and stop placement.", group = G_STRUCTURE)
+nativePivotRightInput = input.int(3, "Native Swing Pivot Right", minval = 1, maxval = 20, group = G_STRUCTURE)
+
+f_getStructureContextRaw() =>
+    float ph = ta.pivothigh(high, structurePivotLeftInput, structurePivotRightInput)
+    float pl = ta.pivotlow(low, structurePivotLeftInput, structurePivotRightInput)
+    float latestHigh = ta.valuewhen(not na(ph), ph, 0)
+    float previousHigh = ta.valuewhen(not na(ph), ph, 1)
+    float latestLow = ta.valuewhen(not na(pl), pl, 0)
+    float previousLow = ta.valuewhen(not na(pl), pl, 1)
+    [latestHigh, previousHigh, latestLow, previousLow]
+
+f_getStructureContext() =>
+    [lh, ph, ll, pl] = f_getStructureContextRaw()
+    [lh[1], ph[1], ll[1], pl[1]]
+
+[htfLastHigh, htfPrevHigh, htfLastLow, htfPrevLow] = request.security(
+     syminfo.tickerid,
+     structureTimeframeInput,
+     f_getStructureContext(),
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_on
+)
+
+bool structureHaveEnoughPivots = (
+     not na(htfLastHigh) and
+     not na(htfPrevHigh) and
+     not na(htfLastLow) and
+     not na(htfPrevLow)
+)
+
+bool structureHigherHigh = structureHaveEnoughPivots and htfLastHigh > htfPrevHigh
+bool structureHigherLow = structureHaveEnoughPivots and htfLastLow > htfPrevLow
+bool structureLowerHigh = structureHaveEnoughPivots and htfLastHigh < htfPrevHigh
+bool structureLowerLow = structureHaveEnoughPivots and htfLastLow < htfPrevLow
+
+string structureTrend = (
+     structureHigherHigh and structureHigherLow ?
+     "UP" :
+     structureLowerHigh and structureLowerLow ?
+     "DOWN" :
+     "RANGE"
+)
+
+// Native-timeframe swing tracking. No longer feeds the entry model itself
+// (section 05 now runs its own separate, asymmetric swing detection for
+// the Breakout & Retest signal) -- this pair now exists for Zone Reaction
+// and the native swing zone boxes (Visuals) only. A plain, direct pivot-
+// confirmation read (not MTF-pulled, so no offset/confirmation trick is
+// needed the way the HTF pull above needed one): ta.pivothigh/low only
+// resolves non-na once genuinely confirmed (nativePivotRightInput bars
+// after the actual peak), so this is already look-ahead-safe by
+// construction.
+float nativePivotHigh = ta.pivothigh(high, nativePivotLeftInput, nativePivotRightInput)
+float nativePivotLow = ta.pivotlow(low, nativePivotLeftInput, nativePivotRightInput)
+
+var float recentSwingHigh = na
+var float recentSwingLow = na
+
+if not na(nativePivotHigh)
+    recentSwingHigh := nativePivotHigh
+if not na(nativePivotLow)
+    recentSwingLow := nativePivotLow
+
+
+// ============================================================================
+// 03 - MOMENTUM (TDI)
+// ----------------------------------------------------------------------------
+// Ported from the template's Traders Dynamic Index block, unchanged math.
+// ============================================================================
+
+string G_TDI = "03 - Momentum (TDI)"
+
+tdiSourceInput = input.source(close, "TDI Source", group = G_TDI)
+tdiRsiPeriodInput = input.int(21, "RSI Period", minval = 1, group = G_TDI)
+tdiBandLengthInput = input.int(34, "Band Length", minval = 1, group = G_TDI)
+tdiFastMaLengthInput = input.int(2, "Fast MA on RSI", minval = 1, group = G_TDI)
+momentumLengthInput = input.int(12, "Momentum Length", minval = 1, group = G_TDI)
+requireTdiAbsoluteLevelInput = input.bool(false, "Require Additional Fixed 68/32 Level", tooltip = "OFF by default. On-device Data Window checks confirmed the ON version (Fast MA past its own dynamic band AND past a fixed 68/32 absolute level, both at once) left Momentum stale/NEUTRAL almost permanently -- the same double-AND funnel-diagnostics lesson as delta_break_retest/Stage8. OFF reads the standard TDI signal (Fast MA crosses its own volatility-adjusted band) alone; turn this back on only if you've watched it and still want the extra strictness.", group = G_TDI)
+
+tdiRsi = ta.rsi(tdiSourceInput, tdiRsiPeriodInput)
+tdiMa = ta.sma(tdiRsi, tdiBandLengthInput)
+tdiOffset = 1.6185 * ta.stdev(tdiRsi, tdiBandLengthInput)
+tdiUpperBand = tdiMa + tdiOffset
+tdiLowerBand = tdiMa - tdiOffset
+tdiFastMa = ta.sma(tdiRsi, tdiFastMaLengthInput)
+momentum = tdiSourceInput - tdiSourceInput[momentumLengthInput]
+momentumRising = momentum > momentum[1]
+momentumFalling = momentum < momentum[1]
+tdiBullishMove = tdiFastMa > tdiUpperBand and (not requireTdiAbsoluteLevelInput or tdiFastMa > 68)
+tdiBearishMove = tdiFastMa < tdiLowerBand and (not requireTdiAbsoluteLevelInput or tdiFastMa < 32)
+
+bool tdiConfirmsLong = tdiBullishMove and momentumRising
+bool tdiConfirmsShort = tdiBearishMove and momentumFalling
+
+
+// ============================================================================
+// 04 - VOLUME PRESSURE
+// ----------------------------------------------------------------------------
+// Was an OHLCV-estimated candle-pressure heuristic (f_delta, proven across
+// delta_break_retest Stage 1-9). Replaced with REAL lower-timeframe buy/sell
+// volume via ta.requestUpAndDownVolume() -- the same source the AlgoAlpha
+// "Breakout and Retest Signals" entry model (section 05) uses for its own
+// box coloring/delta label -- so there is one consistent, more accurate
+// volume-delta source feeding both the entry model's visuals AND every
+// existing consumer of executionDeltaPressure (Setup Grade bonus, the
+// pressure gate, the dashboard's Volume Pressure row). Nothing downstream
+// needed to change -- same variable name, same shape (a rolling-window %),
+// just a better-sourced number underneath it.
+// ============================================================================
+
+string G_VOLUME = "04 - Volume Pressure"
+
+executionDeltaWindowInput = input.int(3, "Execution Pressure Window", minval = 1, maxval = 8, group = G_VOLUME)
+executionLtfInput = input.timeframe("5", "Lower Timeframe For Volume", tooltip = "Timeframe ta.requestUpAndDownVolume() aggregates real buy/sell volume from. Matches the AlgoAlpha entry model's own Lower Timeframe Value input.", group = G_VOLUME)
+requireVolumePressureInput = input.bool(false, "Require Volume Pressure Agreement", tooltip = "OFF by default -- same funnel-diagnostics reasoning as elsewhere in this file: a strict pressure gate can smother signal count on a noisy instrument. Turn on deliberately once you've watched how often it would have agreed.", group = G_VOLUME)
+minimumVolumePressureInput = input.float(5.0, "Minimum Volume Pressure %", minval = 0.0, maxval = 60.0, step = 1.0, tooltip = "Used both by the entry gate (when required above) and by the Setup Grade bonus scoring.", group = G_VOLUME)
+
+[executionUpVolume, executionDownVolume, executionDeltaVolume] = ta.requestUpAndDownVolume(executionLtfInput)
+
+float executionDeltaSum = 0.0
+float executionVolumeSum = 0.0
+
+for i = 0 to executionDeltaWindowInput - 1
+    executionDeltaSum += nz(executionDeltaVolume[i], 0.0)
+    executionVolumeSum += nz(executionUpVolume[i], 0.0) + nz(executionDownVolume[i], 0.0)
+
+float executionDeltaPressure = (
+     executionVolumeSum > 0 ?
+     executionDeltaSum / executionVolumeSum * 100.0 :
+     0.0
+)
+
+bool pressureOkLong = not requireVolumePressureInput or executionDeltaPressure >= minimumVolumePressureInput
+bool pressureOkShort = not requireVolumePressureInput or executionDeltaPressure <= -minimumVolumePressureInput
+
+
+// ============================================================================
+// 04c - RANGE & Z-SCORE (MEAN REVERSION)
+// ----------------------------------------------------------------------------
+// Ported with perfect parity (same math, same array/line/na handling,
+// only identifiers renamed to this file's own convention) from the
+// user-supplied "Trading Ranges + ZScore" indicator (c) MyCoqch. That
+// script is overlay=false (its own oscillator pane) with force_overlay
+// used selectively to punch specific plots onto the main chart --
+// Trading_Coach is overlay=true throughout, so there is no separate pane
+// for the raw Z-Score oscillator line itself to live in (a -100..100
+// value plotted directly into a price-scaled pane would visually break
+// the chart). Everything that IS naturally price-scaled or bar-relative
+// -- the range channel lines and the crossover/weak-signal shapes -- is
+// ported and plotted exactly as designed. Candle/bar recoloring (both
+// this Z-Score's own and the pre-existing Structure Trend one) was
+// removed by request -- neither barcolor() call exists in this file
+// anymore. The raw oscillator values are exposed via Data Window plots
+// (see DATA WINDOW section) and folded into the Setup Grade bonus scoring
+// below instead of a broken on-chart oscillator line -- this is the
+// "skill upgrade": Z-Score mean-reversion agreement becomes a THIRD
+// grading factor alongside zone confluence and volume pressure.
+// ============================================================================
+
+string G_ZSCORE = "04c - Range & Z-Score"
+
+rangePerceptionLengthInput = input.int(20, "Range Perception Length", group = G_ZSCORE)
+rangeAnalysisLengthInput = input.int(100, "Range Analysis Length", group = G_ZSCORE)
+rangeAtrMultInput = input.float(2.0, "Range ATR Factor", minval = 1, step = 0.25, group = G_ZSCORE)
+zscoreObThresholdInput = input.int(70, "Z-Score OB/OS Threshold", group = G_ZSCORE)
+rangeFillZonesInput = input.bool(false, "Fill Range Zones", group = G_ZSCORE)
+showRangeChannelInput = input.bool(true, "Show Range Channel Lines", group = G_ZSCORE)
+showZscoreSignalsInput = input.bool(true, "Show Z-Score Signal Shapes", group = G_ZSCORE)
+zscoreBullColorInput = input.color(#2962ff, "Bullish", group = G_ZSCORE, inline = "zc")
+zscoreBearColorInput = input.color(#e91e63, "Bearish", group = G_ZSCORE, inline = "zc")
+zscoreNeutralColorInput = input.color(color.gray, "Neutral", group = G_ZSCORE, inline = "zc")
+
+f_contSig(bool longCond, bool shortCond, float val) =>
+    float toolVal = 0.0
+    toolVal := if longCond == true
+        val
+    else if shortCond == true
+        -val
+    else
+        toolVal[1]
+
+f_tradingRanges(int rangeLen, int rangeLen2, float rangeMult) =>
+    float highVal = ta.highest(high, rangeLen)
+    float lowVal = ta.lowest(low, rangeLen)
+    float atrVal = ta.sma(math.abs(close - ta.sma(close, rangeLen)), rangeLen2) * rangeMult
+
+    var float holdAvg = na
+    var float holdUpper1 = na
+    var float holdUpper2 = na
+    var float holdLower1 = na
+    var float holdLower2 = na
+    var float holdAtr = na
+
+    holdAtr := na(holdAtr) ? atrVal : holdAtr
+    float upperThreshold = holdUpper2
+    float lowerThreshold = holdLower2
+    bool rangeChanged = close > upperThreshold or close < lowerThreshold
+    holdAvg := (na(holdAvg) or (rangeChanged and close > upperThreshold)) ? highVal[3] : (rangeChanged and close < lowerThreshold) ? lowVal[3] : holdAvg
+    holdAtr := (na(holdAtr) or rangeChanged) ? atrVal : holdAtr
+    holdUpper2 := (na(holdUpper2) or rangeChanged) ? holdAvg + 2 * holdAtr : holdUpper2
+    holdUpper1 := (na(holdUpper1) or rangeChanged) ? holdAvg + holdAtr : holdUpper1
+    holdLower1 := (na(holdLower1) or rangeChanged) ? holdAvg - holdAtr : holdLower1
+    holdLower2 := (na(holdLower2) or rangeChanged) ? holdAvg - 2 * holdAtr : holdLower2
+
+    [holdUpper2, holdUpper1, holdAvg, holdLower1, holdLower2]
+
+// -- Z-Score --
+var array<float> zscoreUpDiff = array.new_float()
+var array<float> zscoreDnDiff = array.new_float()
+float zscoreMa = ta.sma(close, 21)
+if close >= zscoreMa
+    array.push(zscoreUpDiff, close - zscoreMa)
+else if close <= zscoreMa
+    array.push(zscoreDnDiff, math.abs(close - zscoreMa))
+if array.size(zscoreUpDiff) > 300
+    array.remove(zscoreUpDiff, 0)
+if array.size(zscoreDnDiff) > 300
+    array.remove(zscoreDnDiff, 0)
+float zscoreDevUp = array.avg(zscoreUpDiff)
+float zscoreDevDn = array.avg(zscoreDnDiff)
+float rawZscore = math.max(math.min((close - zscoreMa) / (close > zscoreMa ? zscoreDevUp : zscoreDevDn), 4), -4)
+float rawZscoreFast = math.max(math.min((close - zscoreMa) / ta.stdev(close, 21), 4), -4)
+float normZscore = ((rawZscore - ta.lowest(rawZscore, 1000)) / (ta.highest(rawZscore, 1000) - ta.lowest(rawZscore, 1000)) * 200) - 100
+float normZscoreFast = ((rawZscoreFast - ta.lowest(rawZscoreFast, 300)) / (ta.highest(rawZscoreFast, 300) - ta.lowest(rawZscoreFast, 300)) * 200) - 100
+
+bool zscoreOversold = normZscore <= -zscoreObThresholdInput
+bool zscoreOverbought = normZscore >= zscoreObThresholdInput
+
+// -- Trading Ranges --
+[rangeUpper2, rangeUpper1, rangeMid, rangeLower1, rangeLower2] = f_tradingRanges(rangePerceptionLengthInput, rangeAnalysisLengthInput, rangeAtrMultInput)
+float rangeTrend = f_contSig(rangeMid > rangeMid[1], rangeMid < rangeMid[1], 1)
+
+var line rangeLineUpper2 = na
+var line rangeLineUpper1 = na
+var line rangeLineMid = na
+var line rangeLineLower1 = na
+var line rangeLineLower2 = na
+
+if showRangeChannelInput
+    if rangeMid[1] != rangeMid[2] and rangeMid == rangeMid[1]
+        rangeLineUpper2 := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = rangeUpper2, y2 = rangeUpper2, color = zscoreBearColorInput, force_overlay = true)
+        rangeLineUpper1 := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = rangeUpper1, y2 = rangeUpper1, color = zscoreBearColorInput, force_overlay = true, style = line.style_dotted)
+        rangeLineMid := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = rangeMid, y2 = rangeMid, color = zscoreNeutralColorInput, force_overlay = true)
+        rangeLineLower1 := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = rangeLower1, y2 = rangeLower1, color = zscoreBullColorInput, force_overlay = true, style = line.style_dotted)
+        rangeLineLower2 := line.new(x1 = bar_index, x2 = bar_index + 1, y1 = rangeLower2, y2 = rangeLower2, color = zscoreBullColorInput, force_overlay = true)
+    else if rangeMid == rangeMid[1]
+        line.set_x2(rangeLineUpper2, bar_index)
+        line.set_x2(rangeLineUpper1, bar_index)
+        line.set_x2(rangeLineMid, bar_index)
+        line.set_x2(rangeLineLower1, bar_index)
+        line.set_x2(rangeLineLower2, bar_index)
+        if rangeFillZonesInput
+            linefill.new(rangeLineUpper2, rangeLineUpper1, rangeMid == rangeMid[1] ? (rangeTrend == -1 ? color.new(zscoreBearColorInput, 70) : color.new(zscoreBearColorInput, 85)) : na)
+            linefill.new(rangeLineUpper1, rangeLineMid, rangeMid == rangeMid[1] ? (rangeTrend == -1 ? color.new(zscoreBearColorInput, 80) : color.new(zscoreBearColorInput, 95)) : na)
+            linefill.new(rangeLineLower2, rangeLineLower1, rangeMid == rangeMid[1] ? (rangeTrend == 1 ? color.new(zscoreBullColorInput, 70) : color.new(zscoreBullColorInput, 85)) : na)
+            linefill.new(rangeLineLower1, rangeLineMid, rangeMid == rangeMid[1] ? (rangeTrend == 1 ? color.new(zscoreBullColorInput, 80) : color.new(zscoreBullColorInput, 95)) : na)
+
+plotshape(showZscoreSignalsInput and ta.crossover(normZscore, -zscoreObThresholdInput), title = "Z-Score Long Signal", style = shape.diamond, location = location.belowbar, color = zscoreBullColorInput)
+plotshape(showZscoreSignalsInput and ta.crossunder(normZscore, zscoreObThresholdInput), title = "Z-Score Short Signal", style = shape.diamond, location = location.abovebar, color = zscoreBearColorInput)
+plotshape(showZscoreSignalsInput and normZscoreFast < -zscoreObThresholdInput, title = "Z-Score Weak Long", style = shape.xcross, location = location.belowbar, color = color.new(zscoreNeutralColorInput, 50))
+plotshape(showZscoreSignalsInput and normZscoreFast > zscoreObThresholdInput, title = "Z-Score Weak Short", style = shape.xcross, location = location.abovebar, color = color.new(zscoreNeutralColorInput, 50))
+
+
+// ============================================================================
+// 05 - ENTRY SETUP (Breakout & Retest -- AlgoAlpha)
+// ----------------------------------------------------------------------------
+// Replaces the prior Pullback/Breakout dual-mode entry model entirely, per
+// explicit request, with the user-supplied "Breakout and Retest Signals
+// [AlgoAlpha]" algorithm, ported with parity (same swing-matching math,
+// same "always consume the matched pivot" behavior, same zone/split-box
+// and dashed-line visuals) -- identifiers renamed to this file's
+// convention, colors moved to dedicated inputs here since
+// longColorInput/shortColorInput aren't declared until the Visuals
+// section, and the source's Unicode up/down triangle text labels swapped
+// for actual triangleup/triangledown plotshape markers, matching this
+// file's existing entry-marker convention (Visuals' showEntryMarkersInput)
+// instead of a floating text box per signal.
+//
+// MECHANISM: keeps the most recent arSwingMemoryInput swing highs/lows
+// (asymmetric pivots -- the confirmation length is Pivot Period divided by
+// Confirmation Multiplier, shorter than the detection length, so it
+// confirms faster than a symmetric pivot would). Whenever a NEW swing high
+// forms, it's matched against the closest-priced swing LOW still in
+// memory; if that low is within an ATR-scaled tolerance of the new high
+// AND price already closed below it (old support already broken), that's
+// a bearish breakout-retest -- old support broken, now being
+// retested/rejected from below as resistance. Mirrored for a new swing low
+// matched against stored swing highs (bullish breakout-retest, old
+// resistance broken and now support). The matched pivot is always removed
+// from memory once checked, signal or not, exactly as the source does.
+//
+// Structure/Momentum/Pressure/Session/Cooldown still gate the raw signal
+// into an actual LONG/SHORT setup -- those are general-purpose coaching
+// layers, not specific to the old dual-mode model, so they carry over.
+// ============================================================================
+
+string G_ENTRY = "05 - Entry Setup (Breakout & Retest)"
+
+arPeriodInput = input.int(7, "Pivot Period", minval = 1, tooltip = "Number of bars to look back for identifying swing points.", group = G_ENTRY)
+arConfirmMultiplierInput = input.int(2, "Confirmation Multiplier", minval = 1, maxval = 10, tooltip = "Pivot Period divided by this gives the confirmation (right-side) length -- higher gives earlier, less-confirmed signals.", group = G_ENTRY)
+arSwingMemoryInput = input.int(3, "Swing Points Memory", minval = 1, tooltip = "Number of recent opposite-side swing points kept in memory to match a new pivot against.", group = G_ENTRY)
+arAtrLengthInput = input.int(40, "Match Tolerance ATR Length", minval = 1, group = G_ENTRY)
+arAtrMultiplierInput = input.float(2.0, "Match Tolerance ATR Multiplier", minval = 0.1, group = G_ENTRY)
+cooldownBarsInput = input.int(12, "Cooldown Bars Between Setups (Per Direction)", minval = 0, group = G_ENTRY)
+requireMomentumInput = input.bool(true, "Require Momentum Confirmation", group = G_ENTRY)
+requireFavorableSessionInput = input.bool(true, "Require Favorable Session", group = G_ENTRY)
+showBreakoutRetestBoxesInput = input.bool(true, "Show Breakout & Retest Boxes", group = G_ENTRY)
+showBreakoutRetestLabelsInput = input.bool(true, "Show Breakout & Retest Entry Triangles", group = G_ENTRY)
+arBullColorInput = input.color(#00ffbb, "Bullish Color", group = G_ENTRY, inline = "arcolor")
+arBearColorInput = input.color(#ff1100, "Bearish Color", group = G_ENTRY, inline = "arcolor")
+
+float atrCoach = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
+
+float arAtrVal = ta.atr(arAtrLengthInput)
+float arTolerance = arAtrVal * arAtrMultiplierInput
+int arConfirmLen = int(arPeriodInput / arConfirmMultiplierInput)
+
+type ArPivot
+    int idx
+    float price
+
+var array<ArPivot> arSwingHighs = array.new<ArPivot>()
+var array<ArPivot> arSwingLows = array.new<ArPivot>()
+
+float arPh = ta.pivothigh(high, arPeriodInput, arConfirmLen)
+float arPl = ta.pivotlow(low, arPeriodInput, arConfirmLen)
+
+if not na(arPh)
+    int arPhBar = bar_index - arConfirmLen
+    array.unshift(arSwingHighs, ArPivot.new(arPhBar, arPh))
+    if array.size(arSwingHighs) > arSwingMemoryInput
+        array.pop(arSwingHighs)
+if not na(arPl)
+    int arPlBar = bar_index - arConfirmLen
+    array.unshift(arSwingLows, ArPivot.new(arPlBar, arPl))
+    if array.size(arSwingLows) > arSwingMemoryInput
+        array.pop(arSwingLows)
+
+bool shortSignalNow = false
+bool longSignalNow = false
+
+if not na(arPh) and array.size(arSwingLows) > 0
+    int arMinIndex = 0
+    float arMinDist = math.abs(array.get(arSwingLows, 0).price - arPh)
+    for i = 0 to array.size(arSwingLows) - 1
+        float arCurrentDist = math.abs(array.get(arSwingLows, i).price - arPh)
+        if arCurrentDist < arMinDist
+            arMinDist := arCurrentDist
+            arMinIndex := i
+
+    ArPivot arMatchedLow = array.get(arSwingLows, arMinIndex)
+
+    if arMinDist < arTolerance and low[arConfirmLen] < arMatchedLow.price
+        if showBreakoutRetestBoxesInput
+            box.new(arMatchedLow.idx, math.max(arPh, arMatchedLow.price), bar_index - arConfirmLen, math.min(arPh, arMatchedLow.price), color.new(color.gray, 100), bgcolor = color.new(chart.fg_color, 85))
+
+            float arRatio = math.abs(executionUpVolume[arConfirmLen] / executionDownVolume[arConfirmLen])
+            float arRatio_ = math.abs(executionDownVolume[arConfirmLen] / executionUpVolume[arConfirmLen])
+            int arMidpoint = int(math.avg(arMatchedLow.idx, bar_index - arConfirmLen))
+            int arDistance = math.abs(arMidpoint - arMatchedLow.idx)
+
+            box.new(arMatchedLow.idx, math.max(arPh, arMatchedLow.price), arRatio > 1 ? arMidpoint : int(arMatchedLow.idx + arDistance * arRatio), math.avg(arPh, arMatchedLow.price), color.new(color.gray, 100), bgcolor = color.new(arBearColorInput, 50))
+            box.new(arMatchedLow.idx, math.avg(arPh, arMatchedLow.price), arRatio < 1 ? arMidpoint : int(arMatchedLow.idx + arDistance * arRatio_), math.min(arPh, arMatchedLow.price), color.new(color.gray, 100), bgcolor = color.new(arBullColorInput, 50))
+
+            line.new(arMatchedLow.idx, math.avg(arPh, arMatchedLow.price), bar_index - arConfirmLen, math.avg(arPh, arMatchedLow.price), color = chart.fg_color, style = line.style_dashed)
+
+        if showBreakoutRetestLabelsInput
+            plotshape(true, title = "Bearish Breakout & Retest Entry", style = shape.triangledown, location = location.abovebar, offset = -arConfirmLen, color = arBearColorInput, size = size.tiny)
+
+        shortSignalNow := true
+
+    array.remove(arSwingLows, arMinIndex)
+
+if not na(arPl) and array.size(arSwingHighs) > 0
+    int arMinIndex2 = 0
+    float arMinDist2 = math.abs(array.get(arSwingHighs, 0).price - arPl)
+    for i = 0 to array.size(arSwingHighs) - 1
+        float arCurrentDist2 = math.abs(array.get(arSwingHighs, i).price - arPl)
+        if arCurrentDist2 < arMinDist2
+            arMinDist2 := arCurrentDist2
+            arMinIndex2 := i
+
+    ArPivot arMatchedHigh = array.get(arSwingHighs, arMinIndex2)
+
+    if arMinDist2 < arTolerance and high[arConfirmLen] > arMatchedHigh.price
+        if showBreakoutRetestBoxesInput
+            box.new(arMatchedHigh.idx, math.max(arPl, arMatchedHigh.price), bar_index - arConfirmLen, math.min(arPl, arMatchedHigh.price), color.new(color.gray, 100), bgcolor = color.new(chart.fg_color, 85))
+
+            float arRatio2 = math.abs(executionUpVolume[arConfirmLen] / executionDownVolume[arConfirmLen])
+            float arRatio2_ = math.abs(executionDownVolume[arConfirmLen] / executionUpVolume[arConfirmLen])
+            int arMidpoint2 = int(math.avg(arMatchedHigh.idx, bar_index - arConfirmLen))
+            int arDistance2 = math.abs(arMidpoint2 - arMatchedHigh.idx)
+
+            box.new(arMatchedHigh.idx, math.max(arPl, arMatchedHigh.price), arRatio2 > 1 ? arMidpoint2 : int(arMatchedHigh.idx + arDistance2 * arRatio2), math.avg(arPl, arMatchedHigh.price), color.new(color.gray, 100), bgcolor = color.new(arBullColorInput, 50))
+            box.new(arMatchedHigh.idx, math.avg(arPl, arMatchedHigh.price), arRatio2 < 1 ? arMidpoint2 : int(arMatchedHigh.idx + arDistance2 * arRatio2_), math.min(arPl, arMatchedHigh.price), color.new(color.gray, 100), bgcolor = color.new(arBearColorInput, 50))
+
+            line.new(arMatchedHigh.idx, math.avg(arPl, arMatchedHigh.price), bar_index - arConfirmLen, math.avg(arPl, arMatchedHigh.price), color = chart.fg_color, style = line.style_dashed)
+
+        if showBreakoutRetestLabelsInput
+            plotshape(true, title = "Bullish Breakout & Retest Entry", style = shape.triangleup, location = location.belowbar, offset = -arConfirmLen, color = arBullColorInput, size = size.tiny)
+
+        longSignalNow := true
+
+    array.remove(arSwingHighs, arMinIndex2)
+
+bool longStructureOk = structureTrend == "UP"
+bool shortStructureOk = structureTrend == "DOWN"
+
+bool momentumOkLong = not requireMomentumInput or tdiConfirmsLong
+bool momentumOkShort = not requireMomentumInput or tdiConfirmsShort
+
+bool sessionOkForLong = not requireFavorableSessionInput or sessionFavorable
+bool sessionOkForShort = not requireFavorableSessionInput or sessionFavorable
+
+var int lastLongSetupBar = na
+var int lastShortSetupBar = na
+
+bool longCooldownOk = na(lastLongSetupBar) or (bar_index - lastLongSetupBar) > cooldownBarsInput
+bool shortCooldownOk = na(lastShortSetupBar) or (bar_index - lastShortSetupBar) > cooldownBarsInput
+
+bool longSetupNow = (
+     barstate.isconfirmed and
+     longSignalNow and
+     longStructureOk and
+     momentumOkLong and
+     pressureOkLong and
+     sessionOkForLong and
+     longCooldownOk
+)
+
+bool shortSetupNow = (
+     barstate.isconfirmed and
+     shortSignalNow and
+     shortStructureOk and
+     momentumOkShort and
+     pressureOkShort and
+     sessionOkForShort and
+     shortCooldownOk
+)
+
+if longSetupNow
+    lastLongSetupBar := bar_index
+if shortSetupNow
+    lastShortSetupBar := bar_index
+
+// -- Zone confluence & Setup Grade --
+// Zone confluence does NOT gate longSetupNow/shortSetupNow above -- it
+// only grades a setup that already qualified on structure/candle/momentum
+// alone, same reasoning as delta_break_retest/Stage8's funnel-diagnostics
+// lesson (an extra confirmation layered on as a hard AND-gate collapses
+// signal count; layered on as a grade, it stays informative without
+// smothering anything).
+f_nearZone(float price, float level, bool broken) =>
+    not broken and not na(level) and math.abs(price - level) <= zoneToleranceAtrInput * atrCoach
+
+f_nearBrokenZone(float price, float level, bool broken) =>
+    broken and not na(level) and math.abs(price - level) <= zoneToleranceAtrInput * atrCoach
+
+// Original-role confluence (an un-broken session low/high still respected).
+bool longZoneConfluenceOriginal = (
+     f_nearZone(close, asiaLow, asiaLowBroken) or
+     f_nearZone(close, londonLow, londonLowBroken) or
+     f_nearZone(close, nyLow, nyLowBroken)
+)
+
+bool shortZoneConfluenceOriginal = (
+     f_nearZone(close, asiaHigh, asiaHighBroken) or
+     f_nearZone(close, londonHigh, londonHighBroken) or
+     f_nearZone(close, nyHigh, nyHighBroken)
+)
+
+// Role-reversed confluence (a BROKEN high retested from above now reads as
+// support for a long; a BROKEN low retested from below now reads as
+// resistance for a short) -- this is the "invalidate, then flip role"
+// half of the ask, not just "invalidate and ignore."
+bool longZoneConfluenceReversed = (
+     f_nearBrokenZone(close, asiaHigh, asiaHighBroken) or
+     f_nearBrokenZone(close, londonHigh, londonHighBroken) or
+     f_nearBrokenZone(close, nyHigh, nyHighBroken)
+)
+
+bool shortZoneConfluenceReversed = (
+     f_nearBrokenZone(close, asiaLow, asiaLowBroken) or
+     f_nearBrokenZone(close, londonLow, londonLowBroken) or
+     f_nearBrokenZone(close, nyLow, nyLowBroken)
+)
+
+bool longZoneConfluence = longZoneConfluenceOriginal or longZoneConfluenceReversed
+bool shortZoneConfluence = shortZoneConfluenceOriginal or shortZoneConfluenceReversed
+
+// Pressure AGREEMENT for grading purposes, independent of the Volume
+// Pressure group's own Require Volume Pressure Agreement gate -- a setup
+// can still earn the grading bonus for pressure agreeing even when that
+// gate itself isn't required.
+bool longPressureBonus = executionDeltaPressure >= minimumVolumePressureInput
+bool shortPressureBonus = executionDeltaPressure <= -minimumVolumePressureInput
+
+// Z-Score mean-reversion AGREEMENT -- the "skill upgrade" from the
+// ported Range & Z-Score section (04c): a long earns the bonus when
+// price is statistically stretched to the downside (oversold) right as
+// the breakout-retest signal fires, same reasoning as pressure and zone
+// confluence -- a bonus factor, never a hard gate, per this file's own
+// funnel-diagnostics lesson.
+bool longZscoreBonus = zscoreOversold
+bool shortZscoreBonus = zscoreOverbought
+
+int longBonusPoints = (longZoneConfluence ? 1 : 0) + (longPressureBonus ? 1 : 0) + (longZscoreBonus ? 1 : 0)
+int shortBonusPoints = (shortZoneConfluence ? 1 : 0) + (shortPressureBonus ? 1 : 0) + (shortZscoreBonus ? 1 : 0)
+
+string longSetupGrade = longBonusPoints >= 3 ? "A" : longBonusPoints >= 1 ? "B" : "C"
+string shortSetupGrade = shortBonusPoints >= 3 ? "A" : shortBonusPoints >= 1 ? "B" : "C"
+
+string longGradeNote = (
+     (longZoneConfluenceReversed and not longZoneConfluenceOriginal ? ", broken-zone flip" : longZoneConfluence ? ", zone confluence" : "") +
+     (longZscoreBonus ? ", z-score oversold" : "") +
+     (dayShowsManipulation ? ", manipulation day" : "")
+)
+
+string shortGradeNote = (
+     (shortZoneConfluenceReversed and not shortZoneConfluenceOriginal ? ", broken-zone flip" : shortZoneConfluence ? ", zone confluence" : "") +
+     (shortZscoreBonus ? ", z-score overbought" : "") +
+     (dayShowsManipulation ? ", manipulation day" : "")
+)
+
+// -- "Coach Says" -- names the single most relevant blocker/status right
+// now, in the order a trader would actually check them: structure first
+// (is there even a trend to trade with), then the breakout-retest signal
+// itself (an instantaneous event, not a persistent zone state like the
+// old model had -- so "waiting" here just means no signal has fired yet
+// this bar), then momentum/pressure/session/cooldown, same order as
+// before. --
+string coachMessage = (
+     structureTrend == "RANGE" ?
+     "Structure ranging -- no clear trend, stand aside" :
+     structureTrend == "UP" and not longSignalNow ?
+     "Uptrend -- watching for a bullish breakout & retest signal" :
+     structureTrend == "UP" and longSignalNow and not momentumOkLong ?
+     "Breakout & retest signal fired -- waiting for momentum confirmation" :
+     structureTrend == "UP" and longSignalNow and momentumOkLong and not pressureOkLong ?
+     "Momentum confirms -- waiting for volume pressure agreement" :
+     structureTrend == "UP" and longSignalNow and momentumOkLong and pressureOkLong and not sessionOkForLong ?
+     "Setup ready -- outside a favorable session, consider waiting" :
+     structureTrend == "UP" and longSignalNow and momentumOkLong and pressureOkLong and sessionOkForLong and not longCooldownOk ?
+     "Setup ready -- cooling down after a recent long signal" :
+     longSetupNow ?
+     "LONG SETUP ACTIVE [Grade " + longSetupGrade + longGradeNote + "]" :
+     structureTrend == "DOWN" and not shortSignalNow ?
+     "Downtrend -- watching for a bearish breakout & retest signal" :
+     structureTrend == "DOWN" and shortSignalNow and not momentumOkShort ?
+     "Breakout & retest signal fired -- waiting for momentum confirmation" :
+     structureTrend == "DOWN" and shortSignalNow and momentumOkShort and not pressureOkShort ?
+     "Momentum confirms -- waiting for volume pressure agreement" :
+     structureTrend == "DOWN" and shortSignalNow and momentumOkShort and pressureOkShort and not sessionOkForShort ?
+     "Setup ready -- outside a favorable session, consider waiting" :
+     structureTrend == "DOWN" and shortSignalNow and momentumOkShort and pressureOkShort and sessionOkForShort and not shortCooldownOk ?
+     "Setup ready -- cooling down after a recent short signal" :
+     shortSetupNow ?
+     "SHORT SETUP ACTIVE [Grade " + shortSetupGrade + shortGradeNote + "]" :
+     "No clear setup forming"
+)
+
+// -- Zone Reaction --
+// Live read of how price is behaving inside the nearest native
+// support/resistance zone -- separate from "Coach Says" above (which is
+// about entry-setup gating, not moment-to-moment price action). A
+// persistent state per zone: Untested -> Testing -> Holding/Rejected.
+// Resets to Untested whenever the underlying swing pivot itself changes
+// (a new zone to test), using the na()-safe change check from gotcha #6
+// (recentSwingLow can start life as na, so a plain != would misread it).
+float zoneHalfCoach = zoneToleranceAtrInput * atrCoach
+
+var float lastSupportZoneLevel = na
+var float lastResistanceZoneLevel = na
+var string supportZoneStatus = "Untested"
+var string resistanceZoneStatus = "Untested"
+
+bool supportZoneChanged = not na(recentSwingLow) and (na(lastSupportZoneLevel) or recentSwingLow != lastSupportZoneLevel)
+bool resistanceZoneChanged = not na(recentSwingHigh) and (na(lastResistanceZoneLevel) or recentSwingHigh != lastResistanceZoneLevel)
+
+float supportZoneTop = recentSwingLow + zoneHalfCoach
+float supportZoneBottom = recentSwingLow - zoneHalfCoach
+float resistanceZoneTop = recentSwingHigh + zoneHalfCoach
+float resistanceZoneBottom = recentSwingHigh - zoneHalfCoach
+
+bool testingSupportNow = not na(recentSwingLow) and low <= supportZoneTop and high >= supportZoneBottom
+bool testingResistanceNow = not na(recentSwingHigh) and low <= resistanceZoneTop and high >= resistanceZoneBottom
+
+if barstate.isconfirmed
+    if supportZoneChanged
+        lastSupportZoneLevel := recentSwingLow
+        supportZoneStatus := "Untested"
+    else if testingSupportNow
+        supportZoneStatus := "Testing"
+    else if supportZoneStatus == "Testing" and close > supportZoneTop
+        supportZoneStatus := "Holding"
+    else if supportZoneStatus == "Testing" and close < supportZoneBottom
+        supportZoneStatus := "Rejected"
+
+    if resistanceZoneChanged
+        lastResistanceZoneLevel := recentSwingHigh
+        resistanceZoneStatus := "Untested"
+    else if testingResistanceNow
+        resistanceZoneStatus := "Testing"
+    else if resistanceZoneStatus == "Testing" and close < resistanceZoneBottom
+        resistanceZoneStatus := "Holding"
+    else if resistanceZoneStatus == "Testing" and close > resistanceZoneTop
+        resistanceZoneStatus := "Rejected"
+
+// One engaging line combining both zones' live reads, same branch order
+// reused for the color ternary below so text and color never disagree.
+string zoneReactionMessage = (
+     supportZoneStatus == "Testing" and resistanceZoneStatus == "Testing" ?
+     "Price caught between support and resistance -- watch both" :
+     supportZoneStatus == "Testing" ?
+     "Testing support " + str.tostring(recentSwingLow, format.mintick) + " -- watch for bounce or break" :
+     resistanceZoneStatus == "Testing" ?
+     "Testing resistance " + str.tostring(recentSwingHigh, format.mintick) + " -- watch for rejection or break" :
+     supportZoneStatus == "Rejected" and resistanceZoneStatus == "Holding" ?
+     "Support broke, resistance still capping -- bearish read" :
+     resistanceZoneStatus == "Rejected" and supportZoneStatus == "Holding" ?
+     "Resistance broke, support still underneath -- bullish read" :
+     supportZoneStatus == "Holding" ?
+     "Support holding -- buyers defended the level" :
+     supportZoneStatus == "Rejected" ?
+     "Support rejected -- level failed, price broke through" :
+     resistanceZoneStatus == "Holding" ?
+     "Resistance holding -- sellers defended the level" :
+     resistanceZoneStatus == "Rejected" ?
+     "Resistance rejected -- level failed, price broke through" :
+     "No active zone test right now"
+)
+// zoneReactionColor (needs longColorInput/shortColorInput) is computed
+// further down once the Visuals section brings those inputs into scope --
+// see "Zone Reaction color" near the dashboard build below.
+
+
+// ============================================================================
+// 06 - RISK MANAGEMENT
+// ----------------------------------------------------------------------------
+// Structure-based stop (beyond the actual swing level, not an arbitrary
+// distance), an R-multiple target, and a suggested position size derived
+// directly from your own account-risk inputs -- the "coaching" is in
+// showing the arithmetic, not hiding it.
+// ============================================================================
+
+string G_RISK = "06 - Risk Management"
+
+accountSizeInput = input.float(10000.0, "Account Size ($)", minval = 0.0, group = G_RISK)
+riskPercentInput = input.float(1.0, "Risk Per Trade (%)", minval = 0.0, maxval = 100.0, step = 0.1, group = G_RISK)
+pointValueInput = input.float(2.0, "Dollar Value Per Point (Per Contract/Share)", minval = 0.0, tooltip = "How much $1 of price movement is worth per contract/share of your instrument (e.g. Micro Nasdaq MNQ = 2, E-mini S&P ES = 50, a single stock share = 1). Get this wrong and every position-size suggestion below is wrong -- check your instrument's actual point value.", group = G_RISK)
+stopBufferAtrMultInput = input.float(0.15, "Stop Buffer Beyond Swing (x ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = G_RISK)
+rMultipleInput = input.float(2.0, "Target R-Multiple", minval = 0.5, maxval = 10.0, step = 0.5, group = G_RISK)
+maximumEntryRiskAtrInput = input.float(1.5, "Maximum Entry Risk (x ATR)", minval = 0.25, maxval = 5.0, step = 0.05, tooltip = "Caps how far the stop is allowed to sit from entry, in ATR terms -- a structure-based stop that's simply too far away for the current volatility gets flagged rather than silently sized down to nothing.", group = G_RISK)
+
+float longStopPrice = na
+float longTargetPrice = na
+float longRiskPerUnit = na
+float longRiskAtr = na
+bool longRiskOk = false
+
+float shortStopPrice = na
+float shortTargetPrice = na
+float shortRiskPerUnit = na
+float shortRiskAtr = na
+bool shortRiskOk = false
+
+// Stop anchor is the swing point the breakout-retest signal actually
+// matched against on this bar: a bullish signal (arPl just confirmed)
+// stops below that fresh swing low; a bearish signal (arPh just
+// confirmed) stops above that fresh swing high -- the same structural
+// point the signal itself is built on, available same-bar since
+// longSetupNow/shortSetupNow can only be true on the bar arPl/arPh
+// resolves non-na.
+float longStopAnchor = arPl
+float shortStopAnchor = arPh
+
+if longSetupNow and not na(longStopAnchor)
+    longStopPrice := longStopAnchor - stopBufferAtrMultInput * atrCoach
+    longRiskPerUnit := math.abs(close - longStopPrice)
+    longRiskAtr := atrCoach > 0 ? longRiskPerUnit / atrCoach : 999.0
+    longRiskOk := longRiskAtr <= maximumEntryRiskAtrInput
+    longTargetPrice := close + longRiskPerUnit * rMultipleInput
+
+if shortSetupNow and not na(shortStopAnchor)
+    shortStopPrice := shortStopAnchor + stopBufferAtrMultInput * atrCoach
+    shortRiskPerUnit := math.abs(close - shortStopPrice)
+    shortRiskAtr := atrCoach > 0 ? shortRiskPerUnit / atrCoach : 999.0
+    shortRiskOk := shortRiskAtr <= maximumEntryRiskAtrInput
+    shortTargetPrice := close - shortRiskPerUnit * rMultipleInput
+
+float riskDollars = accountSizeInput * (riskPercentInput / 100.0)
+
+f_suggestedSize(float riskPerUnit) =>
+    float riskPerContract = riskPerUnit * pointValueInput
+    riskPerContract > 0 ? riskDollars / riskPerContract : na
+
+float longSuggestedSize = longSetupNow ? f_suggestedSize(longRiskPerUnit) : na
+float shortSuggestedSize = shortSetupNow ? f_suggestedSize(shortRiskPerUnit) : na
+
+bool actualLongSignal = longSetupNow and longRiskOk
+bool actualShortSignal = shortSetupNow and shortRiskOk
+
+
+// ============================================================================
+// 07 - OUTCOME TRACKING
+// ----------------------------------------------------------------------------
+// Same pattern proven in Advanced_Session_Profile_Predictor_SR_OR.pine's
+// Outcome Tracker: a simple 1:1 race to outcomeTargetAtrInput ATR in the
+// predicted direction (Win) vs. against it (Loss), or Expired if neither
+// happens within the horizon. Registration gated behind barstate.isconfirmed
+// (native-timeframe-confirmation-gating pattern) -- resolution is not,
+// since a bar's real high/low reaching a level is a real event regardless
+// of whether that bar has closed yet. Deliberately never reset -- this is
+// meant to accumulate a running record of how good this script's OWN
+// setups actually are.
+// ============================================================================
+
+string G_OUTCOME = "07 - Outcome Tracking"
+
+showOutcomeTrackerInput = input.bool(true, "Show Outcome Tracker Table", group = G_OUTCOME)
+outcomeHorizonBarsInput = input.int(20, "Outcome Tracking Horizon (Bars)", minval = 1, maxval = 500, group = G_OUTCOME)
+outcomeTablePositionInput = input.string("Bottom Right", "Outcome Table Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_OUTCOME)
+outcomeTableSizeInput = input.string("Small", "Outcome Table Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_OUTCOME)
+
+var array<bool> pendingIsLong = array.new_bool()
+var array<int> pendingEntryBar = array.new_int()
+var array<float> pendingTargetPrice = array.new_float()
+var array<float> pendingStopPrice = array.new_float()
+
+var int longWins = 0
+var int longLosses = 0
+var int longExpired = 0
+var int shortWins = 0
+var int shortLosses = 0
+var int shortExpired = 0
+var int totalSetupsRegistered = 0
+
+if actualLongSignal
+    array.push(pendingIsLong, true)
+    array.push(pendingEntryBar, bar_index)
+    array.push(pendingTargetPrice, longTargetPrice)
+    array.push(pendingStopPrice, longStopPrice)
+    totalSetupsRegistered += 1
+
+if actualShortSignal
+    array.push(pendingIsLong, false)
+    array.push(pendingEntryBar, bar_index)
+    array.push(pendingTargetPrice, shortTargetPrice)
+    array.push(pendingStopPrice, shortStopPrice)
+    totalSetupsRegistered += 1
+
+if array.size(pendingEntryBar) > 0
+    for i = array.size(pendingEntryBar) - 1 to 0
+        bool isLongPending = array.get(pendingIsLong, i)
+        float targetPending = array.get(pendingTargetPrice, i)
+        float stopPending = array.get(pendingStopPrice, i)
+        int entryBarPending = array.get(pendingEntryBar, i)
+
+        bool hitTarget = isLongPending ? high >= targetPending : low <= targetPending
+        bool hitStop = isLongPending ? low <= stopPending : high >= stopPending
+        bool expiredNow = bar_index - entryBarPending >= outcomeHorizonBarsInput
+
+        bool resolvedNow = false
+        bool wasWin = false
+
+        if hitTarget and hitStop
+            // Ambiguous same-bar case -- conservatively scored as a loss
+            // rather than guessing which was actually touched first
+            // intrabar (same convention as the template's Outcome Tracker).
+            resolvedNow := true
+            wasWin := false
+        else if hitTarget
+            resolvedNow := true
+            wasWin := true
+        else if hitStop
+            resolvedNow := true
+            wasWin := false
+
+        if resolvedNow
+            if isLongPending
+                if wasWin
+                    longWins += 1
+                else
+                    longLosses += 1
+            else
+                if wasWin
+                    shortWins += 1
+                else
+                    shortLosses += 1
+            array.remove(pendingIsLong, i)
+            array.remove(pendingEntryBar, i)
+            array.remove(pendingTargetPrice, i)
+            array.remove(pendingStopPrice, i)
+        else if expiredNow
+            if isLongPending
+                longExpired += 1
+            else
+                shortExpired += 1
+            array.remove(pendingIsLong, i)
+            array.remove(pendingEntryBar, i)
+            array.remove(pendingTargetPrice, i)
+            array.remove(pendingStopPrice, i)
+
+
+// ============================================================================
+// 08 - VISUALS
+// ============================================================================
+
+string G_VISUALS = "08 - Visuals"
+
+showSwingZonesInput = input.bool(true, "Show Native Swing Zone Boxes", group = G_VISUALS)
+showEntryMarkersInput = input.bool(true, "Show Entry Markers", group = G_VISUALS)
+longColorInput = input.color(color.aqua, "Long Color", group = G_VISUALS)
+shortColorInput = input.color(color.orange, "Short Color", group = G_VISUALS)
+
+// Zone Reaction color -- same branch order as zoneReactionMessage above so
+// text and color never disagree; deferred to here because it needs
+// longColorInput/shortColorInput, which only exist from this point on.
+color zoneReactionColor = (
+     supportZoneStatus == "Testing" and resistanceZoneStatus == "Testing" ?
+     color.gray :
+     supportZoneStatus == "Testing" ?
+     color.yellow :
+     resistanceZoneStatus == "Testing" ?
+     color.yellow :
+     supportZoneStatus == "Rejected" and resistanceZoneStatus == "Holding" ?
+     shortColorInput :
+     resistanceZoneStatus == "Rejected" and supportZoneStatus == "Holding" ?
+     longColorInput :
+     supportZoneStatus == "Holding" ?
+     longColorInput :
+     supportZoneStatus == "Rejected" ?
+     shortColorInput :
+     resistanceZoneStatus == "Holding" ?
+     shortColorInput :
+     resistanceZoneStatus == "Rejected" ?
+     longColorInput :
+     color.gray
+)
+
+// ============================================================================
+// SUPPORT / RESISTANCE ZONE BOXES
+// ----------------------------------------------------------------------------
+// Every level this script actually uses for confluence -- the two native
+// swing pivots and the six session highs/lows -- drawn as a box (not a
+// thin line) sized by the same confluence tolerance used to check
+// pullbacks, so the box IS the "zone of interest," not just a
+// price marker. Color reflects the CURRENT effective role, not the
+// level's original identity: an unbroken high is resistance-colored, but
+// once broken it flips to support-colored (and vice versa for lows) --
+// the same role-reversal logic already driving longZoneConfluenceReversed/
+// shortZoneConfluenceReversed above. Native swing levels have no tracked
+// broken state (they're simply replaced by the next confirmed pivot), so
+// they always draw in their native role.
+//
+// Redrawn from scratch each barstate.islast tick (old boxes explicitly
+// deleted first) -- the same box-array lifecycle already proven in
+// delta_break_retest/Stage8-9's Volume Delta Profile section.
+// ============================================================================
+
+f_zoneBox(float level, bool broken, bool isHighRole, int leftX, int rightX, float halfWidth) =>
+    box result = na
+    if not na(level)
+        bool effectiveIsSupport = isHighRole ? broken : not broken
+        color zoneColor = effectiveIsSupport ? longColorInput : shortColorInput
+        // Only the native swing box uses this now (the redundant session-
+        // level version was removed) -- made bolder (thicker border, less
+        // transparent fill) since it's the one box that actually matters
+        // for the Entry Setup logic and needs to stand out on its own,
+        // not blend into the bigger, bolder session boxes around it.
+        result := box.new(
+             left = leftX,
+             top = level + halfWidth,
+             bottom = level - halfWidth,
+             right = rightX,
+             xloc = xloc.bar_index,
+             bgcolor = color.new(zoneColor, 75),
+             border_color = zoneColor,
+             border_width = 2
+        )
+    result
+
+var array<box> zoneBoxes = array.new_box()
+
+if barstate.islast
+    if array.size(zoneBoxes) > 0
+        for i = array.size(zoneBoxes) - 1 to 0
+            box.delete(array.get(zoneBoxes, i))
+        array.clear(zoneBoxes)
+
+    float zoneHalf = zoneToleranceAtrInput * atrCoach
+    int zoneRight = bar_index + 3
+
+    if showSwingZonesInput
+        int swingLeft = bar_index - zoneBoxWidthBarsInput
+        box swingHighBox = f_zoneBox(recentSwingHigh, false, true, swingLeft, zoneRight, zoneHalf)
+        box swingLowBox = f_zoneBox(recentSwingLow, false, false, swingLeft, zoneRight, zoneHalf)
+        if not na(swingHighBox)
+            array.push(zoneBoxes, swingHighBox)
+        if not na(swingLowBox)
+            array.push(zoneBoxes, swingLowBox)
+
+    // NOTE: the six session highs/lows are NOT also drawn as thin
+    // confluence boxes here anymore -- they used to be, and sat directly
+    // on top of the same levels the full Session Boxes (Asia/London/New
+    // York, with their own name + price labels) already draw, at a much
+    // bigger, bolder size. The thin version was getting visually
+    // swallowed by the bigger one and made the actual support/resistance
+    // zone (the native swing box below, which is what the Entry Setup
+    // logic actually trades off of) harder to pick out. Session-level
+    // confluence is still checked in the longZoneConfluence/
+    // shortZoneConfluence logic above -- this only removes the
+    // redundant duplicate box.
+
+
+plotshape(showEntryMarkersInput and actualLongSignal, title = "Long Setup", style = shape.triangleup, location = location.belowbar, size = size.small, color = longColorInput, text = "LONG", textcolor = color.white)
+plotshape(showEntryMarkersInput and actualShortSignal, title = "Short Setup", style = shape.triangledown, location = location.abovebar, size = size.small, color = shortColorInput, text = "SHORT", textcolor = color.white)
+
+alertcondition(actualLongSignal, title = "Trading Coach: Long Setup", message = "Trading Coach LONG setup -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(actualShortSignal, title = "Trading Coach: Short Setup", message = "Trading Coach SHORT setup -- {{ticker}} {{interval}} @ {{close}}")
+
+
+// ============================================================================
+// 09 - COACHING DASHBOARD
+// ============================================================================
+
+string G_DASH = "09 - Dashboard"
+
+showDashboardInput = input.bool(true, "Show Coaching Dashboard", group = G_DASH)
+dashboardPositionInput = input.string("Top Right", "Dashboard Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_DASH)
+dashboardSizeInput = input.string("Small", "Dashboard Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_DASH)
+
+// Trimmed to exactly the 7 rows requested: Coach Observation, Reaction,
+// Session Profile, Structure, Volume Pressure, Momentum, Zone Broken.
+// Session (name + favorable/caution) and Day Profile were previously two
+// separate rows -- merged into one "Session Profile" row here since only
+// one slot was requested for session context. Swing High/Low, Cooldown,
+// Setups Registered, and Long/Short Record are no longer shown on this
+// table (the Outcome Tracker's underlying counters still accumulate in
+// the background -- see Entry Funnel Diagnostics for anything needing
+// that level of detail).
+string sessionProfileText = activeSessionLabel + " -- " + dayProfile + (dayShowsManipulation ? " (!)" : "")
+color sessionProfileColor = dayShowsManipulation ? color.orange : sessionFavorable ? color.aqua : color.gray
+
+var table coachTable = table.new(f_tablePosition(dashboardPositionInput), 2, 8, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast and showDashboardInput
+    dashTextSize = f_tableTextSize(dashboardSizeInput)
+
+    table.cell(coachTable, 0, 0, "TRADING COACH", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = dashTextSize)
+    table.cell(coachTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 1, "Coach Observation", text_color = color.yellow, text_size = dashTextSize)
+    table.cell(coachTable, 1, 1, coachMessage, text_color = (actualLongSignal or actualShortSignal) ? color.white : color.yellow, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 2, "Reaction", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 2, zoneReactionMessage, text_color = zoneReactionColor, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 3, "Session Profile", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 3, sessionProfileText, text_color = sessionProfileColor, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 4, "Structure", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 4, structureTrend, text_color = structureTrend == "UP" ? longColorInput : structureTrend == "DOWN" ? shortColorInput : color.gray, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 5, "Volume Pressure", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 5, str.tostring(executionDeltaPressure, "#.0") + "%", text_color = executionDeltaPressure >= 0 ? longColorInput : shortColorInput, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 6, "Momentum", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 6, tdiConfirmsLong ? "BULLISH" : tdiConfirmsShort ? "BEARISH" : "NEUTRAL", text_color = tdiConfirmsLong ? longColorInput : tdiConfirmsShort ? shortColorInput : color.gray, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 7, "Zone Broken", text_color = color.white, text_size = dashTextSize)
+    table.cell(coachTable, 1, 7, str.tostring(zonesBrokenCount) + " / 6", text_color = zonesBrokenCount > 0 ? color.orange : color.gray, text_size = dashTextSize)
+
+
+// ============================================================================
+// 10 - ENTRY FUNNEL DIAGNOSTICS
+// ----------------------------------------------------------------------------
+// Same reasoning as delta_break_retest/Stage8's own funnel diagnostics:
+// when a script reports zero signals over real chart history, the useful
+// question isn't "is it broken" -- it's "which single gate is actually
+// killing every attempt." Each of the 4 direction x mode combinations
+// gets its own cumulative funnel: a bar only counts at stage N if it
+// already passed every stage before it, so the gap between any two
+// consecutive stage counts IS the number of bars that specific gate
+// blocked (once the earlier stages were already satisfied).
+// ============================================================================
+
+string G_FUNNEL = "10 - Entry Funnel Diagnostics"
+
+showFunnelInput = input.bool(true, "Show Entry Funnel Diagnostics Table", group = G_FUNNEL)
+funnelTablePositionInput = input.string("Bottom Left", "Funnel Table Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_FUNNEL)
+funnelTableSizeInput = input.string("Tiny", "Funnel Table Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_FUNNEL)
+
+// counts[0] = bars evaluated, [1] = +structure, [2] = +signal (the
+// breakout-retest event itself fired), [3] = +momentum, [4] = +pressure,
+// [5] = +session, [6] = +cooldown (== longSetupNow/shortSetupNow),
+// [7] = +risk OK (this is what ACTUALLY reaches actualLongSignal/
+// actualShortSignal and gets registered -- Risk Management's
+// maximumEntryRiskAtrInput cap is a SEPARATE, LATER gate than the entry
+// signal itself). Only 2 columns now (Long/Short) since there is a single
+// entry model -- longRiskOk/shortRiskOk are reused directly from Risk
+// Management rather than recomputed, since they're already only ever
+// true on a bar where every earlier stage (through cooldown) already
+// held, which is exactly the condition this funnel measures too.
+var array<int> fLong = array.new_int(8, 0)
+var array<int> fShort = array.new_int(8, 0)
+
+f_incrFunnel(array<int> counts, bool structureOk, bool signalOk, bool momentumOk, bool pressureOk, bool sessionOk, bool cooldownOk, bool riskOk) =>
+    array.set(counts, 0, array.get(counts, 0) + 1)
+    if structureOk
+        array.set(counts, 1, array.get(counts, 1) + 1)
+        if signalOk
+            array.set(counts, 2, array.get(counts, 2) + 1)
+            if momentumOk
+                array.set(counts, 3, array.get(counts, 3) + 1)
+                if pressureOk
+                    array.set(counts, 4, array.get(counts, 4) + 1)
+                    if sessionOk
+                        array.set(counts, 5, array.get(counts, 5) + 1)
+                        if cooldownOk
+                            array.set(counts, 6, array.get(counts, 6) + 1)
+                            if riskOk
+                                array.set(counts, 7, array.get(counts, 7) + 1)
+    true
+
+if barstate.isconfirmed
+    f_incrFunnel(fLong, longStructureOk, longSignalNow, momentumOkLong, pressureOkLong, sessionOkForLong, longCooldownOk, longRiskOk)
+    f_incrFunnel(fShort, shortStructureOk, shortSignalNow, momentumOkShort, pressureOkShort, sessionOkForShort, shortCooldownOk, shortRiskOk)
+
+var table funnelTable = table.new(f_tablePosition(funnelTablePositionInput), 3, 9, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast and showFunnelInput
+    funnelTextSize = f_tableTextSize(funnelTableSizeInput)
+    array<string> funnelLabels = array.from("ENTRY FUNNEL", "Bars Evaluated", "+ Structure", "+ Signal", "+ Momentum", "+ Pressure", "+ Session", "+ Cooldown", "+ Risk OK (Registered)")
+
+    for row = 0 to 8
+        table.cell(funnelTable, 0, row, array.get(funnelLabels, row), text_color = color.white, bgcolor = row == 0 ? color.rgb(22, 52, 86) : na, text_size = funnelTextSize)
+
+    table.cell(funnelTable, 1, 0, "LONG", text_color = longColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
+    table.cell(funnelTable, 2, 0, "SHORT", text_color = shortColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
+
+    for row = 1 to 8
+        table.cell(funnelTable, 1, row, str.tostring(array.get(fLong, row - 1)), text_color = color.gray, text_size = funnelTextSize)
+        table.cell(funnelTable, 2, row, str.tostring(array.get(fShort, row - 1)), text_color = color.gray, text_size = funnelTextSize)
+
+
+// ============================================================================
+// RESET ON NEW DAY
+// ----------------------------------------------------------------------------
+// Session OHLC, zone-broken flags, and the day's Profile classification
+// all need a daily reset -- none of this existed in the file before the
+// Session Zones & Day Profile section was added. Same timezone-safe idiom
+// already proven in the template's own [r]-round fix and in
+// delta_break_retest/Stage8-9. The Outcome Tracker's win/loss/expired
+// counts are deliberately NOT included here -- those are meant to
+// accumulate a running record across the whole history loaded, same as
+// the template's own Outcome Tracker. newDayCoach itself is computed up
+// in section 01 (needed there for the PDH/PDL day-boundary reset) and
+// reused here as-is.
+// ============================================================================
+
+if newDayCoach
+    asiaOpen := na
+    asiaClose := na
+    asiaHigh := na
+    asiaLow := na
+    londonOpen := na
+    londonClose := na
+    londonHigh := na
+    londonLow := na
+    nyOpen := na
+    nyClose := na
+    nyHigh := na
+    nyLow := na
+    asiaHighBroken := false
+    asiaLowBroken := false
+    londonHighBroken := false
+    londonLowBroken := false
+    nyHighBroken := false
+    nyLowBroken := false
+    dayProfile := "Unknown"
+
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+
+plot(structureTrend == "UP" ? 1 : structureTrend == "DOWN" ? -1 : 0, title = "Structure Trend (1=UP, -1=DOWN, 0=RANGE)", display = display.data_window)
+plot(structureHigherHigh ? 1 : structureLowerHigh ? -1 : 0, title = "Structure HH/LH Flag", display = display.data_window)
+plot(atrCoach, title = "ATR", display = display.data_window)
+plot(executionDeltaPressure, title = "Execution Pressure %", display = display.data_window)
+plot(actualLongSignal ? 1 : 0, title = "Actual Long Signal", display = display.data_window)
+plot(actualShortSignal ? 1 : 0, title = "Actual Short Signal", display = display.data_window)
+
+// Breakout & Retest diagnostics -- the swing points actually matched on
+// the LAST CONFIRMED bar, and whether each direction's raw signal fired.
+plot(arPh, title = "Confirmed Swing High (arPh)", display = display.data_window)
+plot(arPl, title = "Confirmed Swing Low (arPl)", display = display.data_window)
+plot(longSignalNow ? 1 : 0, title = "Bullish Breakout & Retest Signal (Confirmed Bar)", display = display.data_window)
+plot(shortSignalNow ? 1 : 0, title = "Bearish Breakout & Retest Signal (Confirmed Bar)", display = display.data_window)
+plot(array.size(arSwingHighs), title = "Swing Highs In Memory", display = display.data_window)
+plot(array.size(arSwingLows), title = "Swing Lows In Memory", display = display.data_window)
+
+// TDI Momentum diagnostics -- tdiConfirmsLong/Short is TWO separate
+// conditions ANDed together (tdiBullishMove/tdiBearishMove needs the
+// Fast MA above/below its own dynamic band AND past the fixed 68/32
+// absolute level; momentumRising/momentumFalling needs the raw
+// momentum value to have ticked up/down bar-over-bar). "Momentum:
+// NEUTRAL" on the dashboard just means neither combo is true -- these
+// let you check WHICH half failed instead of guessing from one word.
+plot(tdiFastMa, title = "TDI Fast MA", display = display.data_window)
+plot(tdiUpperBand, title = "TDI Upper Band", display = display.data_window)
+plot(tdiLowerBand, title = "TDI Lower Band", display = display.data_window)
+plot(momentum, title = "TDI Momentum Value", display = display.data_window)
+plot(tdiBullishMove ? 1 : 0, title = "TDI Bullish Move (Fast MA vs Band+68)", display = display.data_window)
+plot(tdiBearishMove ? 1 : 0, title = "TDI Bearish Move (Fast MA vs Band+32)", display = display.data_window)
+plot(momentumRising ? 1 : 0, title = "TDI Momentum Rising", display = display.data_window)
+plot(momentumFalling ? 1 : 0, title = "TDI Momentum Falling", display = display.data_window)
+
+// Z-Score oscillator values -- these lived in their own pane in the
+// original standalone script; Trading Coach is overlay-only, so a
+// -100..100 value can't be plotted on the price pane without breaking
+// the chart's scale. Available here in the Data Window instead (and
+// folded into the Setup Grade bonus above).
+plot(normZscore, title = "Z-Score", display = display.data_window)
+plot(normZscoreFast, title = "Z-Score Fast", display = display.data_window)
+plot(rangeTrend, title = "Range Trend (1=UP, -1=DOWN)", display = display.data_window)
+plot(prevDayHigh, title = "Prior Day High (PDH)", display = display.data_window)
+plot(prevDayLow, title = "Prior Day Low (PDL)", display = display.data_window)
+plot(sweptPdhToday ? 1 : 0, title = "PDH Swept (Today)", display = display.data_window)
+plot(sweptPdlToday ? 1 : 0, title = "PDL Swept (Today)", display = display.data_window)
+plot(pdhSweepRate, title = "PDH Sweep Rate %", display = display.data_window)
+plot(pdlSweepRate, title = "PDL Sweep Rate %", display = display.data_window)
+
+
+// ============================================================================
+// STARTING SETTINGS
+// ----------------------------------------------------------------------------
+// A first build, not yet validated against real setup outcomes -- run the
+// Outcome Tracker for a real stretch before trusting the win rate on any
+// of this, the same discipline the template's own tuning needed.
+//
+// Structure Timeframe:            60
+// Native Swing Pivot L/R:         3 / 3 (Zone Reaction / swing zone boxes)
+// Entry Model:                    Breakout & Retest (AlgoAlpha), section 05
+// Pivot Period / Confirm Mult:    7 / 2
+// Swing Points Memory:            3
+// Match Tolerance:                40-bar ATR x 2.0
+// Require Momentum:               ON initially
+// Require Volume Pressure:        OFF initially
+// Cooldown Bars:                  12
+// Stop Buffer:                    0.15 ATR
+// Target R-Multiple:              2.0
+// Max Entry Risk:                 1.5 ATR
+// Risk Per Trade:                 1.0% of Account Size
+// ============================================================================

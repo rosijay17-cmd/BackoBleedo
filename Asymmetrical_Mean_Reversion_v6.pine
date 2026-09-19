@@ -1,0 +1,98 @@
+//@version=6
+strategy("Asymmetrical Mean Reversion v6", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// --- General Inputs ---
+bbLength     = input.int(20, title="BB Length", group="Bollinger Bands")
+baseMult     = input.float(2.0, title="Base BB Multiplier", tooltip="The standard multiplier when trend is neutral", group="Bollinger Bands")
+asymOffset   = input.float(0.5, title="Asymmetric Offset", tooltip="How much to widen the counter-trend band and narrow the trend-aligned band", group="Bollinger Bands")
+cooldownBars = input.int(5, title="Cooldown Bars", minval=0, group="Execution Settings")
+
+// --- Trend Detector Inputs ---
+emaLength    = input.int(200, title="Trend Filter EMA", group="Trend Engine")
+
+// --- Calculations ---
+basis     = ta.sma(close, bbLength)
+stdDevVal = ta.stdev(close, bbLength)
+trendEma  = ta.ema(close, emaLength)
+
+// Determine if we are in a Macro Uptrend or Downtrend
+bool isUptrend = close > trendEma
+
+// Dynamic Asymmetric Multipliers
+// If uptrend: Long is trend-aligned (easier), Short is counter-trend (harder)
+// If downtrend: Short is trend-aligned (easier), Long is counter-trend (harder)
+float longMult  = isUptrend ? (baseMult - asymOffset) : (baseMult + asymOffset)
+float shortMult = isUptrend ? (baseMult + asymOffset) : (baseMult - asymOffset)
+
+// Calculate separate upper and lower bands
+upper = basis + (shortMult * stdDevVal)
+lower = basis - (longMult * stdDevVal)
+
+// --- Plotting ---
+plot(basis, color=color.blue, title="Basis (Mean)")
+plot(trendEma, color=color.orange, linewidth=2, title="Trend EMA")
+p1 = plot(upper, color=color.red, title="Upper Band (Asymmetric)")
+p2 = plot(lower, color=color.green, title="Lower Band (Asymmetric)")
+fill(p1, p2, color=color.new(color.purple, 95), title="Background Fill")
+
+// --- Cooldown Tracking ---
+var int lastSignalBar = -99999
+bool isCooldownOver   = (bar_index - lastSignalBar) >= cooldownBars
+
+// --- Entry Conditions ---
+bool longCondition  = ta.crossover(close, lower) and isCooldownOver
+bool shortCondition = ta.crossunder(close, upper) and isCooldownOver
+
+// --- Update Cooldown Tracker ---
+if longCondition or shortCondition
+    lastSignalBar := bar_index
+
+// ==========================================
+// --- ALERT MESSAGE BUILDER ---
+// ==========================================
+// FIX (same gap as Hierarchical Trading System v6): entries already had a
+// bare alert() call, but (a) it used alert.freq_once_per_bar, which can
+// re-fire on an intrabar retouch before the bar's close is final -- the
+// crossover itself is only meaningful at bar close, so the alert should
+// only ever fire once per CLOSED bar, matching how the order actually
+// gets evaluated; (b) strategy.entry() had no alert_message, so anyone
+// using an "Order fills" alert (instead of "Any alert() function call")
+// got a blank/generic message; (c) the two mean-reversion EXITS had no
+// alert at all -- you'd see the position close on the chart with nothing
+// telling you it happened.
+f_alertMsg(string label, float px) =>
+    label + " | " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(px, format.mintick)
+
+// --- Execution ---
+if longCondition
+    string msg = f_alertMsg("LONG entry (mean reversion)", close)
+    strategy.entry("Long Entry", strategy.long, alert_message=msg)
+    alert(msg, alert.freq_once_per_bar_close)
+
+if shortCondition
+    string msg = f_alertMsg("SHORT entry (mean reversion)", close)
+    strategy.entry("Short Entry", strategy.short, alert_message=msg)
+    alert(msg, alert.freq_once_per_bar_close)
+
+// --- Exit Conditions (Reversion to Mean) ---
+if ta.crossover(close, basis) and strategy.position_size < 0
+    string msg = f_alertMsg("SHORT exit (cover, reverted to mean)", close)
+    strategy.close("Short Entry", comment="Cover at Mean", alert_message=msg)
+    alert(msg, alert.freq_once_per_bar_close)
+
+if ta.crossunder(close, basis) and strategy.position_size > 0
+    string msg = f_alertMsg("LONG exit (sell, reverted to mean)", close)
+    strategy.close("Long Entry", comment="Sell at Mean", alert_message=msg)
+    alert(msg, alert.freq_once_per_bar_close)
+
+// --- Visual Entry Signals (Shapes) ---
+plotshape(longCondition, title="Long Signal", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+plotshape(shortCondition, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small)
+
+// --- Alerts ---
+// alertcondition() gives a second, independent way to pick an alert on
+// this script from the "Condition" dropdown (rather than "Any alert()
+// function call") -- pick whichever workflow you prefer in the Create
+// Alert dialog; both are wired to fire on the same bars.
+alertcondition(longCondition, title="Long Entry", message="Asymmetric Mean Reversion: LONG entry | {{ticker}} | {{interval}}")
+alertcondition(shortCondition, title="Short Entry", message="Asymmetric Mean Reversion: SHORT entry | {{ticker}} | {{interval}}")

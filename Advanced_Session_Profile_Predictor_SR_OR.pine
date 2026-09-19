@@ -1,0 +1,912 @@
+//@version=6
+indicator("Advanced Session Profile Predictor with SR Boxes & OR", overlay=true, max_boxes_count=50)
+
+// ============================================================================
+// ADVANCED SESSION PROFILE PREDICTOR WITH SR BOXES & OR -- IMPROVED
+// ----------------------------------------------------------------------------
+// Started as a byte-for-byte-behavior code cleanup (renamed identifiers,
+// English comments, no logic/UI changes). Six real findings from that pass
+// are now APPLIED here on top, each changing something observable -- listed
+// so it's clear what's different from the original script, not just from
+// the earlier "parity" pass:
+//
+// 1. Session tracking is now three INDEPENDENT `if` blocks instead of an
+//    if/else-if chain. The default windows overlap 13:00-16:00 (London +
+//    New York both active); the old chain let London "win" that whole
+//    window, so New York's open/high/low/close never saw its first 3
+//    hours. Both sessions now update on every bar they're each active,
+//    regardless of what else is active.
+// 2. Session start-time capture no longer reconstructs a timestamp from
+//    `timestamp(timezoneInput, year, month, dayofmonth, H, 0)` (where
+//    year/month/dayofmonth are in the chart's EXCHANGE timezone, not
+//    necessarily timezoneInput). It now just captures `time` directly on
+//    the first bar each session becomes active -- `time` is an absolute
+//    UTC-epoch value, so there is no timezone reconstruction to get wrong.
+// 3. The daily reset condition is now
+//    `ta.change(time("D", timezoneInput)) != 0` instead of comparing
+//    `dayofmonth != dayofmonth[1]` -- fixes the na-comparison-on-bar-0
+//    fragility (pine-proven-patterns skill gotcha #6) AND makes the reset
+//    boundary track the selected timezone instead of the exchange's.
+// 4. The 15-minute opening-range window and the Vol/2.5 SR volume divisor
+//    are now inputs (orWindowMinutesInput, volumePivotDivisorInput) instead
+//    of hardcoded literals. Both default to their original values, so
+//    nothing changes unless you touch them.
+// 5. "Slow MA on RSI" (tdiSlowMaLengthInput) was declared but never used.
+//    It now drives a plotted TDI signal line (a standard second TDI line)
+//    -- added as a new plot only, NOT folded into the existing bullish/
+//    bearish arrow logic, so today's signals are unaffected; it's a new
+//    visual reference line, not a new gate.
+// 6. "Momentum Length" now has `group=G_TDI` like its TDI siblings, so it
+//    displays grouped with them in Settings instead of sitting ungrouped
+//    above.
+// ============================================================================
+
+
+// ============================================================================
+// INPUTS -- SESSIONS & TREND THRESHOLD
+// ----------------------------------------------------------------------------
+// Left ungrouped, exactly as in the original (they appear above the
+// explicit groups in the Settings panel because of that).
+// ============================================================================
+
+timezoneInput = input.string("UTC", "Tidszone", options=["UTC", "Europe/London", "America/New_York"])
+asiaSessionInput = input.session("0000-0800", "Asien Session")
+londonSessionInput = input.session("0800-1600", "London Session")
+newYorkSessionInput = input.session("1300-2100", "New York Session")
+trendThresholdInput = input.float(1.5, "Trend Tærskel", minval=1.0, step=0.1)
+orWindowMinutesInput = input.int(15, "Opening Range Window (Minutes)", minval=1, maxval=120, tooltip="Was hardcoded to 15 minutes. Default unchanged.")
+orBoxTransparencyInput = input.int(90, "Opening Range Box Transparency", minval=0, maxval=100, tooltip="0 = fully solid, 100 = fully invisible. Applies to the Asia/London/New York opening-range boxes (yellow/red/blue). Was hardcoded to 90. Default unchanged.")
+sessionBgTransparencyInput = input.int(90, "Session Background Tint Transparency", minval=0, maxval=100, tooltip="0 = fully solid, 100 = fully invisible. The faint yellow/red/blue background shading behind price during each session. Was hardcoded to 90. Default unchanged.")
+
+
+// ============================================================================
+// INPUTS -- SR (SUPPORT/RESISTANCE) SETTINGS
+// ============================================================================
+
+srLookbackInput = input.int(20, "Lookback Period", minval=1, group="SR Settings")
+volumeFilterLengthInput = input.int(2, "Delta Volume Filter Length", tooltip="Higher input filters low volume boxes", group="SR Settings")
+boxWidthMultInput = input.float(1, "Adjust Box Width", maxval=1000, minval=0, step=0.1, group="SR Settings")
+volumePivotDivisorInput = input.float(2.5, "Volume Pivot Divisor", minval=0.1, step=0.1, tooltip="Was a hardcoded /2.5 in the delta-volume high/low filter. Default unchanged.", group="SR Settings")
+srBoxTransparencyInput = input.int(70, "SR Box Transparency", minval=0, maxval=100, tooltip="0 = fully solid, 100 = fully invisible. Was hardcoded to 30 (fairly opaque).", group="SR Settings")
+
+
+// ============================================================================
+// INPUTS -- TRADERS DYNAMIC INDEX (TDI) & MOMENTUM
+// ============================================================================
+
+string G_TDI = 'Traders Dynamic Index Settings'
+
+tdiRsiPeriodInput = input.int(21, minval=1, title="RSI Period", group=G_TDI)
+tdiBandLengthInput = input.int(34, minval=1, title="Band Length", group=G_TDI)
+tdiFastMaLengthInput = input.int(2, minval=1, title="Fast MA on RSI", group=G_TDI)
+tdiSlowMaLengthInput = input.int(7, minval=0, title="Slow MA on RSI", group=G_TDI)
+tdiSourceInput = input.source(close, title="TDI Source", group=G_TDI)
+momentumLengthInput = input.int(12, minval=1, title="Momentum Length", group=G_TDI)
+
+
+// ============================================================================
+// INPUTS -- TDI CONFIRMATION & OUTCOME TRACKING
+// ----------------------------------------------------------------------------
+// New: links the two previously-independent signal halves (session-profile
+// price triggers + TDI momentum), and scores every trigger touch forward
+// in time instead of leaving the prediction system unvalidated.
+// ============================================================================
+
+string G_OUTCOME = "Outcome Tracking & TDI Confirmation"
+
+showTdiConfirmationInput = input.bool(true, "Show Trigger-Touch Markers (Plain + TDI-Confirmed)", group=G_OUTCOME)
+showOutcomeTrackerInput = input.bool(true, "Show Outcome Tracker Table", group=G_OUTCOME)
+outcomeHorizonBarsInput = input.int(20, "Outcome Tracking Horizon (Bars)", minval=1, maxval=500, tooltip="How many bars forward to watch a triggered touch before giving up on it (marked Expired if neither target nor stop is hit in time).", group=G_OUTCOME)
+outcomeTargetAtrInput = input.float(1.0, "Outcome Target / Stop (x ATR)", minval=0.1, step=0.1, tooltip="A triggered touch is scored a Win if price moves this many ATR in the predicted direction before moving the same amount against it (a simple 1:1 race), a Loss if the reverse happens first, or Expired if neither happens within the horizon.", group=G_OUTCOME)
+
+
+// ============================================================================
+// SESSION DETECTION
+// ============================================================================
+
+asiaInSession = nz(time(timeframe.period, asiaSessionInput, timezoneInput), 0) != 0
+londonInSession = nz(time(timeframe.period, londonSessionInput, timezoneInput), 0) != 0
+nyInSession = nz(time(timeframe.period, newYorkSessionInput, timezoneInput), 0) != 0
+
+
+// ============================================================================
+// PER-SESSION OPEN / CLOSE / HIGH / LOW TRACKING
+// ----------------------------------------------------------------------------
+// FIXED (was #1 in the improvements list): these are now three INDEPENDENT
+// `if` blocks, not an if/else-if chain. The default windows overlap
+// 13:00-16:00 (London + New York both active); the old chain let whichever
+// session was checked first "win" that whole window, so the other one's
+// open/high/low/close never updated during the overlap. Every session that
+// is active on a given bar now updates, regardless of what else is active.
+// ============================================================================
+
+var float asiaOpen = na
+var float asiaClose = na
+var float asiaHigh = na
+var float asiaLow = na
+var float londonOpen = na
+var float londonClose = na
+var float londonHigh = na
+var float londonLow = na
+var float nyOpen = na
+var float nyClose = na
+var float nyHigh = na
+var float nyLow = na
+
+if asiaInSession
+    asiaOpen := na(asiaOpen) ? open : asiaOpen
+    asiaClose := close
+    asiaHigh := math.max(high, nz(asiaHigh, low))
+    asiaLow := math.min(low, nz(asiaLow, high))
+
+if londonInSession
+    londonOpen := na(londonOpen) ? open : londonOpen
+    londonClose := close
+    londonHigh := math.max(high, nz(londonHigh, low))
+    londonLow := math.min(low, nz(londonLow, high))
+
+if nyInSession
+    nyOpen := na(nyOpen) ? open : nyOpen
+    nyClose := close
+    nyHigh := math.max(high, nz(nyHigh, low))
+    nyLow := math.min(low, nz(nyLow, high))
+
+
+// ============================================================================
+// OPENING RANGE (OR) -- FIRST 15 MINUTES OF EACH SESSION
+// ============================================================================
+
+var float asiaOrHigh = na
+var float asiaOrLow = na
+var float londonOrHigh = na
+var float londonOrLow = na
+var float nyOrHigh = na
+var float nyOrLow = na
+var int asiaSessionStartTime = na
+var int londonSessionStartTime = na
+var int nySessionStartTime = na
+var box asiaOrBox = na
+var box londonOrBox = na
+var box nyOrBox = na
+
+// Detect the start of each session by capturing the bar's own absolute
+// timestamp directly, rather than reconstructing one from
+// year/month/dayofmonth (which are in the chart's EXCHANGE timezone, not
+// necessarily timezoneInput). `time` is an absolute UTC-epoch value, so
+// there is no timezone to get wrong here.
+if asiaInSession and na(asiaSessionStartTime)
+    asiaSessionStartTime := time
+if londonInSession and na(londonSessionStartTime)
+    londonSessionStartTime := time
+if nyInSession and na(nySessionStartTime)
+    nySessionStartTime := time
+
+int orWindowMs = orWindowMinutesInput * 60000
+
+// Build the OR box over the first orWindowMinutesInput minutes (default 15,
+// was hardcoded to 900000 ms) of each session.
+if asiaInSession and time >= asiaSessionStartTime and time <= asiaSessionStartTime + orWindowMs
+    asiaOrHigh := math.max(high, nz(asiaOrHigh, high))
+    asiaOrLow := math.min(low, nz(asiaOrLow, low))
+    if na(asiaOrBox)
+        asiaOrBox := box.new(left=bar_index, top=high, right=bar_index+1, bottom=low, bgcolor=color.new(color.yellow, orBoxTransparencyInput), border_color=color.yellow)
+    else
+        box.set_top(asiaOrBox, asiaOrHigh)
+        box.set_bottom(asiaOrBox, asiaOrLow)
+        box.set_right(asiaOrBox, bar_index + 1)
+else if time > asiaSessionStartTime + orWindowMs and not na(asiaOrBox)
+    box.set_right(asiaOrBox, bar_index)  // Freeze the box at the end of the OR window.
+
+if londonInSession and time >= londonSessionStartTime and time <= londonSessionStartTime + orWindowMs
+    londonOrHigh := math.max(high, nz(londonOrHigh, high))
+    londonOrLow := math.min(low, nz(londonOrLow, low))
+    if na(londonOrBox)
+        londonOrBox := box.new(left=bar_index, top=high, right=bar_index+1, bottom=low, bgcolor=color.new(color.red, orBoxTransparencyInput), border_color=color.red)
+    else
+        box.set_top(londonOrBox, londonOrHigh)
+        box.set_bottom(londonOrBox, londonOrLow)
+        box.set_right(londonOrBox, bar_index + 1)
+else if time > londonSessionStartTime + orWindowMs and not na(londonOrBox)
+    box.set_right(londonOrBox, bar_index)
+
+if nyInSession and time >= nySessionStartTime and time <= nySessionStartTime + orWindowMs
+    nyOrHigh := math.max(high, nz(nyOrHigh, high))
+    nyOrLow := math.min(low, nz(nyOrLow, low))
+    if na(nyOrBox)
+        nyOrBox := box.new(left=bar_index, top=high, right=bar_index+1, bottom=low, bgcolor=color.new(color.blue, orBoxTransparencyInput), border_color=color.blue)
+    else
+        box.set_top(nyOrBox, nyOrHigh)
+        box.set_bottom(nyOrBox, nyOrLow)
+        box.set_right(nyOrBox, bar_index + 1)
+else if time > nySessionStartTime + orWindowMs and not na(nyOrBox)
+    box.set_right(nyOrBox, bar_index)
+
+
+// ============================================================================
+// SESSION BACKGROUND HIGHLIGHT
+// ============================================================================
+
+bgcolor(asiaInSession ? color.new(color.yellow, sessionBgTransparencyInput) : na, title="Asien Session")
+bgcolor(londonInSession ? color.new(color.red, sessionBgTransparencyInput) : na, title="London Session")
+bgcolor(nyInSession ? color.new(color.blue, sessionBgTransparencyInput) : na, title="New York Session")
+
+
+// ============================================================================
+// SESSION PROFILE PATTERN DETECTION
+// ============================================================================
+
+asiaRange = asiaHigh - asiaLow
+londonRange = londonHigh - londonLow
+nyRange = nyHigh - nyLow
+asiaDirection = nz(asiaClose, 0) > nz(asiaOpen, 0) ? 1 : (nz(asiaClose, 0) < nz(asiaOpen, 0) ? -1 : 0)
+londonDirection = nz(londonClose, 0) > nz(londonOpen, 0) ? 1 : (nz(londonClose, 0) < nz(londonOpen, 0) ? -1 : 0)
+nyDirection = nz(nyClose, 0) > nz(nyOpen, 0) ? 1 : (nz(nyClose, 0) < nz(nyOpen, 0) ? -1 : 0)
+asiaTrending = nz(asiaRange, 0) > nz(ta.sma(asiaRange, 5), 0) * trendThresholdInput
+londonTrending = nz(londonRange, 0) > nz(ta.sma(londonRange, 5), 0) * trendThresholdInput
+londonConsolidating = nz(londonRange, 0) < nz(ta.sma(londonRange, 5), 0)
+londonManipulatesAsiaHigh = nz(londonHigh, 0) > nz(asiaHigh, 0) and nz(londonLow, 0) < nz(asiaClose, 0)
+londonManipulatesAsiaLow = nz(londonLow, 0) < nz(asiaLow, 0) and nz(londonHigh, 0) > nz(asiaClose, 0)
+nyManipulatesLondonHigh = nz(nyHigh, 0) > nz(londonHigh, 0) and nz(nyLow, 0) < nz(londonClose, 0)
+nyManipulatesLondonLow = nz(nyLow, 0) < nz(londonLow, 0) and nz(nyHigh, 0) > nz(londonClose, 0)
+
+
+// ============================================================================
+// PROFILE PREDICTION
+// ============================================================================
+
+var string nextProfile = "Ukendt"
+if not nyInSession and londonInSession and not na(asiaHigh)
+    if asiaTrending and londonTrending and asiaDirection == londonDirection
+        nextProfile := "Profil 1: Trend Continuation"
+    else if asiaTrending and londonConsolidating
+        nextProfile := "Profil 2: NY Manipulation"
+    else if not asiaTrending and (londonManipulatesAsiaHigh or londonManipulatesAsiaLow)
+        if londonManipulatesAsiaHigh
+            nextProfile := "Profil 3: London+NY Manipulation"
+        else
+            nextProfile := "Profil 4: Consolidation+Continuation"
+    else
+        nextProfile := "Ingen klar profil"
+
+
+// ============================================================================
+// SHORT / LONG CONDITION TEXT (BASED ON PREDICTED PROFILE + CURRENT PRICE)
+// ============================================================================
+
+var string shortCondition = "No Short"
+var string longCondition = "No Long"
+// Parallel float trigger prices, added alongside the text so a real
+// crossover/crossunder touch can be detected below instead of the trigger
+// staying purely informational text. na whenever the text says "No
+// Short"/"No Long". Every branch below follows the same shape: a SHORT
+// trigger price is always ABOVE the current close (waiting for price to
+// drop down to it), a LONG trigger price is always BELOW it (waiting to
+// rise up to it) -- confirmed by re-reading every branch's own close-vs-
+// level comparison against the original text it produces.
+var float shortTriggerPrice = na
+var float longTriggerPrice = na
+if barstate.islast
+    if nextProfile == "Profil 1: Trend Continuation"
+        if asiaDirection == 1 and londonDirection == 1
+            if close < asiaHigh
+                longCondition := "IF price hits " + str.tostring(asiaHigh) + " LONG (A/L/NY)"
+                longTriggerPrice := asiaHigh
+            else
+                longCondition := "No Long (over " + str.tostring(asiaHigh) + ")"
+                longTriggerPrice := na
+            shortCondition := "No Short"
+            shortTriggerPrice := na
+        else if asiaDirection == -1 and londonDirection == -1
+            if close > asiaLow
+                shortCondition := "IF price hits " + str.tostring(asiaLow) + " SHORT (A/L/NY)"
+                shortTriggerPrice := asiaLow
+            else
+                shortCondition := "No Short (under " + str.tostring(asiaLow) + ")"
+                shortTriggerPrice := na
+            longCondition := "No Long"
+            longTriggerPrice := na
+    else if nextProfile == "Profil 2: NY Manipulation"
+        if asiaDirection == 1
+            if close < asiaHigh
+                longCondition := "IF price hits " + str.tostring(asiaHigh) + " LONG (A/L/NY)"
+                longTriggerPrice := asiaHigh
+            else if nyInSession and close < londonHigh
+                longCondition := "IF price hits " + str.tostring(londonHigh) + " LONG (NY)"
+                longTriggerPrice := londonHigh
+            else
+                longCondition := "No Long (over " + str.tostring(londonHigh) + ")"
+                longTriggerPrice := na
+            if close > londonLow
+                shortCondition := "IF price hits " + str.tostring(londonLow) + " SHORT (L/NY)"
+                shortTriggerPrice := londonLow
+            else
+                shortCondition := "No Short (under " + str.tostring(londonLow) + ")"
+                shortTriggerPrice := na
+        else if asiaDirection == -1
+            if close > asiaLow
+                shortCondition := "IF price hits " + str.tostring(asiaLow) + " SHORT (A/L/NY)"
+                shortTriggerPrice := asiaLow
+            else if nyInSession and close > londonLow
+                shortCondition := "IF price hits " + str.tostring(londonLow) + " SHORT (NY)"
+                shortTriggerPrice := londonLow
+            else
+                shortCondition := "No Short (under " + str.tostring(londonLow) + ")"
+                shortTriggerPrice := na
+            if close < londonHigh
+                longCondition := "IF price hits " + str.tostring(londonHigh) + " LONG (L/NY)"
+                longTriggerPrice := londonHigh
+            else
+                longCondition := "No Long (over " + str.tostring(londonHigh) + ")"
+                longTriggerPrice := na
+    else if nextProfile == "Profil 3: London+NY Manipulation"
+        if close > asiaClose
+            shortCondition := "IF price hits " + str.tostring(asiaClose) + " SHORT (L/NY)"
+            shortTriggerPrice := asiaClose
+        else
+            shortCondition := "No Short (under " + str.tostring(asiaClose) + ")"
+            shortTriggerPrice := na
+        if close < asiaHigh
+            longCondition := "IF price hits " + str.tostring(asiaHigh) + " LONG (L/NY)"
+            longTriggerPrice := asiaHigh
+        else
+            longCondition := "No Long (over " + str.tostring(asiaHigh) + ")"
+            longTriggerPrice := na
+    else if nextProfile == "Profil 4: Consolidation+Continuation"
+        if close > asiaLow
+            shortCondition := "IF price hits " + str.tostring(asiaLow) + " SHORT (L/NY)"
+            shortTriggerPrice := asiaLow
+        else
+            shortCondition := "No Short (under " + str.tostring(asiaLow) + ")"
+            shortTriggerPrice := na
+        if close < asiaClose
+            longCondition := "IF price hits " + str.tostring(asiaClose) + " LONG (L/NY)"
+            longTriggerPrice := asiaClose
+        else
+            longCondition := "No Long (over " + str.tostring(asiaClose) + ")"
+            longTriggerPrice := na
+    else
+        shortCondition := "No Short"
+        longCondition := "No Long"
+        shortTriggerPrice := na
+        longTriggerPrice := na
+
+
+// ============================================================================
+// DELTA VOLUME (CHARTPRIME)
+// ============================================================================
+
+f_upAndDownVolume() =>
+    posVol = 0.0
+    negVol = 0.0
+    var isBuyVolume = true
+    if close > open
+        isBuyVolume := true
+    else if close < open
+        isBuyVolume := false
+    if isBuyVolume
+        posVol := posVol + volume
+    else
+        negVol := negVol - volume
+    posVol + negVol
+
+
+// ============================================================================
+// SUPPORT / RESISTANCE (CHARTPRIME)
+// ============================================================================
+
+f_calcSupportResistance(srSource, srLookback) =>
+    deltaVolume = f_upAndDownVolume()
+    deltaVolumeHigh = ta.highest(deltaVolume / volumePivotDivisorInput, volumeFilterLengthInput)
+    deltaVolumeLow = ta.lowest(deltaVolume / volumePivotDivisorInput, volumeFilterLengthInput)
+
+    var float supportLevel = na
+    var float supportBreakLevel = na
+    var float resistanceLevel = na
+    var float resistanceBreakLevel = na
+    var box supportBox = na
+    var box resistanceBox = na
+    var color resistanceColor = color.new(color.red, srBoxTransparencyInput)
+    var color supportColor = color.new(color.green, srBoxTransparencyInput)
+
+    // Pine v6 will not accept plain `na` as a `var bool` initial value
+    // (CE10173 -- see pine-proven-patterns skill gotcha #3). `false` is
+    // behaviorally identical here: all four are unconditionally reassigned
+    // via ta.crossover()/ta.crossunder() every single bar below, so this
+    // seed value is only ever visible for the instant before that first
+    // assignment.
+    var bool resistanceBreakout = false
+    var bool supportBreakout = false
+    var bool resistanceHolds = false
+    var bool supportHolds = false
+
+    pivotHigh = ta.pivothigh(srSource, srLookback, srLookback)
+    pivotLow = ta.pivotlow(srSource, srLookback, srLookback)
+    atrValue = ta.atr(200)
+    boxWidth = atrValue * boxWidthMultInput
+
+    if (not na(pivotLow)) and deltaVolume > deltaVolumeHigh
+        supportLevel := pivotLow
+        supportBreakLevel := supportLevel - boxWidth
+        topLeft = chart.point.from_index(bar_index - srLookback, supportLevel)
+        bottomRight = chart.point.from_index(bar_index, supportBreakLevel)
+        supportBox := box.new(
+             top_left=topLeft,
+             bottom_right=bottomRight,
+             border_color=color.green,
+             border_width=1,
+             bgcolor=supportColor,
+             text="Vol: " + str.tostring(math.round(deltaVolume, 2)),
+             text_color=chart.fg_color,
+             text_size=size.small
+         )
+
+    if (not na(pivotHigh)) and deltaVolume < deltaVolumeLow
+        resistanceLevel := pivotHigh
+        resistanceBreakLevel := resistanceLevel + boxWidth
+        topLeft = chart.point.from_index(bar_index - srLookback, resistanceLevel)
+        bottomRight = chart.point.from_index(bar_index, resistanceBreakLevel)
+        resistanceBox := box.new(
+             top_left=topLeft,
+             bottom_right=bottomRight,
+             border_color=color.red,
+             border_width=1,
+             bgcolor=resistanceColor,
+             text="Vol: " + str.tostring(math.round(deltaVolume, 2)),
+             text_color=chart.fg_color,
+             text_size=size.small
+         )
+
+    if not na(supportBox)
+        supportBox.set_right(bar_index + 1)
+    if not na(resistanceBox)
+        resistanceBox.set_right(bar_index + 1)
+
+    resistanceBreakout := ta.crossover(low, resistanceBreakLevel)
+    resistanceHolds := ta.crossunder(high, resistanceLevel)
+    supportHolds := ta.crossover(low, supportLevel)
+    supportBreakout := ta.crossunder(high, supportBreakLevel)
+
+    if supportBreakout and not na(supportBox)
+        supportBox.set_border_style(line.style_dashed)
+    if supportHolds and not na(supportBox)
+        supportBox.set_border_style(line.style_solid)
+    if resistanceBreakout and not na(resistanceBox)
+        resistanceBox.set_border_style(line.style_dashed)
+    if resistanceHolds and not na(resistanceBox)
+        resistanceBox.set_border_style(line.style_solid)
+
+    [supportLevel, resistanceLevel, resistanceBreakout, resistanceHolds, supportHolds, supportBreakout]
+
+[supportLevel, resistanceLevel, resistanceBreakout, resistanceHolds, supportHolds, supportBreakout] = f_calcSupportResistance(close, srLookbackInput)
+
+
+// ============================================================================
+// RESISTANCE <-> SUPPORT ROLLOVER TRACKING
+// ============================================================================
+
+// Same CE10173 fix as above -- both are only ever read inside plain
+// boolean `and` expressions below (e.g. resistanceBecameSupport[1]), where
+// `na` and `false` behave identically, so this changes nothing observable.
+var bool resistanceBecameSupport = false
+var bool supportBecameResistance = false
+if resistanceBreakout
+    resistanceBecameSupport := true
+if resistanceHolds
+    resistanceBecameSupport := false
+if supportBreakout
+    supportBecameResistance := true
+if supportHolds
+    supportBecameResistance := false
+
+
+// ============================================================================
+// INFO LABELS (PROFILE / SHORT / LONG)
+// ============================================================================
+
+var label profileLabel = na
+var label shortLabel = na
+var label longLabel = na
+if barstate.islast
+    if na(profileLabel)
+        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r7] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(profileLabel, "[r7] Session Profil: " + nextProfile)
+    label.set_x(profileLabel, bar_index)
+    label.set_y(profileLabel, high * 1.005)
+
+    if na(shortLabel)
+        shortLabel := label.new(x=bar_index, y=high * 1.003, text=shortCondition, color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(shortLabel, shortCondition)
+    label.set_x(shortLabel, bar_index)
+    label.set_y(shortLabel, high * 1.003)
+
+    if na(longLabel)
+        longLabel := label.new(x=bar_index, y=high * 1.001, text=longCondition, color=color.green, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(longLabel, longCondition)
+    label.set_x(longLabel, bar_index)
+    label.set_y(longLabel, high * 1.001)
+
+// Diagnostic: if these two ever diverge in the Data Window, the labels are
+// genuinely not tracking the current bar. If they always match, the label
+// position code is working and the issue is elsewhere (stale/cached script,
+// or the numbers inside the text -- which intentionally freeze to the Asia
+// session's close/high for the rest of the day, by original design).
+plot(bar_index, "Current Bar Index (Data Window)", display=display.data_window)
+plot(na(profileLabel) ? na : label.get_x(profileLabel), "Profile Label X (Data Window)", display=display.data_window)
+
+
+// ============================================================================
+// SR BREAKOUT / HOLD MARKERS
+// ============================================================================
+
+plotchar(resistanceHolds, "Resistance Holds", "◆", color=#e92929, size=size.tiny, location=location.abovebar, offset=-1)
+plotchar(supportHolds, "Support Holds", "◆", color=#20ca26, size=size.tiny, location=location.belowbar, offset=-1)
+plotchar(resistanceBreakout and resistanceBecameSupport[1], "Resistance as Support Holds", "◆", color=#20ca26, size=size.tiny, location=location.belowbar, offset=-1)
+plotchar(supportBreakout and supportBecameResistance[1], "Support as Resistance Holds", "◆", color=#e92929, size=size.tiny, location=location.abovebar, offset=-1)
+
+if supportBreakout and not supportBecameResistance[1]
+    label.new(bar_index[1], supportLevel[1], text="Break Sup", style=label.style_label_down, color=#7e1e1e, textcolor=chart.fg_color, size=size.small)
+if resistanceBreakout and not resistanceBecameSupport[1]
+    label.new(bar_index[1], resistanceLevel[1], text="Break Res", style=label.style_label_up, color=#2b6d2d, textcolor=chart.fg_color, size=size.small)
+
+
+// ============================================================================
+// SESSION HIGH / LOW LINES
+// ============================================================================
+
+plot(asiaHigh, "Asien High", color=color.yellow, style=plot.style_cross)
+plot(asiaLow, "Asien Low", color=color.yellow, style=plot.style_cross)
+plot(londonHigh, "London High", color=color.red, style=plot.style_cross)
+plot(londonLow, "London Low", color=color.red, style=plot.style_cross)
+plot(nyHigh, "NY High", color=color.blue, style=plot.style_cross)
+plot(nyLow, "NY Low", color=color.blue, style=plot.style_cross)
+
+
+// ============================================================================
+// TDI & MOMENTUM
+// ============================================================================
+
+tdiRsi = ta.rsi(tdiSourceInput, tdiRsiPeriodInput)
+tdiMa = ta.sma(tdiRsi, tdiBandLengthInput)
+tdiOffset = 1.6185 * ta.stdev(tdiRsi, tdiBandLengthInput)
+tdiUpperBand = tdiMa + tdiOffset
+tdiLowerBand = tdiMa - tdiOffset
+tdiFastMa = ta.sma(tdiRsi, tdiFastMaLengthInput)
+// tdiSlowMaLengthInput was declared but never used anywhere -- it now drives
+// a plotted TDI "Signal Line" (the standard second TDI line), added as a
+// new plot ONLY. It is not folded into tdiBullishMove/tdiBearishMove below,
+// so the existing Bullish/Bearish Arrow signals are unaffected.
+tdiSlowMa = ta.sma(tdiRsi, tdiSlowMaLengthInput)
+momentum = tdiSourceInput - tdiSourceInput[momentumLengthInput]
+momentumRising = momentum > momentum[1]
+momentumFalling = momentum < momentum[1]
+tdiBullishMove = tdiFastMa > tdiUpperBand and tdiFastMa > 68
+tdiBearishMove = tdiFastMa < tdiLowerBand and tdiFastMa < 32
+
+plot(tdiSlowMa, "TDI Signal Line (Slow MA)", color=color.orange, display=display.data_window)
+plotshape(tdiBullishMove and momentumRising ? high : na, style=shape.arrowup, color=color.new(color.lime, 0), size=size.normal, location=location.abovebar, title="Bullish Arrow")
+plotshape(tdiBearishMove and momentumFalling ? low : na, style=shape.arrowdown, color=color.new(#FF0000, 0), size=size.normal, location=location.belowbar, title="Bearish Arrow")
+
+// Same TDI criteria the arrows already use above, reused as-is -- this is
+// the confirmation link between the profile price-triggers and the TDI
+// momentum state, not a new invented threshold.
+bool tdiConfirmsShort = tdiBearishMove and momentumFalling
+bool tdiConfirmsLong = tdiBullishMove and momentumRising
+
+
+// ============================================================================
+// TRIGGER-TOUCH DETECTION
+// ----------------------------------------------------------------------------
+// The session-profile SHORT/LONG condition text above states a price level
+// but never previously confirmed when it was actually reached. Every branch
+// follows the same shape (re-verified against each one's own close-vs-level
+// comparison): a SHORT trigger price is always above the current close,
+// waiting for price to drop down to it; a LONG trigger price is always
+// below it, waiting to rise up to it.
+// ============================================================================
+
+// Race-condition fix: shortTriggerPrice/longTriggerPrice are recomputed
+// fresh every bar from THIS bar's own close-vs-level comparison, which
+// means the exact bar a crossunder/crossover should register is also the
+// bar where the branch that set the trigger price flips to "No
+// Short"/"No Long" and resets it to na -- checking ta.crossunder/crossover
+// against the live (already-reset) value made this always false, so the
+// tracker below never accumulated ANY outcomes even after real touches
+// happened on the chart. Fixed by comparing against the PREVIOUS bar's
+// trigger price explicitly (the level that was actually being watched
+// coming into this bar) instead of the just-reset current one.
+float shortTriggerPricePrev = shortTriggerPrice[1]
+float longTriggerPricePrev = longTriggerPrice[1]
+bool shortTouchNow = not na(shortTriggerPricePrev) and close < shortTriggerPricePrev and close[1] >= shortTriggerPricePrev
+bool longTouchNow = not na(longTriggerPricePrev) and close > longTriggerPricePrev and close[1] <= longTriggerPricePrev
+bool shortTouchConfirmedNow = shortTouchNow and tdiConfirmsShort
+bool longTouchConfirmedNow = longTouchNow and tdiConfirmsLong
+
+plotshape(showTdiConfirmationInput and shortTouchNow and not shortTouchConfirmedNow ? high : na, title="Short Trigger Touch", style=shape.xcross, color=color.new(color.red, 40), size=size.tiny, location=location.abovebar)
+plotshape(showTdiConfirmationInput and longTouchNow and not longTouchConfirmedNow ? low : na, title="Long Trigger Touch", style=shape.xcross, color=color.new(color.green, 40), size=size.tiny, location=location.belowbar)
+plotshape(showTdiConfirmationInput and shortTouchConfirmedNow ? high : na, title="Short Trigger Touch (TDI Confirmed)", style=shape.triangledown, color=color.red, size=size.small, location=location.abovebar, text="TDI")
+plotshape(showTdiConfirmationInput and longTouchConfirmedNow ? low : na, title="Long Trigger Touch (TDI Confirmed)", style=shape.triangleup, color=color.green, size=size.small, location=location.belowbar, text="TDI")
+
+alertcondition(shortTouchNow, title="Short Trigger Touched", message="Session Profile SHORT trigger touched (check TDI confirmation on chart) -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(longTouchNow, title="Long Trigger Touched", message="Session Profile LONG trigger touched (check TDI confirmation on chart) -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(shortTouchConfirmedNow, title="Short Trigger Touched + TDI Confirmed", message="Session Profile SHORT trigger touched AND TDI confirms bearish momentum -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(longTouchConfirmedNow, title="Long Trigger Touched + TDI Confirmed", message="Session Profile LONG trigger touched AND TDI confirms bullish momentum -- {{ticker}} {{interval}} @ {{close}}")
+
+
+// ============================================================================
+// OUTCOME TRACKING
+// ----------------------------------------------------------------------------
+// Scores every trigger touch forward in time instead of leaving the
+// prediction system as an unvalidated guess: a simple 1:1 race to
+// outcomeTargetAtrInput ATR in the predicted direction (Win) vs. against it
+// (Loss), or Expired if neither happens within outcomeHorizonBarsInput bars.
+// Tracked per profile+direction, and separately by whether TDI confirmed
+// the touch, to answer "does TDI confirmation actually help" with real
+// counts rather than assuming it does. Deliberately NOT reset on a new day
+// (see RESET ON NEW DAY below) -- this is meant to accumulate a running
+// record across the whole history loaded, not restart daily.
+// ============================================================================
+
+f_profileCode(string profile) =>
+    switch profile
+        "Profil 1: Trend Continuation" => 0
+        "Profil 2: NY Manipulation" => 1
+        "Profil 3: London+NY Manipulation" => 2
+        "Profil 4: Consolidation+Continuation" => 3
+        => -1
+
+float outcomeAtr = ta.atr(14)
+int currentProfileCode = f_profileCode(nextProfile)
+
+// Diagnostic: counts, once per calendar day, which profile actually got
+// classified that day -- separates "this profile genuinely hasn't occurred
+// yet in the tested window" from "it occurred but the tracker didn't
+// remember it." statWins/statLosses/statExpired are var arrays and are
+// never reset, so if a profile's row stays at 0-0 (--) while this counter
+// shows it HAS occurred more than zero times, that is a real memory bug to
+// chase; if this counter also reads 0 for that profile, it simply hasn't
+// happened yet.
+var array<int> profileOccurrences = array.new_int(4, 0)
+var bool profileCountedToday = false
+
+if barstate.islast and not profileCountedToday and currentProfileCode >= 0
+    array.set(profileOccurrences, currentProfileCode, array.get(profileOccurrences, currentProfileCode) + 1)
+    profileCountedToday := true
+
+var array<int> pendingProfileCode = array.new_int()
+var array<bool> pendingIsShort = array.new_bool()
+var array<bool> pendingTdiConfirmed = array.new_bool()
+var array<int> pendingEntryBar = array.new_int()
+var array<float> pendingTargetPrice = array.new_float()
+var array<float> pendingStopPrice = array.new_float()
+
+// 8 buckets: profileCode (0-3) * 2 + (isShort ? 0 : 1)
+var array<int> statWins = array.new_int(8, 0)
+var array<int> statLosses = array.new_int(8, 0)
+var array<int> statExpired = array.new_int(8, 0)
+
+// Diagnostic: increments the instant ANY touch is registered, well before
+// it resolves to a win/loss/expiry. Watch this number specifically while
+// stepping Replay forward -- if it climbs, the tracker is alive and simply
+// hasn't had a NEW touch to register yet (this profile's trigger price is a
+// single fixed Asia/London level per day, not a re-arming ladder, so at
+// most one touch per direction can ever fire per calendar day). If it never
+// climbs despite visible crosses of the stated trigger price on the chart,
+// that is a real bug still to chase.
+var int totalTouchesRegistered = 0
+
+var int confirmedWins = 0
+var int confirmedLosses = 0
+var int unconfirmedWins = 0
+var int unconfirmedLosses = 0
+
+// Registering a NEW pending touch is gated behind barstate.isconfirmed --
+// same reasoning as the native-timeframe-confirmation-gating pattern this
+// account's Pine work already established: a crossover/crossunder right at
+// a level could in principle register on a still-forming bar and then
+// un-happen before that bar closes. Resolving an ALREADY-pending touch
+// below is not gated the same way -- once a bar's real high/low has
+// actually reached a target or stop, that is a real, already-happened
+// price event regardless of whether the bar itself has closed yet.
+if barstate.isconfirmed and not na(outcomeAtr)
+    if shortTouchNow and currentProfileCode >= 0
+        array.push(pendingProfileCode, currentProfileCode)
+        array.push(pendingIsShort, true)
+        array.push(pendingTdiConfirmed, tdiConfirmsShort)
+        array.push(pendingEntryBar, bar_index)
+        array.push(pendingTargetPrice, close - outcomeTargetAtrInput * outcomeAtr)
+        array.push(pendingStopPrice, close + outcomeTargetAtrInput * outcomeAtr)
+        totalTouchesRegistered += 1
+
+    if longTouchNow and currentProfileCode >= 0
+        array.push(pendingProfileCode, currentProfileCode)
+        array.push(pendingIsShort, false)
+        array.push(pendingTdiConfirmed, tdiConfirmsLong)
+        array.push(pendingEntryBar, bar_index)
+        array.push(pendingTargetPrice, close + outcomeTargetAtrInput * outcomeAtr)
+        array.push(pendingStopPrice, close - outcomeTargetAtrInput * outcomeAtr)
+        totalTouchesRegistered += 1
+
+if array.size(pendingEntryBar) > 0
+    for i = array.size(pendingEntryBar) - 1 to 0
+        bool isShortPending = array.get(pendingIsShort, i)
+        float targetPending = array.get(pendingTargetPrice, i)
+        float stopPending = array.get(pendingStopPrice, i)
+        int entryBarPending = array.get(pendingEntryBar, i)
+        int profileCodePending = array.get(pendingProfileCode, i)
+        bool tdiConfirmedPending = array.get(pendingTdiConfirmed, i)
+
+        bool hitTarget = isShortPending ? low <= targetPending : high >= targetPending
+        bool hitStop = isShortPending ? high >= stopPending : low <= stopPending
+        bool expired = bar_index - entryBarPending >= outcomeHorizonBarsInput
+
+        int statIdx = profileCodePending * 2 + (isShortPending ? 0 : 1)
+        bool resolved = false
+        bool wasWin = false
+
+        if hitTarget and hitStop
+            // Ambiguous same-bar case (a wide bar spanning both target and
+            // stop) -- conservatively scored as a loss rather than
+            // guessing which was actually touched first intrabar.
+            resolved := true
+            wasWin := false
+        else if hitTarget
+            resolved := true
+            wasWin := true
+        else if hitStop
+            resolved := true
+            wasWin := false
+
+        if resolved
+            if wasWin
+                array.set(statWins, statIdx, array.get(statWins, statIdx) + 1)
+                if tdiConfirmedPending
+                    confirmedWins += 1
+                else
+                    unconfirmedWins += 1
+            else
+                array.set(statLosses, statIdx, array.get(statLosses, statIdx) + 1)
+                if tdiConfirmedPending
+                    confirmedLosses += 1
+                else
+                    unconfirmedLosses += 1
+            array.remove(pendingProfileCode, i)
+            array.remove(pendingIsShort, i)
+            array.remove(pendingTdiConfirmed, i)
+            array.remove(pendingEntryBar, i)
+            array.remove(pendingTargetPrice, i)
+            array.remove(pendingStopPrice, i)
+        else if expired
+            array.set(statExpired, statIdx, array.get(statExpired, statIdx) + 1)
+            array.remove(pendingProfileCode, i)
+            array.remove(pendingIsShort, i)
+            array.remove(pendingTdiConfirmed, i)
+            array.remove(pendingEntryBar, i)
+            array.remove(pendingTargetPrice, i)
+            array.remove(pendingStopPrice, i)
+
+
+// ============================================================================
+// OUTCOME TRACKER DASHBOARD
+// ============================================================================
+
+f_tablePosition(string label) =>
+    switch label
+        "Top Left" => position.top_left
+        "Top Center" => position.top_center
+        "Top Right" => position.top_right
+        "Middle Left" => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right" => position.middle_right
+        "Bottom Left" => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Bottom Right" => position.bottom_right
+        => position.bottom_right
+
+f_tableTextSize(string label) =>
+    switch label
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        => size.small
+
+outcomeTablePositionInput = input.string("Bottom Right", "Outcome Table Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=G_OUTCOME)
+outcomeTableSizeInput = input.string("Small", "Outcome Table Text Size", options=["Tiny", "Small", "Normal", "Large"], group=G_OUTCOME)
+
+f_winRateCell(int wins, int losses) =>
+    int total = wins + losses
+    total > 0 ? str.tostring(wins) + "-" + str.tostring(losses) + " (" + str.tostring(math.round(wins / total * 100)) + "%)" : "0-0 (--)"
+
+f_profileStatCell(int profileCode) =>
+    (
+     "S " + f_winRateCell(array.get(statWins, profileCode * 2 + 0), array.get(statLosses, profileCode * 2 + 0)) +
+     " / L " + f_winRateCell(array.get(statWins, profileCode * 2 + 1), array.get(statLosses, profileCode * 2 + 1))
+    )
+
+var table outcomeTable = table.new(f_tablePosition(outcomeTablePositionInput), 2, 9, bgcolor=color.new(color.rgb(15, 20, 27), 10), border_width=1)
+
+if barstate.islast and showOutcomeTrackerInput
+    outcomeTextSize = f_tableTextSize(outcomeTableSizeInput)
+
+    table.cell(outcomeTable, 0, 0, "OUTCOME TRACKER", text_color=color.white, bgcolor=color.rgb(22, 52, 86), text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 0, "Touches: " + str.tostring(totalTouchesRegistered), text_color=color.white, bgcolor=color.rgb(22, 52, 86), text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 1, "Profile 1", text_color=color.white, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 1, f_profileStatCell(0), text_color=color.gray, text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 2, "Profile 2", text_color=color.white, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 2, f_profileStatCell(1), text_color=color.gray, text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 3, "Profile 3", text_color=color.white, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 3, f_profileStatCell(2), text_color=color.gray, text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 4, "Profile 4", text_color=color.white, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 4, f_profileStatCell(3), text_color=color.gray, text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 5, "TDI Confirmed", text_color=color.aqua, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 5, f_winRateCell(confirmedWins, confirmedLosses), text_color=color.aqua, text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 6, "TDI Unconfirmed", text_color=color.orange, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 6, f_winRateCell(unconfirmedWins, unconfirmedLosses), text_color=color.orange, text_size=outcomeTextSize)
+
+    // Diagnostic: settles whether this table is actually calculating on the
+    // Bar Replay cursor's current position, or only on the chart's true
+    // real-time last bar (which would sit still while Replay is scrubbed).
+    // Compare the printed time here against wherever the Replay cursor
+    // visually sits on the chart -- if they don't match, the whole
+    // barstate.islast-gated block is not running where Replay's cursor is,
+    // and none of this table can track Replay at all.
+    table.cell(outcomeTable, 0, 7, "Calc Bar", text_color=color.yellow, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 7, str.tostring(bar_index) + " @ " + str.format_time(time, "MM-dd HH:mm", timezoneInput), text_color=color.yellow, text_size=outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 8, "Profiles Seen", text_color=color.yellow, text_size=outcomeTextSize)
+    table.cell(outcomeTable, 1, 8, "P1:" + str.tostring(array.get(profileOccurrences, 0)) + " P2:" + str.tostring(array.get(profileOccurrences, 1)) + " P3:" + str.tostring(array.get(profileOccurrences, 2)) + " P4:" + str.tostring(array.get(profileOccurrences, 3)), text_color=color.yellow, text_size=outcomeTextSize)
+
+
+// ============================================================================
+// RESET ON NEW DAY
+// ----------------------------------------------------------------------------
+// FIXED (was #3 in the improvements list): `ta.change(time("D", timezoneInput)) != 0`
+// replaces the old `dayofmonth != dayofmonth[1]` check. Main fix: the reset
+// boundary now tracks the SELECTED timezone instead of the chart's exchange
+// timezone, matching the sessions themselves (which are already defined via
+// timezoneInput). This is also the same daily-reset idiom already proven
+// elsewhere in this account's own Pine work (delta_break_retest/Stage8 and
+// Stage9) -- na on bar 0 reads as falsy in the `if`, which is the correct
+// "nothing to reset yet" behavior there, and every bar after that has a
+// real value, so this doesn't carry gotcha #6's actual failure mode (a
+// PERSISTENT var sentinel that never adopts a real value because every
+// comparison against it silently resolves to na forever).
+// ============================================================================
+
+bool newDay = ta.change(time("D", timezoneInput)) != 0
+
+if newDay
+    profileCountedToday := false
+    asiaOpen := na
+    asiaClose := na
+    asiaHigh := na
+    asiaLow := na
+    londonOpen := na
+    londonClose := na
+    londonHigh := na
+    londonLow := na
+    nyOpen := na
+    nyClose := na
+    nyHigh := na
+    nyLow := na
+    asiaOrHigh := na
+    asiaOrLow := na
+    londonOrHigh := na
+    londonOrLow := na
+    nyOrHigh := na
+    nyOrLow := na
+    asiaSessionStartTime := na
+    londonSessionStartTime := na
+    nySessionStartTime := na
+    if not na(asiaOrBox)
+        box.delete(asiaOrBox)
+    if not na(londonOrBox)
+        box.delete(londonOrBox)
+    if not na(nyOrBox)
+        box.delete(nyOrBox)

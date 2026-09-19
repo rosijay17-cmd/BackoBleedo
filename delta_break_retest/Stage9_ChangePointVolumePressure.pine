@@ -1,0 +1,1819 @@
+//@version=6
+strategy(
+     title = "Delta Break & Retest - Stage 9 Change Point + Volume Pressure",
+     shorttitle = "DBR CP-VP S9",
+     overlay = true,
+     max_bars_back = 5000,
+     max_boxes_count = 500,
+     max_lines_count = 500,
+     max_labels_count = 300,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     calc_on_order_fills = false,
+     calc_on_every_tick = true,
+     process_orders_on_close = false,
+     initial_capital = 100000,
+     margin_long = 3,
+     margin_short = 3
+)
+
+// ============================================================================
+// DELTA BREAK & RETEST - STAGE 9 (CHANGE POINT + VOLUME PRESSURE)
+// ----------------------------------------------------------------------------
+// PARITY NOTE: the retest/reclaim/candle-quality/alignment/cooldown/risk/order
+// gating below is a direct, structural port of Stage8_ProfileEntryFix.pine's
+// entry logic ([r5] live-alignment-check version, not its earlier stale-
+// snapshot bug) -- same gates, same formulas, same recently-funnel-tuned
+// defaults. The ONLY thing swapped out is the upstream signal generator:
+// Stage 8 detected a POI break on a pulled 15m timeframe; this stage detects
+// a CUSUM change point natively on the chart's own execution timeframe (no
+// request.security pull needed for the detector itself, since it isn't a
+// higher timeframe -- there is nothing to offset/confirm across bars the way
+// Stage 8's two-layer break-context split needed).
+//
+// 4H  = directional bias.
+// 1H  = active trend quality.
+// Native chart TF = change-point detection + retest + reclaim + execution.
+//
+// ENTRY SEQUENCE:
+// CHANGE POINT (CUSUM regime flip)
+// -> RETEST FROM CORRECT SIDE
+// -> RECLAIM
+// -> VOLUME PRESSURE CONFIRMATION (single condition -- see note below)
+// -> 4H + 1H AGREEMENT
+// -> ENTRY
+//
+// VOLUME PRESSURE NOTE:
+// Stage 8's funnel diagnostics proved, on real MNQ 5m data, that a
+// double-condition pressure gate (absolute level AND a rotation-from-touch
+// requirement) blocked ~76% of every retest attempt -- by far the single
+// biggest bottleneck in that script. This stage's pressure gate is
+// deliberately a SINGLE plain condition (current pressure agrees in sign and
+// magnitude with the trade direction) so it confirms without smothering
+// signal count the same way. Re-run the funnel diagnostics table below after
+// any real testing and tighten from there if it's too loose -- don't assume
+// this starting design is correct without the same kind of on-device
+// evidence Stage 8 needed.
+//
+// IMPORTANT:
+// Pine does not expose exchange-native bid/ask aggressor delta here.
+// All volume-pressure values below are estimated from OHLCV candle pressure,
+// same as Stage 8.
+//
+// This is a first build, seeded with Stage 8's already-funnel-tuned retest
+// defaults where the same parameters apply -- it has NOT itself been
+// validated against real change-point + volume-pressure trade data yet.
+// Treat it exactly like Stage 8 was treated before its own tuning rounds:
+// run the funnel diagnostics table first, then adjust from real numbers.
+// ============================================================================
+
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+f_clamp(float v, float lo, float hi) =>
+    math.max(lo, math.min(hi, v))
+
+f_delta(float o, float h, float l, float c, float v) =>
+    float safeRange = math.max(h - l, syminfo.mintick)
+    float pressure = f_clamp((c - o) / safeRange, -1.0, 1.0)
+    v * pressure
+
+float barDelta = f_delta(open, high, low, close, nz(volume, 0.0))
+float atrExec = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
+
+
+// ============================================================================
+// 00 - CHANGE POINT DETECTION (CUSUM)
+// ----------------------------------------------------------------------------
+// Ported directly from the user's own CUSUM change-point script -- same
+// names, same defaults, same core math. Only addition: the accumulator
+// update and regime-state mutation are gated behind barstate.isconfirmed,
+// which the original (a pure visual indicator) did not need -- flicker on a
+// still-forming bar is cosmetically fine for a plot, but here this state
+// directly drives strategy.entry() calls, so it must not update, reset, or
+// fire isChange multiple times intrabar off an incomplete close.
+// ============================================================================
+
+string G_CUSUM = "00 - Change Point Detection (CUSUM)"
+
+int lengthInput = input.int(
+     50,
+     "Lookback Period",
+     minval = 10,
+     tooltip = "Period used to calculate the rolling statistics of log-returns.",
+     group = G_CUSUM
+)
+
+float thresholdInput = input.float(
+     4.0,
+     "Threshold (h)",
+     minval = 0.1,
+     step = 0.1,
+     tooltip = "Sensitivity of the detection. Higher values require more accumulation to trigger a change.",
+     group = G_CUSUM
+)
+
+float slackInput = input.float(
+     0.5,
+     "Slack (k)",
+     minval = 0.0,
+     step = 0.1,
+     tooltip = "The 'allowable' deviation. Smaller values make the algorithm more sensitive.",
+     group = G_CUSUM
+)
+
+float src = close
+
+float logReturns = math.log(src / nz(src[1], src))
+float rollingMean = ta.sma(logReturns, lengthInput)
+float rollingStd = ta.stdev(logReturns, lengthInput)
+float zScore = (logReturns - rollingMean) / (rollingStd == 0 ? 1.0 : rollingStd)
+
+var float sPos = 0.0
+var float sNeg = 0.0
+var int trend = 0
+
+bool changeUp = false
+bool changeDn = false
+
+if barstate.isconfirmed
+    if not na(zScore)
+        sPos := math.max(0, sPos + zScore - slackInput)
+        sNeg := math.min(0, sNeg + zScore + slackInput)
+
+    changeUp := sPos > thresholdInput
+    changeDn := sNeg < -thresholdInput
+
+bool isChange = changeUp or changeDn
+
+var float regimePrice = na
+var int regimeStartBar = bar_index
+
+if barstate.isconfirmed and (isChange or bar_index == lengthInput)
+    trend := changeUp ? 1 : (changeDn ? -1 : trend)
+    regimePrice := src
+    regimeStartBar := bar_index
+    sPos := 0.0
+    sNeg := 0.0
+
+int barsInRegime = bar_index - regimeStartBar
+
+
+// ============================================================================
+// EXECUTION VOLUME PRESSURE / CANDLE QUALITY
+// ----------------------------------------------------------------------------
+// Same rolling candle-pressure estimate Stage 8 uses, reused as-is.
+// ============================================================================
+
+string G_PRESSURE = "01 - Volume Pressure"
+
+int executionDeltaWindowInput = input.int(
+     3,
+     "Execution Pressure Window",
+     minval = 1,
+     maxval = 8,
+     group = G_PRESSURE
+)
+
+bool requireVolumePressureConfirmationInput = input.bool(
+     true,
+     "Require Volume Pressure Confirmation",
+     tooltip = "SINGLE condition by design: current pressure must simply agree in sign and clear a modest magnitude in the trade's own direction. Stage 8's funnel diagnostics proved a double-condition pressure gate (absolute level AND a rotation-from-touch requirement) blocked ~76% of every attempt -- this gate deliberately does not repeat that. Still, verify against the funnel diagnostics table below before trusting it.",
+     group = G_PRESSURE
+)
+
+float minimumVolumePressureInput = input.float(
+     5.0,
+     "Minimum Volume Pressure %",
+     minval = 0.0,
+     maxval = 60.0,
+     step = 1.0,
+     tooltip = "Modest starting threshold, not re-derived from real data yet -- run the funnel diagnostics table and adjust from what it actually shows, the same way Stage 8's thresholds were tuned.",
+     group = G_PRESSURE
+)
+
+bool requireRvolOnTriggerInput = input.bool(
+     false,
+     "Require RVOL On Trigger",
+     group = G_PRESSURE
+)
+
+int triggerRvolLengthInput = input.int(
+     20,
+     "Trigger RVOL Length",
+     minval = 5,
+     maxval = 100,
+     group = G_PRESSURE
+)
+
+float minimumTriggerRvolInput = input.float(
+     1.05,
+     "Minimum Trigger RVOL",
+     minval = 0.50,
+     maxval = 3.0,
+     step = 0.05,
+     group = G_PRESSURE
+)
+
+float executionDeltaSum = 0.0
+float executionVolumeSum = 0.0
+
+for i = 0 to executionDeltaWindowInput - 1
+    float execVolume = nz(volume[i], 0.0)
+    executionDeltaSum += f_delta(open[i], high[i], low[i], close[i], execVolume)
+    executionVolumeSum += execVolume
+
+float executionDeltaPressure = (
+     executionVolumeSum > 0 ?
+     executionDeltaSum / executionVolumeSum * 100.0 :
+     0.0
+)
+
+float triggerVolumeAverage = ta.sma(volume, triggerRvolLengthInput)
+float triggerRvol = triggerVolumeAverage > 0 ? volume / triggerVolumeAverage : 0.0
+float triggerRange = math.max(high - low, syminfo.mintick)
+float triggerBodyFraction = math.abs(close - open) / triggerRange
+float triggerCloseLocation = (close - low) / triggerRange
+
+
+// ============================================================================
+// 02 - REGIME ZONE / RETEST INPUTS
+// ----------------------------------------------------------------------------
+// Structurally identical to Stage 8's "02 - Retest / Trigger" group. Defaults
+// for the parameters Stage 8 already funnel-tuned (min/max bars after
+// retest, max entry extension, min close location) are seeded from that
+// tuning directly rather than reintroduced at Stage 8's ORIGINAL over-tight
+// values -- no reason to re-discover the same lesson twice.
+// ============================================================================
+
+string G_EXEC = "02 - Regime Zone / Retest"
+
+float regimeZoneAtrMultInput = input.float(
+     0.25,
+     "Regime Zone Half-Width (x ATR)",
+     minval = 0.05,
+     maxval = 2.0,
+     step = 0.05,
+     group = G_EXEC
+)
+
+float retestWindowHoursInput = input.float(
+     6.0,
+     "Maximum Change-Point-To-Retest Window (Hours)",
+     minval = 0.5,
+     maxval = 48.0,
+     step = 0.5,
+     group = G_EXEC
+)
+
+int minBarsAfterRetestInput = input.int(
+     0,
+     "Minimum Bars After Retest Before Trigger",
+     minval = 0,
+     maxval = 5,
+     group = G_EXEC
+)
+
+int maxBarsAfterRetestInput = input.int(
+     4,
+     "Maximum Bars After Retest To Trigger",
+     minval = 1,
+     maxval = 12,
+     group = G_EXEC
+)
+
+float maxRetestOvershootAtrInput = input.float(
+     0.10,
+     "Maximum Retest Overshoot Beyond Far Edge (ATR)",
+     minval = 0.0,
+     maxval = 1.0,
+     step = 0.05,
+     group = G_EXEC
+)
+
+float reclaimBufferAtrInput = input.float(
+     0.05,
+     "Minimum Reclaim Beyond Zone Edge (ATR)",
+     minval = 0.0,
+     maxval = 0.50,
+     step = 0.01,
+     group = G_EXEC
+)
+
+float maxEntryExtensionAtrInput = input.float(
+     0.50,
+     "Maximum Entry Extension From Zone (ATR)",
+     minval = 0.10,
+     maxval = 1.50,
+     step = 0.05,
+     group = G_EXEC
+)
+
+float minimumTriggerBodyFractionInput = input.float(
+     0.30,
+     "Minimum Trigger Candle Body / Range",
+     minval = 0.0,
+     maxval = 1.0,
+     step = 0.05,
+     group = G_EXEC
+)
+
+float minimumTriggerCloseLocationInput = input.float(
+     0.58,
+     "Minimum Trigger Close Location",
+     minval = 0.50,
+     maxval = 0.95,
+     step = 0.05,
+     group = G_EXEC
+)
+
+
+// ============================================================================
+// 03 - MTF CONTEXT INPUTS
+// ----------------------------------------------------------------------------
+// Ported verbatim from Stage 8 -- the same proven two-layer
+// request.security + [1]-offset pattern (mtf-confirmed-pivot-pull.md /
+// pine-proven-patterns skill), unchanged.
+// ============================================================================
+
+string G_MTF = "03 - MTF Context"
+
+string biasTimeframeInput = input.timeframe(
+     "240",
+     "4H Bias Timeframe",
+     group = G_MTF
+)
+
+int pivotLeftInput = input.int(
+     3,
+     "4H Pivot Left",
+     minval = 1,
+     maxval = 20,
+     group = G_MTF
+)
+
+int pivotRightInput = input.int(
+     3,
+     "4H Pivot Right",
+     minval = 1,
+     maxval = 20,
+     group = G_MTF
+)
+
+int biasEmaLengthInput = input.int(
+     50,
+     "4H EMA Length",
+     minval = 2,
+     group = G_MTF
+)
+
+int biasSlopeLookbackInput = input.int(
+     5,
+     "4H EMA Slope Lookback",
+     minval = 1,
+     maxval = 50,
+     group = G_MTF
+)
+
+string trendTimeframeInput = input.timeframe(
+     "60",
+     "1H Trend Timeframe",
+     group = G_MTF
+)
+
+int adxLengthInput = input.int(
+     14,
+     "1H ADX / DI Length",
+     minval = 1,
+     group = G_MTF
+)
+
+float adxMinimumInput = input.float(
+     20.0,
+     "1H Minimum ADX",
+     minval = 0.0,
+     step = 0.5,
+     group = G_MTF
+)
+
+int fastEmaInput = input.int(
+     21,
+     "1H Fast EMA",
+     minval = 1,
+     group = G_MTF
+)
+
+int slowEmaInput = input.int(
+     50,
+     "1H Slow EMA",
+     minval = 2,
+     group = G_MTF
+)
+
+int erLengthInput = input.int(
+     10,
+     "1H Efficiency Ratio Length",
+     minval = 2,
+     group = G_MTF
+)
+
+float erMinimumInput = input.float(
+     0.30,
+     "1H Minimum Efficiency Ratio",
+     minval = 0.0,
+     maxval = 1.0,
+     step = 0.05,
+     group = G_MTF
+)
+
+bool require1hTrendAgreementInput = input.bool(
+     true,
+     "Require 1H Trend Agreement",
+     group = G_MTF
+)
+
+
+// ============================================================================
+// 04 - COOLDOWN / ORDERS / RISK
+// ----------------------------------------------------------------------------
+// Ported verbatim from Stage 8. No POI-type analog exists here (a change
+// point only has a direction, not a type code), so Stage 8's typeEnabled /
+// enableDeltaFlipEntriesInput gate has no counterpart and is intentionally
+// omitted rather than faked.
+// ============================================================================
+
+string G_RISK = "04 - Cooldown / Orders / Risk"
+
+int globalCooldownWinBarsInput = input.int(
+     6,
+     "Global Cooldown After Win",
+     minval = 0,
+     group = G_RISK
+)
+
+int globalCooldownLossBarsInput = input.int(
+     12,
+     "Global Cooldown After Loss",
+     minval = 0,
+     group = G_RISK
+)
+
+int directionCooldownBarsInput = input.int(
+     12,
+     "Direction Cooldown After Loss",
+     minval = 0,
+     group = G_RISK
+)
+
+int consecutiveLossLimitInput = input.int(
+     2,
+     "Consecutive Loss Session Limit",
+     minval = 1,
+     group = G_RISK
+)
+
+bool requireAlignedEntryInput = input.bool(
+     true,
+     "Require Full Trend Alignment",
+     group = G_RISK
+)
+
+float stopBufferAtrMultInput = input.float(
+     0.10,
+     "Stop Buffer Beyond Zone (x ATR)",
+     minval = 0.0,
+     maxval = 1.0,
+     step = 0.05,
+     group = G_RISK
+)
+
+float maximumEntryRiskAtrInput = input.float(
+     1.25,
+     "Maximum Entry-To-Stop Risk (ATR)",
+     minval = 0.25,
+     maxval = 4.0,
+     step = 0.05,
+     group = G_RISK
+)
+
+float rMultipleInput = input.float(
+     2.0,
+     "Target R-Multiple",
+     minval = 0.5,
+     maxval = 10.0,
+     step = 0.5,
+     group = G_RISK
+)
+
+int contractsInput = input.int(
+     1,
+     "Contracts Per Entry",
+     minval = 1,
+     maxval = 100,
+     group = G_RISK
+)
+
+
+// ============================================================================
+// 05 - SIGNAL VISUALS
+// ============================================================================
+
+string G_SIG = "05 - Signal Visuals"
+
+bool showChangePointVisualInput = input.bool(
+     true,
+     "Show CUSUM Regime Line + Pressure Fill",
+     group = G_SIG
+)
+
+bool showRetestTouchMarkerInput = input.bool(
+     true,
+     "Show Retest Touch Marker",
+     group = G_SIG
+)
+
+bool showEntrySignalInput = input.bool(
+     true,
+     "Show Actual Entry Signal",
+     group = G_SIG
+)
+
+bool showQualifiedTriggerInput = input.bool(
+     true,
+     "Show Qualified Retest Trigger",
+     tooltip = "Diamond = price/pressure retest trigger. Triangle = actual strategy entry after trend, cooldown, and risk gates.",
+     group = G_SIG
+)
+
+string entrySignalSizeInput = input.string(
+     "Normal",
+     "Entry Signal Size",
+     options = ["Tiny", "Small", "Normal", "Large", "Huge"],
+     group = G_SIG
+)
+
+color longEntryColorInput = input.color(
+     color.aqua,
+     "Long Entry Color",
+     group = G_SIG
+)
+
+color shortEntryColorInput = input.color(
+     color.orange,
+     "Short Entry Color",
+     group = G_SIG
+)
+
+color longTriggerColorInput = input.color(
+     color.rgb(70, 160, 255),
+     "Long Qualified Trigger Color",
+     group = G_SIG
+)
+
+color shortTriggerColorInput = input.color(
+     color.rgb(255, 120, 70),
+     "Short Qualified Trigger Color",
+     group = G_SIG
+)
+
+color retestLongColorInput = input.color(
+     color.new(color.aqua, 20),
+     "Long Retest Touch Color",
+     group = G_SIG
+)
+
+color retestShortColorInput = input.color(
+     color.new(color.orange, 20),
+     "Short Retest Touch Color",
+     group = G_SIG
+)
+
+bool highlightEntryBarInput = input.bool(
+     true,
+     "Highlight Entry Candle",
+     group = G_SIG
+)
+
+
+// ============================================================================
+// 06 - DASHBOARD
+// ============================================================================
+
+string G_DASH = "06 - Dashboard"
+
+bool showDashboardInput = input.bool(
+     true,
+     "Show Dashboard",
+     group = G_DASH
+)
+
+int deltaStrengthWindowInput = input.int(
+     20,
+     "Buyer / Seller Strength Window",
+     minval = 5,
+     maxval = 200,
+     group = G_DASH
+)
+
+bool showFunnelDiagnosticsInput = input.bool(
+     true,
+     "Show Change-Point Funnel Diagnostics",
+     tooltip = "Second table: counts how many change points reach each stage of the retest/trigger chain, and which gate blocks a RETESTED bar most often -- same diagnostic pattern that found and fixed Stage 8's pressure-gate bottleneck.",
+     group = G_DASH
+)
+
+string dashboardSizeInput = input.string(
+     "Small",
+     "Dashboard Text Size",
+     options = ["Tiny", "Small", "Normal", "Large"],
+     tooltip = "Shrinks both tables' text (and therefore their footprint) without hiding any row -- use Tiny on a small phone screen.",
+     group = G_DASH
+)
+
+string dashboardPositionInput = input.string(
+     "Bottom Right",
+     "Main Dashboard Position",
+     options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"],
+     group = G_DASH
+)
+
+string funnelPositionInput = input.string(
+     "Bottom Left",
+     "Funnel Diagnostics Position",
+     options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"],
+     tooltip = "Keep this different from Main Dashboard Position or the two tables will stack on top of each other.",
+     group = G_DASH
+)
+
+f_tablePosition(string label) =>
+    switch label
+        "Top Left" => position.top_left
+        "Top Center" => position.top_center
+        "Top Right" => position.top_right
+        "Middle Left" => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right" => position.middle_right
+        "Bottom Left" => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Bottom Right" => position.bottom_right
+        => position.bottom_right
+
+f_tableTextSize(string label) =>
+    switch label
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        => size.small
+
+tableTextSize = f_tableTextSize(dashboardSizeInput)
+
+
+// ============================================================================
+// CHANGE-POINT ZONE (analogous to Stage 8's break-context zone)
+// ----------------------------------------------------------------------------
+// No request.security pull is needed here -- the CUSUM detector already runs
+// natively on the chart's own execution timeframe, so a change point IS the
+// event, with no cross-timeframe confirmation/offset step required the way
+// Stage 8's 15m break context needed.
+// ============================================================================
+
+float cpHalfWidth = atrExec * regimeZoneAtrMultInput
+float cpZoneLow = src - cpHalfWidth
+float cpZoneHigh = src + cpHalfWidth
+int cpDirection = changeUp ? 1 : (changeDn ? -1 : 0)
+
+
+// ============================================================================
+// 4H BIAS
+// ============================================================================
+
+f_get4hContext() =>
+    float ph = ta.pivothigh(high, pivotLeftInput, pivotRightInput)
+    float pl = ta.pivotlow(low, pivotLeftInput, pivotRightInput)
+
+    float latestHigh = ta.valuewhen(not na(ph), ph, 0)
+    float previousHigh = ta.valuewhen(not na(ph), ph, 1)
+    float latestLow = ta.valuewhen(not na(pl), pl, 0)
+    float previousLow = ta.valuewhen(not na(pl), pl, 1)
+
+    float ema = ta.ema(close, biasEmaLengthInput)
+    bool aboveEma = close > ema
+    bool slopeUp = ema > ema[biasSlopeLookbackInput]
+    bool slopeDown = ema < ema[biasSlopeLookbackInput]
+
+    [latestHigh[1], previousHigh[1], latestLow[1], previousLow[1], aboveEma[1], slopeUp[1], slopeDown[1]]
+
+[lastPivotHigh, prevPivotHigh, lastPivotLow, prevPivotLow, closeAboveEma4h, emaSlopeUp4h, emaSlopeDown4h] = request.security(
+     syminfo.tickerid,
+     biasTimeframeInput,
+     f_get4hContext(),
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_on
+)
+
+bool haveEnoughPivots = (
+     not na(lastPivotHigh) and
+     not na(prevPivotHigh) and
+     not na(lastPivotLow) and
+     not na(prevPivotLow)
+)
+
+bool higherHigh = haveEnoughPivots and lastPivotHigh > prevPivotHigh
+bool lowerHigh = haveEnoughPivots and lastPivotHigh < prevPivotHigh
+bool higherLow = haveEnoughPivots and lastPivotLow > prevPivotLow
+bool lowerLow = haveEnoughPivots and lastPivotLow < prevPivotLow
+
+bool structureUp = higherHigh and higherLow
+bool structureDown = lowerHigh and lowerLow
+bool slowFilterUp = closeAboveEma4h and emaSlopeUp4h
+bool slowFilterDown = not closeAboveEma4h and emaSlopeDown4h
+
+string bias = (
+     structureUp and slowFilterUp ?
+     "LONG_ONLY" :
+     structureDown and slowFilterDown ?
+     "SHORT_ONLY" :
+     "NO_TRADE"
+)
+
+
+// ============================================================================
+// 1H TREND
+// ============================================================================
+
+f_efficiencyRatio(int length) =>
+    float netMove = math.abs(close - close[length])
+    float sumMoves = 0.0
+
+    for i = 0 to length - 1
+        sumMoves += math.abs(close[i] - close[i + 1])
+
+    sumMoves > 0 ? netMove / sumMoves : 0.0
+
+f_get1hContext() =>
+    [plusDi, minusDi, adx] = ta.dmi(adxLengthInput, adxLengthInput)
+    float emaFast = ta.ema(close, fastEmaInput)
+    float emaSlow = ta.ema(close, slowEmaInput)
+    float er = f_efficiencyRatio(erLengthInput)
+
+    [adx[1], emaFast[1], emaSlow[1], er[1]]
+
+[adx1h, emaFast1h, emaSlow1h, er1h] = request.security(
+     syminfo.tickerid,
+     trendTimeframeInput,
+     f_get1hContext(),
+     gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_on
+)
+
+bool adxOk = adx1h >= adxMinimumInput
+bool erOk = er1h >= erMinimumInput
+bool emaStackBullish1h = emaFast1h > emaSlow1h
+bool emaStackBearish1h = emaFast1h < emaSlow1h
+
+bool long1hTrendOk = (
+     emaStackBullish1h and
+     adxOk and
+     erOk
+)
+
+bool short1hTrendOk = (
+     emaStackBearish1h and
+     adxOk and
+     erOk
+)
+
+bool fullLongContext = (
+     bias == "LONG_ONLY" and
+     (
+          not require1hTrendAgreementInput or
+          long1hTrendOk
+     )
+)
+
+bool fullShortContext = (
+     bias == "SHORT_ONLY" and
+     (
+          not require1hTrendAgreementInput or
+          short1hTrendOk
+     )
+)
+
+
+// ============================================================================
+// COOLDOWN MODULE
+// ----------------------------------------------------------------------------
+// Ported verbatim from Stage 8 (bar-index-cooldown-arithmetic.md pattern),
+// renamed usedPoiIds -> usedEventIds since there is no POI concept here --
+// the lockout still keys off a per-event id string, just built from the
+// change point's direction + timestamp instead of a POI type + timestamp.
+// ============================================================================
+
+type CooldownState
+    int lastExitBarIndex = na
+    bool lastExitWasWin = false
+    int lastLongLossBar = na
+    int lastShortLossBar = na
+    int lossesThisSession = 0
+    array<string> usedEventIds
+
+f_eventUsed(array<string> usedIds, string eventId) =>
+    bool found = false
+
+    if array.size(usedIds) > 0
+        for i = 0 to array.size(usedIds) - 1
+            if array.get(usedIds, i) == eventId
+                found := true
+
+    found
+
+f_canTrade(
+     CooldownState state,
+     string direction,
+     string eventId,
+     int barIdx,
+     int winBars,
+     int lossBars,
+     int dirBars,
+     int lossLimit
+) =>
+    string reason = "OK"
+    bool tradeable = true
+
+    if state.lossesThisSession >= lossLimit
+        tradeable := false
+        reason := "CONSECUTIVE_LOSS_LOCKOUT"
+
+    if tradeable and not na(state.lastExitBarIndex)
+        int requiredBars = state.lastExitWasWin ? winBars : lossBars
+
+        if barIdx - state.lastExitBarIndex <= requiredBars
+            tradeable := false
+            reason := "GLOBAL_POST_TRADE"
+
+    if tradeable and f_eventUsed(state.usedEventIds, eventId)
+        tradeable := false
+        reason := "EVENT_LOCKOUT"
+
+    if tradeable
+        int lastDirLoss = (
+             direction == "long" ?
+             state.lastLongLossBar :
+             state.lastShortLossBar
+        )
+
+        if not na(lastDirLoss) and barIdx - lastDirLoss <= dirBars
+            tradeable := false
+            reason := "DIRECTION_LOCKOUT"
+
+    [tradeable, reason]
+
+f_recordExit(
+     CooldownState state,
+     int barIdx,
+     bool isWin,
+     string direction,
+     string eventId
+) =>
+    state.lastExitBarIndex := barIdx
+    state.lastExitWasWin := isWin
+
+    if not isWin
+        if direction == "long"
+            state.lastLongLossBar := barIdx
+        else
+            state.lastShortLossBar := barIdx
+
+        state.lossesThisSession += 1
+
+    if not f_eventUsed(state.usedEventIds, eventId)
+        array.push(state.usedEventIds, eventId)
+
+f_resetSession(CooldownState state) =>
+    state.lossesThisSession := 0
+    array.clear(state.usedEventIds)
+
+var CooldownState cd = CooldownState.new(
+     usedEventIds = array.new_string()
+)
+
+bool newDayExec = ta.change(time("D")) != 0
+
+if barstate.isconfirmed and newDayExec
+    f_resetSession(cd)
+
+
+// ============================================================================
+// RETEST / TRIGGER STATE MACHINE
+// ----------------------------------------------------------------------------
+// Structurally identical to Stage 8's state machine (WATCHING -> RETESTED ->
+// TRIGGERED / INVALIDATED / EXPIRED). No breakEventTime dedup is needed the
+// way Stage 8 needed it: isChange is already a one-shot, native-timeframe
+// event (accumulators reset to 0 the instant it fires), so it cannot re-fire
+// on the very next bar the way a pulled HTF signal could appear "new" across
+// several lower-timeframe bars.
+// ============================================================================
+
+var float activeZoneLow = na
+var float activeZoneHigh = na
+var int activeDirection = 0
+var int activeEventTime = na
+var string retestState = "NONE"
+var bool activeTriggerAligned = false
+var int retestTouchBar = na
+var float retestTouchPressure = na
+
+// -- change-point funnel diagnostics: count where events die in the chain --
+var int cEvents = 0
+var int cRetested = 0
+var int cTriggered = 0
+var int cExpired = 0
+var int cInvalidated = 0
+var int cEvalBars = 0
+var int cReclaimFail = 0
+var int cExtensionFail = 0
+var int cBodyFail = 0
+var int cLocationFail = 0
+var int cPressureFail = 0
+var int cRvolFail = 0
+
+bool newChangePointEvent = barstate.isconfirmed and cpDirection != 0
+
+if newChangePointEvent
+    cEvents += 1
+    activeZoneLow := cpZoneLow
+    activeZoneHigh := cpZoneHigh
+    activeDirection := cpDirection
+    activeEventTime := int(time)
+    retestState := "WATCHING"
+    activeTriggerAligned := false
+    retestTouchBar := na
+    retestTouchPressure := na
+
+int hoursSinceEvent = (
+     na(activeEventTime) ?
+     na :
+     int((time - activeEventTime) / (60 * 60 * 1000))
+)
+
+bool windowExpired = (
+     not na(activeEventTime) and
+     hoursSinceEvent > retestWindowHoursInput
+)
+
+bool retestLongTouchNow = false
+bool retestShortTouchNow = false
+
+if retestState == "WATCHING"
+    if windowExpired
+        retestState := "EXPIRED"
+        cExpired += 1
+    else
+        bool failedBeforeRetestLong = (
+             activeDirection == 1 and
+             close < activeZoneLow
+        )
+
+        bool failedBeforeRetestShort = (
+             activeDirection == -1 and
+             close > activeZoneHigh
+        )
+
+        if failedBeforeRetestLong or failedBeforeRetestShort
+            retestState := "INVALIDATED"
+            cInvalidated += 1
+        else
+            bool validLongTouch = (
+                 activeDirection == 1 and
+                 close[1] > activeZoneHigh and
+                 low <= activeZoneHigh and
+                 high >= activeZoneLow and
+                 low >= activeZoneLow -
+                 atrExec * maxRetestOvershootAtrInput
+            )
+
+            bool validShortTouch = (
+                 activeDirection == -1 and
+                 close[1] < activeZoneLow and
+                 high >= activeZoneLow and
+                 low <= activeZoneHigh and
+                 high <= activeZoneHigh +
+                 atrExec * maxRetestOvershootAtrInput
+            )
+
+            if validLongTouch or validShortTouch
+                retestState := "RETESTED"
+                cRetested += 1
+                retestTouchBar := bar_index
+                retestTouchPressure := executionDeltaPressure
+                retestLongTouchNow := validLongTouch
+                retestShortTouchNow := validShortTouch
+
+bool triggerUpNow = false
+bool triggerDownNow = false
+
+if retestState == "RETESTED"
+    int barsAfterRetest = (
+         na(retestTouchBar) ?
+         100000 :
+         bar_index - retestTouchBar
+    )
+
+    bool retestTooOld = (
+         barsAfterRetest > maxBarsAfterRetestInput
+    )
+
+    bool invalidateLong = (
+         activeDirection == 1 and
+         close <
+         activeZoneLow -
+         atrExec * maxRetestOvershootAtrInput
+    )
+
+    bool invalidateShort = (
+         activeDirection == -1 and
+         close >
+         activeZoneHigh +
+         atrExec * maxRetestOvershootAtrInput
+    )
+
+    if windowExpired or retestTooOld
+        retestState := "EXPIRED"
+        cExpired += 1
+    else if invalidateLong or invalidateShort
+        retestState := "INVALIDATED"
+        cInvalidated += 1
+    else if barsAfterRetest >= minBarsAfterRetestInput
+        float reclaimBuffer = atrExec * reclaimBufferAtrInput
+        float maxExtension = atrExec * maxEntryExtensionAtrInput
+
+        bool priceReclaimLong = (
+             activeDirection == 1 and
+             close > activeZoneHigh + reclaimBuffer
+        )
+
+        bool priceReclaimShort = (
+             activeDirection == -1 and
+             close < activeZoneLow - reclaimBuffer
+        )
+
+        bool extensionLongOk = (
+             close - activeZoneHigh <= maxExtension
+        )
+
+        bool extensionShortOk = (
+             activeZoneLow - close <= maxExtension
+        )
+
+        bool candleBodyOk = (
+             triggerBodyFraction >= minimumTriggerBodyFractionInput
+        )
+
+        bool candleLocationLongOk = (
+             triggerCloseLocation >= minimumTriggerCloseLocationInput
+        )
+
+        bool candleLocationShortOk = (
+             triggerCloseLocation <= 1.0 - minimumTriggerCloseLocationInput
+        )
+
+        // -- volume pressure: SINGLE condition, not Stage 8's double-AND --
+        bool pressureLongOk = (
+             not requireVolumePressureConfirmationInput or
+             executionDeltaPressure >= minimumVolumePressureInput
+        )
+
+        bool pressureShortOk = (
+             not requireVolumePressureConfirmationInput or
+             executionDeltaPressure <= -minimumVolumePressureInput
+        )
+
+        bool rvolOk = (
+             not requireRvolOnTriggerInput or
+             triggerRvol >= minimumTriggerRvolInput
+        )
+
+        triggerUpNow := (
+             priceReclaimLong and
+             extensionLongOk and
+             candleBodyOk and
+             candleLocationLongOk and
+             pressureLongOk and
+             rvolOk
+        )
+
+        triggerDownNow := (
+             priceReclaimShort and
+             extensionShortOk and
+             candleBodyOk and
+             candleLocationShortOk and
+             pressureShortOk and
+             rvolOk
+        )
+
+        // -- funnel diagnostics: tally which gate(s) blocked this bar's attempt,
+        // resolved to the active event's own direction so a long event isn't
+        // penalized by the (always-false) short-side conditions and vice versa --
+        cEvalBars += 1
+
+        bool reclaimOkDir = activeDirection == 1 ? priceReclaimLong : priceReclaimShort
+        bool extensionOkDir = activeDirection == 1 ? extensionLongOk : extensionShortOk
+        bool locationOkDir = activeDirection == 1 ? candleLocationLongOk : candleLocationShortOk
+        bool pressureOkDir = activeDirection == 1 ? pressureLongOk : pressureShortOk
+
+        if not reclaimOkDir
+            cReclaimFail += 1
+        if not extensionOkDir
+            cExtensionFail += 1
+        if not candleBodyOk
+            cBodyFail += 1
+        if not locationOkDir
+            cLocationFail += 1
+        if not pressureOkDir
+            cPressureFail += 1
+        if not rvolOk
+            cRvolFail += 1
+
+        if triggerUpNow or triggerDownNow
+            retestState := "TRIGGERED"
+            cTriggered += 1
+
+            activeTriggerAligned := (
+                 (
+                      triggerUpNow and
+                      fullLongContext
+                 ) or
+                 (
+                      triggerDownNow and
+                      fullShortContext
+                 )
+            )
+
+
+// ============================================================================
+// ORDERS
+// ----------------------------------------------------------------------------
+// Ported from Stage 8's [r5] FIXED version: alignedOk is checked LIVE against
+// current bias at the moment of entry, never a frozen snapshot from the
+// (possibly much earlier) trigger bar -- building this in from the start
+// rather than reintroducing the bug we just fixed there.
+// ============================================================================
+
+var int lastActedEventTime = na
+var string openTradeDirection = ""
+var string openTradeEventId = ""
+var int entryCallCount = 0
+var int processedClosedTrades = 0
+
+bool actualLongEntrySignal = false
+bool actualShortEntrySignal = false
+
+bool freshTrigger = (
+     retestState == "TRIGGERED" and
+     (
+          na(lastActedEventTime) or
+          activeEventTime != lastActedEventTime
+     )
+)
+
+if barstate.isconfirmed and freshTrigger and strategy.position_size == 0
+    string directionStr = (
+         activeDirection == 1 ?
+         "long" :
+         "short"
+    )
+
+    string eventId = (
+         "CP_" +
+         directionStr +
+         "_" +
+         str.tostring(activeEventTime)
+    )
+
+    // -- checked LIVE against current bias, not the frozen activeTriggerAligned
+    // snapshot from the (possibly much earlier) trigger bar -- see Stage 8's
+    // [r5] fix note for why this matters --
+    bool alignedOk = (
+         not requireAlignedEntryInput or
+         (
+              directionStr == "long" ?
+              fullLongContext :
+              fullShortContext
+         )
+    )
+
+    [tradeable, reason] = f_canTrade(
+         cd,
+         directionStr,
+         eventId,
+         bar_index,
+         globalCooldownWinBarsInput,
+         globalCooldownLossBarsInput,
+         directionCooldownBarsInput,
+         consecutiveLossLimitInput
+    )
+
+    lastActedEventTime := activeEventTime
+
+    float stopPrice = (
+         directionStr == "long" ?
+         activeZoneLow -
+         stopBufferAtrMultInput * atrExec :
+         activeZoneHigh +
+         stopBufferAtrMultInput * atrExec
+    )
+
+    float riskPerUnit = math.abs(
+         close - stopPrice
+    )
+
+    float riskAtr = (
+         atrExec > 0 ?
+         riskPerUnit / atrExec :
+         999.0
+    )
+
+    bool riskOk = (
+         riskAtr <= maximumEntryRiskAtrInput
+    )
+
+    if alignedOk and tradeable and riskOk
+        float targetPrice = (
+             directionStr == "long" ?
+             close +
+             riskPerUnit * rMultipleInput :
+             close -
+             riskPerUnit * rMultipleInput
+        )
+
+        string entryId = (
+             directionStr == "long" ?
+             "Long" :
+             "Short"
+        )
+
+        openTradeDirection := directionStr
+        openTradeEventId := eventId
+
+        if directionStr == "long"
+            strategy.entry(
+                 entryId,
+                 strategy.long,
+                 qty = contractsInput
+            )
+            actualLongEntrySignal := true
+        else
+            strategy.entry(
+                 entryId,
+                 strategy.short,
+                 qty = contractsInput
+            )
+            actualShortEntrySignal := true
+
+        strategy.exit(
+             entryId + " Exit",
+             entryId,
+             stop = stopPrice,
+             limit = targetPrice
+        )
+
+        entryCallCount += 1
+
+
+// ============================================================================
+// BROKER-VERIFIED EXIT DETECTION
+// ============================================================================
+
+if strategy.closedtrades > processedClosedTrades
+    int closedIdx = strategy.closedtrades - 1
+    string closedEntryId = strategy.closedtrades.entry_id(closedIdx)
+    float closedProfit = strategy.closedtrades.profit(closedIdx)
+    bool isWin = closedProfit > 0
+    string closedDirection = closedEntryId == "Long" ? "long" : "short"
+    int closedExitBar = strategy.closedtrades.exit_bar_index(closedIdx)
+
+    f_recordExit(
+         cd,
+         closedExitBar,
+         isWin,
+         closedDirection,
+         openTradeEventId
+    )
+
+    processedClosedTrades := strategy.closedtrades
+
+
+// ============================================================================
+// ACTIVE RETEST ZONE
+// ============================================================================
+
+var box activeZoneBox = na
+
+if barstate.islast
+    if not na(activeZoneBox)
+        box.delete(activeZoneBox)
+
+    if retestState == "WATCHING" or retestState == "RETESTED"
+        color zoneColor = (
+             activeDirection == 1 ?
+             retestLongColorInput :
+             retestShortColorInput
+        )
+
+        activeZoneBox := box.new(
+             left = bar_index - 40,
+             top = activeZoneHigh,
+             right = bar_index + 5,
+             bottom = activeZoneLow,
+             xloc = xloc.bar_index,
+             bgcolor = color.new(zoneColor, 87),
+             border_color = zoneColor
+        )
+
+
+// ============================================================================
+// CHANGE-POINT REGIME VISUAL (ported from the user's own CUSUM script)
+// ----------------------------------------------------------------------------
+// Kept as close as possible to the original tested visual -- only addition
+// is gating each plot's color behind showChangePointVisualInput, matching
+// this file's toggle convention, using the same "color = na hides it" trick
+// the original script already used for isLevelChange.
+// ============================================================================
+
+color trendColor = trend == 1 ? longEntryColorInput : (trend == -1 ? shortEntryColorInput : color.gray)
+bool isLevelChange = regimePrice != regimePrice[1]
+
+pRegime = plot(
+     regimePrice,
+     "Regime Price",
+     color = showChangePointVisualInput and not isLevelChange ? trendColor : na,
+     style = plot.style_linebr,
+     linewidth = 2
+)
+
+float priceVol = ta.stdev(src, lengthInput)
+float cusumLevelPos = regimePrice + sPos * priceVol
+float cusumLevelNeg = regimePrice + sNeg * priceVol
+
+pCusumPos = plot(
+     cusumLevelPos,
+     "Bullish Pressure",
+     color = showChangePointVisualInput and not isLevelChange ? color.new(longEntryColorInput, 80) : na,
+     style = plot.style_linebr
+)
+
+pCusumNeg = plot(
+     cusumLevelNeg,
+     "Bearish Pressure",
+     color = showChangePointVisualInput and not isLevelChange ? color.new(shortEntryColorInput, 80) : na,
+     style = plot.style_linebr
+)
+
+fill(pRegime, pCusumPos, color.new(longEntryColorInput, 90), "Bullish CUSUM Fill")
+fill(pRegime, pCusumNeg, color.new(shortEntryColorInput, 90), "Bearish CUSUM Fill")
+
+plotshape(
+     showChangePointVisualInput and changeUp,
+     title = "Change Up",
+     style = shape.triangleup,
+     location = location.belowbar,
+     color = longEntryColorInput,
+     size = size.tiny
+)
+
+plotshape(
+     showChangePointVisualInput and changeDn,
+     title = "Change Down",
+     style = shape.triangledown,
+     location = location.abovebar,
+     color = shortEntryColorInput,
+     size = size.tiny
+)
+
+
+// ============================================================================
+// QUALIFIED RETEST TRIGGER MARKERS
+// ----------------------------------------------------------------------------
+// Diamond = retest/reclaim/pressure trigger occurred.
+// This is intentionally separate from the actual strategy entry triangle.
+// ============================================================================
+
+plotshape(
+     showQualifiedTriggerInput and triggerUpNow,
+     title = "Qualified Long Retest Trigger",
+     style = shape.diamond,
+     location = location.belowbar,
+     size = size.small,
+     color = longTriggerColorInput,
+     text = "T",
+     textcolor = color.white
+)
+
+plotshape(
+     showQualifiedTriggerInput and triggerDownNow,
+     title = "Qualified Short Retest Trigger",
+     style = shape.diamond,
+     location = location.abovebar,
+     size = size.small,
+     color = shortTriggerColorInput,
+     text = "T",
+     textcolor = color.white
+)
+
+// ============================================================================
+// RETEST TOUCH MARKERS
+// ============================================================================
+
+plotshape(
+     showRetestTouchMarkerInput and retestLongTouchNow,
+     title = "Long Retest Touch",
+     style = shape.circle,
+     location = location.belowbar,
+     size = size.tiny,
+     color = retestLongColorInput
+)
+
+plotshape(
+     showRetestTouchMarkerInput and retestShortTouchNow,
+     title = "Short Retest Touch",
+     style = shape.circle,
+     location = location.abovebar,
+     size = size.tiny,
+     color = retestShortColorInput
+)
+
+
+// ============================================================================
+// ENTRY MARKERS - INPUT-CONTROLLED COLOR + SIZE
+// ============================================================================
+
+bool showLongEntry = showEntrySignalInput and actualLongEntrySignal
+bool showShortEntry = showEntrySignalInput and actualShortEntrySignal
+
+plotshape(
+     showLongEntry and entrySignalSizeInput == "Tiny",
+     title = "Long Entry Tiny",
+     style = shape.triangleup,
+     location = location.belowbar,
+     size = size.tiny,
+     color = longEntryColorInput,
+     text = "LONG",
+     textcolor = color.white
+)
+
+plotshape(
+     showLongEntry and entrySignalSizeInput == "Small",
+     title = "Long Entry Small",
+     style = shape.triangleup,
+     location = location.belowbar,
+     size = size.small,
+     color = longEntryColorInput,
+     text = "LONG",
+     textcolor = color.white
+)
+
+plotshape(
+     showLongEntry and entrySignalSizeInput == "Normal",
+     title = "Long Entry Normal",
+     style = shape.triangleup,
+     location = location.belowbar,
+     size = size.normal,
+     color = longEntryColorInput,
+     text = "LONG",
+     textcolor = color.white
+)
+
+plotshape(
+     showLongEntry and entrySignalSizeInput == "Large",
+     title = "Long Entry Large",
+     style = shape.triangleup,
+     location = location.belowbar,
+     size = size.large,
+     color = longEntryColorInput,
+     text = "LONG",
+     textcolor = color.white
+)
+
+plotshape(
+     showLongEntry and entrySignalSizeInput == "Huge",
+     title = "Long Entry Huge",
+     style = shape.triangleup,
+     location = location.belowbar,
+     size = size.huge,
+     color = longEntryColorInput,
+     text = "LONG",
+     textcolor = color.white
+)
+
+plotshape(
+     showShortEntry and entrySignalSizeInput == "Tiny",
+     title = "Short Entry Tiny",
+     style = shape.triangledown,
+     location = location.abovebar,
+     size = size.tiny,
+     color = shortEntryColorInput,
+     text = "SHORT",
+     textcolor = color.white
+)
+
+plotshape(
+     showShortEntry and entrySignalSizeInput == "Small",
+     title = "Short Entry Small",
+     style = shape.triangledown,
+     location = location.abovebar,
+     size = size.small,
+     color = shortEntryColorInput,
+     text = "SHORT",
+     textcolor = color.white
+)
+
+plotshape(
+     showShortEntry and entrySignalSizeInput == "Normal",
+     title = "Short Entry Normal",
+     style = shape.triangledown,
+     location = location.abovebar,
+     size = size.normal,
+     color = shortEntryColorInput,
+     text = "SHORT",
+     textcolor = color.white
+)
+
+plotshape(
+     showShortEntry and entrySignalSizeInput == "Large",
+     title = "Short Entry Large",
+     style = shape.triangledown,
+     location = location.abovebar,
+     size = size.large,
+     color = shortEntryColorInput,
+     text = "SHORT",
+     textcolor = color.white
+)
+
+plotshape(
+     showShortEntry and entrySignalSizeInput == "Huge",
+     title = "Short Entry Huge",
+     style = shape.triangledown,
+     location = location.abovebar,
+     size = size.huge,
+     color = shortEntryColorInput,
+     text = "SHORT",
+     textcolor = color.white
+)
+
+barcolor(
+     highlightEntryBarInput and actualLongEntrySignal ?
+     color.new(longEntryColorInput, 35) :
+     highlightEntryBarInput and actualShortEntrySignal ?
+     color.new(shortEntryColorInput, 35) :
+     na
+)
+
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+var table statusTable = table.new(
+     f_tablePosition(dashboardPositionInput),
+     2,
+     13,
+     bgcolor = color.new(color.rgb(15, 20, 27), 10),
+     border_width = 1
+)
+
+if barstate.islast and showDashboardInput
+    string cpTrendLabel = (
+         trend == 1 ?
+         "BULL" :
+         trend == -1 ?
+         "BEAR" :
+         "NONE"
+    )
+
+    float rollingBuyDelta = 0.0
+    float rollingSellDelta = 0.0
+
+    for i = 0 to deltaStrengthWindowInput - 1
+        float d = f_delta(
+             open[i],
+             high[i],
+             low[i],
+             close[i],
+             nz(volume[i], 0.0)
+        )
+
+        if d > 0
+            rollingBuyDelta += d
+        else
+            rollingSellDelta += -d
+
+    float totalPressure = rollingBuyDelta + rollingSellDelta
+
+    float buyRatio = (
+         totalPressure > 0 ?
+         rollingBuyDelta / totalPressure :
+         0.5
+    )
+
+    float sellRatio = 1.0 - buyRatio
+
+    string queryDirection = (
+         activeDirection == 1 ?
+         "long" :
+         activeDirection == -1 ?
+         "short" :
+         "long"
+    )
+
+    string queryEventId = (
+         na(activeEventTime) ?
+         "none" :
+         "CP_" +
+         queryDirection +
+         "_" +
+         str.tostring(activeEventTime)
+    )
+
+    [cooldownOk, cooldownReason] = f_canTrade(
+         cd,
+         queryDirection,
+         queryEventId,
+         bar_index,
+         globalCooldownWinBarsInput,
+         globalCooldownLossBarsInput,
+         directionCooldownBarsInput,
+         consecutiveLossLimitInput
+    )
+
+    string positionDisplay = (
+         strategy.position_size == 0 ?
+         "FLAT" :
+         strategy.position_size > 0 ?
+         "LONG" :
+         "SHORT"
+    )
+
+    table.cell(statusTable, 0, 0, "DBR CP-VP STAGE 9 [r2]", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = tableTextSize)
+    table.cell(statusTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = tableTextSize)
+
+    table.cell(statusTable, 0, 1, "4H Bias", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 1, bias, text_color = bias == "LONG_ONLY" ? color.aqua : bias == "SHORT_ONLY" ? color.orange : color.gray, text_size = tableTextSize)
+
+    table.cell(statusTable, 0, 2, "1H Trend", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 2, long1hTrendOk ? "BULL" : short1hTrendOk ? "BEAR" : "MIXED", text_color = long1hTrendOk ? color.aqua : short1hTrendOk ? color.orange : color.gray, text_size = tableTextSize)
+
+    table.cell(statusTable, 0, 3, "CP Trend", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 3, cpTrendLabel, text_color = trend == 1 ? color.aqua : trend == -1 ? color.orange : color.gray, text_size = tableTextSize)
+
+    table.cell(statusTable, 0, 4, "CUSUM sPos/sNeg", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 4, str.tostring(sPos, "#.00") + " / " + str.tostring(sNeg, "#.00"), text_color = color.gray, text_size = tableTextSize)
+
+    table.cell(statusTable, 0, 5, "Bars In Regime", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 5, str.tostring(barsInRegime), text_color = color.gray, text_size = tableTextSize)
+
+    table.cell(statusTable, 0, 6, "Retest", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 6, retestState, text_color = retestState == "TRIGGERED" ? color.white : color.gray, text_size = tableTextSize)
+
+    table.cell(statusTable, 0, 7, "Pressure", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 7, str.tostring(executionDeltaPressure, "#.0") + "%", text_color = executionDeltaPressure >= 0 ? color.aqua : color.orange, text_size = tableTextSize)
+
+    table.cell(statusTable, 0, 8, "Buyers / Sellers", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 8, str.tostring(int(math.round(buyRatio * 100.0))) + "% / " + str.tostring(int(math.round(sellRatio * 100.0))) + "%", text_color = color.gray, text_size = tableTextSize)
+
+    table.cell(statusTable, 0, 9, "Position", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 9, positionDisplay, text_color = strategy.position_size > 0 ? color.aqua : strategy.position_size < 0 ? color.orange : color.gray, text_size = tableTextSize)
+
+    table.cell(statusTable, 0, 10, "Cooldown", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 10, cooldownOk ? "READY" : cooldownReason, text_color = cooldownOk ? color.aqua : color.orange, text_size = tableTextSize)
+
+    table.cell(statusTable, 0, 11, "Broker Trades", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 11, str.tostring(strategy.opentrades) + " / " + str.tostring(strategy.closedtrades), text_color = color.white, text_size = tableTextSize)
+
+    table.cell(statusTable, 0, 12, "Chart TF", text_color = color.white, text_size = tableTextSize)
+    table.cell(statusTable, 1, 12, timeframe.period, text_color = color.gray, text_size = tableTextSize)
+
+
+// ============================================================================
+// CHANGE-POINT FUNNEL DIAGNOSTICS
+// ----------------------------------------------------------------------------
+// Same diagnostic pattern that found and fixed Stage 8's pressure-gate
+// bottleneck -- run this on real data before trusting the pressure/reclaim/
+// candle-quality defaults above.
+// ============================================================================
+
+var table funnelTable = table.new(
+     f_tablePosition(funnelPositionInput),
+     2,
+     9,
+     bgcolor = color.new(color.rgb(15, 20, 27), 10),
+     border_width = 1
+)
+
+if barstate.islast and showDashboardInput and showFunnelDiagnosticsInput
+    table.cell(funnelTable, 0, 0, "CHANGE-POINT FUNNEL", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = tableTextSize)
+    table.cell(funnelTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = tableTextSize)
+
+    table.cell(funnelTable, 0, 1, "Change Points", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 1, str.tostring(cEvents), text_color = color.white, text_size = tableTextSize)
+
+    table.cell(funnelTable, 0, 2, "-> Retested", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 2, str.tostring(cRetested), text_color = cRetested > 0 ? color.aqua : color.gray, text_size = tableTextSize)
+
+    table.cell(funnelTable, 0, 3, "-> Triggered", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 3, str.tostring(cTriggered), text_color = cTriggered > 0 ? color.aqua : color.gray, text_size = tableTextSize)
+
+    table.cell(funnelTable, 0, 4, "Expired / Invalid", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 4, str.tostring(cExpired) + " / " + str.tostring(cInvalidated), text_color = color.orange, text_size = tableTextSize)
+
+    table.cell(funnelTable, 0, 5, "Eval Bars (RETESTED)", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 5, str.tostring(cEvalBars), text_color = color.gray, text_size = tableTextSize)
+
+    table.cell(funnelTable, 0, 6, "Fail: Reclaim / Ext", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 6, str.tostring(cReclaimFail) + " / " + str.tostring(cExtensionFail), text_color = color.orange, text_size = tableTextSize)
+
+    table.cell(funnelTable, 0, 7, "Fail: Body / Loc", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 7, str.tostring(cBodyFail) + " / " + str.tostring(cLocationFail), text_color = color.orange, text_size = tableTextSize)
+
+    table.cell(funnelTable, 0, 8, "Fail: Pressure / RVOL", text_color = color.white, text_size = tableTextSize)
+    table.cell(funnelTable, 1, 8, str.tostring(cPressureFail) + " / " + str.tostring(cRvolFail), text_color = color.orange, text_size = tableTextSize)
+
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(
+     actualLongEntrySignal,
+     title = "BULL LONG CHANGE-POINT ENTRY",
+     message = "BULL | LONG ENTRY | CHANGE POINT RETEST | {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     actualShortEntrySignal,
+     title = "BEAR SHORT CHANGE-POINT ENTRY",
+     message = "BEAR | SHORT ENTRY | CHANGE POINT RETEST | {{ticker}} {{interval}} @ {{close}}"
+)
+
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+
+plot(barDelta, title = "Per-Bar Estimated Delta", display = display.data_window)
+plot(executionDeltaPressure, title = "Execution Pressure %", display = display.data_window)
+plot(triggerRvol, title = "Trigger RVOL", display = display.data_window)
+plot(sPos, title = "CUSUM sPos", display = display.data_window)
+plot(sNeg, title = "CUSUM sNeg", display = display.data_window)
+plot(trend, title = "CUSUM Trend", display = display.data_window)
+plot(zScore, title = "Log-Return Z-Score", display = display.data_window)
+plot(activeDirection, title = "Active Retest Direction", display = display.data_window)
+plot(strategy.position_size, title = "Position Size", display = display.data_window)
+plot(strategy.opentrades, title = "Open Trades", display = display.data_window)
+plot(strategy.closedtrades, title = "Closed Trades", display = display.data_window)
+plot(entryCallCount, title = "Entry Calls", display = display.data_window)
+plot(triggerUpNow ? 1 : 0, title = "Qualified Long Trigger", display = display.data_window)
+plot(triggerDownNow ? 1 : 0, title = "Qualified Short Trigger", display = display.data_window)
+plot(actualLongEntrySignal ? 1 : 0, title = "Actual Long Entry", display = display.data_window)
+plot(actualShortEntrySignal ? 1 : 0, title = "Actual Short Entry", display = display.data_window)
+
+// ============================================================================
+// STARTING SETTINGS - SEEDED FROM STAGE 8'S FUNNEL-TUNED DEFAULTS [r1]
+// ----------------------------------------------------------------------------
+// The retest/reclaim/candle-quality defaults below are carried over directly
+// from Stage 8's OWN funnel-diagnostic tuning ([r3]/[r4] in that file) --
+// not re-guessed from scratch. The CUSUM (length/threshold/slack) and volume
+// pressure (single-condition, 5%) defaults are NEW and have NOT been
+// validated against real change-point trade data yet. Run the
+// Change-Point Funnel Diagnostics table on real history before trusting any
+// of this on size -- same discipline Stage 8 needed, applied from day one
+// here instead of after the fact.
+//
+// CUSUM Lookback:                  50
+// CUSUM Threshold (h):             4.0
+// CUSUM Slack (k):                 0.5
+//
+// 4H Bias TF:                      240
+// 1H Trend TF:                     60
+// Require 1H Trend Agreement:      ON
+//
+// Regime zone half-width:          0.25 ATR
+// Change-point-to-retest window:   6 hours
+// Min bars after retest:           0
+// Max bars after retest:           4
+// Max retest overshoot:            0.10 ATR
+// Reclaim buffer:                  0.05 ATR
+// Max entry extension:             0.50 ATR
+// Min trigger body/range:          0.30
+// Min trigger close location:      0.58
+//
+// Pressure window:                 3
+// Require Pressure Confirmation:   ON (single condition)
+// Minimum pressure:                5%
+// RVOL requirement:                OFF initially
+//
+// Max entry risk:                  1.25 ATR
+// Target:                          2.0R
+// ============================================================================

@@ -1,0 +1,197 @@
+//@version=6
+
+// ============================================================================
+// DELTA BREAK & RETEST -- STAGE 1: DELTA ENGINE (Revision 1)
+// ----------------------------------------------------------------------------
+// Per the build spec (Section 9), Stage 1: "Port the histogram as a pure
+// function. Plot it. Sanity-check against a known session by eye."
+//
+// Revision 1 per request: instead of a per-bar-over-TIME histogram, the
+// delta is now shown as a PRICE-BINNED profile (teal/orange horizontal bars
+// at price, like the old script's right-side histogram) plus a dashboard.
+// This pulls forward the price-binning piece of Stage 2 ("Delta profile +
+// POI extraction") a bit early for the visual -- flagged here explicitly so
+// the staged-build boundary stays clear. NOT pulled forward: POI extraction
+// itself (POC/flip-level/absorption-node typing, contamination counters,
+// zone merging, freshness expiry) -- that is still genuine Stage 2 work and
+// is not in this file.
+//
+// SCOPE DISCIPLINE (Section 0) unchanged: the ONLY thing inherited from the
+// old strategy is f_delta() -- a pure function taking nothing but OHLCV.
+// The profile-binning and dashboard code below are freshly written for this
+// rebuild, not copied from the old script's histogram/dashboard code (which
+// was entangled with P0/acceptance-rejection state this rebuild is
+// deliberately leaving behind).
+//
+// STILL NO TRADING LOGIC of any kind -- indicator only.
+// ============================================================================
+
+indicator(title = "Delta Break & Retest - Stage 1 Delta Engine", shorttitle = "DBR Stage1", overlay = true)
+
+// ============================================================================
+// PURE DELTA FUNCTION
+//-----------------------------------------------------------------------------
+// delta(bar) -> float, in spec terms. Nothing enters this function but
+// price/volume data -- no globals, no strategy state, no filter variables.
+// Ported unchanged from the old script's f_delta().
+// ============================================================================
+
+f_delta(float o, float h, float l, float c, float v) =>
+    float safeRange = math.max(h - l, syminfo.mintick)
+    float pressure = math.max(math.min((c - o) / safeRange, 1.0), -1.0)
+    v * pressure
+
+float barDelta = f_delta(open, high, low, close, nz(volume, 0.0))
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+int profileRowsInput = input.int(40, "Profile Rows", minval = 10, maxval = 120, group = "Delta Profile")
+int maxSessionBarsInput = input.int(300, "Max Bars Scanned Per Session", minval = 20, maxval = 2000, group = "Delta Profile", tooltip = "Safety cap on how far back the profile rebuild looks each bar. A normal intraday session should stay well under this.")
+int histogramOffsetInput = input.int(6, "Histogram Offset (Bars)", minval = 1, maxval = 60, group = "Delta Profile")
+int histogramWidthInput = input.int(30, "Histogram Max Width (Bars)", minval = 5, maxval = 100, group = "Delta Profile")
+color positiveDeltaColorInput = input.color(color.teal, "Positive Delta Color", group = "Delta Profile")
+color negativeDeltaColorInput = input.color(color.orange, "Negative Delta Color", group = "Delta Profile")
+
+// ============================================================================
+// SESSION TRACKING
+// ============================================================================
+
+bool newSession = ta.change(time("D")) != 0
+
+var int sessionStartBar = bar_index
+
+if newSession
+    sessionStartBar := bar_index
+
+int barsIntoSession = bar_index - sessionStartBar + 1
+int scanBars = math.min(barsIntoSession, maxSessionBarsInput)
+
+var float cumulativeDelta = 0.0
+
+if newSession
+    cumulativeDelta := 0.0
+
+cumulativeDelta := cumulativeDelta + barDelta
+
+// ============================================================================
+// PRICE-BINNED DELTA PROFILE (current session, rebuilt on the last bar)
+// ----------------------------------------------------------------------------
+// Simplification flagged explicitly: each bar's delta is attributed to the
+// single row containing that bar's CLOSE, not distributed proportionally
+// across the bar's full high/low range. That range-proportional version is
+// Stage 2 POI-construction territory (Section 3 of the spec) -- this stage
+// is the plain, by-eye sanity check only.
+// ============================================================================
+
+var array<box> profileBoxes = array.new_box()
+var float sessionHigh = na
+var float sessionLow = na
+var float deltaPocPrice = na
+var float totalPositiveDelta = 0.0
+var float totalNegativeDelta = 0.0
+
+if barstate.islast
+
+    if array.size(profileBoxes) > 0
+        for i = 0 to array.size(profileBoxes) - 1
+            box.delete(array.get(profileBoxes, i))
+    array.clear(profileBoxes)
+
+    float scanHigh = -1.0e20
+    float scanLow = 1.0e20
+
+    for i = 0 to scanBars - 1
+        scanHigh := math.max(scanHigh, high[i])
+        scanLow := math.min(scanLow, low[i])
+
+    sessionHigh := scanHigh
+    sessionLow := scanLow
+
+    float rowStep = math.max((scanHigh - scanLow) / profileRowsInput, syminfo.mintick)
+
+    array<float> rowDelta = array.new_float(profileRowsInput, 0.0)
+    array<float> rowVolume = array.new_float(profileRowsInput, 0.0)
+
+    for i = 0 to scanBars - 1
+        float barD = f_delta(open[i], high[i], low[i], close[i], nz(volume[i], 0.0))
+        int row = int(math.floor((close[i] - scanLow) / rowStep))
+        row := math.max(0, math.min(profileRowsInput - 1, row))
+        array.set(rowDelta, row, array.get(rowDelta, row) + barD)
+        array.set(rowVolume, row, array.get(rowVolume, row) + nz(volume[i], 0.0))
+
+    float maxAbsDelta = 0.0
+    float maxAbsDeltaValue = 0.0
+    int pocRow = 0
+    float posSum = 0.0
+    float negSum = 0.0
+
+    for row = 0 to profileRowsInput - 1
+        float d = array.get(rowDelta, row)
+        if d > 0
+            posSum += d
+        if d < 0
+            negSum += d
+        if math.abs(d) > maxAbsDelta
+            maxAbsDelta := math.abs(d)
+            maxAbsDeltaValue := d
+            pocRow := row
+
+    totalPositiveDelta := posSum
+    totalNegativeDelta := negSum
+    deltaPocPrice := scanLow + (pocRow + 0.5) * rowStep
+
+    int centerX = bar_index + histogramOffsetInput
+
+    for row = 0 to profileRowsInput - 1
+        float d = array.get(rowDelta, row)
+        if d != 0
+            float rowLow = scanLow + row * rowStep
+            float rowHigh = rowLow + rowStep
+            int barWidth = maxAbsDelta > 0 ? int(math.round(histogramWidthInput * math.abs(d) / maxAbsDelta)) : 0
+            if barWidth > 0
+                color barColor = d >= 0 ? positiveDeltaColorInput : negativeDeltaColorInput
+                box rowBox = box.new(
+                     left = centerX,
+                     top = rowHigh,
+                     right = centerX + barWidth,
+                     bottom = rowLow,
+                     xloc = xloc.bar_index,
+                     bgcolor = color.new(barColor, 15),
+                     border_color = color.new(barColor, 40)
+                )
+                array.push(profileBoxes, rowBox)
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+var table statusTable = table.new(position.top_right, 2, 6, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast
+    table.cell(statusTable, 0, 0, "STAGE 1 DELTA ENGINE", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+
+    table.cell(statusTable, 0, 1, "Bars Scanned (Session)", text_color = color.white)
+    table.cell(statusTable, 1, 1, str.tostring(scanBars), text_color = color.white)
+
+    table.cell(statusTable, 0, 2, "Session High / Low", text_color = color.white)
+    table.cell(statusTable, 1, 2, str.tostring(sessionHigh, format.mintick) + " / " + str.tostring(sessionLow, format.mintick), text_color = color.white)
+
+    table.cell(statusTable, 0, 3, "Delta POC Price", text_color = color.white)
+    table.cell(statusTable, 1, 3, str.tostring(deltaPocPrice, format.mintick), text_color = color.aqua)
+
+    table.cell(statusTable, 0, 4, "Total Pos / Neg Delta", text_color = color.white)
+    table.cell(statusTable, 1, 4, str.tostring(totalPositiveDelta, "#") + " / " + str.tostring(totalNegativeDelta, "#"), text_color = color.white)
+
+    table.cell(statusTable, 0, 5, "Session Net Delta", text_color = color.white)
+    table.cell(statusTable, 1, 5, str.tostring(cumulativeDelta, "#"), text_color = cumulativeDelta >= 0 ? positiveDeltaColorInput : negativeDeltaColorInput)
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+
+plot(barDelta, title = "Per-Bar Delta", display = display.data_window)
+plot(cumulativeDelta, title = "Cumulative Session Delta", display = display.data_window)
+plot(newSession ? 1 : 0, title = "New Session", display = display.data_window)
