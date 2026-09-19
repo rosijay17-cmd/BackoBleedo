@@ -2508,7 +2508,7 @@ architectureTablePosition = (
 var table architectureTable = table.new(
      architectureTablePosition,
      5,
-     15,
+     12,
      bgcolor = color.new(color.rgb(15, 20, 27), 10),
      border_width = 1
 )
@@ -2650,49 +2650,9 @@ if barstate.islast
             table.cell(architectureTable, 3, 11, str.tostring(shortCooldownBarsLeft) + " left", text_color = color.white)
         table.cell(architectureTable, readCol, 11, readShortCooldown, text_color = readShortCooldown == "READY" ? acceptanceColor : readShortCooldown == "STALE" ? color.orange : rejectionColor)
 
-        // Raw exit trace, guaranteed visible on mobile since it uses the
-        // same dashboard mechanism as every other row here (no Pine Logs,
-        // Strategy Tester, or Data Window needed). Shows the actual
-        // activeTradeType recorded at each of the last 4 detected exits,
-        // whatever it really was -- if it's ever unexpectedly empty or
-        // mismatched, that is the direct, on-chart proof of why a
-        // cooldown timer isn't updating.
-        string exitLogText = array.size(exitLog) > 0 ? array.join(exitLog, "  ") : "no exits yet"
-        table.cell(architectureTable, 0, 12, "Exit Log", text_color = color.white)
-        table.cell(architectureTable, 1, 12, exitLogText, text_color = color.white, text_halign = text.align_left)
-
-        // CORRECTED: a live "position size right now" reading only shows
-        // the CURRENT/last bar's state, not whatever bar you're scrolled
-        // back to looking at -- of course it reads flat if the strategy
-        // isn't in a trade at this exact moment, regardless of what
-        // happened historically. Showing the cumulative change log
-        // instead (same var-array pattern as Exit Log), which stays
-        // meaningful no matter the scroll position: if this is empty,
-        // strategy.position_size has NEVER changed throughout the ENTIRE
-        // processed history, meaning strategy.entry() has never actually
-        // filled once -- the entry markers are firing purely from our own
-        // scoring logic. If it's NOT empty, this shows the real
-        // 0->X->0->X sequence directly, which tells us whether closes are
-        // genuinely reaching exactly 0 or getting stuck somewhere else.
-        string positionLogText = array.size(positionChangeLog) > 0 ? array.join(positionChangeLog, "  ") : "no changes yet"
-        table.cell(architectureTable, 0, 13, "Position Log", text_color = color.white)
-        table.cell(architectureTable, 1, 13, positionLogText, text_color = color.white, text_halign = text.align_left)
-
-        // Pine's OWN broker-side trade counters, queried directly --
-        // completely independent of any of the custom tracking above
-        // (activeTradeType, exitLog, positionChangeLog). If these are
-        // ALSO 0, that's the most authoritative confirmation possible
-        // that zero orders have ever actually filled -- ruling out a bug
-        // in this script's own tracking logic. If EITHER is nonzero
-        // while positionChangeLog above reads "no changes yet", that
-        // instead points at a bug in this script's tracking rather than
-        // the broker.
-        table.cell(architectureTable, 0, 14, "Broker Trades (Open/Closed)", text_color = color.white)
-        table.cell(architectureTable, 1, 14, str.tostring(strategy.opentrades) + " / " + str.tostring(strategy.closedtrades), text_color = (strategy.opentrades > 0 or strategy.closedtrades > 0) ? acceptanceColor : color.gray)
-
         dashboardSizeValue = f_dashboardSize(dashboardTextSize)
 
-        for dashboardRow = 0 to 14
+        for dashboardRow = 0 to 11
             for dashboardCol = 0 to 4
                 table.cell_set_text_size(
                      architectureTable,
