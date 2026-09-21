@@ -811,8 +811,8 @@ float lsrPivotLowRaw = ta.pivotlow(lsrLeftBarsInput, lsrRightBarsInput)
 float lsrHighUsePivot = fixnan(lsrPivotHighRaw[1])
 float lsrLowUsePivot = fixnan(lsrPivotLowRaw[1])
 
-plot(lsrHighUsePivot, title = "Resistance", color = ta.change(lsrHighUsePivot) ? na : color.red, linewidth = 3, offset = -(lsrRightBarsInput + 1))
-plot(lsrLowUsePivot, title = "Support", color = ta.change(lsrLowUsePivot) ? na : color.blue, linewidth = 3, offset = -(lsrRightBarsInput + 1))
+plot(lsrHighUsePivot, title = "Resistance", color = ta.change(lsrHighUsePivot) != 0 ? na : color.red, linewidth = 3, offset = -(lsrRightBarsInput + 1))
+plot(lsrLowUsePivot, title = "Support", color = ta.change(lsrLowUsePivot) != 0 ? na : color.blue, linewidth = 3, offset = -(lsrRightBarsInput + 1))
 
 // -- Volume oscillator (5 vs. 10-period EMA of volume, as a %) --
 float lsrShortEma = ta.ema(volume, 5)
