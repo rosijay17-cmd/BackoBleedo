@@ -1246,6 +1246,7 @@ string G_VISUALS = "08 - Visuals"
 
 showSwingZonesInput = input.bool(true, "Show Native Swing Zone Boxes", group = G_VISUALS)
 showEntryMarkersInput = input.bool(true, "Show Entry Markers", group = G_VISUALS)
+showGoLongShortLabelsInput = input.bool(true, "Show 'Go Long/Go Short' Trigger Labels", tooltip = "A label pinned at the current LuxAlgo resistance/support step-line, stating the exact price that would trigger a LONG/SHORT signal -- same idea as the SHORT/LONG condition labels in Advanced_Session_Profile_Predictor_SR_OR.pine, adapted to this file's S/R-break entry model.", group = G_VISUALS)
 longColorInput = input.color(color.aqua, "Long Color", group = G_VISUALS)
 shortColorInput = input.color(color.orange, "Short Color", group = G_VISUALS)
 
@@ -1354,6 +1355,42 @@ plotshape(showEntryMarkersInput and actualShortSignal, title = "Short Setup", st
 
 alertcondition(actualLongSignal, title = "Trading Coach: Long Setup", message = "Trading Coach LONG setup -- {{ticker}} {{interval}} @ {{close}}")
 alertcondition(actualShortSignal, title = "Trading Coach: Short Setup", message = "Trading Coach SHORT setup -- {{ticker}} {{interval}} @ {{close}}")
+
+// -- "Go Long / Go Short" trigger labels --
+// Same idea as Advanced_Session_Profile_Predictor_SR_OR.pine's SHORT/LONG
+// condition labels (shortLabel/longLabel), adapted to this file's entry
+// model: pinned directly at the LuxAlgo resistance/support step-line
+// price (section 05's lsrHighUsePivot/lsrLowUsePivot -- the same level
+// the "Break" signal itself is built on), stating the exact price that
+// would trigger a LONG/SHORT. Create-once/update-in-place lifecycle
+// (same as the predictor's own profileLabel/shortLabel/longLabel and
+// this file's own pdhLabel/pdlLabel), redrawn every barstate.islast tick
+// so it can't go stale the way the predictor's labels did before that
+// fix -- there is no persisted text state here to leave unreassigned,
+// the label text is rebuilt fresh from lsrHighUsePivot/lsrLowUsePivot
+// every single time.
+string goLongLabelText = na(lsrHighUsePivot) ? "No Long (no resistance level yet)" : "IF price hits " + str.tostring(lsrHighUsePivot, format.mintick) + "  ->  GO LONG"
+string goShortLabelText = na(lsrLowUsePivot) ? "No Short (no support level yet)" : "IF price hits " + str.tostring(lsrLowUsePivot, format.mintick) + "  ->  GO SHORT"
+float goLongLabelY = na(lsrHighUsePivot) ? high : lsrHighUsePivot
+float goShortLabelY = na(lsrLowUsePivot) ? low : lsrLowUsePivot
+
+var label goLongLabel = na
+var label goShortLabel = na
+
+if showGoLongShortLabelsInput and barstate.islast
+    if na(goLongLabel)
+        goLongLabel := label.new(x = bar_index, y = goLongLabelY, text = goLongLabelText, style = label.style_label_left, color = color.new(longColorInput, 10), textcolor = color.white, size = size.small)
+    else
+        label.set_x(goLongLabel, bar_index)
+        label.set_y(goLongLabel, goLongLabelY)
+        label.set_text(goLongLabel, goLongLabelText)
+
+    if na(goShortLabel)
+        goShortLabel := label.new(x = bar_index, y = goShortLabelY, text = goShortLabelText, style = label.style_label_left, color = color.new(shortColorInput, 10), textcolor = color.white, size = size.small)
+    else
+        label.set_x(goShortLabel, bar_index)
+        label.set_y(goShortLabel, goShortLabelY)
+        label.set_text(goShortLabel, goShortLabelText)
 
 
 // ============================================================================
