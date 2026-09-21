@@ -902,6 +902,13 @@ if barstate.islast and showOutcomeTrackerInput
 bool newDay = ta.change(time("D", timezoneInput)) != 0
 
 if newDay
+    // nextProfile only gets reassigned inside the London-before-NY window
+    // each day (see PROFILE PREDICTION above) -- without resetting it
+    // here, it keeps showing yesterday's (or, across a weekend/holiday/
+    // data gap, an even older) classification on the Session Profile
+    // label from midnight until that window runs again, which reads as
+    // a stale/stuck label even though the underlying logic is working.
+    nextProfile := "Ukendt"
     profileCountedToday := false
     asiaOpen := na
     asiaClose := na
