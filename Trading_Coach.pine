@@ -35,14 +35,15 @@ import TradingView/ta/9
 // teach you to read structure/session/momentum/risk yourself over time, not
 // just to blink an arrow at you.
 //
-// ENTRY MODEL (section 05 -- RSI + Bollinger Band Mean Reversion, ported
-// -- entry logic only -- from a user-supplied "Bollinger Band with RSI"
-// strategy, replacing the High Volume S/R + VPA Retest model entirely):
+// ENTRY MODEL (section 05 -- High Volume S/R + VPA Retest, ported from
+// the user-supplied "High Volume S/R + VPA Entries + Broken Level
+// Cleanup v2" indicator, replacing the AlgoAlpha breakout & retest model
+// entirely):
 // HTF STRUCTURE (UP/DOWN/RANGE)
-// -> RSI CROSSES INTO OVERSOLD/OVERBOUGHT TERRITORY WHILE PRICE CLOSES
-//    BEYOND THE CORRESPONDING BOLLINGER BAND -- A MEAN-REVERSION SIGNAL
-//    (LONG: RSI OVERSOLD + CLOSE BELOW LOWER BAND. SHORT: RSI OVERBOUGHT
-//    + CLOSE ABOVE UPPER BAND, MIRRORING THE SOURCE'S LONG CONDITION)
+// -> A SYMMETRIC PIVOT FORMS ALONGSIDE A VOLUME CLUSTER (VOLUME ELEVATED
+//    VS. ITS OWN EMA) -- A PERSISTENT S/R LINE IS DRAWN AND FIFO-CAPPED
+// -> PRICE APPROACHES THAT LINE ON QUIET (LOW) VOLUME, THEN REVERSES ON
+//    A HIGH-VOLUME CANDLE -- A VOLUME PRICE ANALYSIS (VPA) RETEST EVENT
 // -> TDI MOMENTUM AGREES
 // -> SESSION IS FAVORABLE
 // -> COOLDOWN ALLOWS IT
@@ -532,9 +533,10 @@ string structureTrend = (
 )
 
 // Native-timeframe swing tracking. No longer feeds the entry model itself
-// (section 05 now runs its own separate RSI + Bollinger Band mean-
-// reversion detection) -- this pair now exists for Zone Reaction and the
-// native swing zone boxes (Visuals) only. A plain, direct pivot-
+// (section 05 now runs its own separate, volume-confirmed symmetric pivot
+// detection for the High Volume S/R + VPA retest signal) -- this pair now
+// exists for Zone Reaction and the native swing zone boxes (Visuals)
+// only. A plain, direct pivot-
 // confirmation read (not MTF-pulled, so no offset/confirmation trick is
 // needed the way the HTF pull above needed one): ta.pivothigh/low only
 // resolves non-na once genuinely confirmed (nativePivotRightInput bars
@@ -752,63 +754,146 @@ plotshape(showZscoreSignalsInput and normZscoreFast > zscoreObThresholdInput, ti
 
 
 // ============================================================================
-// 05 - ENTRY SETUP (RSI + Bollinger Band Mean Reversion)
+// 05 - ENTRY SETUP (High Volume S/R + VPA Retest)
 // ----------------------------------------------------------------------------
-// Replaces the High Volume S/R + VPA Retest entry model entirely, per
-// explicit request to port ONLY the entry logic from a user-supplied
-// "Bollinger Band with RSI" strategy -- its exit/take-profit/stop-loss
-// levels, position sizing, plotting, and strategy.entry/exit calls were
-// deliberately left behind, since Trading Coach already has its own risk
-// management (section 06) and entry-marker machinery (Visuals). long
-// SignalNow/shortSignalNow are kept as the exact same interface names the
-// prior model exposed, so every downstream gate (Structure/Momentum/
-// Pressure/Session/Cooldown below, Risk Management, Entry Funnel
-// Diagnostics) needed no changes beyond the stop-anchor reference and
-// Coach Says wording.
+// Replaces the AlgoAlpha Breakout & Retest entry model entirely, per
+// explicit request, with the user-supplied "High Volume S/R + VPA Entries
+// + Broken Level Cleanup v2" algorithm, ported with parity (same pivot/
+// volume-cluster math, same FIFO line-array management, same broken-level
+// cleanup, same VPA retest conditions) -- identifiers renamed to this
+// file's convention. longSignalNow/shortSignalNow are kept as the exact
+// same interface names the old model exposed, so every downstream gate
+// (Structure/Momentum/Pressure/Session/Cooldown below, Risk Management,
+// Entry Funnel Diagnostics) needed no changes beyond the stop-anchor
+// reference and Coach Says wording.
 //
-// MECHANISM: the source only defined a LONG entry (RSI oversold + price
-// closed below the lower Bollinger Band). Per explicit confirmation, the
-// SHORT side mirrors it symmetrically (RSI overbought + price closed
-// above the upper Bollinger Band) -- the standard mean-reversion opposite
-// of the source's long condition.
+// MECHANISM: a symmetric pivot high/low only counts once a volume cluster
+// around it also confirms elevated volume (vs. its own EMA) -- each
+// confirmed pivot draws a persistent horizontal S/R line (FIFO-capped at
+// hvsrMaxLinesInput per side, oldest evicted first). Lines are checked
+// every bar and deleted the moment price closes decisively through them
+// on elevated volume (a genuine break, not a wick). The entry signal
+// itself is Volume Price Analysis: a quiet (low-volume) approach over the
+// last few bars, followed by a high-volume reversal candle, while price
+// is sitting near ANY currently-live S/R line.
 //
 // Structure/Momentum/Pressure/Session/Cooldown still gate the raw signal
 // into an actual LONG/SHORT setup -- those are general-purpose coaching
 // layers, not specific to any one entry model, so they carry over.
 // ============================================================================
 
-string G_ENTRY = "05 - Entry Setup (RSI + Bollinger Band)"
+string G_ENTRY = "05 - Entry Setup (High Volume S/R + VPA)"
 
-bbRsiSourceInput = input.source(close, "Source", group = G_ENTRY)
-bbRsiLengthInput = input.int(14, "RSI Length", minval = 1, group = G_ENTRY)
-bbRsiOversoldInput = input.int(30, "RSI Oversold Level", minval = 1, maxval = 100, tooltip = "Long fires when RSI is below this level AND price closes below the lower Bollinger Band.", group = G_ENTRY)
-bbRsiOverboughtInput = input.int(70, "RSI Overbought Level", minval = 1, maxval = 100, tooltip = "Short fires when RSI is above this level AND price closes above the upper Bollinger Band -- the mirror image of the long condition.", group = G_ENTRY)
-bbLengthInput = input.int(20, "Bollinger Band Length", minval = 1, group = G_ENTRY)
-bbMultInput = input.float(2.0, "Bollinger Band StdDev", minval = 0.001, maxval = 50, group = G_ENTRY)
-showBbRsiBandsInput = input.bool(true, "Show Bollinger Bands", group = G_ENTRY)
-showBbRsiEntryMarkersInput = input.bool(true, "Show RSI+BB Entry Markers", group = G_ENTRY)
+hvsrPivotLengthInput = input.int(8, "Pivot Lookback", minval = 1, group = G_ENTRY)
+hvsrVolMaLengthInput = input.int(20, "Volume EMA Length", minval = 1, group = G_ENTRY)
+hvsrVolFactorInput = input.float(1.5, "Volume Factor", minval = 1.0, step = 0.1, tooltip = "A bar counts as high-volume once its volume exceeds this multiple of its own volume EMA.", group = G_ENTRY)
+hvsrVolClusterBarsInput = input.int(1, "Min Consecutive High-Vol Bars", minval = 1, group = G_ENTRY)
+hvsrMaxLinesInput = input.int(15, "Max S/R Lines Per Side", minval = 1, tooltip = "FIFO cap -- the oldest line on each side (support/resistance) is dropped once a new one would exceed this.", group = G_ENTRY)
+hvsrAtrMultInput = input.float(0.75, "Retest Zone (x ATR)", minval = 0.1, step = 0.1, group = G_ENTRY)
+hvsrEntryLookbackInput = input.int(3, "Entry Confirmation Bars", minval = 1, tooltip = "How many prior bars are checked for a quiet (low-volume) approach before a high-volume reversal candle can count as a retest entry.", group = G_ENTRY)
+hvsrBreakAtrBufferInput = input.float(0.2, "Break Buffer (x ATR)", minval = 0.0, step = 0.05, group = G_ENTRY)
+hvsrBreakVolMultInput = input.float(1.0, "Break Volume (x EMA)", minval = 1.0, step = 0.1, group = G_ENTRY)
+showHvsrDebugInput = input.bool(true, "Show S/R Line Debug Labels", group = G_ENTRY)
+showHvsrBreakDebugInput = input.bool(true, "Show 'Broken & Removed' Labels", group = G_ENTRY)
+showHvsrEntryMarkersInput = input.bool(true, "Show VPA Entry Markers", group = G_ENTRY)
 cooldownBarsInput = input.int(12, "Cooldown Bars Between Setups (Per Direction)", minval = 0, group = G_ENTRY)
 requireMomentumInput = input.bool(true, "Require Momentum Confirmation", group = G_ENTRY)
 requireFavorableSessionInput = input.bool(true, "Require Favorable Session", group = G_ENTRY)
 
 float atrCoach = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
 
-// -- RSI + Bollinger Band mean-reversion entry --
-float bbRsi = ta.rsi(bbRsiSourceInput, bbRsiLengthInput)
-float bbBasis = ta.sma(bbRsiSourceInput, bbLengthInput)
-float bbDev = bbMultInput * ta.stdev(bbRsiSourceInput, bbLengthInput)
-float bbUpper = bbBasis + bbDev
-float bbLower = bbBasis - bbDev
+// -- Pivot + volume-cluster confirmation --
+float hvsrAtr = ta.atr(14)
+float hvsrVolMa = ta.ema(volume, hvsrVolMaLengthInput)
+bool hvsrHighVol = volume > hvsrVolMa * hvsrVolFactorInput
 
-plot(showBbRsiBandsInput ? bbUpper : na, title = "BB Upper", color = color.new(color.gray, 40))
-plot(showBbRsiBandsInput ? bbBasis : na, title = "BB Basis", color = color.new(color.gray, 60))
-plot(showBbRsiBandsInput ? bbLower : na, title = "BB Lower", color = color.new(color.gray, 40))
+bool hvsrVolClusterHigh = true
+for i = hvsrPivotLengthInput to hvsrPivotLengthInput + hvsrVolClusterBarsInput - 1
+    hvsrVolClusterHigh := hvsrVolClusterHigh and hvsrHighVol[i]
 
-bool longSignalNow = bbRsi < bbRsiOversoldInput and bbRsiSourceInput < bbLower
-bool shortSignalNow = bbRsi > bbRsiOverboughtInput and bbRsiSourceInput > bbUpper
+bool hvsrVolClusterLow = true
+for i = hvsrPivotLengthInput to hvsrPivotLengthInput + hvsrVolClusterBarsInput - 1
+    hvsrVolClusterLow := hvsrVolClusterLow and hvsrHighVol[i]
 
-plotshape(showBbRsiEntryMarkersInput and longSignalNow, title = "Bull RSI+BB Entry", style = shape.arrowup, location = location.belowbar, color = color.blue, size = size.small)
-plotshape(showBbRsiEntryMarkersInput and shortSignalNow, title = "Bear RSI+BB Entry", style = shape.arrowdown, location = location.abovebar, color = color.orange, size = size.small)
+float hvsrPh = ta.pivothigh(high, hvsrPivotLengthInput, hvsrPivotLengthInput)
+float hvsrPl = ta.pivotlow(low, hvsrPivotLengthInput, hvsrPivotLengthInput)
+
+bool pivotHighVol = not na(hvsrPh) and hvsrVolClusterHigh
+bool pivotLowVol = not na(hvsrPl) and hvsrVolClusterLow
+
+// -- S/R line management --
+var array<line> hvsrResLines = array.new_line()
+var array<line> hvsrSupLines = array.new_line()
+
+f_hvsrDrawHline(array<line> arr, int offset, float price, color col, string tag) =>
+    int x1 = bar_index - offset
+    line ln = line.new(x1 = x1, y1 = price, x2 = bar_index + 50, y2 = price, extend = extend.right, color = color.new(col, 25), width = 2, style = line.style_solid)
+    array.push(arr, ln)
+    if showHvsrDebugInput
+        label.new(x = x1, y = price, text = tag + "\n" + str.tostring(price, "#.#####"), color = col, textcolor = color.white, style = label.style_label_down, size = size.small)
+    if array.size(arr) > hvsrMaxLinesInput
+        line.delete(array.shift(arr))
+
+if pivotHighVol
+    f_hvsrDrawHline(hvsrResLines, hvsrPivotLengthInput, hvsrPh, color.red, "Res")
+
+if pivotLowVol
+    f_hvsrDrawHline(hvsrSupLines, hvsrPivotLengthInput, hvsrPl, color.green, "Sup")
+
+plotshape(pivotHighVol, title = "HighVol PH", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny)
+plotshape(pivotLowVol, title = "HighVol PL", style = shape.triangleup, location = location.belowbar, color = color.green, size = size.tiny)
+
+// -- Broken-level cleanup (runs after adding new levels) --
+if array.size(hvsrSupLines) > 0
+    for i = array.size(hvsrSupLines) - 1 to 0 by 1
+        float hvsrSupLvl = line.get_y1(array.get(hvsrSupLines, i))
+        bool hvsrSupBroken = close < hvsrSupLvl - hvsrAtr * hvsrBreakAtrBufferInput and volume > hvsrVolMa * hvsrBreakVolMultInput
+        if hvsrSupBroken
+            line.delete(array.get(hvsrSupLines, i))
+            array.remove(hvsrSupLines, i)
+            if showHvsrBreakDebugInput
+                label.new(bar_index, hvsrSupLvl, "Broken Down - Removed", yloc = yloc.price, color = color.red, textcolor = color.white, style = label.style_label_down, size = size.tiny)
+
+if array.size(hvsrResLines) > 0
+    for i = array.size(hvsrResLines) - 1 to 0 by 1
+        float hvsrResLvl = line.get_y1(array.get(hvsrResLines, i))
+        bool hvsrResBroken = close > hvsrResLvl + hvsrAtr * hvsrBreakAtrBufferInput and volume > hvsrVolMa * hvsrBreakVolMultInput
+        if hvsrResBroken
+            line.delete(array.get(hvsrResLines, i))
+            array.remove(hvsrResLines, i)
+            if showHvsrBreakDebugInput
+                label.new(bar_index, hvsrResLvl, "Broken Up - Removed", yloc = yloc.price, color = color.red, textcolor = color.white, style = label.style_label_up, size = size.tiny)
+
+// -- VPA retest + entry detection --
+f_hvsrIsNear(float lvl) =>
+    math.abs(close - lvl) <= hvsrAtr * hvsrAtrMultInput
+
+bool hvsrLowVolApproach = ta.lowest(volume[1], hvsrEntryLookbackInput) < hvsrVolMa[1]
+bool hvsrHighVolReversalUp = volume > hvsrVolMa and close > open
+bool hvsrHighVolReversalDown = volume > hvsrVolMa and close < open
+
+bool longSignalNow = false
+float longMatchedLevel = na
+if hvsrLowVolApproach and hvsrHighVolReversalUp and array.size(hvsrSupLines) > 0
+    for i = 0 to array.size(hvsrSupLines) - 1
+        float hvsrSup = line.get_y1(array.get(hvsrSupLines, i))
+        if f_hvsrIsNear(hvsrSup)
+            longSignalNow := true
+            longMatchedLevel := hvsrSup
+            break
+
+bool shortSignalNow = false
+float shortMatchedLevel = na
+if hvsrLowVolApproach and hvsrHighVolReversalDown and array.size(hvsrResLines) > 0
+    for i = 0 to array.size(hvsrResLines) - 1
+        float hvsrRes = line.get_y1(array.get(hvsrResLines, i))
+        if f_hvsrIsNear(hvsrRes)
+            shortSignalNow := true
+            shortMatchedLevel := hvsrRes
+            break
+
+plotshape(showHvsrEntryMarkersInput and longSignalNow, title = "Bull VPA Entry", style = shape.arrowup, location = location.belowbar, color = color.blue, size = size.small, text = "Long\nTest")
+plotshape(showHvsrEntryMarkersInput and shortSignalNow, title = "Bear VPA Entry", style = shape.arrowdown, location = location.abovebar, color = color.orange, size = size.small, text = "Short\nTest")
 
 bool longStructureOk = structureTrend == "UP"
 bool shortStructureOk = structureTrend == "DOWN"
@@ -905,8 +990,8 @@ bool shortPressureBonus = executionDeltaPressure <= -minimumVolumePressureInput
 // Z-Score mean-reversion AGREEMENT -- the "skill upgrade" from the
 // ported Range & Z-Score section (04c): a long earns the bonus when
 // price is statistically stretched to the downside (oversold) right as
-// the RSI+BB mean-reversion signal fires, same reasoning as pressure and
-// zone confluence -- a bonus factor, never a hard gate, per this file's own
+// the VPA retest signal fires, same reasoning as pressure and zone
+// confluence -- a bonus factor, never a hard gate, per this file's own
 // funnel-diagnostics lesson.
 bool longZscoreBonus = zscoreOversold
 bool shortZscoreBonus = zscoreOverbought
@@ -931,18 +1016,18 @@ string shortGradeNote = (
 
 // -- "Coach Says" -- names the single most relevant blocker/status right
 // now, in the order a trader would actually check them: structure first
-// (is there even a trend to trade with), then the RSI+BB mean-reversion
-// signal itself (an instantaneous event, not a persistent zone state
-// like an earlier model had -- so "waiting" here just means no signal
-// has fired yet this bar), then momentum/pressure/session/cooldown,
-// same order as before. --
+// (is there even a trend to trade with), then the VPA retest signal
+// itself (an instantaneous event, not a persistent zone state like the
+// old model had -- so "waiting" here just means no signal has fired yet
+// this bar), then momentum/pressure/session/cooldown, same order as
+// before. --
 string coachMessage = (
      structureTrend == "RANGE" ?
      "Structure ranging -- no clear trend, stand aside" :
      structureTrend == "UP" and not longSignalNow ?
-     "Uptrend -- watching for a bullish RSI+BB mean-reversion signal" :
+     "Uptrend -- watching for a bullish VPA retest signal" :
      structureTrend == "UP" and longSignalNow and not momentumOkLong ?
-     "RSI+BB signal fired -- waiting for momentum confirmation" :
+     "VPA retest signal fired -- waiting for momentum confirmation" :
      structureTrend == "UP" and longSignalNow and momentumOkLong and not pressureOkLong ?
      "Momentum confirms -- waiting for volume pressure agreement" :
      structureTrend == "UP" and longSignalNow and momentumOkLong and pressureOkLong and not sessionOkForLong ?
@@ -952,9 +1037,9 @@ string coachMessage = (
      longSetupNow ?
      "LONG SETUP ACTIVE [Grade " + longSetupGrade + longGradeNote + "]" :
      structureTrend == "DOWN" and not shortSignalNow ?
-     "Downtrend -- watching for a bearish RSI+BB mean-reversion signal" :
+     "Downtrend -- watching for a bearish VPA retest signal" :
      structureTrend == "DOWN" and shortSignalNow and not momentumOkShort ?
-     "RSI+BB signal fired -- waiting for momentum confirmation" :
+     "VPA retest signal fired -- waiting for momentum confirmation" :
      structureTrend == "DOWN" and shortSignalNow and momentumOkShort and not pressureOkShort ?
      "Momentum confirms -- waiting for volume pressure agreement" :
      structureTrend == "DOWN" and shortSignalNow and momentumOkShort and pressureOkShort and not sessionOkForShort ?
@@ -1071,13 +1156,15 @@ float shortRiskPerUnit = na
 float shortRiskAtr = na
 bool shortRiskOk = false
 
-// Stop anchor is the Bollinger Band the mean-reversion signal actually
-// triggered against on this bar: a bullish signal stops below the lower
-// band it closed under (bbLower); a bearish signal stops above the
-// upper band it closed over (bbUpper) -- the same extreme the signal
-// itself is built on, beyond which the mean-reversion thesis is wrong.
-float longStopAnchor = bbLower
-float shortStopAnchor = bbUpper
+// Stop anchor is the S/R line the VPA retest signal actually matched
+// against on this bar: a bullish signal stops below the support line
+// it retested (longMatchedLevel); a bearish signal stops above the
+// resistance line it retested (shortMatchedLevel) -- the same
+// structural level the signal itself is built on, available same-bar
+// since longSetupNow/shortSetupNow can only be true on the bar
+// longMatchedLevel/shortMatchedLevel resolves non-na.
+float longStopAnchor = longMatchedLevel
+float shortStopAnchor = shortMatchedLevel
 
 if longSetupNow and not na(longStopAnchor)
     longStopPrice := longStopAnchor - stopBufferAtrMultInput * atrCoach
@@ -1397,7 +1484,7 @@ funnelTablePositionInput = input.string("Bottom Left", "Funnel Table Position", 
 funnelTableSizeInput = input.string("Tiny", "Funnel Table Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_FUNNEL)
 
 // counts[0] = bars evaluated, [1] = +structure, [2] = +signal (the
-// RSI+BB mean-reversion event itself fired), [3] = +momentum, [4] = +pressure,
+// VPA retest event itself fired), [3] = +momentum, [4] = +pressure,
 // [5] = +session, [6] = +cooldown (== longSetupNow/shortSetupNow),
 // [7] = +risk OK (this is what ACTUALLY reaches actualLongSignal/
 // actualShortSignal and gets registered -- Risk Management's
@@ -1497,13 +1584,15 @@ plot(executionDeltaPressure, title = "Execution Pressure %", display = display.d
 plot(actualLongSignal ? 1 : 0, title = "Actual Long Signal", display = display.data_window)
 plot(actualShortSignal ? 1 : 0, title = "Actual Short Signal", display = display.data_window)
 
-// RSI + Bollinger Band diagnostics -- the raw RSI/band values and
-// whether each direction's mean-reversion signal fired on this bar.
-plot(bbRsi, title = "RSI", display = display.data_window)
-plot(bbUpper, title = "Bollinger Band Upper", display = display.data_window)
-plot(bbLower, title = "Bollinger Band Lower", display = display.data_window)
-plot(longSignalNow ? 1 : 0, title = "Bullish RSI+BB Signal (Confirmed Bar)", display = display.data_window)
-plot(shortSignalNow ? 1 : 0, title = "Bearish RSI+BB Signal (Confirmed Bar)", display = display.data_window)
+// High Volume S/R + VPA diagnostics -- the latest confirmed pivot
+// prices, how many live S/R lines are on each side, and whether each
+// direction's VPA retest signal fired on this bar.
+plot(hvsrPh, title = "Confirmed High-Vol Swing High (hvsrPh)", display = display.data_window)
+plot(hvsrPl, title = "Confirmed High-Vol Swing Low (hvsrPl)", display = display.data_window)
+plot(longSignalNow ? 1 : 0, title = "Bullish VPA Retest Signal (Confirmed Bar)", display = display.data_window)
+plot(shortSignalNow ? 1 : 0, title = "Bearish VPA Retest Signal (Confirmed Bar)", display = display.data_window)
+plot(array.size(hvsrResLines), title = "Resistance Lines Live", display = display.data_window)
+plot(array.size(hvsrSupLines), title = "Support Lines Live", display = display.data_window)
 
 // TDI Momentum diagnostics -- tdiConfirmsLong/Short is TWO separate
 // conditions ANDed together (tdiBullishMove/tdiBearishMove needs the
@@ -1546,10 +1635,13 @@ plot(pdlSweepRate, title = "PDL Sweep Rate %", display = display.data_window)
 //
 // Structure Timeframe:            60
 // Native Swing Pivot L/R:         3 / 3 (Zone Reaction / swing zone boxes)
-// Entry Model:                    RSI + Bollinger Band Mean Reversion, section 05
-// RSI Length:                     14
-// RSI Oversold / Overbought:      30 / 70
-// Bollinger Band Length / StdDev: 20 / 2.0
+// Entry Model:                    High Volume S/R + VPA Retest, section 05
+// Pivot Lookback:                 8
+// Volume EMA Length / Factor:     20 / 1.5
+// Max S/R Lines Per Side:         15 (FIFO)
+// Retest Zone:                    0.75 ATR
+// Entry Confirmation Bars:        3
+// Break Buffer / Break Volume:    0.2 ATR / 1.0x EMA
 // Require Momentum:               ON initially
 // Require Volume Pressure:        OFF initially
 // Cooldown Bars:                  12
