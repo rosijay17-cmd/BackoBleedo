@@ -528,8 +528,8 @@ var label shortLabel = na
 var label longLabel = na
 if barstate.islast
     if na(profileLabel)
-        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r7] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
-    label.set_text(profileLabel, "[r7] Session Profil: " + nextProfile)
+        profileLabel := label.new(x=bar_index, y=high * 1.005, text="[r10] Session Profil: " + nextProfile, color=color.black, textcolor=color.white, style=label.style_label_down, size=size.small)
+    label.set_text(profileLabel, "[r10] Session Profil: " + nextProfile)
     label.set_x(profileLabel, bar_index)
     label.set_y(profileLabel, high * 1.005)
 
@@ -937,3 +937,33 @@ if newDay
         box.delete(londonOrBox)
     if not na(nyOrBox)
         box.delete(nyOrBox)
+
+
+// ============================================================================
+// DATA WINDOW -- SESSION CLASSIFICATION DIAGNOSTICS
+// ----------------------------------------------------------------------------
+// Added to debug "Profiles Seen" staying at 0/0/0/0 indefinitely on some
+// charts/timeframes -- nextProfile only ever gets (re)classified on a bar
+// where `not nyInSession and londonInSession and not na(asiaHigh)` is
+// true (the "London active, NY not yet active" window, ~08:00-13:00 in
+// the selected timezone by default). On a higher timeframe (e.g. 4H), if
+// this chart's bar-open times don't land inside that window on ANY bar
+// -- which happens when the data feed's bar boundaries aren't aligned to
+// clean hour marks in the selected timezone -- the window condition can
+// be false on every single bar, and nextProfile/dayProfile never get
+// (re)classified even once no matter how much history is loaded.
+//
+// Check these in the Data Window (scrub through history if needed): if
+// "Profile Window Active" reads 0 on every bar you check, that confirms
+// the window genuinely never opens on this chart's own bar boundaries --
+// the fix at that point is switching to a lower timeframe (so more bars
+// fall inside the window) or widening the session inputs so the London-
+// only window covers more of each bar's span.
+// ============================================================================
+
+plot(asiaInSession ? 1 : 0, "Asia In Session (This Bar)", display=display.data_window)
+plot(londonInSession ? 1 : 0, "London In Session (This Bar)", display=display.data_window)
+plot(nyInSession ? 1 : 0, "NY In Session (This Bar)", display=display.data_window)
+plot(na(asiaHigh) ? 0 : 1, "Asia High Captured Yet (Today)", display=display.data_window)
+plot((not nyInSession and londonInSession and not na(asiaHigh)) ? 1 : 0, "Profile Window Active (This Bar)", display=display.data_window)
+plot(currentProfileCode, "Current Profile Code (-1 = None Yet)", display=display.data_window)
