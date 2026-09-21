@@ -746,8 +746,11 @@ if showRangeChannelInput
             linefill.new(rangeLineLower2, rangeLineLower1, rangeMid == rangeMid[1] ? (rangeTrend == 1 ? color.new(zscoreBullColorInput, 70) : color.new(zscoreBullColorInput, 85)) : na)
             linefill.new(rangeLineLower1, rangeLineMid, rangeMid == rangeMid[1] ? (rangeTrend == 1 ? color.new(zscoreBullColorInput, 80) : color.new(zscoreBullColorInput, 95)) : na)
 
-plotshape(showZscoreSignalsInput and ta.crossover(normZscore, -zscoreObThresholdInput), title = "Z-Score Long Signal", style = shape.diamond, location = location.belowbar, color = zscoreBullColorInput)
-plotshape(showZscoreSignalsInput and ta.crossunder(normZscore, zscoreObThresholdInput), title = "Z-Score Short Signal", style = shape.diamond, location = location.abovebar, color = zscoreBearColorInput)
+bool zscoreCrossoverLong = ta.crossover(normZscore, -zscoreObThresholdInput)
+bool zscoreCrossunderShort = ta.crossunder(normZscore, zscoreObThresholdInput)
+
+plotshape(showZscoreSignalsInput and zscoreCrossoverLong, title = "Z-Score Long Signal", style = shape.diamond, location = location.belowbar, color = zscoreBullColorInput)
+plotshape(showZscoreSignalsInput and zscoreCrossunderShort, title = "Z-Score Short Signal", style = shape.diamond, location = location.abovebar, color = zscoreBearColorInput)
 plotshape(showZscoreSignalsInput and normZscoreFast < -zscoreObThresholdInput, title = "Z-Score Weak Long", style = shape.xcross, location = location.belowbar, color = color.new(zscoreNeutralColorInput, 50))
 plotshape(showZscoreSignalsInput and normZscoreFast > zscoreObThresholdInput, title = "Z-Score Weak Short", style = shape.xcross, location = location.abovebar, color = color.new(zscoreNeutralColorInput, 50))
 
@@ -764,7 +767,7 @@ plotshape(showZscoreSignalsInput and normZscoreFast > zscoreObThresholdInput, ti
 // conditions. Ported from that indicator's legacy Pine v3/v4 syntax
 // (study(), bare pivothigh()/ema()/crossunder()/fixnan(), transp=) into
 // this file's Pine v6 equivalents (ta.pivothigh()/ta.ema()/ta.crossunder()/
-// ta.fixnan(), color.new() transparency) -- the math and structure are
+// fixnan(), color.new() transparency) -- the math and structure are
 // otherwise unchanged. longSignalNow/shortSignalNow are kept as the exact
 // same interface names the prior model exposed, so every downstream gate
 // (Structure/Momentum/Pressure/Session/Cooldown below, Risk Management,
@@ -805,8 +808,8 @@ float atrCoach = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
 // -- Pivot step-lines, held forward with fixnan() (chart object) --
 float lsrPivotHighRaw = ta.pivothigh(lsrLeftBarsInput, lsrRightBarsInput)
 float lsrPivotLowRaw = ta.pivotlow(lsrLeftBarsInput, lsrRightBarsInput)
-float lsrHighUsePivot = ta.fixnan(lsrPivotHighRaw[1])
-float lsrLowUsePivot = ta.fixnan(lsrPivotLowRaw[1])
+float lsrHighUsePivot = fixnan(lsrPivotHighRaw[1])
+float lsrLowUsePivot = fixnan(lsrPivotLowRaw[1])
 
 plot(lsrHighUsePivot, title = "Resistance", color = ta.change(lsrHighUsePivot) ? na : color.red, linewidth = 3, offset = -(lsrRightBarsInput + 1))
 plot(lsrLowUsePivot, title = "Support", color = ta.change(lsrLowUsePivot) ? na : color.blue, linewidth = 3, offset = -(lsrRightBarsInput + 1))
@@ -817,10 +820,17 @@ float lsrLongEma = ta.ema(volume, 10)
 float lsrOsc = 100 * (lsrShortEma - lsrLongEma) / lsrLongEma
 
 // -- Break / wick classification --
-bool lsrBreakDown = lsrToggleBreaksInput and ta.crossunder(close, lsrLowUsePivot) and not (open - close < high - open) and lsrOsc > lsrVolumeThreshInput
-bool lsrBreakUp = lsrToggleBreaksInput and ta.crossover(close, lsrHighUsePivot) and not (open - low > close - open) and lsrOsc > lsrVolumeThreshInput
-bool lsrBullWick = lsrToggleBreaksInput and ta.crossover(close, lsrHighUsePivot) and open - low > close - open
-bool lsrBearWick = lsrToggleBreaksInput and ta.crossunder(close, lsrLowUsePivot) and open - close < high - open
+// ta.crossover()/ta.crossunder() are computed once each, unconditionally,
+// into their own variables (Pine v6 flags calling them inline inside a
+// conditional and-chain as CW10002 -- the call might not run every bar,
+// which is unreliable for a function that depends on historical state).
+bool lsrCrossUnderSupport = ta.crossunder(close, lsrLowUsePivot)
+bool lsrCrossOverResistance = ta.crossover(close, lsrHighUsePivot)
+
+bool lsrBreakDown = lsrToggleBreaksInput and lsrCrossUnderSupport and not (open - close < high - open) and lsrOsc > lsrVolumeThreshInput
+bool lsrBreakUp = lsrToggleBreaksInput and lsrCrossOverResistance and not (open - low > close - open) and lsrOsc > lsrVolumeThreshInput
+bool lsrBullWick = lsrToggleBreaksInput and lsrCrossOverResistance and open - low > close - open
+bool lsrBearWick = lsrToggleBreaksInput and lsrCrossUnderSupport and open - close < high - open
 
 plotshape(lsrBreakDown, title = "Break Down", text = "B", style = shape.labeldown, location = location.abovebar, color = color.red, textcolor = color.white, size = size.tiny)
 plotshape(lsrBreakUp, title = "Break Up", text = "B", style = shape.labelup, location = location.belowbar, color = color.green, textcolor = color.white, size = size.tiny)
