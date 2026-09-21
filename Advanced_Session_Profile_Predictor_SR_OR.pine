@@ -305,6 +305,18 @@ if barstate.islast
                 shortTriggerPrice := na
             longCondition := "No Long"
             longTriggerPrice := na
+        else
+            // Neither direction pair matched (e.g. a flat/doji Asia or
+            // London session, direction == 0) -- without this branch,
+            // shortCondition/longCondition/shortTriggerPrice/
+            // longTriggerPrice simply keep whatever value they held from
+            // the last bar that DID match one of the branches above,
+            // which can be a stale price level from an entirely
+            // different day. Reset explicitly instead of leaving stale.
+            shortCondition := "No Short"
+            longCondition := "No Long"
+            shortTriggerPrice := na
+            longTriggerPrice := na
     else if nextProfile == "Profil 2: NY Manipulation"
         if asiaDirection == 1
             if close < asiaHigh
@@ -338,6 +350,14 @@ if barstate.islast
             else
                 longCondition := "No Long (over " + str.tostring(londonHigh) + ")"
                 longTriggerPrice := na
+        else
+            // Same fix as Profile 1's else above -- asiaDirection == 0
+            // (flat Asia session) would otherwise leave shortCondition/
+            // longCondition/*TriggerPrice stale from a previous match.
+            shortCondition := "No Short"
+            longCondition := "No Long"
+            shortTriggerPrice := na
+            longTriggerPrice := na
     else if nextProfile == "Profil 3: London+NY Manipulation"
         if close > asiaClose
             shortCondition := "IF price hits " + str.tostring(asiaClose) + " SHORT (L/NY)"
