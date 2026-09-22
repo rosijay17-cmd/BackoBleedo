@@ -249,7 +249,6 @@ string G_ALERT = "08 — Signals / Alerts (Anchor)"
 bool showSetupMarkers = input.bool(true, "Show Setup Armed Hollow Triangles", group = G_ALERT)
 bool showEntryMarkers = input.bool(true, "Show Actual Entry Solid Triangles", group = G_ALERT)
 bool showCooldownGapLabelsInput = input.bool(true, "Show Bars-Since-Last-Exit Label On Each Entry", group = G_ALERT)
-string entryMarkerSizeInput = input.string("Normal", "Entry Marker Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = G_ALERT)
 color entryLongColor = input.color(color.aqua, "Long Entry Marker Color", group = G_ALERT)
 color entryShortColor = input.color(color.orange, "Short Entry Marker Color", group = G_ALERT)
 bool showEntryBarColorInput = input.bool(true, "Highlight Entry Bar Color", group = G_ALERT)
@@ -350,7 +349,6 @@ bool showChangePointVisualInput = input.bool(true, "Show CUSUM Regime Line + Pre
 bool showRetestTouchMarkerInput = input.bool(true, "Show Retest Touch Marker", group = G_SIG)
 bool showEntrySignalInput = input.bool(true, "Show Actual Entry Signal", group = G_SIG)
 bool showQualifiedTriggerInput = input.bool(true, "Show Qualified Retest Trigger", tooltip = "Diamond = price/pressure retest trigger. Triangle = actual strategy entry after trend, cooldown, and risk gates.", group = G_SIG)
-string entrySignalSizeInput = input.string("Normal", "Entry Signal Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = G_SIG)
 color longEntryColorInput = input.color(color.aqua, "Long Entry Color", group = G_SIG)
 color shortEntryColorInput = input.color(color.orange, "Short Entry Color", group = G_SIG)
 color longTriggerColorInput = input.color(color.rgb(70, 160, 255), "Long Qualified Trigger Color", group = G_SIG)
@@ -1082,17 +1080,8 @@ plotchar(showAllChartObjectsInput and showSetupMarkers and shortSetupArmed and n
 bool showLongEntryMarker = showAllChartObjectsInput and showEntryMarkers and actualLongEntry
 bool showShortEntryMarker = showAllChartObjectsInput and showEntryMarkers and actualShortEntry
 
-plotshape(showLongEntryMarker and entryMarkerSizeInput == "Tiny", title = "Bull Actual Entry (Tiny)", style = shape.triangleup, location = location.belowbar, size = size.tiny, color = entryLongColor)
-plotshape(showLongEntryMarker and entryMarkerSizeInput == "Small", title = "Bull Actual Entry (Small)", style = shape.triangleup, location = location.belowbar, size = size.small, color = entryLongColor)
-plotshape(showLongEntryMarker and entryMarkerSizeInput == "Normal", title = "Bull Actual Entry (Normal)", style = shape.triangleup, location = location.belowbar, size = size.normal, color = entryLongColor)
-plotshape(showLongEntryMarker and entryMarkerSizeInput == "Large", title = "Bull Actual Entry (Large)", style = shape.triangleup, location = location.belowbar, size = size.large, color = entryLongColor)
-plotshape(showLongEntryMarker and entryMarkerSizeInput == "Huge", title = "Bull Actual Entry (Huge)", style = shape.triangleup, location = location.belowbar, size = size.huge, color = entryLongColor)
-
-plotshape(showShortEntryMarker and entryMarkerSizeInput == "Tiny", title = "Bear Actual Entry (Tiny)", style = shape.triangledown, location = location.abovebar, size = size.tiny, color = entryShortColor)
-plotshape(showShortEntryMarker and entryMarkerSizeInput == "Small", title = "Bear Actual Entry (Small)", style = shape.triangledown, location = location.abovebar, size = size.small, color = entryShortColor)
-plotshape(showShortEntryMarker and entryMarkerSizeInput == "Normal", title = "Bear Actual Entry (Normal)", style = shape.triangledown, location = location.abovebar, size = size.normal, color = entryShortColor)
-plotshape(showShortEntryMarker and entryMarkerSizeInput == "Large", title = "Bear Actual Entry (Large)", style = shape.triangledown, location = location.abovebar, size = size.large, color = entryShortColor)
-plotshape(showShortEntryMarker and entryMarkerSizeInput == "Huge", title = "Bear Actual Entry (Huge)", style = shape.triangledown, location = location.abovebar, size = size.huge, color = entryShortColor)
+plotshape(showLongEntryMarker, title = "Bull Actual Entry", style = shape.triangleup, location = location.belowbar, size = size.normal, color = entryLongColor)
+plotshape(showShortEntryMarker, title = "Bear Actual Entry", style = shape.triangledown, location = location.abovebar, size = size.normal, color = entryShortColor)
 
 
 //=============================================================================
@@ -1882,17 +1871,8 @@ plotshape(showAllChartObjectsInput and showRetestTouchMarkerInput and retestShor
 bool showLongEntry = showAllChartObjectsInput and showEntrySignalInput and actualLongEntrySignal
 bool showShortEntry = showAllChartObjectsInput and showEntrySignalInput and actualShortEntrySignal
 
-plotshape(showLongEntry and entrySignalSizeInput == "Tiny", title = "CP Long Entry Tiny", style = shape.triangleup, location = location.belowbar, size = size.tiny, color = longEntryColorInput, text = "LONG", textcolor = color.white)
-plotshape(showLongEntry and entrySignalSizeInput == "Small", title = "CP Long Entry Small", style = shape.triangleup, location = location.belowbar, size = size.small, color = longEntryColorInput, text = "LONG", textcolor = color.white)
-plotshape(showLongEntry and entrySignalSizeInput == "Normal", title = "CP Long Entry Normal", style = shape.triangleup, location = location.belowbar, size = size.normal, color = longEntryColorInput, text = "LONG", textcolor = color.white)
-plotshape(showLongEntry and entrySignalSizeInput == "Large", title = "CP Long Entry Large", style = shape.triangleup, location = location.belowbar, size = size.large, color = longEntryColorInput, text = "LONG", textcolor = color.white)
-plotshape(showLongEntry and entrySignalSizeInput == "Huge", title = "CP Long Entry Huge", style = shape.triangleup, location = location.belowbar, size = size.huge, color = longEntryColorInput, text = "LONG", textcolor = color.white)
-
-plotshape(showShortEntry and entrySignalSizeInput == "Tiny", title = "CP Short Entry Tiny", style = shape.triangledown, location = location.abovebar, size = size.tiny, color = shortEntryColorInput, text = "SHORT", textcolor = color.white)
-plotshape(showShortEntry and entrySignalSizeInput == "Small", title = "CP Short Entry Small", style = shape.triangledown, location = location.abovebar, size = size.small, color = shortEntryColorInput, text = "SHORT", textcolor = color.white)
-plotshape(showShortEntry and entrySignalSizeInput == "Normal", title = "CP Short Entry Normal", style = shape.triangledown, location = location.abovebar, size = size.normal, color = shortEntryColorInput, text = "SHORT", textcolor = color.white)
-plotshape(showShortEntry and entrySignalSizeInput == "Large", title = "CP Short Entry Large", style = shape.triangledown, location = location.abovebar, size = size.large, color = shortEntryColorInput, text = "SHORT", textcolor = color.white)
-plotshape(showShortEntry and entrySignalSizeInput == "Huge", title = "CP Short Entry Huge", style = shape.triangledown, location = location.abovebar, size = size.huge, color = shortEntryColorInput, text = "SHORT", textcolor = color.white)
+plotshape(showLongEntry, title = "CP Long Entry", style = shape.triangleup, location = location.belowbar, size = size.normal, color = longEntryColorInput, text = "LONG", textcolor = color.white)
+plotshape(showShortEntry, title = "CP Short Entry", style = shape.triangledown, location = location.abovebar, size = size.normal, color = shortEntryColorInput, text = "SHORT", textcolor = color.white)
 
 barcolor(showAllChartObjectsInput and highlightEntryBarInput and actualLongEntrySignal ? color.new(longEntryColorInput, 35) : showAllChartObjectsInput and highlightEntryBarInput and actualShortEntrySignal ? color.new(shortEntryColorInput, 35) : na, title = "CP Entry Bar Highlight")
 
@@ -2174,64 +2154,21 @@ alertcondition(cpShortClosed, title = "CP Short Exit", message = "SHORT EXIT | C
 
 //=============================================================================
 // DATA WINDOW
+//-----------------------------------------------------------------------------
+// Removed. Pine caps a single script at 64 total plot()/plotshape()/
+// plotchar()/fill()/barcolor() outputs combined; merging two previously
+// separate scripts pushed this file's true count to 135 (RE10140: "The
+// script creates too many plots"), even though only ~40 of those ever
+// drew anything on the chart pane -- Data Window plots still count
+// against that same 64-slot budget despite never being visible there.
+// This whole block of ~54 diagnostic-only Data Window plots was the
+// single largest contributor and added nothing to the chart itself, so
+// it was cut entirely rather than trimmed. All the values it exposed
+// (acceptance/rejection scores, structural levels, anchor/CUSUM state,
+// funnel counters, etc.) are still fully computed and still visible on
+// the Architecture dashboard table or via log.info() where already
+// present -- only the raw Data Window plot rows are gone.
 //=============================================================================
-
-plot(distanceFromP0ATR, title = "Distance From P0 ATR", display = display.data_window)
-plot(p0MigrationATR, title = "P0 Migration ATR", display = display.data_window)
-plot(p0CatchUpPercent, title = "P0 Catch-Up %", display = display.data_window)
-plot(newLocationShare, title = "New-Location Volume %", display = display.data_window)
-plot(valueMigrationATR, title = "Value Area Migration ATR", display = display.data_window)
-plot(deltaPercent, title = "Estimated Delta %", display = display.data_window)
-plot(deltaPersistence, title = "Delta Persistence %", display = display.data_window)
-plot(profileCoherence, title = "Profile Coherence %", display = display.data_window)
-plot(acceptanceScore, title = "Acceptance Score", display = display.data_window)
-plot(rejectionScore, title = "Rejection Score", display = display.data_window)
-plot(longSetupArmed ? 1 : 0, title = "Bull Setup Armed", display = display.data_window)
-plot(shortSetupArmed ? 1 : 0, title = "Bear Setup Armed", display = display.data_window)
-plot(structuralPOC, title = "Structural POC", display = display.data_window)
-plot(structuralVAH, title = "Structural VAH", display = display.data_window)
-plot(structuralVAL, title = "Structural VAL", display = display.data_window)
-plot(structuralSupport, title = "Structural Delta Support", display = display.data_window)
-plot(structuralResistance, title = "Structural Delta Resistance", display = display.data_window)
-
-plot(strategy.position_size, title = "Net Position Size", display = display.data_window)
-plot(anchorFlat ? 1 : 0, title = "Anchor Flat", display = display.data_window)
-plot(dbrInTrade ? 1 : 0, title = "DBR In Trade", display = display.data_window)
-plot(longClosed ? 1 : 0, title = "Anchor Long Closed Event", display = display.data_window)
-plot(shortClosed ? 1 : 0, title = "Anchor Short Closed Event", display = display.data_window)
-plot(lastLongExitBar, title = "Last Anchor Long Exit Bar", display = display.data_window)
-plot(lastShortExitBar, title = "Last Anchor Short Exit Bar", display = display.data_window)
-plot(anchorTs4, title = "Anchor Band Value", display = display.data_window)
-plot(anchorTrend, title = "Anchor Trend (1=UP, -1=DOWN)", display = display.data_window)
-plot(anchorLongRaw ? 1 : 0, title = "Anchor Raw Long Signal", display = display.data_window)
-plot(anchorShortRaw ? 1 : 0, title = "Anchor Raw Short Signal", display = display.data_window)
-
-plot(barDelta, title = "Per-Bar Estimated Delta", display = display.data_window)
-plot(executionDeltaPressure, title = "Execution Pressure %", display = display.data_window)
-plot(triggerRvol, title = "Trigger RVOL", display = display.data_window)
-plot(sPos, title = "CUSUM sPos", display = display.data_window)
-plot(sNeg, title = "CUSUM sNeg", display = display.data_window)
-plot(trend, title = "CUSUM Trend", display = display.data_window)
-plot(zScore, title = "Log-Return Z-Score", display = display.data_window)
-plot(activeDirection, title = "Active Retest Direction", display = display.data_window)
-plot(strategy.opentrades, title = "Open Trades (All Engines)", display = display.data_window)
-plot(strategy.closedtrades, title = "Closed Trades (All Engines)", display = display.data_window)
-plot(entryCallCount, title = "CP Entry Calls", display = display.data_window)
-plot(triggerUpNow ? 1 : 0, title = "Qualified Long Trigger", display = display.data_window)
-plot(triggerDownNow ? 1 : 0, title = "Qualified Short Trigger", display = display.data_window)
-plot(actualLongEntrySignal ? 1 : 0, title = "CP Actual Long Entry", display = display.data_window)
-plot(actualShortEntrySignal ? 1 : 0, title = "CP Actual Short Entry", display = display.data_window)
-plot(cEvents, title = "DBR Funnel: Change Points", display = display.data_window)
-plot(cRetested, title = "DBR Funnel: Retested", display = display.data_window)
-plot(cTriggered, title = "DBR Funnel: Triggered", display = display.data_window)
-plot(cExpired, title = "DBR Funnel: Expired", display = display.data_window)
-plot(cInvalidated, title = "DBR Funnel: Invalidated", display = display.data_window)
-plot(cReclaimFail, title = "DBR Funnel Fail: Reclaim", display = display.data_window)
-plot(cExtensionFail, title = "DBR Funnel Fail: Extension", display = display.data_window)
-plot(cBodyFail, title = "DBR Funnel Fail: Body", display = display.data_window)
-plot(cLocationFail, title = "DBR Funnel Fail: Location", display = display.data_window)
-plot(cPressureFail, title = "DBR Funnel Fail: Pressure", display = display.data_window)
-plot(cRvolFail, title = "DBR Funnel Fail: RVOL", display = display.data_window)
 
 // REALTIME VISUALS:
 // Dashboard, dynamic P0, value area, structural levels, and the DeltaFlow
