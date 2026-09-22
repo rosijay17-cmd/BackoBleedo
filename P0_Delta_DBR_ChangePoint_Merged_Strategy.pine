@@ -1928,8 +1928,8 @@ if barstate.islast and showAllChartObjectsInput
             upper = lower + step
             mid   = lower + step / 2
             vol   = maxVolumeArry > 0 ? int(vp.volumeArry.get(i) / maxVolumeArry * 100) : 0
-            bullV = maxVolumeArry > 0 ? math.floor(vp.bullVolume.get(i) / maxVolumeArry * 100) : 0.0
-            bearV = maxVolumeArry > 0 ? math.floor(vp.bearVolume.get(i) / maxVolumeArry * 100) : 0.0
+            bullV = maxVolumeArry > 0 ? math.floor(vp.bullVolume.get(i) / maxVolumeArry * 100) : 0
+            bearV = maxVolumeArry > 0 ? math.floor(vp.bearVolume.get(i) / maxVolumeArry * 100) : 0
             size  = (start - start - vol)
             bullsPercent = math.abs(bullV / size * 100)
             bearsPercent = math.abs(bearV / size * 100)
