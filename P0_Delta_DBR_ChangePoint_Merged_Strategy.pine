@@ -1884,63 +1884,80 @@ if barstate.islast and showAllChartObjectsInput
     if boxes.size() > 0
         for b in boxes
             b.delete()
-    for i = 0 to lookBack
-        MaxMin.push(high[i])
-        MaxMin.push(low[i])
-    top = MaxMin.max()
-    bot = MaxMin.min()
-    step = (top - bot) / binsAmount
-    for i = 0 to lookBack
-        price = close[i]
-        isBear = close[i] < open[i]
-        voll = volume[i]
-        for k = 0 to binsAmount - 1
-            lower = bot + step * k
+    // Guard added: the original code read high[i]/low[i]/volume[i] back
+    // `lookBack` bars with no check that that much history actually
+    // exists yet. When it doesn't (early on a fresh symbol/session, or
+    // any feed with fewer than `lookBack` bars loaded), high[i] etc.
+    // return na, which poisons MaxMin/vp's arrays with na and eventually
+    // reaches box.new() with an na coordinate -- a runtime error that
+    // halts the ENTIRE script for that bar, freezing every plot/table
+    // downstream (including the Architecture dashboard) at whatever it
+    // last computed. Skipping this block until bar_index >= lookBack
+    // prevents that; the histogram simply doesn't draw until then.
+    if bar_index >= lookBack
+        for i = 0 to lookBack
+            MaxMin.push(high[i])
+            MaxMin.push(low[i])
+        top = MaxMin.max()
+        bot = MaxMin.min()
+        step = (top - bot) / binsAmount
+        for i = 0 to lookBack
+            price = close[i]
+            isBear = close[i] < open[i]
+            voll = volume[i]
+            for k = 0 to binsAmount - 1
+                lower = bot + step * k
+                mid   = lower + step / 2
+                if math.abs(mid - price) <= step
+                    vp.volumeArry.set(k, vp.volumeArry.get(k) + voll)
+                    if isBear
+                        vp.bearVolume.set(k, vp.bearVolume.get(k) + voll)
+                    else
+                        vp.bullVolume.set(k, vp.bullVolume.get(k) + voll)
+
+        // Guard added: vp.volumeArry.max() can legitimately be 0 (a
+        // window with no recorded volume) -- dividing by it directly, as
+        // the original code did 3 times over, produces na and the same
+        // box.new()-halts-the-script failure mode described above.
+        float maxVolumeArry = vp.volumeArry.max()
+
+        for i = 0 to binsAmount - 1
+            start = bar_index + 100 + offset
+            volumeArryvalue = vp.volumeArry.get(i)
+            lower = bot + step * i
+            upper = lower + step
             mid   = lower + step / 2
-            if math.abs(mid - price) <= step
-                vp.volumeArry.set(k, vp.volumeArry.get(k) + voll)
-                if isBear
-                    vp.bearVolume.set(k, vp.bearVolume.get(k) + voll)
-                else
-                    vp.bullVolume.set(k, vp.bullVolume.get(k) + voll)
+            vol   = maxVolumeArry > 0 ? int(vp.volumeArry.get(i) / maxVolumeArry * 100) : 0
+            bullV = maxVolumeArry > 0 ? math.floor(vp.bullVolume.get(i) / maxVolumeArry * 100) : 0.0
+            bearV = maxVolumeArry > 0 ? math.floor(vp.bearVolume.get(i) / maxVolumeArry * 100) : 0.0
+            size  = (start - start - vol)
+            bullsPercent = math.abs(bullV / size * 100)
+            bearsPercent = math.abs(bearV / size * 100)
+            bullsPercent := bullsPercent > 100 ? 100 : bullsPercent
+            delta       = bullsPercent - bearsPercent
+            deltaColor  = color.from_gradient(delta, -30, 30, bearcolor, bullcolor)
+            box poc      = na
+            box labelBox = na
+            box MapBody  = na
+            box bulls    = na
+            box bears    = na
+            if deltaHeatMap
+                MapBody  := box.new(start - lookBack - 50 - vol, upper, start, lower, border_color = chart.bg_color, border_width = 0, bgcolor = color.from_gradient(vol, 0, 100, color.new(deltaColor, 100), color.new(deltaColor, 70)))
+            if vol == 100 and pocDisplay
+                poc := box.new(start - lookBack - 50 - vol, upper, start, lower, border_color = pocColor, border_width = 1, bgcolor = na, text = str.tostring(volumeArryvalue, format.volume), text_color = chart.fg_color)
+            if deltaDisplay
+                labelBox := box.new(start + 15, upper, start, lower, border_color = chart.bg_color, border_width = 1, bgcolor = color.new(deltaColor, 80), text = "Δ " + str.tostring(delta, format.percent), text_color = deltaColor)
+            body        = box.new(start - vol, upper, start, lower, border_color = chart.bg_color, border_width = 1, bgcolor = color.new(deltaColor, 50))
+            if volumeBars
+                bulls  := box.new(start - bullV, mid, start, lower, bgcolor = bullcolor, border_color = chart.bg_color, border_width = 1, text = str.tostring(bullsPercent, format = format.percent), text_halign = text.align_right)
+                bears  := box.new(start - bearV, upper, start, mid, bgcolor = bearcolor, border_color = chart.bg_color, border_width = 1, text = str.tostring(bearsPercent, format = format.percent), text_halign = text.align_right)
 
-    for i = 0 to binsAmount - 1
-        start = bar_index + 100 + offset
-        volumeArryvalue = vp.volumeArry.get(i)
-        lower = bot + step * i
-        upper = lower + step
-        mid   = lower + step / 2
-        vol   = int(vp.volumeArry.get(i) / vp.volumeArry.max() * 100)
-        bullV = math.floor(vp.bullVolume.get(i) / vp.volumeArry.max() * 100)
-        bearV = math.floor(vp.bearVolume.get(i) / vp.volumeArry.max() * 100)
-        size  = (start - start - vol)
-        bullsPercent = math.abs(bullV / size * 100)
-        bearsPercent = math.abs(bearV / size * 100)
-        bullsPercent := bullsPercent > 100 ? 100 : bullsPercent
-        delta       = bullsPercent - bearsPercent
-        deltaColor  = color.from_gradient(delta, -30, 30, bearcolor, bullcolor)
-        box poc      = na
-        box labelBox = na
-        box MapBody  = na
-        box bulls    = na
-        box bears    = na
-        if deltaHeatMap
-            MapBody  := box.new(start - lookBack - 50 - vol, upper, start, lower, border_color = chart.bg_color, border_width = 0, bgcolor = color.from_gradient(vol, 0, 100, color.new(deltaColor, 100), color.new(deltaColor, 70)))
-        if vol == 100 and pocDisplay
-            poc := box.new(start - lookBack - 50 - vol, upper, start, lower, border_color = pocColor, border_width = 1, bgcolor = na, text = str.tostring(volumeArryvalue, format.volume), text_color = chart.fg_color)
-        if deltaDisplay
-            labelBox := box.new(start + 15, upper, start, lower, border_color = chart.bg_color, border_width = 1, bgcolor = color.new(deltaColor, 80), text = "Δ " + str.tostring(delta, format.percent), text_color = deltaColor)
-        body        = box.new(start - vol, upper, start, lower, border_color = chart.bg_color, border_width = 1, bgcolor = color.new(deltaColor, 50))
-        if volumeBars
-            bulls  := box.new(start - bullV, mid, start, lower, bgcolor = bullcolor, border_color = chart.bg_color, border_width = 1, text = str.tostring(bullsPercent, format = format.percent), text_halign = text.align_right)
-            bears  := box.new(start - bearV, upper, start, mid, bgcolor = bearcolor, border_color = chart.bg_color, border_width = 1, text = str.tostring(bearsPercent, format = format.percent), text_halign = text.align_right)
-
-        boxes.push(poc)
-        boxes.push(labelBox)
-        boxes.push(MapBody)
-        boxes.push(body)
-        boxes.push(bulls)
-        boxes.push(bears)
+            boxes.push(poc)
+            boxes.push(labelBox)
+            boxes.push(MapBody)
+            boxes.push(body)
+            boxes.push(bulls)
+            boxes.push(bears)
 
 
 //=============================================================================
