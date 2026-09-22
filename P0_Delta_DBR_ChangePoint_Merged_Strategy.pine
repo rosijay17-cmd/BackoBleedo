@@ -235,7 +235,6 @@ bool showArchitectureHistogram = input.bool(true, "Show Acceptance / Rejection H
 string architecturePosition = input.string("Top Right", "Position", options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group = G_DASH)
 string dashboardTextSize = input.string("Small", "Dashboard Text Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = G_DASH)
 bool showLiveColumnInput = input.bool(false, "Show LIVE Value Column", group = G_DASH)
-bool showDbrStatusRowsInput = input.bool(true, "Show DBR Change-Point Status Rows In Dashboard", tooltip = "Appends 7 extra rows to this same table summarizing the DBR Change-Point engine (4H Bias, 1H Trend, CUSUM Trend, Retest State, Cooldown, per-engine trade counts, Funnel totals) -- this replaces that engine's own separate Status/Funnel tables, which were dropped so only one dashboard remains on the chart.", group = G_DASH)
 color acceptanceColor = input.color(color.rgb(0, 200, 140), "Acceptance Color", group = G_DASH)
 color rejectionColor = input.color(color.rgb(245, 75, 85), "Rejection Color", group = G_DASH)
 
@@ -1947,12 +1946,12 @@ if barstate.islast and showAllChartObjectsInput
 //=============================================================================
 // ACCEPTANCE / REJECTION COMPONENT HISTOGRAM — UNIFIED ARCHITECTURE DASHBOARD
 //-----------------------------------------------------------------------------
-// The ONE dashboard table in this file (per request). Rows 0-11 are the
-// original P0 Delta Architecture table, unchanged. Rows 12-18 summarize the
-// DBR Change-Point engine (bias, trend, CUSUM state, retest state, its own
-// cooldown, per-engine trade counts, funnel totals) and replace that
-// engine's own separate Status + Funnel tables, toggled off with
-// showDbrStatusRowsInput.
+// The ONE dashboard table in this file (per request), rows 0-9: the
+// original P0 Delta Architecture table. The Long/Short Cooldown rows and
+// the 7-row DBR Change-Point status summary that previously followed them
+// (rows 10-18) were removed per request -- the underlying cooldown state
+// and DBR engine computations are untouched and still drive both engines'
+// entries, only these display rows are gone.
 //=============================================================================
 
 architectureTablePosition = (
@@ -1964,7 +1963,7 @@ architectureTablePosition = (
      position.bottom_right :
      position.top_right)
 
-var table architectureTable = table.new(architectureTablePosition, 5, 19, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+var table architectureTable = table.new(architectureTablePosition, 5, 10, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
 
 if barstate.islast
 
@@ -2050,89 +2049,9 @@ if barstate.islast
             table.cell(architectureTable, 3, 9, f_pct(profileCoherence), text_color = color.white)
         table.cell(architectureTable, readCol, 9, profileCoherence >= minimumCoherence ? "STRUCTURED" : "NOISY", text_color = profileCoherence >= minimumCoherence ? acceptanceColor : color.gray)
 
-        bool longCooldownOkForRead = cooldownOkLong
-        bool longCooldownArmedForRead = longCooldownArmed
-        int lastLongExitBarForRead = lastLongExitBar
-
-        float longCooldownElapsed = bar_index - lastLongExitBarForRead
-        float longCooldownProgressPct = f_clamp(100.0 * longCooldownElapsed / math.max(cooldownBarsLongInput, 1), 0.0, 100.0)
-        int longCooldownBarsLeft = int(math.max(0.0, cooldownBarsLongInput - longCooldownElapsed))
-        string readLongCooldown = (not longCooldownOkForRead ? "COOLING" : not longCooldownArmedForRead ? "STALE" : "READY")
-
-        table.cell(architectureTable, 0, 10, "Long Cooldown", text_color = color.white)
-        table.cell(architectureTable, 1, 10, f_bar(longCooldownProgressPct), text_color = acceptanceColor)
-        table.cell(architectureTable, 2, 10, f_bar(100.0 - longCooldownProgressPct), text_color = rejectionColor)
-        if showLiveColumnInput
-            table.cell(architectureTable, 3, 10, str.tostring(longCooldownBarsLeft) + " left", text_color = color.white)
-        table.cell(architectureTable, readCol, 10, readLongCooldown, text_color = readLongCooldown == "READY" ? acceptanceColor : readLongCooldown == "STALE" ? color.orange : rejectionColor)
-
-        bool shortCooldownOkForRead = cooldownOkShort
-        bool shortCooldownArmedForRead = shortCooldownArmed
-        int lastShortExitBarForRead = lastShortExitBar
-
-        float shortCooldownElapsed = bar_index - lastShortExitBarForRead
-        float shortCooldownProgressPct = f_clamp(100.0 * shortCooldownElapsed / math.max(cooldownBarsShortInput, 1), 0.0, 100.0)
-        int shortCooldownBarsLeft = int(math.max(0.0, cooldownBarsShortInput - shortCooldownElapsed))
-        string readShortCooldown = (not shortCooldownOkForRead ? "COOLING" : not shortCooldownArmedForRead ? "STALE" : "READY")
-
-        table.cell(architectureTable, 0, 11, "Short Cooldown", text_color = color.white)
-        table.cell(architectureTable, 1, 11, f_bar(shortCooldownProgressPct), text_color = acceptanceColor)
-        table.cell(architectureTable, 2, 11, f_bar(100.0 - shortCooldownProgressPct), text_color = rejectionColor)
-        if showLiveColumnInput
-            table.cell(architectureTable, 3, 11, str.tostring(shortCooldownBarsLeft) + " left", text_color = color.white)
-        table.cell(architectureTable, readCol, 11, readShortCooldown, text_color = readShortCooldown == "READY" ? acceptanceColor : readShortCooldown == "STALE" ? color.orange : rejectionColor)
-
-        if showDbrStatusRowsInput
-            string dbrQueryDirection = activeDirection == 1 ? "long" : activeDirection == -1 ? "short" : "long"
-            string dbrQueryEventId = na(activeEventTime) ? "none" : "CP_" + dbrQueryDirection + "_" + str.tostring(activeEventTime)
-            [dbrCooldownOk, dbrCooldownReason] = f_canTrade(cd, dbrQueryDirection, dbrQueryEventId, bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
-
-            int anchorOpenCount = 0
-            int anchorClosedCount = 0
-            int dbrOpenCount = 0
-            int dbrClosedCount = 0
-
-            if strategy.opentrades > 0
-                for i = 0 to strategy.opentrades - 1
-                    string oid = strategy.opentrades.entry_id(i)
-                    if oid == "Anchor Long" or oid == "Anchor Short"
-                        anchorOpenCount += 1
-                    if oid == "CP Long" or oid == "CP Short"
-                        dbrOpenCount += 1
-
-            if strategy.closedtrades > 0
-                for i = 0 to strategy.closedtrades - 1
-                    string cid = strategy.closedtrades.entry_id(i)
-                    if cid == "Anchor Long" or cid == "Anchor Short"
-                        anchorClosedCount += 1
-                    if cid == "CP Long" or cid == "CP Short"
-                        dbrClosedCount += 1
-
-            table.cell(architectureTable, 0, 12, "DBR 4H Bias", text_color = color.white)
-            table.cell(architectureTable, 1, 12, bias, text_color = bias == "LONG_ONLY" ? acceptanceColor : bias == "SHORT_ONLY" ? rejectionColor : color.gray)
-
-            table.cell(architectureTable, 0, 13, "DBR 1H Trend", text_color = color.white)
-            table.cell(architectureTable, 1, 13, long1hTrendOk ? "BULL" : short1hTrendOk ? "BEAR" : "MIXED", text_color = long1hTrendOk ? acceptanceColor : short1hTrendOk ? rejectionColor : color.gray)
-
-            string dbrCusumLabel = trend == 1 ? "BULL" : trend == -1 ? "BEAR" : "NONE"
-            table.cell(architectureTable, 0, 14, "DBR CUSUM Trend", text_color = color.white)
-            table.cell(architectureTable, 1, 14, dbrCusumLabel + " (" + str.tostring(barsInRegime) + "b)", text_color = trend == 1 ? acceptanceColor : trend == -1 ? rejectionColor : color.gray)
-
-            table.cell(architectureTable, 0, 15, "DBR Retest State", text_color = color.white)
-            table.cell(architectureTable, 1, 15, retestState, text_color = retestState == "TRIGGERED" ? color.white : color.gray)
-
-            table.cell(architectureTable, 0, 16, "DBR CP Cooldown", text_color = color.white)
-            table.cell(architectureTable, 1, 16, dbrCooldownOk ? "READY" : dbrCooldownReason, text_color = dbrCooldownOk ? acceptanceColor : color.orange)
-
-            table.cell(architectureTable, 0, 17, "Engine Trades (O/C)", text_color = color.white)
-            table.cell(architectureTable, 1, 17, "Anchor " + str.tostring(anchorOpenCount) + "/" + str.tostring(anchorClosedCount) + "  DBR " + str.tostring(dbrOpenCount) + "/" + str.tostring(dbrClosedCount), text_color = color.white)
-
-            table.cell(architectureTable, 0, 18, "DBR Funnel (Ev/Ret/Trig)", text_color = color.white)
-            table.cell(architectureTable, 1, 18, str.tostring(cEvents) + " / " + str.tostring(cRetested) + " / " + str.tostring(cTriggered), text_color = color.gray)
-
         dashboardSizeValue = f_dashboardSize(dashboardTextSize)
 
-        for dashboardRow = 0 to 18
+        for dashboardRow = 0 to 9
             for dashboardCol = 0 to 4
                 table.cell_set_text_size(architectureTable, dashboardCol, dashboardRow, dashboardSizeValue)
 
