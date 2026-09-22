@@ -1353,8 +1353,8 @@ if barstate.islast
 plotshape(showEntryMarkersInput and actualLongSignal, title = "Long Setup", style = shape.triangleup, location = location.belowbar, size = size.small, color = longColorInput, text = "LONG", textcolor = color.white)
 plotshape(showEntryMarkersInput and actualShortSignal, title = "Short Setup", style = shape.triangledown, location = location.abovebar, size = size.small, color = shortColorInput, text = "SHORT", textcolor = color.white)
 
-alertcondition(actualLongSignal, title = "Trading Coach: Long Setup", message = "Trading Coach LONG setup -- {{ticker}} {{interval}} @ {{close}}")
-alertcondition(actualShortSignal, title = "Trading Coach: Short Setup", message = "Trading Coach SHORT setup -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(actualLongSignal, title = "Trading Coach: Long Setup (Bullish)", message = "BULLISH | Trading Coach LONG setup -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(actualShortSignal, title = "Trading Coach: Short Setup (Bearish)", message = "BEARISH | Trading Coach SHORT setup -- {{ticker}} {{interval}} @ {{close}}")
 
 // -- "Go Long / Go Short" trigger labels --
 // Same idea as Advanced_Session_Profile_Predictor_SR_OR.pine's SHORT/LONG

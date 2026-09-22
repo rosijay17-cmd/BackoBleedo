@@ -1020,11 +1020,11 @@ if showDashboardInput and barstate.islast
 alertcondition(
      longSignal,
      "Long Trend Entry",
-     "Trend Following Strategy: LONG breakout"
+     "Trend Following Strategy: BULLISH (LONG) breakout -- {{ticker}} {{interval}} @ {{close}}"
      )
 
 alertcondition(
      shortSignal,
      "Short Trend Entry",
-     "Trend Following Strategy: SHORT breakout"
+     "Trend Following Strategy: BEARISH (SHORT) breakout -- {{ticker}} {{interval}} @ {{close}}"
      )
