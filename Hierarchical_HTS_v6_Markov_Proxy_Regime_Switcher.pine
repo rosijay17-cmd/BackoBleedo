@@ -1,0 +1,243 @@
+//@version=6
+strategy("Hierarchical HTS v6 (Markov-Proxy Regime Switcher)", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// ==========================================
+// --- INPUTS ---
+// ==========================================
+// 1. Layer 1: Markov-Proxy Regime Switcher Inputs
+adxLength      = input.int(14, title="ADX Length", group="Layer 1: Regime Switcher")
+adxThreshold   = input.int(25, title="ADX Trend Threshold", group="Layer 1: Regime Switcher")
+bbSqueezeLen   = input.int(20, title="Squeeze BB Length", group="Layer 1: Regime Switcher")
+bbSqueezeMult  = input.float(2.0, title="Squeeze BB Multiplier", group="Layer 1: Regime Switcher")
+kcSqueezeMult  = input.float(1.5, title="Squeeze Keltner Multiplier", group="Layer 1: Regime Switcher")
+cooldownBars   = input.int(5, title="Cooldown Bars", minval=0, group="Execution Settings")
+
+// 2. Sub-Strategy A: Mean Reversion Inputs (Active in Ranging Regime)
+bbLength       = input.int(20, title="BB Length", group="Sub-Strategy A: Mean Reversion")
+baseMult       = input.float(2.5, title="Base BB Multiplier", group="Sub-Strategy A: Mean Reversion")
+asymOffset     = input.float(0.5, title="Asymmetric Offset", group="Sub-Strategy A: Mean Reversion")
+emaLength      = input.int(200, title="Trend Filter EMA", group="Sub-Strategy A: Mean Reversion")
+
+// 3. Sub-Strategy B: Trend Following Inputs (Active in Trending Regime)
+dcLength       = input.int(20, title="Donchian Breakout Length", group="Sub-Strategy B: Trend Following")
+dcExitLength   = input.int(10, title="Donchian Exit Length", group="Sub-Strategy B: Trend Following")
+
+// 4. Fakeout Breakout Filters (Applied to Sub-Strategy B)
+useVolumeFilter = input.bool(true, title="Enable Volume Confirmation?", group="Sub-Strategy B: Breakout Filters")
+volLength       = input.int(20, title="Volume Average Length", group="Sub-Strategy B: Breakout Filters")
+volMultiplier   = input.float(1.5, title="Volume Multiplier (x SMA)", group="Sub-Strategy B: Breakout Filters")
+
+useAtrFilter    = input.bool(true, title="Enable Range (ATR) Confirmation?", group="Sub-Strategy B: Breakout Filters")
+atrLength       = input.int(14, title="ATR Length", group="Sub-Strategy B: Breakout Filters")
+atrMultiplier   = input.float(1.0, title="Range Multiplier (x ATR)", group="Sub-Strategy B: Breakout Filters")
+
+useWickFilter   = input.bool(true, title="Enable Rejection Wick Filter?", group="Sub-Strategy B: Breakout Filters")
+maxWickPct      = input.float(35.0, title="Max Rejection Wick %", group="Sub-Strategy B: Breakout Filters")
+
+useAtrPenetration  = input.bool(true, title="Enable ATR Penetration Filter?", group="Sub-Strategy B: Breakout Filters")
+atrPenetrationMult = input.float(0.5, title="Min ATR Penetration Multiplier", group="Sub-Strategy B: Breakout Filters")
+
+// ==========================================
+// --- LAYER 1: REGIME SWITCHER ENGINE ---
+// ==========================================
+// A. Volatility Compression Calculation (Squeeze Detection)
+basisSqueeze = ta.sma(close, bbSqueezeLen)
+devSqueeze   = bbSqueezeMult * ta.stdev(close, bbSqueezeLen)
+upperBB      = basisSqueeze + devSqueeze
+lowerBB      = basisSqueeze - devSqueeze
+
+atrValSqueeze = ta.atr(bbSqueezeLen)
+upperKC       = basisSqueeze + (atrValSqueeze * kcSqueezeMult)
+lowerKC       = basisSqueeze - (atrValSqueeze * kcSqueezeMult)
+
+// A squeeze occurs when Bollinger Bands compress inside the Keltner Channels
+bool isSqueezed = (upperBB < upperKC) and (lowerBB > lowerKC)
+
+// B. Trend Momentum Calculation (ADX)
+[diPlus, diMinus, adxValue] = ta.dmi(adxLength, adxLength)
+
+// C. Dynamic Regime Assignment
+// State 0 = Squeeze (Imminent breakout, lock out all entries)
+// State 1 = Trending (High volatility breakout, run Sub-Strategy B)
+// State 2 = Ranging (Sideways market waves, run Sub-Strategy A)
+int regimeState = 2
+if isSqueezed
+    regimeState := 0
+else if adxValue >= adxThreshold
+    regimeState := 1
+else
+    regimeState := 2
+
+// D. Routing Variables
+bool isSqueezeState = regimeState == 0
+bool isTrendState   = regimeState == 1
+bool isRangeState   = regimeState == 2
+
+// Highlight chart background based on active regime: Yellow (Squeeze), Teal (Trending), Orange (Ranging)
+color bgRegimeColor = isSqueezeState ? color.new(color.yellow, 98) :
+                      isTrendState   ? color.new(color.teal, 98)   :
+                      color.new(color.orange, 98)
+bgcolor(bgRegimeColor, title="Active Regime Background")
+
+// ==========================================
+// --- SUB-STRATEGY CALCULATIONS ---
+// ==========================================
+// Sub-Strategy A: Asymmetric Bollinger Bands
+basisMR     = ta.sma(close, bbLength)
+stdDevValMR = ta.stdev(close, bbLength)
+trendEma    = ta.ema(close, emaLength)
+bool isUptrend = close > trendEma
+
+float longMult  = isUptrend ? (baseMult - asymOffset) : (baseMult + asymOffset)
+float shortMult = isUptrend ? (baseMult + asymOffset) : (baseMult - asymOffset)
+
+upperBB_MR = basisMR + (shortMult * stdDevValMR)
+lowerBB_MR = basisMR - (longMult * stdDevValMR)
+
+// Sub-Strategy B: Donchian Channels
+dcUpper = ta.highest(high, dcLength)[1]
+dcLower = ta.lowest(low, dcLength)[1]
+dcExitUpper = ta.highest(high, dcExitLength)[1]
+dcExitLower = ta.lowest(low, dcExitLength)[1]
+
+// ==========================================
+// --- SUB-STRATEGY B FAKEOUT FILTERS ---
+// ==========================================
+// 1. Volume Confirmation
+volMa = ta.sma(volume, volLength)
+bool isVolumeConfirmed = not useVolumeFilter or (volume > (volMa * volMultiplier))
+
+// 2. Range Confirmation
+atrVal = ta.atr(atrLength)
+candleRange = high - low
+bool isRangeConfirmed = not useAtrFilter or (candleRange > (atrVal * atrMultiplier))
+
+// 3. Rejection Wick Filter
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+bool longWickOK  = not useWickFilter or (candleRange > 0 ? (upperWick / candleRange) * 100 <= maxWickPct : true)
+bool shortWickOK = not useWickFilter or (candleRange > 0 ? (lowerWick / candleRange) * 100 <= maxWickPct : true)
+
+// 4. ATR Penetration Filter
+bool longAtrPenetration  = not useAtrPenetration or ((close - dcUpper) >= (atrVal * atrPenetrationMult))
+bool shortAtrPenetration = not useAtrPenetration or ((dcLower - close) >= (atrVal * atrPenetrationMult))
+
+// Combined validated breakout pipelines
+bool isLongBreakoutValid  = isVolumeConfirmed and isRangeConfirmed and longWickOK and longAtrPenetration
+bool isShortBreakoutValid = isVolumeConfirmed and isRangeConfirmed and shortWickOK and shortAtrPenetration
+
+// ==========================================
+// --- SIGNALS & COOLDOWN ---
+// ==========================================
+var int lastSignalBar = -99999
+bool isCooldownOver   = (bar_index - lastSignalBar) >= cooldownBars
+
+// Raw Strategy Signals
+bool rawMrLong  = ta.crossover(close, lowerBB_MR)
+bool rawMrShort = ta.crossunder(close, upperBB_MR)
+
+bool rawTfLong  = ta.crossover(close, dcUpper)
+bool rawTfShort = ta.crossunder(close, dcLower)
+
+// Final Conditions filtered strictly by the Markov-Proxy Active State
+// During Squeeze State (0), both entry conditions evaluate to false (sidelined)
+bool mrLongCondition  = isRangeState and rawMrLong and isCooldownOver
+bool mrShortCondition = isRangeState and rawMrShort and isCooldownOver
+
+bool tfLongCondition  = isTrendState and rawTfLong and isCooldownOver and isLongBreakoutValid
+bool tfShortCondition = isTrendState and rawTfShort and isCooldownOver and isShortBreakoutValid
+
+// Update Cooldown Tracker on any executed signal
+if mrLongCondition or mrShortCondition or tfLongCondition or tfShortCondition
+    lastSignalBar := bar_index
+
+// ==========================================
+// --- EXECUTION ENGINE ---
+// ==========================================
+// 1. Mean Reversion Execution (MR)
+if mrLongCondition
+    strategy.entry("MR Long", strategy.long, comment="MR Buy")
+
+if mrShortCondition
+    strategy.entry("MR Short", strategy.short, comment="MR Short")
+
+// 2. Trend Following Execution (TF)
+if tfLongCondition
+    strategy.entry("TF Long", strategy.long, comment="TF Breakout Buy")
+
+if tfShortCondition
+    strategy.entry("TF Short", strategy.short, comment="TF Breakout Short")
+
+// ==========================================
+// --- EXIT ENGINE ---
+// ==========================================
+// MR Exits (Reversion to Mean)
+if isRangeState
+    if ta.crossover(close, basisMR) and (strategy.position_size < 0)
+        strategy.close("MR Short", comment="MR Short Cover")
+    if ta.crossunder(close, basisMR) and (strategy.position_size > 0)
+        strategy.close("MR Long", comment="MR Long Sell")
+
+// TF Exits (Trailing Highs/Lows)
+if isTrendState
+    if ta.crossunder(close, dcExitLower) and (strategy.position_size > 0)
+        strategy.close("TF Long", comment="TF Trail Exit")
+    if ta.crossover(close, dcExitUpper) and (strategy.position_size < 0)
+        strategy.close("TF Short", comment="TF Trail Exit")
+
+// ==========================================
+// --- VISUALIZATIONS & HUD ---
+// ==========================================
+plot(basisMR, color=color.new(color.blue, 50), title="BB Basis (Mean)")
+plot(trendEma, color=color.orange, linewidth=2, title="Trend Filter EMA")
+
+plotshape(mrLongCondition, title="MR Long Signal", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, text="MR")
+plotshape(mrShortCondition, title="MR Short Signal", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="MR")
+
+plotshape(tfLongCondition, title="TF Long Signal", style=shape.triangleup, location=location.belowbar, color=color.teal, size=size.small, text="TF Breakout")
+plotshape(tfShortCondition, title="TF Short Signal", style=shape.triangledown, location=location.abovebar, color=color.maroon, size=size.small, text="TF Breakout")
+
+// Real-Time HUD Dashboard
+var table hud = table.new(position.top_right, 2, 3, bgcolor=color.new(color.black, 30), border_width=1)
+if barstate.islast
+    table.clear(hud, 0, 0, 1, 2)
+    string activeStateText = isSqueezeState ? "SQUEEZE (SIDELINED)" :
+                             isTrendState   ? "TRENDING (TF ACTIVE)"  :
+                             "RANGING (MR ACTIVE)"
+    color activeStateColor = isSqueezeState ? color.yellow :
+                             isTrendState   ? color.teal   :
+                             color.orange
+
+    // Cell 0: Regime State
+    table.cell(hud, 0, 0, "HTS REGIME:", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 0, activeStateText, bgcolor=activeStateColor, text_color=color.white, text_size=size.small)
+
+    // Cell 1: ADX Value
+    table.cell(hud, 0, 1, "ADX POWER:", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 1, str.tostring(adxValue, "#.#"), text_color=color.white, text_size=size.small)
+
+    // Cell 2: Volatility compression
+    table.cell(hud, 0, 2, "VOL COMPRESSION:", text_color=color.white, text_size=size.small)
+    table.cell(hud, 1, 2, isSqueezed ? "COILING" : "EXPANDED", bgcolor=isSqueezed ? color.new(color.yellow, 20) : color.new(color.green, 20), text_color=color.white, text_size=size.small)
+
+// ==========================================
+// --- ALERTS ---
+// ==========================================
+// Added when this script was brought into the repo -- the original pasted
+// version had NO alertcondition()/alert() calls at all, which was the real
+// bug behind "my alerts aren't working" (the only alert option available
+// without these is TradingView's coarse built-in "Order fills", which
+// can't distinguish MR from TF or long from short). Each of the four raw
+// entry conditions gets its own named, explicitly bullish/bearish alert.
+//
+// NOTE: adding these does not by itself fix "alerts stopped after
+// switching to the December contract" -- that symptom is TradingView
+// binding an alert to the exact symbol it was created on, which no Pine
+// code change can fix. Any alert made against this script still needs to
+// be (re)created on the contract you're actually charting, or you trade/
+// alert off the continuous contract (e.g. NQ1!/MNQ1!) to avoid repeating
+// this every roll period.
+alertcondition(mrLongCondition, title="MR Long Signal (Bullish)", message="BULLISH | Mean Reversion LONG entry -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(mrShortCondition, title="MR Short Signal (Bearish)", message="BEARISH | Mean Reversion SHORT entry -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(tfLongCondition, title="TF Long Breakout (Bullish)", message="BULLISH | Trend Breakout LONG entry -- {{ticker}} {{interval}} @ {{close}}")
+alertcondition(tfShortCondition, title="TF Short Breakout (Bearish)", message="BEARISH | Trend Breakout SHORT entry -- {{ticker}} {{interval}} @ {{close}}")
