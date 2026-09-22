@@ -93,6 +93,15 @@ strategy(
 
 
 //=============================================================================
+// 00 — Master Visibility
+//=============================================================================
+
+string G_MASTER = "00 — Master Visibility"
+
+bool showAllChartObjectsInput = input.bool(true, "Show All Chart Objects", tooltip = "Master switch for everything this script draws ON THE CHART PANE -- plots, labels, lines, boxes, setup/entry markers, bar coloring, the DeltaFlow histogram, and the Architecture dashboard table. Uncheck to hide all of it at once instead of unticking every individual 'Show ...' toggle below. Does NOT affect the diagnostic plots under Data Window at the bottom of this script -- those never draw on the chart itself.", group = G_MASTER)
+
+
+//=============================================================================
 // 01 — Structural Profile (Anchor / P0 Delta engine)
 //=============================================================================
 
@@ -832,7 +841,7 @@ bool anchorTrendChange = anchorTrend != anchorTrend[1]
 bool anchorLongRaw = anchorTrendChange and anchorTrend == 1
 bool anchorShortRaw = anchorTrendChange and anchorTrend == -1
 
-plot(anchorTs4, title = "Anchor Band", color = anchorTrend == 1 ? color.new(color.lime, 0) : color.new(color.red, 0), linewidth = 2, style = plot.style_linebr)
+plot(anchorTs4, title = "Anchor Band", color = showAllChartObjectsInput ? (anchorTrend == 1 ? color.new(color.lime, 0) : color.new(color.red, 0)) : na, linewidth = 2, style = plot.style_linebr)
 
 
 //=============================================================================
@@ -922,7 +931,7 @@ if longSignal
 
     strategy.entry(id = "Anchor Long", direction = strategy.long, qty = contracts, comment = "ANCHOR LONG", alert_message = message)
 
-    if showCooldownGapLabelsInput
+    if showAllChartObjectsInput and showCooldownGapLabelsInput
         int barsSinceLastLongExit = bar_index - lastLongExitBar
         label.new(bar_index, high, "Δ" + str.tostring(barsSinceLastLongExit), style = label.style_label_down, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
 
@@ -944,7 +953,7 @@ if shortSignal
 
     strategy.entry(id = "Anchor Short", direction = strategy.short, qty = contracts, comment = "ANCHOR SHORT", alert_message = message)
 
-    if showCooldownGapLabelsInput
+    if showAllChartObjectsInput and showCooldownGapLabelsInput
         int barsSinceLastShortExit = bar_index - lastShortExitBar
         label.new(bar_index, low, "Δ" + str.tostring(barsSinceLastShortExit), style = label.style_label_up, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
 
@@ -1021,7 +1030,7 @@ while anchorProcessedClosedTrades < strategy.closedtrades
         if array.size(exitLog) > 4
             array.pop(exitLog)
 
-        if showCooldownGapLabelsInput
+        if showAllChartObjectsInput and showCooldownGapLabelsInput
             label.new(bar_index, thisLongClosed ? low : high, "EXIT id='" + thisClosedId + "'", style = thisLongClosed ? label.style_label_down : label.style_label_up, color = color.new(color.red, 60), textcolor = color.white, size = size.tiny)
 
         if enableDynamicAlerts and alertExits
@@ -1042,20 +1051,20 @@ while anchorProcessedClosedTrades < strategy.closedtrades
 // DYNAMIC P0 / VA DISPLAY
 //=============================================================================
 
-dynamicP0Plot = plot(showDynamicP0 ? dynamicP0 : na, title = "Dynamic P0", color = dynamicP0Color, linewidth = dynamicP0Width)
+dynamicP0Plot = plot(showAllChartObjectsInput and showDynamicP0 ? dynamicP0 : na, title = "Dynamic P0", color = dynamicP0Color, linewidth = dynamicP0Width)
 
 var label dynamicP0Label = na
-if showDynamicP0 and showDynamicP0LabelInput
+if showAllChartObjectsInput and showDynamicP0 and showDynamicP0LabelInput
     if na(dynamicP0Label)
         dynamicP0Label := label.new(bar_index, dynamicP0, "P0 " + f_price(dynamicP0), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(dynamicP0Color, 0), textcolor = color.black, size = size.small)
     else
         label.set_xy(dynamicP0Label, bar_index, dynamicP0)
         label.set_text(dynamicP0Label, "P0 " + f_price(dynamicP0))
 
-dynamicVAHPlot = plot(showDynamicValueArea ? dynamicVAH : na, title = "Dynamic VAH", color = color.new(dynamicValueAreaColor, 25), linewidth = 1)
-dynamicVALPlot = plot(showDynamicValueArea ? dynamicVAL : na, title = "Dynamic VAL", color = color.new(dynamicValueAreaColor, 25), linewidth = 1)
+dynamicVAHPlot = plot(showAllChartObjectsInput and showDynamicValueArea ? dynamicVAH : na, title = "Dynamic VAH", color = color.new(dynamicValueAreaColor, 25), linewidth = 1)
+dynamicVALPlot = plot(showAllChartObjectsInput and showDynamicValueArea ? dynamicVAL : na, title = "Dynamic VAL", color = color.new(dynamicValueAreaColor, 25), linewidth = 1)
 
-fill(dynamicVAHPlot, dynamicVALPlot, color = showDynamicValueArea ? color.new(dynamicValueAreaColor, 93) : na, title = "Dynamic Value Area")
+fill(dynamicVAHPlot, dynamicVALPlot, color = showAllChartObjectsInput and showDynamicValueArea ? color.new(dynamicValueAreaColor, 93) : na, title = "Dynamic Value Area")
 
 
 //=============================================================================
@@ -1065,13 +1074,13 @@ fill(dynamicVAHPlot, dynamicVALPlot, color = showDynamicValueArea ? color.new(dy
 bool actualLongEntry = longSignal
 bool actualShortEntry = shortSignal
 
-barcolor(showEntryBarColorInput and actualLongEntry ? entryLongBarColor : showEntryBarColorInput and actualShortEntry ? entryShortBarColor : na, title = "Anchor Entry Bar Highlight")
+barcolor(showAllChartObjectsInput and showEntryBarColorInput and actualLongEntry ? entryLongBarColor : showAllChartObjectsInput and showEntryBarColorInput and actualShortEntry ? entryShortBarColor : na, title = "Anchor Entry Bar Highlight")
 
-plotchar(showSetupMarkers and longSetupArmed and not actualLongEntry, title = "Bull Setup Armed", char = "△", location = location.belowbar, size = size.small, color = color.aqua)
-plotchar(showSetupMarkers and shortSetupArmed and not actualShortEntry, title = "Bear Setup Armed", char = "▽", location = location.abovebar, size = size.small, color = color.orange)
+plotchar(showAllChartObjectsInput and showSetupMarkers and longSetupArmed and not actualLongEntry, title = "Bull Setup Armed", char = "△", location = location.belowbar, size = size.small, color = color.aqua)
+plotchar(showAllChartObjectsInput and showSetupMarkers and shortSetupArmed and not actualShortEntry, title = "Bear Setup Armed", char = "▽", location = location.abovebar, size = size.small, color = color.orange)
 
-bool showLongEntryMarker = showEntryMarkers and actualLongEntry
-bool showShortEntryMarker = showEntryMarkers and actualShortEntry
+bool showLongEntryMarker = showAllChartObjectsInput and showEntryMarkers and actualLongEntry
+bool showShortEntryMarker = showAllChartObjectsInput and showEntryMarkers and actualShortEntry
 
 plotshape(showLongEntryMarker and entryMarkerSizeInput == "Tiny", title = "Bull Actual Entry (Tiny)", style = shape.triangleup, location = location.belowbar, size = size.tiny, color = entryLongColor)
 plotshape(showLongEntryMarker and entryMarkerSizeInput == "Small", title = "Bull Actual Entry (Small)", style = shape.triangleup, location = location.belowbar, size = size.small, color = entryLongColor)
@@ -1316,21 +1325,21 @@ if barstate.islast
         int profileStartTime = array.get(storedTime, 0)
         int futureTime = time_close + int(timeframeSeconds * 1000.0 * 40)
 
-        if showStructuralPOC
+        if showAllChartObjectsInput and showStructuralPOC
             line pocLine = line.new(profileStartTime, structuralPOC, futureTime, structuralPOC, xloc = xloc.bar_time, color = structuralPOCColor, width = 2)
             array.push(structuralLines, pocLine)
 
-        if showStructuralValueArea
+        if showAllChartObjectsInput and showStructuralValueArea
             array.push(structuralLines, line.new(profileStartTime, structuralVAH, futureTime, structuralVAH, xloc = xloc.bar_time, color = structuralValueAreaColor))
             array.push(structuralLines, line.new(profileStartTime, structuralVAL, futureTime, structuralVAL, xloc = xloc.bar_time, color = structuralValueAreaColor))
 
-        if showSupportResistance and not na(structuralSupport)
+        if showAllChartObjectsInput and showSupportResistance and not na(structuralSupport)
             array.push(structuralLines, line.new(profileStartTime, structuralSupport, futureTime, structuralSupport, xloc = xloc.bar_time, color = supportColor, width = 3))
 
-        if showSupportResistance and not na(structuralResistance)
+        if showAllChartObjectsInput and showSupportResistance and not na(structuralResistance)
             array.push(structuralLines, line.new(profileStartTime, structuralResistance, futureTime, structuralResistance, xloc = xloc.bar_time, color = resistanceColor, width = 3))
 
-        if showLiquidityZones
+        if showAllChartObjectsInput and showLiquidityZones
 
             array<bool> usedNodes = array.new_bool(structuralRows, false)
 
@@ -1831,7 +1840,7 @@ if barstate.islast
     if not na(activeZoneBox)
         box.delete(activeZoneBox)
 
-    if retestState == "WATCHING" or retestState == "RETESTED"
+    if showAllChartObjectsInput and (retestState == "WATCHING" or retestState == "RETESTED")
         color zoneColor = (activeDirection == 1 ? retestLongColorInput : retestShortColorInput)
 
         activeZoneBox := box.new(left = bar_index - 40, top = activeZoneHigh, right = bar_index + 5, bottom = activeZoneLow, xloc = xloc.bar_index, bgcolor = color.new(zoneColor, 87), border_color = zoneColor)
@@ -1844,34 +1853,34 @@ if barstate.islast
 color trendColor = trend == 1 ? longEntryColorInput : (trend == -1 ? shortEntryColorInput : color.gray)
 bool isLevelChange = regimePrice != regimePrice[1]
 
-pRegime = plot(regimePrice, "Regime Price", color = showChangePointVisualInput and not isLevelChange ? trendColor : na, style = plot.style_linebr, linewidth = 2)
+pRegime = plot(regimePrice, "Regime Price", color = showAllChartObjectsInput and showChangePointVisualInput and not isLevelChange ? trendColor : na, style = plot.style_linebr, linewidth = 2)
 
 float priceVol = ta.stdev(src, lengthInput)
 float cusumLevelPos = regimePrice + sPos * priceVol
 float cusumLevelNeg = regimePrice + sNeg * priceVol
 
-pCusumPos = plot(cusumLevelPos, "Bullish Pressure", color = showChangePointVisualInput and not isLevelChange ? color.new(longEntryColorInput, 80) : na, style = plot.style_linebr)
-pCusumNeg = plot(cusumLevelNeg, "Bearish Pressure", color = showChangePointVisualInput and not isLevelChange ? color.new(shortEntryColorInput, 80) : na, style = plot.style_linebr)
+pCusumPos = plot(cusumLevelPos, "Bullish Pressure", color = showAllChartObjectsInput and showChangePointVisualInput and not isLevelChange ? color.new(longEntryColorInput, 80) : na, style = plot.style_linebr)
+pCusumNeg = plot(cusumLevelNeg, "Bearish Pressure", color = showAllChartObjectsInput and showChangePointVisualInput and not isLevelChange ? color.new(shortEntryColorInput, 80) : na, style = plot.style_linebr)
 
-fill(pRegime, pCusumPos, color.new(longEntryColorInput, 90), "Bullish CUSUM Fill")
-fill(pRegime, pCusumNeg, color.new(shortEntryColorInput, 90), "Bearish CUSUM Fill")
+fill(pRegime, pCusumPos, color = showAllChartObjectsInput and showChangePointVisualInput ? color.new(longEntryColorInput, 90) : na, title = "Bullish CUSUM Fill")
+fill(pRegime, pCusumNeg, color = showAllChartObjectsInput and showChangePointVisualInput ? color.new(shortEntryColorInput, 90) : na, title = "Bearish CUSUM Fill")
 
-plotshape(showChangePointVisualInput and changeUp, title = "Change Up", style = shape.triangleup, location = location.belowbar, color = longEntryColorInput, size = size.tiny)
-plotshape(showChangePointVisualInput and changeDn, title = "Change Down", style = shape.triangledown, location = location.abovebar, color = shortEntryColorInput, size = size.tiny)
+plotshape(showAllChartObjectsInput and showChangePointVisualInput and changeUp, title = "Change Up", style = shape.triangleup, location = location.belowbar, color = longEntryColorInput, size = size.tiny)
+plotshape(showAllChartObjectsInput and showChangePointVisualInput and changeDn, title = "Change Down", style = shape.triangledown, location = location.abovebar, color = shortEntryColorInput, size = size.tiny)
 
 
 //=============================================================================
 // DBR QUALIFIED RETEST TRIGGER + TOUCH + ENTRY MARKERS
 //=============================================================================
 
-plotshape(showQualifiedTriggerInput and triggerUpNow, title = "Qualified Long Retest Trigger", style = shape.diamond, location = location.belowbar, size = size.small, color = longTriggerColorInput, text = "T", textcolor = color.white)
-plotshape(showQualifiedTriggerInput and triggerDownNow, title = "Qualified Short Retest Trigger", style = shape.diamond, location = location.abovebar, size = size.small, color = shortTriggerColorInput, text = "T", textcolor = color.white)
+plotshape(showAllChartObjectsInput and showQualifiedTriggerInput and triggerUpNow, title = "Qualified Long Retest Trigger", style = shape.diamond, location = location.belowbar, size = size.small, color = longTriggerColorInput, text = "T", textcolor = color.white)
+plotshape(showAllChartObjectsInput and showQualifiedTriggerInput and triggerDownNow, title = "Qualified Short Retest Trigger", style = shape.diamond, location = location.abovebar, size = size.small, color = shortTriggerColorInput, text = "T", textcolor = color.white)
 
-plotshape(showRetestTouchMarkerInput and retestLongTouchNow, title = "Long Retest Touch", style = shape.circle, location = location.belowbar, size = size.tiny, color = retestLongColorInput)
-plotshape(showRetestTouchMarkerInput and retestShortTouchNow, title = "Short Retest Touch", style = shape.circle, location = location.abovebar, size = size.tiny, color = retestShortColorInput)
+plotshape(showAllChartObjectsInput and showRetestTouchMarkerInput and retestLongTouchNow, title = "Long Retest Touch", style = shape.circle, location = location.belowbar, size = size.tiny, color = retestLongColorInput)
+plotshape(showAllChartObjectsInput and showRetestTouchMarkerInput and retestShortTouchNow, title = "Short Retest Touch", style = shape.circle, location = location.abovebar, size = size.tiny, color = retestShortColorInput)
 
-bool showLongEntry = showEntrySignalInput and actualLongEntrySignal
-bool showShortEntry = showEntrySignalInput and actualShortEntrySignal
+bool showLongEntry = showAllChartObjectsInput and showEntrySignalInput and actualLongEntrySignal
+bool showShortEntry = showAllChartObjectsInput and showEntrySignalInput and actualShortEntrySignal
 
 plotshape(showLongEntry and entrySignalSizeInput == "Tiny", title = "CP Long Entry Tiny", style = shape.triangleup, location = location.belowbar, size = size.tiny, color = longEntryColorInput, text = "LONG", textcolor = color.white)
 plotshape(showLongEntry and entrySignalSizeInput == "Small", title = "CP Long Entry Small", style = shape.triangleup, location = location.belowbar, size = size.small, color = longEntryColorInput, text = "LONG", textcolor = color.white)
@@ -1885,14 +1894,14 @@ plotshape(showShortEntry and entrySignalSizeInput == "Normal", title = "CP Short
 plotshape(showShortEntry and entrySignalSizeInput == "Large", title = "CP Short Entry Large", style = shape.triangledown, location = location.abovebar, size = size.large, color = shortEntryColorInput, text = "SHORT", textcolor = color.white)
 plotshape(showShortEntry and entrySignalSizeInput == "Huge", title = "CP Short Entry Huge", style = shape.triangledown, location = location.abovebar, size = size.huge, color = shortEntryColorInput, text = "SHORT", textcolor = color.white)
 
-barcolor(highlightEntryBarInput and actualLongEntrySignal ? color.new(longEntryColorInput, 35) : highlightEntryBarInput and actualShortEntrySignal ? color.new(shortEntryColorInput, 35) : na, title = "CP Entry Bar Highlight")
+barcolor(showAllChartObjectsInput and highlightEntryBarInput and actualLongEntrySignal ? color.new(longEntryColorInput, 35) : showAllChartObjectsInput and highlightEntryBarInput and actualShortEntrySignal ? color.new(shortEntryColorInput, 35) : na, title = "CP Entry Bar Highlight")
 
 
 //=============================================================================
 // DELTAFLOW VOLUME PROFILE [BIGBELUGA] — THE ONE HISTOGRAM IN THIS FILE
 //=============================================================================
 
-if barstate.islast
+if barstate.islast and showAllChartObjectsInput
     if boxes.size() > 0
         for b in boxes
             b.delete()
@@ -1979,7 +1988,7 @@ var table architectureTable = table.new(architectureTablePosition, 5, 19, bgcolo
 
 if barstate.islast
 
-    if showArchitectureHistogram
+    if showAllChartObjectsInput and showArchitectureHistogram
 
         int readCol = showLiveColumnInput ? 4 : 3
 
