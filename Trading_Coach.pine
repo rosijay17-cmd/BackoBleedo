@@ -472,11 +472,21 @@ bool tdiConfirmsShort = tdiBearishMove and momentumFalling
 string G_VOLUME = "04 - Volume Pressure"
 
 executionDeltaWindowInput = input.int(3, "Execution Pressure Window", minval = 1, maxval = 8, group = G_VOLUME)
-executionLtfInput = input.timeframe("5", "Lower Timeframe For Volume", group = G_VOLUME)
+executionLtfInput = input.timeframe("5", "Lower Timeframe For Volume", tooltip = "Must be a timeframe at or below the chart's own timeframe -- request.security_lower_tf() (which ta.requestUpAndDownVolume() uses internally) errors out otherwise (RE10066). On a chart faster than this setting (e.g. a 1m or 2m chart with this left at the default 5), this script automatically falls back to the chart's own timeframe instead of crashing -- see effectiveExecutionLtf below.", group = G_VOLUME)
 requireVolumePressureInput = input.bool(false, "Require Volume Pressure Agreement", group = G_VOLUME)
 minimumVolumePressureInput = input.float(5.0, "Minimum Volume Pressure %", minval = 0.0, maxval = 60.0, step = 1.0, group = G_VOLUME)
 
-[executionUpVolume, executionDownVolume, executionDeltaVolume] = ta.requestUpAndDownVolume(executionLtfInput)
+// RE10066 GUARD: request.security_lower_tf() requires the requested
+// timeframe to be <= the chart's own timeframe. executionLtfInput defaults
+// to "5" (5 minutes), which is fine on a 5m+ chart but throws RE10066 on
+// anything faster (1m, 2m, 3m). Falling back to the chart's own timeframe.period
+// whenever the input would exceed it keeps this always valid (chart TF vs
+// itself trivially satisfies the >= constraint) -- it just means the
+// up/down volume split is computed at chart-bar granularity instead of a
+// finer sub-bar on very fast charts, rather than crashing outright.
+string effectiveExecutionLtf = timeframe.in_seconds(executionLtfInput) > timeframe.in_seconds(timeframe.period) ? timeframe.period : executionLtfInput
+
+[executionUpVolume, executionDownVolume, executionDeltaVolume] = ta.requestUpAndDownVolume(effectiveExecutionLtf)
 
 float executionDeltaSum = 0.0
 float executionVolumeSum = 0.0
