@@ -584,14 +584,16 @@ if longSignal
     strategy.entry(
          id = "Long",
          direction = strategy.long,
-         comment = "Long Breakout"
+         comment = "Long Breakout",
+         alert_message = "BULL | LONG ENTRY | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
          )
 
     strategy.exit(
          id = "Long ATR Exit",
          from_entry = "Long",
          stop = longStop,
-         comment = "Long ATR Stop"
+         comment = "Long ATR Stop",
+         alert_message = "LONG EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
          )
 
 // =============================================================================
@@ -615,14 +617,16 @@ if shortSignal
     strategy.entry(
          id = "Short",
          direction = strategy.short,
-         comment = "Short Breakout"
+         comment = "Short Breakout",
+         alert_message = "BEAR | SHORT ENTRY | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
          )
 
     strategy.exit(
          id = "Short ATR Exit",
          from_entry = "Short",
          stop = shortStop,
-         comment = "Short ATR Stop"
+         comment = "Short ATR Stop",
+         alert_message = "SHORT EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
          )
 
 // =============================================================================
@@ -649,14 +653,16 @@ if strategy.position_size > 0
          id = "Long ATR Exit",
          from_entry = "Long",
          stop = longStop,
-         comment = "Long ATR Stop"
+         comment = "Long ATR Stop",
+         alert_message = "LONG EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
          )
 
     if not na(exitLow) and close < exitLow
 
         strategy.close(
              id = "Long",
-             comment = "Long Channel Exit"
+             comment = "Long Channel Exit",
+             alert_message = "LONG EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
              )
 
 // =============================================================================
@@ -683,14 +689,16 @@ if strategy.position_size < 0
          id = "Short ATR Exit",
          from_entry = "Short",
          stop = shortStop,
-         comment = "Short ATR Stop"
+         comment = "Short ATR Stop",
+         alert_message = "SHORT EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
          )
 
     if not na(exitHigh) and close > exitHigh
 
         strategy.close(
              id = "Short",
-             comment = "Short Channel Exit"
+             comment = "Short Channel Exit",
+             alert_message = "SHORT EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
              )
 
 // =============================================================================
@@ -1099,11 +1107,11 @@ if showDashboardInput and barstate.islast
 alertcondition(
      longSignal,
      "Long Trend Entry",
-     "Trend Following Strategy: BULLISH (LONG) breakout -- {{ticker}} {{interval}} @ {{close}}"
+     "BULL | LONG ENTRY | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
      )
 
 alertcondition(
      shortSignal,
      "Short Trend Entry",
-     "Trend Following Strategy: BEARISH (SHORT) breakout -- {{ticker}} {{interval}} @ {{close}}"
+     "BEAR | SHORT ENTRY | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
      )
