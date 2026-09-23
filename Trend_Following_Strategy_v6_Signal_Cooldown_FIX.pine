@@ -22,11 +22,41 @@
 // to the MNQ Regime strategy. If this is NOT being run on MNQ, or if 1
 // contract isn't the intended size, this is the number to adjust --
 // nothing else in the cooldown/session logic needs to change for that.
+//
+// MERGE (S/R Entry Engine, 100% parity with the original LuxAlgo "Support
+// and Resistance Levels with Breaks" indicator): that script's pivot
+// detection, volume oscillator, break/wick conditions, and its own two
+// alertcondition()s ("Support Broken"/"Resistance Broken") are ported here
+// with unchanged math -- only the legacy v2-style syntax (study(),
+// pivothigh(), ema(), crossunder(), crossover(), change(), fixnan() as
+// bare top-level calls) was converted to v6 (ta.pivothigh(), ta.ema(),
+// ta.crossunder(), ta.crossover(), ta.change(), fixnan() kept bare since
+// that one specific function never moved into the ta. namespace).
+//
+// Its breaks now drive a SECOND, fully independent strategy entry engine
+// (own "SR Long"/"SR Short" ids, own cooldown, own session trade counter,
+// own ATR stop, own in-trade flag) coexisting with the Donchian engine
+// above -- same independence pattern as the two engines in the earlier
+// P0 Delta + DBR Change-Point merge this session: neither engine's
+// cooldown/armed-state reads the other's, and each tracks whether IT has
+// an open trade via its own flag, not strategy.position_size (which is
+// now the NET account position shared by both engines). pyramiding raised
+// from 0 to 2 so one entry from each engine can be open at once. The same
+// platform limit applies as before: TradingView's strategy() broker only
+// ever tracks a single net position, so a same-direction signal from both
+// engines can coexist, but opposite-direction signals will net against
+// each other rather than truly hedge -- no Pine script can change that.
+//
+// The Donchian engine's OWN position management (previously gated on
+// strategy.position_size > 0 / < 0 / == 0) is also updated here to use
+// its own in-trade flag (tfActiveTradeType) for the same reason -- once a
+// second engine can hold its own position, the net account position can
+// no longer be trusted to mean "the Donchian engine's own trade is open."
 strategy(
-     title = "Trend Following Strategy v6 - Signal Cooldown FIX",
-     shorttitle = "TF v6 CD FIX",
+     title = "Trend Following Strategy v6 - Signal Cooldown FIX + S/R Entry",
+     shorttitle = "TF v6 CD + S/R",
      overlay = true,
-     pyramiding = 0,
+     pyramiding = 2,
      initial_capital = 10000,
      default_qty_type = strategy.fixed,
      default_qty_value = 1,
@@ -224,6 +254,100 @@ bool showDashboardInput = input.bool(
      true,
      "Show Dashboard",
      group = visualGroup
+     )
+
+// =============================================================================
+// 08 — S/R ENTRY (LUX PIVOT BREAKS)
+// =============================================================================
+
+string srGroup = "08 — S/R Entry (Lux Pivot Breaks)"
+
+bool srEnableInput = input.bool(
+     true,
+     "Enable S/R Entry Engine",
+     group = srGroup
+     )
+
+int srLeftBarsInput = input.int(
+     15,
+     "Left Bars",
+     minval = 1,
+     group = srGroup
+     )
+
+int srRightBarsInput = input.int(
+     15,
+     "Right Bars",
+     minval = 1,
+     group = srGroup
+     )
+
+int srVolumeThreshInput = input.int(
+     20,
+     "Volume Threshold",
+     group = srGroup
+     )
+
+string srDirectionInput = input.string(
+     "Both",
+     "S/R Trade Direction",
+     options = [
+         "Both",
+         "Long only",
+         "Short only"
+         ],
+     group = srGroup
+     )
+
+int srCooldownBarsInput = input.int(
+     5,
+     "S/R Cooldown Bars",
+     minval = 0,
+     maxval = 500,
+     tooltip = "Minimum number of chart bars between accepted S/R entry signals. Tracked independently from the Donchian engine's own cooldown above.",
+     group = srGroup
+     )
+
+int srMaxTradesPerSessionInput = input.int(
+     8,
+     "S/R Max Trades Per Session",
+     minval = 1,
+     tooltip = "Tracked independently from the Donchian engine's own session trade limit above -- shares the same Trading Session window (section 04), but counts only S/R entries.",
+     group = srGroup
+     )
+
+bool srShowBreaksInput = input.bool(
+     true,
+     "Show Break/Wick Shapes",
+     group = srGroup
+     )
+
+bool srShowLevelsInput = input.bool(
+     true,
+     "Show Support/Resistance Step-Lines",
+     group = srGroup
+     )
+
+// =============================================================================
+// 09 — S/R RISK
+// =============================================================================
+
+string srRiskGroup = "09 — S/R Risk"
+
+int srAtrLengthInput = input.int(
+     14,
+     "S/R ATR Length",
+     minval = 1,
+     group = srRiskGroup
+     )
+
+float srAtrMultiplierInput = input.float(
+     3.0,
+     "S/R ATR Stop Multiplier",
+     minval = 0.1,
+     step = 0.1,
+     tooltip = "The original LuxAlgo S/R indicator had no stop-loss mechanism of its own (it was a pure indicator, not a strategy) -- this ATR trailing stop, mirroring the Donchian engine's own, is new and needed for this to place real, risk-managed trades.",
+     group = srRiskGroup
      )
 
 // =============================================================================
@@ -435,12 +559,21 @@ int cooldownBarsLeft =
 // =============================================================================
 // MASTER ENTRY PERMISSION
 // =============================================================================
+//
+// tfActiveTradeType is the Donchian engine's OWN in-trade flag, read
+// instead of strategy.position_size == 0 -- with the S/R engine below now
+// sharing this strategy's single net account position, position_size can
+// no longer be trusted to mean "the Donchian engine itself is flat." See
+// the merge note above strategy().
+// =============================================================================
 
-bool flat =
-     strategy.position_size == 0
+var string tfActiveTradeType = ""
+
+bool tfFlat =
+     tfActiveTradeType == ""
 
 bool entryPermission =
-     flat and
+     tfFlat and
      inSession and
      not sessionLimitReached and
      cooldownOK
@@ -501,18 +634,21 @@ if longSignal
          atrValue * atrMultiplierInput
 
     shortStop := na
+    tfActiveTradeType := "LONG"
 
     strategy.entry(
          id = "Long",
          direction = strategy.long,
-         comment = "Long Breakout"
+         comment = "Long Breakout",
+         alert_message = "BULL | LONG ENTRY | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
          )
 
     strategy.exit(
          id = "Long ATR Exit",
          from_entry = "Long",
          stop = longStop,
-         comment = "Long ATR Stop"
+         comment = "Long ATR Stop",
+         alert_message = "LONG EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
          )
 
 // =============================================================================
@@ -532,25 +668,28 @@ if shortSignal
          atrValue * atrMultiplierInput
 
     longStop := na
+    tfActiveTradeType := "SHORT"
 
     strategy.entry(
          id = "Short",
          direction = strategy.short,
-         comment = "Short Breakout"
+         comment = "Short Breakout",
+         alert_message = "BEAR | SHORT ENTRY | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
          )
 
     strategy.exit(
          id = "Short ATR Exit",
          from_entry = "Short",
          stop = shortStop,
-         comment = "Short ATR Stop"
+         comment = "Short ATR Stop",
+         alert_message = "SHORT EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
          )
 
 // =============================================================================
 // LONG MANAGEMENT
 // =============================================================================
 
-if strategy.position_size > 0
+if tfActiveTradeType == "LONG"
 
     float longCandidateStop =
          close -
@@ -570,21 +709,23 @@ if strategy.position_size > 0
          id = "Long ATR Exit",
          from_entry = "Long",
          stop = longStop,
-         comment = "Long ATR Stop"
+         comment = "Long ATR Stop",
+         alert_message = "LONG EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
          )
 
     if not na(exitLow) and close < exitLow
 
         strategy.close(
              id = "Long",
-             comment = "Long Channel Exit"
+             comment = "Long Channel Exit",
+             alert_message = "LONG EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
              )
 
 // =============================================================================
 // SHORT MANAGEMENT
 // =============================================================================
 
-if strategy.position_size < 0
+if tfActiveTradeType == "SHORT"
 
     float shortCandidateStop =
          close +
@@ -604,27 +745,238 @@ if strategy.position_size < 0
          id = "Short ATR Exit",
          from_entry = "Short",
          stop = shortStop,
-         comment = "Short ATR Stop"
+         comment = "Short ATR Stop",
+         alert_message = "SHORT EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
          )
 
     if not na(exitHigh) and close > exitHigh
 
         strategy.close(
              id = "Short",
-             comment = "Short Channel Exit"
+             comment = "Short Channel Exit",
+             alert_message = "SHORT EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
              )
+
+// =============================================================================
+// DONCHIAN EXIT DETECTION
+// =============================================================================
+//
+// Walks strategy.closedtrades with its OWN cursor, filtered by its OWN
+// entry ids ("Long"/"Short") -- same while-loop pattern as the P0 Delta +
+// DBR Change-Point merge, needed because a single bar update can now close
+// an S/R trade and a Donchian trade at once, and the account-wide
+// position_size==0 check this script used to rely on could not tell which
+// engine (or both) had actually closed.
+// =============================================================================
+
+var int tfProcessedClosedTrades = 0
+
+bool tfLongClosed = false
+bool tfShortClosed = false
+
+while tfProcessedClosedTrades < strategy.closedtrades
+
+    int tfClosedIdx = tfProcessedClosedTrades
+    string tfThisClosedId = strategy.closedtrades.entry_id(tfClosedIdx)
+
+    if tfThisClosedId == "Long" or tfThisClosedId == "Short"
+        tfActiveTradeType := ""
+        if tfThisClosedId == "Long"
+            tfLongClosed := true
+        else
+            tfShortClosed := true
+
+    tfProcessedClosedTrades += 1
 
 // =============================================================================
 // RESET STOPS WHEN FLAT
 // =============================================================================
 
-if strategy.position_size == 0
+if tfFlat
 
     if not longSignal
         longStop := na
 
     if not shortSignal
         shortStop := na
+
+// =============================================================================
+// S/R PIVOT LEVELS (100% parity with the original LuxAlgo indicator's math
+// -- pivothigh(leftBars, rightBars)/pivotlow(leftBars, rightBars) with no
+// explicit source implicitly read high/low, matching ta.pivothigh/
+// ta.pivotlow's 2-arg overload used here)
+// =============================================================================
+
+float srPivotHighRaw = ta.pivothigh(srLeftBarsInput, srRightBarsInput)
+float srPivotLowRaw = ta.pivotlow(srLeftBarsInput, srRightBarsInput)
+float srHighUsePivot = fixnan(srPivotHighRaw[1])
+float srLowUsePivot = fixnan(srPivotLowRaw[1])
+
+float srShortEma = ta.ema(volume, 5)
+float srLongEma = ta.ema(volume, 10)
+float srOsc = srLongEma != 0 ? 100 * (srShortEma - srLongEma) / srLongEma : 0.0
+
+bool srCrossUnderSupport = ta.crossunder(close, srLowUsePivot)
+bool srCrossOverResistance = ta.crossover(close, srHighUsePivot)
+
+bool srBreakDown = srCrossUnderSupport and not (open - close < high - open) and srOsc > srVolumeThreshInput
+bool srBreakUp = srCrossOverResistance and not (open - low > close - open) and srOsc > srVolumeThreshInput
+bool srBullWick = srCrossOverResistance and open - low > close - open
+bool srBearWick = srCrossUnderSupport and open - close < high - open
+
+float srAtrValue = ta.atr(srAtrLengthInput)
+
+// =============================================================================
+// S/R ENTRY ENGINE
+// =============================================================================
+
+bool srAllowLong = srDirectionInput != "Short only"
+bool srAllowShort = srDirectionInput != "Long only"
+
+var int srTradesThisSession = 0
+
+if newSession
+    srTradesThisSession := 0
+
+bool srSessionLimitReached = srTradesThisSession >= srMaxTradesPerSessionInput
+
+var int srLastAcceptedSignalBar = na
+
+int srBarsSinceLastSignal = na(srLastAcceptedSignalBar) ? 1000000 : bar_index - srLastAcceptedSignalBar
+
+bool srCooldownActive = srCooldownBarsInput > 0 and not na(srLastAcceptedSignalBar) and srBarsSinceLastSignal < srCooldownBarsInput
+bool srCooldownOK = not srCooldownActive
+
+var string srActiveTradeType = ""
+
+bool srFlat = srActiveTradeType == ""
+
+bool srEntryPermission = srEnableInput and srFlat and inSession and not srSessionLimitReached and srCooldownOK
+
+bool srLongSignal = srEntryPermission and srAllowLong and srBreakUp
+bool srShortSignal = srEntryPermission and srAllowShort and srBreakDown
+
+// =============================================================================
+// S/R ORDERS
+// =============================================================================
+
+var float srLongStop = na
+var float srShortStop = na
+
+if srLongSignal
+
+    srLastAcceptedSignalBar := bar_index
+    srTradesThisSession += 1
+
+    srLongStop := close - srAtrValue * srAtrMultiplierInput
+    srShortStop := na
+    srActiveTradeType := "LONG"
+
+    strategy.entry(
+         id = "SR Long",
+         direction = strategy.long,
+         comment = "SR Long Breakout",
+         alert_message = "BULL | LONG ENTRY | S/R BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
+         )
+
+    strategy.exit(
+         id = "SR Long ATR Exit",
+         from_entry = "SR Long",
+         stop = srLongStop,
+         comment = "SR Long ATR Stop",
+         alert_message = "LONG EXIT | S/R BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
+         )
+
+if srShortSignal
+
+    srLastAcceptedSignalBar := bar_index
+    srTradesThisSession += 1
+
+    srShortStop := close + srAtrValue * srAtrMultiplierInput
+    srLongStop := na
+    srActiveTradeType := "SHORT"
+
+    strategy.entry(
+         id = "SR Short",
+         direction = strategy.short,
+         comment = "SR Short Breakout",
+         alert_message = "BEAR | SHORT ENTRY | S/R BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
+         )
+
+    strategy.exit(
+         id = "SR Short ATR Exit",
+         from_entry = "SR Short",
+         stop = srShortStop,
+         comment = "SR Short ATR Stop",
+         alert_message = "SHORT EXIT | S/R BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
+         )
+
+// =============================================================================
+// S/R MANAGEMENT
+// =============================================================================
+
+if srActiveTradeType == "LONG"
+
+    float srLongCandidateStop = close - srAtrValue * srAtrMultiplierInput
+
+    srLongStop := math.max(nz(srLongStop, strategy.position_avg_price - srAtrValue * srAtrMultiplierInput), srLongCandidateStop)
+
+    strategy.exit(
+         id = "SR Long ATR Exit",
+         from_entry = "SR Long",
+         stop = srLongStop,
+         comment = "SR Long ATR Stop",
+         alert_message = "LONG EXIT | S/R BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
+         )
+
+if srActiveTradeType == "SHORT"
+
+    float srShortCandidateStop = close + srAtrValue * srAtrMultiplierInput
+
+    srShortStop := math.min(nz(srShortStop, strategy.position_avg_price + srAtrValue * srAtrMultiplierInput), srShortCandidateStop)
+
+    strategy.exit(
+         id = "SR Short ATR Exit",
+         from_entry = "SR Short",
+         stop = srShortStop,
+         comment = "SR Short ATR Stop",
+         alert_message = "SHORT EXIT | S/R BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
+         )
+
+// =============================================================================
+// S/R EXIT DETECTION
+// =============================================================================
+//
+// Own cursor, filtered by its own entry ids ("SR Long"/"SR Short") -- same
+// pattern as the Donchian engine's own exit detection above.
+// =============================================================================
+
+var int srProcessedClosedTrades = 0
+
+bool srLongClosed = false
+bool srShortClosed = false
+
+while srProcessedClosedTrades < strategy.closedtrades
+
+    int srClosedIdx = srProcessedClosedTrades
+    string srThisClosedId = strategy.closedtrades.entry_id(srClosedIdx)
+
+    if srThisClosedId == "SR Long" or srThisClosedId == "SR Short"
+        srActiveTradeType := ""
+        if srThisClosedId == "SR Long"
+            srLongClosed := true
+        else
+            srShortClosed := true
+
+    srProcessedClosedTrades += 1
+
+if srFlat
+
+    if not srLongSignal
+        srLongStop := na
+
+    if not srShortSignal
+        srShortStop := na
 
 // =============================================================================
 // EMA
@@ -682,7 +1034,7 @@ plot(
 // =============================================================================
 
 plot(
-     showStopsInput and strategy.position_size > 0
+     showStopsInput and tfActiveTradeType == "LONG"
          ? longStop
          : na,
      "Long ATR Stop",
@@ -692,7 +1044,7 @@ plot(
      )
 
 plot(
-     showStopsInput and strategy.position_size < 0
+     showStopsInput and tfActiveTradeType == "SHORT"
          ? shortStop
          : na,
      "Short ATR Stop",
@@ -711,7 +1063,7 @@ plot(
 
 color blockedBackground = na
 
-if showBlockedBackgroundInput and strategy.position_size == 0
+if showBlockedBackgroundInput and tfFlat
 
     if not inSession or sessionLimitReached
 
@@ -781,6 +1133,70 @@ plotshape(
      )
 
 // =============================================================================
+// S/R VISUALS (100% parity with the original LuxAlgo indicator's plots)
+// =============================================================================
+
+plot(
+     srShowLevelsInput ? srHighUsePivot : na,
+     title = "S/R Resistance",
+     color = ta.change(srHighUsePivot) != 0 ? na : color.new(#FF0000, 0),
+     linewidth = 3,
+     offset = -(srRightBarsInput + 1)
+     )
+
+plot(
+     srShowLevelsInput ? srLowUsePivot : na,
+     title = "S/R Support",
+     color = ta.change(srLowUsePivot) != 0 ? na : color.new(#233dee, 0),
+     linewidth = 3,
+     offset = -(srRightBarsInput + 1)
+     )
+
+plotshape(
+     srShowBreaksInput and srBreakDown,
+     title = "S/R Break Down",
+     text = "B",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.red,
+     textcolor = color.white,
+     size = size.tiny
+     )
+
+plotshape(
+     srShowBreaksInput and srBreakUp,
+     title = "S/R Break Up",
+     text = "B",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.green,
+     textcolor = color.white,
+     size = size.tiny
+     )
+
+plotshape(
+     srShowBreaksInput and srBullWick,
+     title = "S/R Bull Wick",
+     text = "Bull Wick",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.green,
+     textcolor = color.white,
+     size = size.tiny
+     )
+
+plotshape(
+     srShowBreaksInput and srBearWick,
+     title = "S/R Bear Wick",
+     text = "Bear Wick",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.red,
+     textcolor = color.white,
+     size = size.tiny
+     )
+
+// =============================================================================
 // DASHBOARD
 // =============================================================================
 
@@ -788,7 +1204,7 @@ var table dashboard =
      table.new(
          position.top_right,
          2,
-         9,
+         13,
          border_width = 1
          )
 
@@ -1013,6 +1429,88 @@ if showDashboardInput and barstate.islast
              : color.new(color.red, 30)
          )
 
+    // -------------------------------------------------------------------------
+    // S/R TRADES
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         9,
+         "SR TRADES / MAX",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         9,
+         str.tostring(srTradesThisSession) + " / " + str.tostring(srMaxTradesPerSessionInput),
+         color.gray
+         )
+
+    // -------------------------------------------------------------------------
+    // S/R COOLDOWN
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         10,
+         "SR COOLDOWN",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         10,
+         not srEnableInput
+             ? "OFF"
+             : na(srLastAcceptedSignalBar)
+                 ? "READY"
+                 : str.tostring(math.max(srCooldownBarsInput - srBarsSinceLastSignal, 0)),
+         srCooldownActive
+             ? color.new(color.red, 25)
+             : color.new(color.green, 30)
+         )
+
+    // -------------------------------------------------------------------------
+    // S/R RAW SETUP
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         11,
+         "SR SETUP (L/S)",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         11,
+         (srBreakUp ? "L:YES" : "L:NO") + " " + (srBreakDown ? "S:YES" : "S:NO"),
+         (srBreakUp or srBreakDown)
+             ? color.new(color.green, 30)
+             : color.new(color.red, 40)
+         )
+
+    // -------------------------------------------------------------------------
+    // S/R ENTRY PERMISSION
+    // -------------------------------------------------------------------------
+
+    f_cell(
+         0,
+         12,
+         "SR ENTRY ALLOWED",
+         color.gray
+         )
+
+    f_cell(
+         1,
+         12,
+         srEntryPermission ? "YES" : "NO",
+         srEntryPermission
+             ? color.new(color.green, 30)
+             : color.new(color.red, 30)
+         )
+
 // =============================================================================
 // ALERTS
 // =============================================================================
@@ -1027,4 +1525,59 @@ alertcondition(
      shortSignal,
      "Short Trend Entry",
      "Trend Following Strategy: BEARISH (SHORT) breakout -- {{ticker}} {{interval}} @ {{close}}"
+     )
+
+alertcondition(
+     tfLongClosed,
+     "Long Trend Exit",
+     "Trend Following Strategy: LONG EXIT -- {{ticker}} {{interval}} @ {{close}}"
+     )
+
+alertcondition(
+     tfShortClosed,
+     "Short Trend Exit",
+     "Trend Following Strategy: SHORT EXIT -- {{ticker}} {{interval}} @ {{close}}"
+     )
+
+alertcondition(
+     srLongSignal,
+     "SR Long Entry",
+     "BULL | LONG ENTRY | S/R BREAKOUT -- {{ticker}} {{interval}} @ {{close}}"
+     )
+
+alertcondition(
+     srShortSignal,
+     "SR Short Entry",
+     "BEAR | SHORT ENTRY | S/R BREAKOUT -- {{ticker}} {{interval}} @ {{close}}"
+     )
+
+alertcondition(
+     srLongClosed,
+     "SR Long Exit",
+     "LONG EXIT | S/R BREAKOUT -- {{ticker}} {{interval}} @ {{close}}"
+     )
+
+alertcondition(
+     srShortClosed,
+     "SR Short Exit",
+     "SHORT EXIT | S/R BREAKOUT -- {{ticker}} {{interval}} @ {{close}}"
+     )
+
+// =============================================================================
+// S/R RAW BREAK ALERTS (100% parity -- unchanged from the original LuxAlgo
+// indicator's own two alertcondition()s, including that they read the raw
+// crossunder/crossover + volume-oscillator condition directly rather than
+// srShowBreaksInput, exactly as the original did)
+// =============================================================================
+
+alertcondition(
+     srCrossUnderSupport and srOsc > srVolumeThreshInput,
+     title = "Support Broken",
+     message = "Support Broken"
+     )
+
+alertcondition(
+     srCrossOverResistance and srOsc > srVolumeThreshInput,
+     title = "Resistance Broken",
+     message = "Resistance Broken"
      )
