@@ -812,9 +812,10 @@ string G_BREAK_PROB = "05b - S/R Breakout Probability"
 breakProbEnableInput = input.bool(true, "Enable Breakout Probability", group = G_BREAK_PROB)
 breakProbTestZoneAtrInput = input.float(0.35, "Test Zone Distance (ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = G_BREAK_PROB)
 breakProbHorizonBarsInput = input.int(12, "Break Prediction Horizon (Bars)", minval = 1, maxval = 100, group = G_BREAK_PROB)
-breakProbPriorAlphaInput = input.float(2.0, "Bayesian Prior Wins", minval = 0.1, maxval = 50.0, step = 0.5, group = G_BREAK_PROB)
-breakProbPriorBetaInput = input.float(2.0, "Bayesian Prior Losses", minval = 0.1, maxval = 50.0, step = 0.5, group = G_BREAK_PROB)
+breakProbPriorAlphaInput = input.float(2.0, "Bayesian Prior Wins (Global)", minval = 0.1, maxval = 50.0, step = 0.5, tooltip = "Only shapes the GLOBAL (ALL) probability now -- a weak nudge toward 50% that barely matters once the global sample is large. The context (CTX) probability no longer uses this; see 'Context Shrinkage Toward Global' below.", group = G_BREAK_PROB)
+breakProbPriorBetaInput = input.float(2.0, "Bayesian Prior Losses (Global)", minval = 0.1, maxval = 50.0, step = 0.5, group = G_BREAK_PROB)
 breakProbMinSampleInput = input.int(20, "Minimum Mature Sample", minval = 1, maxval = 500, group = G_BREAK_PROB)
+breakProbShrinkStrengthInput = input.float(15.0, "Context Shrinkage Toward Global (Pseudo-Trials)", minval = 0.0, maxval = 200.0, step = 1.0, tooltip = "The context (CTX) probability is shrunk toward the GLOBAL (ALL) rate by this many pseudo-trials of 'belief' in the global rate -- e.g. at 15, a context with 0 real trials reads identical to ALL, and it takes roughly 15 real context trials before the raw context-specific rate carries as much weight as that shrinkage. This replaces shrinking a low-sample context toward a flat 50% (which was the old behavior) with shrinking it toward the actual observed base rate instead, so an EARLY-quality CTX% is a reasonable estimate rather than noise. Set to 0 to disable and use the raw context-only rate.", group = G_BREAK_PROB)
 breakProbDisplayInput = input.string("Context + Global", "Probability Display", options = ["Context Only", "Global Only", "Context + Global"], group = G_BREAK_PROB)
 breakProbShowLabelsInput = input.bool(true, "Show Probability Labels At Selected S/R", group = G_BREAK_PROB)
 breakProbLabelSizeInput = input.string("Tiny", "Probability Label Size", options = ["Tiny", "Small", "Normal"], group = G_BREAK_PROB)
@@ -825,6 +826,16 @@ f_breakProbPct(int wins, int trials) =>
     float numerator = wins + breakProbPriorAlphaInput
     float denominator = trials + breakProbPriorAlphaInput + breakProbPriorBetaInput
     denominator > 0 ? numerator / denominator * 100.0 : 50.0
+
+// Empirical-Bayes shrinkage: the context estimate is pulled toward the
+// GLOBAL rate (referencePct) rather than a flat 50%, weighted by how many
+// real context trials exist relative to `strength` pseudo-trials. At
+// trials=0 this returns referencePct exactly; as trials grows past
+// `strength`, it converges on the raw contextWins/trials rate.
+f_breakProbShrunkPct(int wins, int trials, float referencePct, float strength) =>
+    float referenceProb = referencePct / 100.0
+    float denominator = trials + strength
+    denominator > 0 ? (wins + strength * referenceProb) / denominator * 100.0 : referencePct
 
 f_breakProbQuality(int trials) =>
     trials >= breakProbMinSampleInput * 2 ? "MATURE" : trials >= breakProbMinSampleInput ? "USABLE" : trials >= math.max(5, int(math.round(breakProbMinSampleInput * 0.5))) ? "DEVELOPING" : "EARLY"
@@ -961,10 +972,14 @@ int breakProbResContextWins = array.get(breakProbResWins, breakProbResCurrentBuc
 int breakProbSupContextTrials = array.get(breakProbSupTrials, breakProbSupCurrentBucket)
 int breakProbSupContextWins = array.get(breakProbSupWins, breakProbSupCurrentBucket)
 
-float breakProbResContextPct = f_breakProbPct(breakProbResContextWins, breakProbResContextTrials)
-float breakProbSupContextPct = f_breakProbPct(breakProbSupContextWins, breakProbSupContextTrials)
 float breakProbResGlobalPct = f_breakProbPct(breakProbResGlobalWins, breakProbResGlobalTrials)
 float breakProbSupGlobalPct = f_breakProbPct(breakProbSupGlobalWins, breakProbSupGlobalTrials)
+
+// Context now shrinks toward the GLOBAL rate (not a flat 50%) -- see
+// f_breakProbShrunkPct's comment above. Needs breakProb*GlobalPct computed
+// first, which is why this block was reordered.
+float breakProbResContextPct = f_breakProbShrunkPct(breakProbResContextWins, breakProbResContextTrials, breakProbResGlobalPct, breakProbShrinkStrengthInput)
+float breakProbSupContextPct = f_breakProbShrunkPct(breakProbSupContextWins, breakProbSupContextTrials, breakProbSupGlobalPct, breakProbShrinkStrengthInput)
 
 string breakProbResQuality = f_breakProbQuality(breakProbResContextTrials)
 string breakProbSupQuality = f_breakProbQuality(breakProbSupContextTrials)
