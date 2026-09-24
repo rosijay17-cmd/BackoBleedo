@@ -1,0 +1,2243 @@
+//@version=6
+strategy(
+     "Academia TORB v1.5 — Volatility-Regime ORB",
+     shorttitle="TORBv15 VOL",
+     overlay=true,
+     pyramiding=0,
+     initial_capital=50000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.80,
+     slippage=2,
+     process_orders_on_close=true,
+     calc_on_every_tick=false,
+     max_bars_back=5000,
+     max_labels_count=150
+)
+
+//====================================================================
+// DESIGN NOTES
+//====================================================================
+//
+// TORB v1.5 adds a paper-inspired volatility regime overlay.
+//
+// The uploaded volatility-regime paper uses:
+//     change points
+//     locally stationary return segments
+//     Wasserstein distance between empirical distributions
+//     spectral clustering
+//     online matching of current distribution to past regimes
+//
+// Pine cannot practically reproduce that full pipeline.
+// This script implements a tradable proxy:
+//
+//     realized volatility percentile
+//     downside volatility percentile
+//     ATR-ratio percentile
+//     composite volatility score
+//     calm / normal / elevated / crisis regime classification
+//
+// The regime then controls:
+//     breakout buffer
+//     trade permission
+//     position size multiplier
+//     optional premarket alignment requirement
+//
+// v1.5.1 ALERT-SAVE FIX:
+//     TradingView refused to save any alert on this strategy with
+//     "your script inputs contain symbols for which you don't have a
+//     data subscription". Root cause: request.security(ivSymbol, ...)
+//     (default ivSymbol = "CBOE:VIX") ran UNCONDITIONALLY on every bar,
+//     regardless of the "IV source" setting -- so the compiled script
+//     always declared CBOE data as a hard dependency even when
+//     ivMode = "Manual" (the default) never uses that value. TradingView
+//     checks every declared data feed before allowing an alert save, saw
+//     no CBOE market-data subscription on the account, and blocked it.
+//     Fixed by gating the external request.security call behind
+//     ivMode == "External Prior Daily Close", so the CBOE dependency
+//     (and the subscription requirement that comes with it) only exists
+//     when that mode is actually selected.
+//
+//====================================================================
+// GROUPS
+//====================================================================
+
+string G_CORE = "01 — TORB Core"
+string G_EXIT = "02 — Exit Model"
+string G_RISK = "03 — Risk"
+string G_VOL  = "04 — Volatility Regime"
+string G_IV   = "05 — IV / Expected Move"
+string G_PRE  = "06 — 08:30 Precondition"
+string G_OUT  = "07 — Outcome Research"
+string G_VIS  = "08 — Visuals"
+
+//====================================================================
+// CORE INPUTS
+//====================================================================
+
+string sessionTimezone = input.string(
+     "America/New_York",
+     "Session timezone",
+     group=G_CORE
+)
+
+int cashOpenHour = input.int(
+     9,
+     "Cash open hour",
+     minval=0,
+     maxval=23,
+     group=G_CORE
+)
+
+int cashOpenMinute = input.int(
+     30,
+     "Cash open minute",
+     minval=0,
+     maxval=59,
+     group=G_CORE
+)
+
+int probeMinutes = input.int(
+     1,
+     "Probe length, minutes",
+     minval=1,
+     maxval=5,
+     group=G_CORE
+)
+
+int latestEntryMinutesAfterProbe = input.int(
+     120,
+     "Latest entry after probe, minutes",
+     minval=1,
+     maxval=360,
+     group=G_CORE
+)
+
+string directionMode = input.string(
+     "Both",
+     "Trade direction",
+     options=[
+          "Both",
+          "Long Only",
+          "Short Only"
+     ],
+     group=G_CORE
+)
+
+bool firstBreakOnly = input.bool(
+     true,
+     "Only first breakout of the day",
+     group=G_CORE
+)
+
+bool consumeBlockedBreaks = input.bool(
+     true,
+     "Blocked break consumes first-break rule",
+     tooltip="If true, a breakout blocked by risk/regime still counts as the first breakout of the day.",
+     group=G_CORE
+)
+
+bool requireOneMinuteChart = input.bool(
+     true,
+     "Require 1-minute chart",
+     group=G_CORE
+)
+
+// MERGED: same standardized alert convention now used across this
+// repo's alert-wired scripts (Hierarchical_Trading_System_v6_Fakeout_
+// Protected.pine, Sweep_Trend_Continuation_SVP_Merged.pine,
+// Dynamic_Markov_Capacity_PDH_PDL_Liquidity_Retracements_v6.pine).
+bool enableDynamicAlerts = input.bool(
+     true,
+     "Enable Dynamic alert() Calls",
+     tooltip="When on, every accepted entry and every exit (bracket stop/target, Session Close, Time Exit) fires a descriptive alert() message -- BULLISH ENTRY / BEARISH ENTRY naming the regime and size, LONG EXIT / SHORT EXIT naming the exit reason. When off, entries/exits still happen and the alertcondition() rows below still fire, but no alert() message is sent -- which looks identical to a broken alert if you forget this is off.",
+     group=G_CORE
+)
+
+//====================================================================
+// EXIT INPUTS
+//====================================================================
+
+string exitMode = input.string(
+     "Session Close",
+     "Exit model",
+     options=[
+          "Session Close",
+          "Fixed R",
+          "ATR Bracket",
+          "Time Exit"
+     ],
+     group=G_EXIT
+)
+
+int flattenHour = input.int(
+     15,
+     "Session-close exit hour",
+     minval=0,
+     maxval=23,
+     group=G_EXIT
+)
+
+int flattenMinute = input.int(
+     55,
+     "Session-close exit minute",
+     minval=0,
+     maxval=59,
+     group=G_EXIT
+)
+
+int timeExitMinutes = input.int(
+     60,
+     "Time exit after entry, minutes",
+     minval=1,
+     maxval=390,
+     group=G_EXIT
+)
+
+//====================================================================
+// RISK INPUTS
+//====================================================================
+
+int contracts = input.int(
+     1,
+     "Base contracts",
+     minval=1,
+     maxval=100,
+     group=G_RISK
+)
+
+int atrLen = input.int(
+     14,
+     "ATR length",
+     minval=2,
+     group=G_RISK
+)
+
+int atrBaselineLen = input.int(
+     50,
+     "ATR baseline",
+     minval=10,
+     maxval=500,
+     group=G_RISK
+)
+
+float fixedRStopATR = input.float(
+     1.00,
+     "Fixed R stop, ATR",
+     minval=0.10,
+     maxval=10.0,
+     step=0.05,
+     group=G_RISK
+)
+
+float rewardRisk = input.float(
+     1.50,
+     "Fixed R target",
+     minval=0.25,
+     maxval=10.0,
+     step=0.25,
+     group=G_RISK
+)
+
+float bracketStopATR = input.float(
+     1.00,
+     "ATR bracket stop",
+     minval=0.10,
+     maxval=10.0,
+     step=0.05,
+     group=G_RISK
+)
+
+float bracketTargetATR = input.float(
+     1.50,
+     "ATR bracket target",
+     minval=0.10,
+     maxval=20.0,
+     step=0.05,
+     group=G_RISK
+)
+
+float maximumInitialRiskATR = input.float(
+     4.00,
+     "Maximum initial risk, ATR",
+     minval=0.25,
+     maxval=25.0,
+     step=0.25,
+     group=G_RISK
+)
+
+//====================================================================
+// VOLATILITY REGIME INPUTS
+//====================================================================
+
+bool useVolRegimeOverlay = input.bool(
+     true,
+     "Use volatility-regime overlay",
+     group=G_VOL
+)
+
+int volLookback = input.int(
+     20,
+     "Current distribution lookback",
+     minval=5,
+     maxval=100,
+     tooltip="Proxy for the current local return distribution window.",
+     group=G_VOL
+)
+
+int volRankLookback = input.int(
+     252,
+     "Regime percentile lookback",
+     minval=50,
+     maxval=1000,
+     tooltip="Historical window used to rank current volatility conditions.",
+     group=G_VOL
+)
+
+float calmThreshold = input.float(
+     25.0,
+     "Calm regime threshold",
+     minval=1.0,
+     maxval=50.0,
+     step=1.0,
+     group=G_VOL
+)
+
+float elevatedThreshold = input.float(
+     70.0,
+     "Elevated regime threshold",
+     minval=50.0,
+     maxval=95.0,
+     step=1.0,
+     group=G_VOL
+)
+
+float crisisThreshold = input.float(
+     90.0,
+     "Crisis regime threshold",
+     minval=70.0,
+     maxval=100.0,
+     step=1.0,
+     group=G_VOL
+)
+
+bool blockCrisisRegime = input.bool(
+     true,
+     "Block crisis-regime entries",
+     group=G_VOL
+)
+
+bool requirePreAlignElevated = input.bool(
+     true,
+     "Elevated regime requires 08:30 alignment",
+     group=G_VOL
+)
+
+bool requirePreAlignCrisis = input.bool(
+     true,
+     "Crisis regime requires 08:30 alignment",
+     group=G_VOL
+)
+
+float calmBreakBufferATR = input.float(
+     0.05,
+     "Calm breakout buffer, ATR",
+     minval=0.0,
+     maxval=2.0,
+     step=0.01,
+     group=G_VOL
+)
+
+float normalBreakBufferATR = input.float(
+     0.03,
+     "Normal breakout buffer, ATR",
+     minval=0.0,
+     maxval=2.0,
+     step=0.01,
+     group=G_VOL
+)
+
+float elevatedBreakBufferATR = input.float(
+     0.10,
+     "Elevated breakout buffer, ATR",
+     minval=0.0,
+     maxval=2.0,
+     step=0.01,
+     group=G_VOL
+)
+
+float crisisBreakBufferATR = input.float(
+     0.20,
+     "Crisis breakout buffer, ATR",
+     minval=0.0,
+     maxval=3.0,
+     step=0.01,
+     group=G_VOL
+)
+
+float calmSizeMultiplier = input.float(
+     0.50,
+     "Calm size multiplier",
+     minval=0.0,
+     maxval=3.0,
+     step=0.25,
+     group=G_VOL
+)
+
+float normalSizeMultiplier = input.float(
+     1.00,
+     "Normal size multiplier",
+     minval=0.0,
+     maxval=3.0,
+     step=0.25,
+     group=G_VOL
+)
+
+float elevatedSizeMultiplier = input.float(
+     0.75,
+     "Elevated size multiplier",
+     minval=0.0,
+     maxval=3.0,
+     step=0.25,
+     group=G_VOL
+)
+
+float crisisSizeMultiplier = input.float(
+     0.25,
+     "Crisis size multiplier",
+     minval=0.0,
+     maxval=3.0,
+     step=0.25,
+     group=G_VOL
+)
+
+//====================================================================
+// IV / EXPECTED MOVE INPUTS
+//====================================================================
+
+string ivMode = input.string(
+     "Manual",
+     "IV source",
+     options=[
+          "Manual",
+          "External Prior Daily Close",
+          "Off"
+     ],
+     group=G_IV
+)
+
+float manualIV = input.float(
+     20.0,
+     "Manual IV, annualized %",
+     minval=0.1,
+     maxval=200.0,
+     step=0.1,
+     group=G_IV
+)
+
+string ivSymbol = input.symbol(
+     "CBOE:VIX",
+     "External volatility symbol",
+     tooltip="Only queried when IV source = External Prior Daily Close. Requires a market-data subscription for this symbol/exchange -- if TradingView blocks alert creation with a data-subscription error, either switch IV source back to Manual/Off, or point this at a symbol your plan already covers.",
+     group=G_IV
+)
+
+float maxProbeExhaustion = input.float(
+     0.30,
+     "Maximum probe / expected move",
+     minval=0.01,
+     maxval=1.00,
+     step=0.01,
+     group=G_IV
+)
+
+float maxSessionExhaustion = input.float(
+     0.65,
+     "Maximum session / expected move",
+     minval=0.05,
+     maxval=2.00,
+     step=0.05,
+     group=G_IV
+)
+
+bool enforceIVGate = input.bool(
+     false,
+     "Block entries when IV budget is exhausted",
+     group=G_IV
+)
+
+//====================================================================
+// 08:30 PRECONDITION INPUTS
+//====================================================================
+
+int preStartHour = input.int(
+     8,
+     "Precondition start hour",
+     minval=0,
+     maxval=23,
+     group=G_PRE
+)
+
+int preStartMinute = input.int(
+     30,
+     "Precondition start minute",
+     minval=0,
+     maxval=59,
+     group=G_PRE
+)
+
+int preEndHour = input.int(
+     9,
+     "Precondition end hour",
+     minval=0,
+     maxval=23,
+     group=G_PRE
+)
+
+int preEndMinute = input.int(
+     30,
+     "Precondition end minute",
+     minval=0,
+     maxval=59,
+     group=G_PRE
+)
+
+bool showPreRange = input.bool(
+     true,
+     "Show 08:30–09:30 range",
+     group=G_PRE
+)
+
+//====================================================================
+// OUTCOME RESEARCH INPUTS
+//====================================================================
+
+bool researchMode = input.bool(
+     true,
+     "Enable breakout outcome research",
+     group=G_OUT
+)
+
+int outcomeBars = input.int(
+     30,
+     "Outcome window, bars",
+     minval=1,
+     maxval=240,
+     group=G_OUT
+)
+
+float successMFEATR = input.float(
+     1.00,
+     "Success threshold, MFE ATR",
+     minval=0.10,
+     maxval=10.0,
+     step=0.10,
+     group=G_OUT
+)
+
+float failureMAEATR = input.float(
+     1.00,
+     "Failure threshold, MAE ATR",
+     minval=0.10,
+     maxval=10.0,
+     step=0.10,
+     group=G_OUT
+)
+
+//====================================================================
+// VISUAL INPUTS
+//====================================================================
+
+bool showDashboard = input.bool(
+     true,
+     "Show compact dashboard",
+     group=G_VIS
+)
+
+bool showProbe = input.bool(
+     true,
+     "Show probe levels",
+     group=G_VIS
+)
+
+bool showVolBreakLevels = input.bool(
+     true,
+     "Show volatility-adjusted break levels",
+     group=G_VIS
+)
+
+bool showSignals = input.bool(
+     true,
+     "Show signal markers",
+     group=G_VIS
+)
+
+bool showEntryLabels = input.bool(
+     false,
+     "Show entry labels",
+     group=G_VIS
+)
+
+bool showStateBackground = input.bool(
+     true,
+     "Show state background",
+     group=G_VIS
+)
+
+//====================================================================
+// HELPERS
+//====================================================================
+
+f_num(float v) =>
+    na(v) ? "—" : str.tostring(v, "#.00")
+
+f_pct(float v) =>
+    na(v) ? "—" : str.tostring(v, "#.0") + "%"
+
+f_price(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+// MERGED: standardized alert-message convention used across this repo --
+// every message leads with an ALL-CAPS directional tag (BULLISH ENTRY /
+// BEARISH ENTRY / LONG EXIT / SHORT EXIT), then a label, then
+// ticker/timeframe/price. "Ranger" is this script's alert label, same
+// as Sweep_Trend_Continuation_SVP_Merged.pine and
+// Dynamic_Markov_Capacity_PDH_PDL_Liquidity_Retracements_v6.pine.
+f_alertMsg(string kind, string label, float px) =>
+    kind + " | " + label + " | " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(px, format.mintick)
+
+f_dirName(int d) =>
+    switch d
+        1 => "LONG"
+        -1 => "SHORT"
+        => "NONE"
+
+f_exitName(string mode) =>
+    switch mode
+        "Session Close" => "SESSION"
+        "Fixed R" => "FIXED R"
+        "ATR Bracket" => "ATR"
+        "Time Exit" => "TIME"
+        => "UNKNOWN"
+
+f_regimeName(int regime) =>
+    switch regime
+        0 => "CALM"
+        1 => "NORMAL"
+        2 => "ELEVATED"
+        3 => "CRISIS"
+        => "UNKNOWN"
+
+f_riskPass(float riskValue, float atrValue) =>
+    bool magnitudePass = (
+         not na(riskValue) and
+         riskValue > syminfo.mintick
+    )
+
+    bool atrCapPass = (
+         not na(atrValue) and
+         atrValue > 0 and
+         riskValue <= atrValue * maximumInitialRiskATR
+    )
+
+    magnitudePass and atrCapPass
+
+//====================================================================
+// TIME
+//====================================================================
+
+bool chartTFOK = (
+     not requireOneMinuteChart or
+     (
+          timeframe.isminutes and
+          timeframe.multiplier == 1
+     )
+)
+
+int localHour = hour(time, sessionTimezone)
+int localMinute = minute(time, sessionTimezone)
+
+int minuteOfDay = (
+     localHour * 60 +
+     localMinute
+)
+
+int cashOpenMOD = (
+     cashOpenHour * 60 +
+     cashOpenMinute
+)
+
+int probeEndMOD = (
+     cashOpenMOD +
+     probeMinutes
+)
+
+int latestEntryMOD = (
+     probeEndMOD +
+     latestEntryMinutesAfterProbe
+)
+
+int flattenMOD = (
+     flattenHour * 60 +
+     flattenMinute
+)
+
+bool inProbe = (
+     minuteOfDay >= cashOpenMOD and
+     minuteOfDay < probeEndMOD
+)
+
+bool afterProbe = (
+     minuteOfDay >= probeEndMOD
+)
+
+bool inEntryWindow = (
+     minuteOfDay >= probeEndMOD and
+     minuteOfDay <= latestEntryMOD
+)
+
+bool flattenNow = (
+     minuteOfDay >= flattenMOD
+)
+
+bool newCashSession = (
+     minuteOfDay == cashOpenMOD
+)
+
+bool newCalendarDay = timeframe.change("D")
+
+//====================================================================
+// 08:30 → 09:30 PRECONDITION ENGINE
+//====================================================================
+
+int preStartMOD = (
+     preStartHour * 60 +
+     preStartMinute
+)
+
+int preEndMOD = (
+     preEndHour * 60 +
+     preEndMinute
+)
+
+bool inPreWindow = (
+     minuteOfDay >= preStartMOD and
+     minuteOfDay < preEndMOD
+)
+
+bool preWindowStart = (
+     inPreWindow and
+     not inPreWindow[1]
+)
+
+bool preWindowEnd = (
+     not inPreWindow and
+     inPreWindow[1]
+)
+
+var float preHigh = na
+var float preLow = na
+var float preOpen = na
+var float preClose = na
+var bool preLocked = false
+
+if newCalendarDay
+    preHigh := na
+    preLow := na
+    preOpen := na
+    preClose := na
+    preLocked := false
+
+if preWindowStart
+    preHigh := high
+    preLow := low
+    preOpen := open
+    preClose := close
+    preLocked := false
+else if inPreWindow
+    preHigh := math.max(nz(preHigh, high), high)
+    preLow := math.min(nz(preLow, low), low)
+    preClose := close
+
+if preWindowEnd and not na(preHigh) and not na(preLow)
+    preLocked := true
+
+float preRange = na
+float preMid = na
+float preNet = na
+float preCloseLocation = na
+
+if preLocked and not na(preHigh) and not na(preLow)
+    preRange := preHigh - preLow
+    preMid := (preHigh + preLow) * 0.5
+
+if preLocked and not na(preOpen) and not na(preClose)
+    preNet := preClose - preOpen
+
+if preLocked and not na(preRange) and preRange > 0
+    preCloseLocation := (preClose - preLow) / preRange
+
+int preDirection = 0
+
+if not na(preNet)
+    if preNet > 0
+        preDirection := 1
+    else if preNet < 0
+        preDirection := -1
+
+float cashOpenLocationInPreRange = na
+
+if preLocked and not na(preRange) and preRange > 0 and minuteOfDay >= cashOpenMOD
+    cashOpenLocationInPreRange := (open - preLow) / preRange
+
+string cashOpenZone = "—"
+
+if preLocked and not na(cashOpenLocationInPreRange)
+    if open > preHigh
+        cashOpenZone := "ABOVE RANGE"
+    else if open < preLow
+        cashOpenZone := "BELOW RANGE"
+    else if cashOpenLocationInPreRange >= 0.67
+        cashOpenZone := "UPPER THIRD"
+    else if cashOpenLocationInPreRange <= 0.33
+        cashOpenZone := "LOWER THIRD"
+    else
+        cashOpenZone := "MIDDLE"
+
+string preClass = "UNSET"
+
+if preLocked
+    if preDirection == 1 and not na(preCloseLocation) and preCloseLocation >= 0.67
+        preClass := "BULL IMPULSE"
+    else if preDirection == -1 and not na(preCloseLocation) and preCloseLocation <= 0.33
+        preClass := "BEAR IMPULSE"
+    else
+        preClass := "BALANCED"
+
+bool longPreAlign = (
+     preClass == "BULL IMPULSE" or
+     cashOpenZone == "ABOVE RANGE" or
+     cashOpenZone == "UPPER THIRD"
+)
+
+bool shortPreAlign = (
+     preClass == "BEAR IMPULSE" or
+     cashOpenZone == "BELOW RANGE" or
+     cashOpenZone == "LOWER THIRD"
+)
+
+//====================================================================
+// BASE DATA
+//====================================================================
+
+float atr = ta.atr(atrLen)
+float atrBaseline = ta.sma(atr, atrBaselineLen)
+
+float atrRatio = na
+
+if not na(atrBaseline) and atrBaseline > 0
+    atrRatio := atr / atrBaseline
+
+int rvolLen = 20
+float avgVolume = ta.sma(volume, rvolLen)
+
+float rvol = na
+
+if not na(avgVolume) and avgVolume > 0
+    rvol := volume / avgVolume
+
+float dailyVWAP = ta.vwap(hlc3)
+
+float vwapDistanceATR = na
+
+if atr > 0
+    vwapDistanceATR := (close - dailyVWAP) / atr
+
+float previousDayClose = request.security(
+     syminfo.tickerid,
+     "D",
+     close[1],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on
+)
+
+//====================================================================
+// PAPER-INSPIRED VOLATILITY REGIME PROXY
+//====================================================================
+
+float logReturn = 0.0
+
+if close[1] > 0
+    logReturn := math.log(close / close[1])
+
+float downsideReturn = math.min(logReturn, 0.0)
+
+float realizedVol = (
+     ta.stdev(logReturn, volLookback) *
+     math.sqrt(252.0)
+)
+
+float downsideVol = (
+     ta.stdev(downsideReturn, volLookback) *
+     math.sqrt(252.0)
+)
+
+float realizedVolRank = ta.percentrank(
+     realizedVol,
+     volRankLookback
+)
+
+float downsideVolRank = ta.percentrank(
+     downsideVol,
+     volRankLookback
+)
+
+float atrRatioRank = ta.percentrank(
+     atrRatio,
+     volRankLookback
+)
+
+float volCompositeScore = na
+
+if not na(realizedVolRank) and not na(downsideVolRank) and not na(atrRatioRank)
+    volCompositeScore := (
+         realizedVolRank * 0.45 +
+         downsideVolRank * 0.35 +
+         atrRatioRank * 0.20
+    )
+
+int volRegime = 1
+
+if useVolRegimeOverlay and not na(volCompositeScore)
+    if volCompositeScore >= crisisThreshold
+        volRegime := 3
+    else if volCompositeScore >= elevatedThreshold
+        volRegime := 2
+    else if volCompositeScore <= calmThreshold
+        volRegime := 0
+    else
+        volRegime := 1
+
+float regimeBreakBufferATR = normalBreakBufferATR
+float regimeSizeMultiplier = normalSizeMultiplier
+
+if useVolRegimeOverlay
+    if volRegime == 0
+        regimeBreakBufferATR := calmBreakBufferATR
+        regimeSizeMultiplier := calmSizeMultiplier
+    else if volRegime == 1
+        regimeBreakBufferATR := normalBreakBufferATR
+        regimeSizeMultiplier := normalSizeMultiplier
+    else if volRegime == 2
+        regimeBreakBufferATR := elevatedBreakBufferATR
+        regimeSizeMultiplier := elevatedSizeMultiplier
+    else if volRegime == 3
+        regimeBreakBufferATR := crisisBreakBufferATR
+        regimeSizeMultiplier := crisisSizeMultiplier
+
+bool crisisAllowed = (
+     not useVolRegimeOverlay or
+     volRegime != 3 or
+     not blockCrisisRegime
+)
+
+bool elevatedNeedsPreAlign = (
+     useVolRegimeOverlay and
+     volRegime == 2 and
+     requirePreAlignElevated
+)
+
+bool crisisNeedsPreAlign = (
+     useVolRegimeOverlay and
+     volRegime == 3 and
+     requirePreAlignCrisis
+)
+
+bool longRegimeAlignPass = (
+     not elevatedNeedsPreAlign and
+     not crisisNeedsPreAlign
+) or longPreAlign
+
+bool shortRegimeAlignPass = (
+     not elevatedNeedsPreAlign and
+     not crisisNeedsPreAlign
+) or shortPreAlign
+
+int effectiveContracts = int(
+     math.round(
+          contracts * regimeSizeMultiplier
+     )
+)
+
+if regimeSizeMultiplier > 0 and effectiveContracts < 1
+    effectiveContracts := 1
+
+bool sizePass = (
+     effectiveContracts > 0
+)
+
+//====================================================================
+// PROBE RANGE
+//====================================================================
+
+var float probeHigh = na
+var float probeLow = na
+var float probeOpen = na
+var bool probeLocked = false
+
+if newCalendarDay
+    probeHigh := na
+    probeLow := na
+    probeOpen := na
+    probeLocked := false
+
+if newCashSession
+    probeHigh := high
+    probeLow := low
+    probeOpen := open
+    probeLocked := false
+else if inProbe
+    probeHigh := math.max(nz(probeHigh, high), high)
+    probeLow := math.min(nz(probeLow, low), low)
+
+bool probeJustEnded = (
+     afterProbe and
+     not afterProbe[1]
+)
+
+if probeJustEnded and not na(probeHigh) and not na(probeLow)
+    probeLocked := true
+
+float probeWidth = na
+
+if probeLocked
+    probeWidth := probeHigh - probeLow
+
+float probeWidthATR = na
+
+if probeLocked and atr > 0 and not na(probeWidth)
+    probeWidthATR := probeWidth / atr
+
+float openingGap = na
+
+if not na(probeOpen) and not na(previousDayClose)
+    openingGap := probeOpen - previousDayClose
+
+float openingGapATR = na
+
+if not na(openingGap) and atr > 0
+    openingGapATR := openingGap / atr
+
+float longBreakLevel = na
+float shortBreakLevel = na
+
+if probeLocked and not na(probeHigh) and not na(probeLow) and atr > 0
+    longBreakLevel := probeHigh + atr * regimeBreakBufferATR
+    shortBreakLevel := probeLow - atr * regimeBreakBufferATR
+
+//====================================================================
+// IV-NORMALIZED VOLATILITY BUDGET
+//====================================================================
+
+// v1.5.1: only queried when the user actually selects this mode, so the
+// CBOE (or whatever ivSymbol is) data-subscription requirement doesn't
+// silently attach itself to every alert save under the default "Manual"
+// IV source.
+float externalPriorIV = na
+
+if ivMode == "External Prior Daily Close"
+    externalPriorIV := request.security(
+         ivSymbol,
+         "D",
+         close[1],
+         gaps=barmerge.gaps_off,
+         lookahead=barmerge.lookahead_on
+    )
+
+float effectiveIV = na
+
+if ivMode == "Manual"
+    effectiveIV := manualIV
+else if ivMode == "External Prior Daily Close"
+    effectiveIV := externalPriorIV
+
+float expectedMoveBasePrice = not na(probeOpen) ? probeOpen : close
+
+float expectedDailyMovePoints = na
+
+if not na(effectiveIV) and effectiveIV > 0
+    expectedDailyMovePoints := (
+         expectedMoveBasePrice *
+         (effectiveIV / 100.0) /
+         math.sqrt(252.0)
+    )
+
+float preRangeATR = na
+
+if preLocked and atr > 0 and not na(preRange)
+    preRangeATR := preRange / atr
+
+float preRangeEM = na
+
+if preLocked and not na(expectedDailyMovePoints) and expectedDailyMovePoints > 0 and not na(preRange)
+    preRangeEM := preRange / expectedDailyMovePoints
+
+float probeExhaustionRatio = na
+
+if probeLocked and not na(expectedDailyMovePoints) and expectedDailyMovePoints > 0 and not na(probeWidth)
+    probeExhaustionRatio := probeWidth / expectedDailyMovePoints
+
+float probeExpectedMoveRemainingPoints = na
+
+if not na(expectedDailyMovePoints) and not na(probeWidth)
+    probeExpectedMoveRemainingPoints := math.max(
+         expectedDailyMovePoints - probeWidth,
+         0.0
+    )
+
+var float sessionHigh = na
+var float sessionLow = na
+
+if newCalendarDay
+    sessionHigh := na
+    sessionLow := na
+
+if newCashSession
+    sessionHigh := high
+    sessionLow := low
+else if minuteOfDay > cashOpenMOD and minuteOfDay < flattenMOD
+    sessionHigh := math.max(nz(sessionHigh, high), high)
+    sessionLow := math.min(nz(sessionLow, low), low)
+
+float sessionRangePoints = na
+
+if not na(sessionHigh) and not na(sessionLow)
+    sessionRangePoints := sessionHigh - sessionLow
+
+float sessionExhaustionRatio = na
+
+if not na(sessionRangePoints) and not na(expectedDailyMovePoints) and expectedDailyMovePoints > 0
+    sessionExhaustionRatio := sessionRangePoints / expectedDailyMovePoints
+
+float liveExpectedMoveRemainingPoints = na
+
+if not na(expectedDailyMovePoints) and not na(sessionRangePoints)
+    liveExpectedMoveRemainingPoints := math.max(
+         expectedDailyMovePoints - sessionRangePoints,
+         0.0
+    )
+
+bool ivDataReady = false
+
+if ivMode == "Off"
+    ivDataReady := true
+else
+    ivDataReady := (
+         not na(effectiveIV) and
+         effectiveIV > 0 and
+         not na(probeExhaustionRatio) and
+         not na(sessionExhaustionRatio)
+    )
+
+bool probeCapacityOK = true
+bool sessionCapacityOK = true
+
+if ivMode != "Off" and enforceIVGate
+    probeCapacityOK := (
+         ivDataReady and
+         probeExhaustionRatio <= maxProbeExhaustion
+    )
+
+    sessionCapacityOK := (
+         ivDataReady and
+         sessionExhaustionRatio <= maxSessionExhaustion
+    )
+
+bool volatilityCapacityOK = (
+     probeCapacityOK and
+     sessionCapacityOK
+)
+
+string volCapacityText = "OFF"
+
+if ivMode != "Off"
+    if not ivDataReady
+        volCapacityText := "NO IV DATA"
+    else if not probeCapacityOK
+        volCapacityText := "PROBE BLOCK"
+    else if not sessionCapacityOK
+        volCapacityText := "SESSION BLOCK"
+    else
+        volCapacityText := "PASS"
+
+//====================================================================
+// BREAKOUT STATE
+//====================================================================
+
+var bool longBreakSeen = false
+var bool shortBreakSeen = false
+var bool firstBreakConsumed = false
+var int firstBreakDirection = 0
+var int breakoutMinuteOfDay = na
+
+if newCalendarDay
+    longBreakSeen := false
+    shortBreakSeen := false
+    firstBreakConsumed := false
+    firstBreakDirection := 0
+    breakoutMinuteOfDay := na
+
+bool longDirectionAllowed = (
+     directionMode == "Both" or
+     directionMode == "Long Only"
+)
+
+bool shortDirectionAllowed = (
+     directionMode == "Both" or
+     directionMode == "Short Only"
+)
+
+bool longCross = (
+     not na(longBreakLevel) and
+     close > longBreakLevel and
+     close[1] <= longBreakLevel
+)
+
+bool shortCross = (
+     not na(shortBreakLevel) and
+     close < shortBreakLevel and
+     close[1] >= shortBreakLevel
+)
+
+bool freshLongBreak = (
+     chartTFOK and
+     probeLocked and
+     inEntryWindow and
+     longDirectionAllowed and
+     not longBreakSeen and
+     longCross
+)
+
+bool freshShortBreak = (
+     chartTFOK and
+     probeLocked and
+     inEntryWindow and
+     shortDirectionAllowed and
+     not shortBreakSeen and
+     shortCross
+)
+
+bool firstBreakRulePass = (
+     not firstBreakOnly or
+     not firstBreakConsumed
+)
+
+bool flat = (
+     strategy.position_size == 0
+)
+
+bool rawLongSignal = (
+     freshLongBreak and
+     flat and
+     firstBreakRulePass
+)
+
+bool rawShortSignal = (
+     freshShortBreak and
+     flat and
+     firstBreakRulePass
+)
+
+if freshLongBreak
+    longBreakSeen := true
+
+if freshShortBreak
+    shortBreakSeen := true
+
+//====================================================================
+// PRE-BREAK DIAGNOSTICS
+//====================================================================
+
+var int firstBoundaryTouch = 0
+
+if newCalendarDay
+    firstBoundaryTouch := 0
+
+bool diagnosticsWindow = (
+     probeLocked and
+     not firstBreakConsumed and
+     inEntryWindow
+)
+
+if diagnosticsWindow and firstBoundaryTouch == 0
+    bool upperTouched = (
+         not na(probeHigh) and
+         high >= probeHigh
+    )
+
+    bool lowerTouched = (
+         not na(probeLow) and
+         low <= probeLow
+    )
+
+    if upperTouched and not lowerTouched
+        firstBoundaryTouch := 1
+    else if lowerTouched and not upperTouched
+        firstBoundaryTouch := -1
+
+//====================================================================
+// PRE-ENTRY RISK VALIDATION
+//====================================================================
+
+bool bracketMode = (
+     exitMode == "Fixed R" or
+     exitMode == "ATR Bracket"
+)
+
+float candidateLongStop = na
+float candidateLongTarget = na
+float candidateLongRisk = na
+
+float candidateShortStop = na
+float candidateShortTarget = na
+float candidateShortRisk = na
+
+if bracketMode and atr > 0
+    if exitMode == "Fixed R"
+        candidateLongStop := close - atr * fixedRStopATR
+        candidateLongRisk := close - candidateLongStop
+        candidateLongTarget := close + candidateLongRisk * rewardRisk
+
+        candidateShortStop := close + atr * fixedRStopATR
+        candidateShortRisk := candidateShortStop - close
+        candidateShortTarget := close - candidateShortRisk * rewardRisk
+
+    else if exitMode == "ATR Bracket"
+        candidateLongStop := close - atr * bracketStopATR
+        candidateLongRisk := close - candidateLongStop
+        candidateLongTarget := close + atr * bracketTargetATR
+
+        candidateShortStop := close + atr * bracketStopATR
+        candidateShortRisk := candidateShortStop - close
+        candidateShortTarget := close - atr * bracketTargetATR
+
+bool validLongRisk = (
+     not bracketMode or
+     f_riskPass(candidateLongRisk, atr)
+)
+
+bool validShortRisk = (
+     not bracketMode or
+     f_riskPass(candidateShortRisk, atr)
+)
+
+//====================================================================
+// ENTRY BLOCKERS
+//====================================================================
+
+string commonBlocker = "CLEAR"
+
+if not chartTFOK
+    commonBlocker := "USE 1M"
+else if not probeLocked
+    commonBlocker := "NO PROBE"
+else if not inEntryWindow
+    commonBlocker := "WINDOW"
+else if not flat
+    commonBlocker := "POSITION"
+else if not firstBreakRulePass
+    commonBlocker := "FIRST BREAK USED"
+else if not volatilityCapacityOK
+    commonBlocker := "IV BUDGET"
+else if not crisisAllowed
+    commonBlocker := "CRISIS BLOCK"
+else if not sizePass
+    commonBlocker := "SIZE 0"
+
+string longBlocker = "CLEAR"
+
+if commonBlocker != "CLEAR"
+    longBlocker := commonBlocker
+else if not longDirectionAllowed
+    longBlocker := "DIRECTION"
+else if not rawLongSignal
+    longBlocker := "NO LONG BREAK"
+else if not longRegimeAlignPass
+    longBlocker := "PRE ALIGN"
+else if not validLongRisk
+    longBlocker := "RISK"
+
+string shortBlocker = "CLEAR"
+
+if commonBlocker != "CLEAR"
+    shortBlocker := commonBlocker
+else if not shortDirectionAllowed
+    shortBlocker := "DIRECTION"
+else if not rawShortSignal
+    shortBlocker := "NO SHORT BREAK"
+else if not shortRegimeAlignPass
+    shortBlocker := "PRE ALIGN"
+else if not validShortRisk
+    shortBlocker := "RISK"
+
+bool longSignal = (
+     rawLongSignal and
+     longBlocker == "CLEAR"
+)
+
+bool shortSignal = (
+     rawShortSignal and
+     shortBlocker == "CLEAR" and
+     not longSignal
+)
+
+bool blockedLongSignal = (
+     rawLongSignal and
+     not longSignal
+)
+
+bool blockedShortSignal = (
+     rawShortSignal and
+     not shortSignal
+)
+
+if consumeBlockedBreaks and (blockedLongSignal or blockedShortSignal)
+    firstBreakConsumed := true
+    firstBreakDirection := blockedLongSignal ? 1 : -1
+    breakoutMinuteOfDay := minuteOfDay
+
+//====================================================================
+// BREAKOUT OUTCOME RESEARCH
+//====================================================================
+
+var bool researchActive = false
+var int researchDir = 0
+var int researchStartBar = na
+var float researchEntryPrice = na
+var float researchATR = na
+var float researchMFE = 0.0
+var float researchMAE = 0.0
+
+var string lastOutcome = "—"
+var float lastOutcomeMFEATR = na
+var float lastOutcomeMAEATR = na
+
+if newCalendarDay
+    researchActive := false
+    researchDir := 0
+    researchStartBar := na
+    researchEntryPrice := na
+    researchATR := na
+    researchMFE := 0.0
+    researchMAE := 0.0
+
+bool rawBreakEvent = (
+     researchMode and
+     not researchActive and
+     (
+          rawLongSignal or
+          rawShortSignal
+     )
+)
+
+if rawBreakEvent
+    researchActive := true
+    researchDir := rawLongSignal ? 1 : -1
+    researchStartBar := bar_index
+    researchEntryPrice := close
+    researchATR := atr
+    researchMFE := 0.0
+    researchMAE := 0.0
+
+if researchActive and researchDir == 1 and not na(researchEntryPrice)
+    float favLong = high - researchEntryPrice
+    float advLong = researchEntryPrice - low
+    researchMFE := math.max(researchMFE, math.max(favLong, 0.0))
+    researchMAE := math.max(researchMAE, math.max(advLong, 0.0))
+
+if researchActive and researchDir == -1 and not na(researchEntryPrice)
+    float favShort = researchEntryPrice - low
+    float advShort = high - researchEntryPrice
+    researchMFE := math.max(researchMFE, math.max(favShort, 0.0))
+    researchMAE := math.max(researchMAE, math.max(advShort, 0.0))
+
+int researchAge = (
+     researchActive and
+     not na(researchStartBar)
+          ? bar_index - researchStartBar
+          : 0
+)
+
+float researchMFEATR = na
+float researchMAEATR = na
+
+if researchActive and not na(researchATR) and researchATR > 0
+    researchMFEATR := researchMFE / researchATR
+    researchMAEATR := researchMAE / researchATR
+
+bool researchWindowDone = (
+     researchActive and
+     researchAge >= outcomeBars
+)
+
+if researchWindowDone
+    bool hitSuccess = (
+         not na(researchMFEATR) and
+         researchMFEATR >= successMFEATR
+    )
+
+    bool hitFailure = (
+         not na(researchMAEATR) and
+         researchMAEATR >= failureMAEATR
+    )
+
+    if hitSuccess and not hitFailure
+        lastOutcome := "WIN"
+    else if hitFailure and not hitSuccess
+        lastOutcome := "FAIL"
+    else if hitSuccess and hitFailure
+        lastOutcome := "MIXED"
+    else
+        lastOutcome := "FLAT"
+
+    lastOutcomeMFEATR := researchMFEATR
+    lastOutcomeMAEATR := researchMAEATR
+
+    researchActive := false
+    researchDir := 0
+    researchStartBar := na
+    researchEntryPrice := na
+    researchATR := na
+    researchMFE := 0.0
+    researchMAE := 0.0
+
+//====================================================================
+// ENTRY SNAPSHOT / ORDER SUBMISSION
+//====================================================================
+
+var float entryATR = na
+var float entryRVOL = na
+var float entryATRRatio = na
+var float entryProbeWidthATR = na
+var float entryVWAPDistanceATR = na
+var float entryGapATR = na
+var float entryIV = na
+var float entryExpectedMovePoints = na
+var float entryProbeExhaustion = na
+var float entrySessionExhaustion = na
+var float entryVolScore = na
+var int entryVolRegime = na
+var int entryDirection = 0
+var int entryMinuteOfDay = na
+var int entryBarIndex = na
+var float plannedStop = na
+var float plannedTarget = na
+
+if newCalendarDay
+    entryATR := na
+    entryRVOL := na
+    entryATRRatio := na
+    entryProbeWidthATR := na
+    entryVWAPDistanceATR := na
+    entryGapATR := na
+    entryIV := na
+    entryExpectedMovePoints := na
+    entryProbeExhaustion := na
+    entrySessionExhaustion := na
+    entryVolScore := na
+    entryVolRegime := na
+    entryDirection := 0
+    entryMinuteOfDay := na
+    entryBarIndex := na
+    plannedStop := na
+    plannedTarget := na
+
+if longSignal
+    entryATR := atr
+    entryRVOL := rvol
+    entryATRRatio := atrRatio
+    entryProbeWidthATR := probeWidthATR
+    entryVWAPDistanceATR := vwapDistanceATR
+    entryGapATR := openingGapATR
+    entryIV := effectiveIV
+    entryExpectedMovePoints := expectedDailyMovePoints
+    entryProbeExhaustion := probeExhaustionRatio
+    entrySessionExhaustion := sessionExhaustionRatio
+    entryVolScore := volCompositeScore
+    entryVolRegime := volRegime
+    entryDirection := 1
+    entryMinuteOfDay := minuteOfDay
+    entryBarIndex := bar_index
+    breakoutMinuteOfDay := minuteOfDay
+    firstBreakDirection := 1
+    firstBreakConsumed := true
+
+    plannedStop := candidateLongStop
+    plannedTarget := candidateLongTarget
+
+    if showEntryLabels
+        label.new(
+             bar_index,
+             low,
+             "TORB LONG\n" +
+             "Regime " + f_regimeName(volRegime) + "\n" +
+             "Score " + f_pct(volCompositeScore) + "\n" +
+             "Buffer " + f_num(regimeBreakBufferATR) + " ATR\n" +
+             "Qty " + str.tostring(effectiveContracts),
+             style=label.style_label_up,
+             color=color.new(color.green, 10),
+             textcolor=color.white,
+             size=size.tiny
+        )
+
+    strategy.entry(
+         "Long",
+         strategy.long,
+         qty=effectiveContracts,
+         comment="TORB Vol Long"
+    )
+
+    // MERGED: dynamic alert -- standardized BULLISH ENTRY tag, "Ranger"
+    // label, naming the volatility regime that set this trade's
+    // buffer/size, per "I want signal triggers type of entry to the
+    // alert."
+    if enableDynamicAlerts
+        alert(
+             f_alertMsg("BULLISH ENTRY", "Ranger — TORB Breakout Long", close) +
+             "\nRegime: " + f_regimeName(volRegime) + " (" + f_pct(volCompositeScore) + ")" +
+             "\nBuffer: " + f_num(regimeBreakBufferATR) + " ATR" +
+             "\nStop: " + f_price(plannedStop) + " | Target: " + f_price(plannedTarget) +
+             "\nExit Model: " + f_exitName(exitMode) +
+             "\nQty: " + str.tostring(effectiveContracts),
+             alert.freq_once_per_bar_close)
+
+if shortSignal
+    entryATR := atr
+    entryRVOL := rvol
+    entryATRRatio := atrRatio
+    entryProbeWidthATR := probeWidthATR
+    entryVWAPDistanceATR := vwapDistanceATR
+    entryGapATR := openingGapATR
+    entryIV := effectiveIV
+    entryExpectedMovePoints := expectedDailyMovePoints
+    entryProbeExhaustion := probeExhaustionRatio
+    entrySessionExhaustion := sessionExhaustionRatio
+    entryVolScore := volCompositeScore
+    entryVolRegime := volRegime
+    entryDirection := -1
+    entryMinuteOfDay := minuteOfDay
+    entryBarIndex := bar_index
+    breakoutMinuteOfDay := minuteOfDay
+    firstBreakDirection := -1
+    firstBreakConsumed := true
+
+    plannedStop := candidateShortStop
+    plannedTarget := candidateShortTarget
+
+    if showEntryLabels
+        label.new(
+             bar_index,
+             high,
+             "TORB SHORT\n" +
+             "Regime " + f_regimeName(volRegime) + "\n" +
+             "Score " + f_pct(volCompositeScore) + "\n" +
+             "Buffer " + f_num(regimeBreakBufferATR) + " ATR\n" +
+             "Qty " + str.tostring(effectiveContracts),
+             style=label.style_label_down,
+             color=color.new(color.red, 10),
+             textcolor=color.white,
+             size=size.tiny
+        )
+
+    strategy.entry(
+         "Short",
+         strategy.short,
+         qty=effectiveContracts,
+         comment="TORB Vol Short"
+    )
+
+    // MERGED: dynamic alert -- standardized BEARISH ENTRY tag, "Ranger"
+    // label, naming the volatility regime that set this trade's
+    // buffer/size.
+    if enableDynamicAlerts
+        alert(
+             f_alertMsg("BEARISH ENTRY", "Ranger — TORB Breakout Short", close) +
+             "\nRegime: " + f_regimeName(volRegime) + " (" + f_pct(volCompositeScore) + ")" +
+             "\nBuffer: " + f_num(regimeBreakBufferATR) + " ATR" +
+             "\nStop: " + f_price(plannedStop) + " | Target: " + f_price(plannedTarget) +
+             "\nExit Model: " + f_exitName(exitMode) +
+             "\nQty: " + str.tostring(effectiveContracts),
+             alert.freq_once_per_bar_close)
+
+//====================================================================
+// EXIT ENGINE
+//====================================================================
+
+// MERGED: comment_loss/comment_profit added so the exit alert below can
+// name which leg actually filled via strategy.closedtrades.exit_comment()
+// -- previously neither was set, so that call would have returned "".
+if strategy.position_size > 0 and bracketMode
+    strategy.exit(
+         "Long Exit",
+         from_entry="Long",
+         stop=plannedStop,
+         limit=plannedTarget,
+         comment_loss="Stop",
+         comment_profit="Target"
+    )
+
+if strategy.position_size < 0 and bracketMode
+    strategy.exit(
+         "Short Exit",
+         from_entry="Short",
+         stop=plannedStop,
+         limit=plannedTarget,
+         comment_loss="Stop",
+         comment_profit="Target"
+    )
+
+bool sessionCloseExit = (
+     exitMode == "Session Close" and
+     flattenNow and
+     strategy.position_size != 0
+)
+
+if sessionCloseExit
+    strategy.close_all(
+         comment="TORB Session Close"
+    )
+
+int barsSinceEntry = (
+     not na(entryBarIndex)
+          ? bar_index - entryBarIndex
+          : 0
+)
+
+bool timeExitReady = (
+     exitMode == "Time Exit" and
+     strategy.position_size != 0 and
+     barsSinceEntry >= timeExitMinutes
+)
+
+if timeExitReady
+    strategy.close_all(
+         comment="TORB Time Exit"
+    )
+
+//====================================================================
+// TRADE MFE / MAE
+//====================================================================
+
+var float tradeMFE = 0.0
+var float tradeMAE = 0.0
+var float lastTradeMFEATR = na
+var float lastTradeMAEATR = na
+
+bool newLongPosition = (
+     strategy.position_size > 0 and
+     strategy.position_size[1] <= 0
+)
+
+bool newShortPosition = (
+     strategy.position_size < 0 and
+     strategy.position_size[1] >= 0
+)
+
+if newLongPosition or newShortPosition
+    tradeMFE := 0.0
+    tradeMAE := 0.0
+
+if strategy.position_size > 0 and entryDirection == 1 and not na(entryATR) and entryATR > 0
+    float longMFE = high - strategy.position_avg_price
+    float longMAE = strategy.position_avg_price - low
+    tradeMFE := math.max(tradeMFE, math.max(longMFE, 0.0))
+    tradeMAE := math.max(tradeMAE, math.max(longMAE, 0.0))
+
+if strategy.position_size < 0 and entryDirection == -1 and not na(entryATR) and entryATR > 0
+    float shortMFE = strategy.position_avg_price - low
+    float shortMAE = high - strategy.position_avg_price
+    tradeMFE := math.max(tradeMFE, math.max(shortMFE, 0.0))
+    tradeMAE := math.max(tradeMAE, math.max(shortMAE, 0.0))
+
+bool positionJustClosed = (
+     strategy.position_size == 0 and
+     strategy.position_size[1] != 0
+)
+
+if positionJustClosed and not na(entryATR) and entryATR > 0
+    lastTradeMFEATR := tradeMFE / entryATR
+    lastTradeMAEATR := tradeMAE / entryATR
+
+//====================================================================
+// MERGED: EXIT ALERTS -- STANDARDIZED "RANGER" CONVENTION
+//
+// Every exit path above (the bracket stop/target via strategy.exit(),
+// Session Close / Time Exit via strategy.close_all()) only produces an
+// order-fill event, not an alert() message -- the same gap already
+// found and fixed in Sweep_Trend_Continuation_SVP_Merged.pine and
+// Dynamic_Markov_Capacity_PDH_PDL_Liquidity_Retracements_v6.pine this
+// session. Detected generically here (position_size hitting 0 from
+// either side) with strategy.closedtrades.exit_comment() naming which
+// one actually fired ("Stop"/"Target" from the bracket exit() above, or
+// "TORB Session Close"/"TORB Time Exit" from the close_all() calls).
+//====================================================================
+bool longPositionClosed = strategy.position_size == 0 and strategy.position_size[1] > 0
+bool shortPositionClosed = strategy.position_size == 0 and strategy.position_size[1] < 0
+
+string lastExitReason = strategy.closedtrades > 0 ? strategy.closedtrades.exit_comment(strategy.closedtrades - 1) : na
+
+if longPositionClosed and enableDynamicAlerts
+    alert(
+         f_alertMsg("LONG EXIT", "Ranger", close) +
+         "\nReason: " + (na(lastExitReason) or lastExitReason == "" ? "—" : lastExitReason) +
+         "\nMFE/MAE: " + f_num(lastTradeMFEATR) + " / " + f_num(lastTradeMAEATR) + " ATR",
+         alert.freq_once_per_bar_close)
+
+if shortPositionClosed and enableDynamicAlerts
+    alert(
+         f_alertMsg("SHORT EXIT", "Ranger", close) +
+         "\nReason: " + (na(lastExitReason) or lastExitReason == "" ? "—" : lastExitReason) +
+         "\nMFE/MAE: " + f_num(lastTradeMFEATR) + " / " + f_num(lastTradeMAEATR) + " ATR",
+         alert.freq_once_per_bar_close)
+
+//====================================================================
+// DASHBOARD STATE
+//====================================================================
+
+string statusText = "WAIT"
+
+if not chartTFOK
+    statusText := "USE 1M"
+else if inProbe
+    statusText := "BUILD PROBE"
+else if probeLocked and not firstBreakConsumed and inEntryWindow
+    statusText := "ARMED"
+else if strategy.position_size > 0
+    statusText := "LONG"
+else if strategy.position_size < 0
+    statusText := "SHORT"
+else if firstBreakConsumed and strategy.position_size == 0
+    statusText := "DONE"
+else if probeLocked and not inEntryWindow
+    statusText := "WINDOW CLOSED"
+
+string firstTouchText = f_dirName(firstBoundaryTouch)
+string firstBreakText = f_dirName(firstBreakDirection)
+
+int minutesFromProbeToBreak = (
+     not na(breakoutMinuteOfDay)
+          ? breakoutMinuteOfDay - probeEndMOD
+          : na
+)
+
+string minutesToBreakText = (
+     na(minutesFromProbeToBreak)
+          ? "—"
+          : str.tostring(minutesFromProbeToBreak) + "m"
+)
+
+//====================================================================
+// VISUALS
+//====================================================================
+
+plot(
+     showProbe and probeLocked ? probeHigh : na,
+     "Probe High",
+     color=color.teal,
+     linewidth=2,
+     style=plot.style_linebr
+)
+
+plot(
+     showProbe and probeLocked ? probeLow : na,
+     "Probe Low",
+     color=color.maroon,
+     linewidth=2,
+     style=plot.style_linebr
+)
+
+plot(
+     showVolBreakLevels and probeLocked ? longBreakLevel : na,
+     "Vol-Adjusted Long Break",
+     color=color.new(color.green, 35),
+     linewidth=1,
+     style=plot.style_linebr
+)
+
+plot(
+     showVolBreakLevels and probeLocked ? shortBreakLevel : na,
+     "Vol-Adjusted Short Break",
+     color=color.new(color.red, 35),
+     linewidth=1,
+     style=plot.style_linebr
+)
+
+plot(
+     showPreRange and preLocked ? preHigh : na,
+     "08:30-09:30 High",
+     color=color.new(color.blue, 20),
+     linewidth=1,
+     style=plot.style_linebr
+)
+
+plot(
+     showPreRange and preLocked ? preLow : na,
+     "08:30-09:30 Low",
+     color=color.new(color.orange, 20),
+     linewidth=1,
+     style=plot.style_linebr
+)
+
+plotshape(
+     showSignals and longSignal,
+     title="TORB Long",
+     style=shape.triangleup,
+     location=location.belowbar,
+     color=color.lime,
+     size=size.small,
+     text="L"
+)
+
+plotshape(
+     showSignals and shortSignal,
+     title="TORB Short",
+     style=shape.triangledown,
+     location=location.abovebar,
+     color=color.red,
+     size=size.small,
+     text="S"
+)
+
+plotshape(
+     showSignals and blockedLongSignal,
+     title="TORB Long Blocked",
+     style=shape.xcross,
+     location=location.abovebar,
+     color=color.orange,
+     size=size.tiny,
+     text="BLK"
+)
+
+plotshape(
+     showSignals and blockedShortSignal,
+     title="TORB Short Blocked",
+     style=shape.xcross,
+     location=location.belowbar,
+     color=color.orange,
+     size=size.tiny,
+     text="BLK"
+)
+
+color stateBg = na
+
+if showStateBackground
+    if inProbe
+        stateBg := color.new(color.blue, 92)
+    else if probeLocked and inEntryWindow and not firstBreakConsumed
+        stateBg := color.new(color.green, 95)
+    else if useVolRegimeOverlay and volRegime == 3
+        stateBg := color.new(color.red, 94)
+    else if useVolRegimeOverlay and volRegime == 2
+        stateBg := color.new(color.orange, 95)
+
+bgcolor(
+     stateBg,
+     title="TORB State / Vol Regime"
+)
+
+//====================================================================
+// COMPACT DASHBOARD
+//====================================================================
+
+// MERGED: rows 14 -> 15 to fit the new "Alerts (Ranger)" status row.
+var table dash = table.new(
+     position.top_right,
+     2,
+     15,
+     border_width=1
+)
+
+f_cell(int row, string left, string right, color bg) =>
+    table.cell(
+         dash,
+         0,
+         row,
+         left,
+         text_color=color.white,
+         bgcolor=color.new(color.gray, 72),
+         text_size=size.small,
+         text_halign=text.align_left
+    )
+
+    table.cell(
+         dash,
+         1,
+         row,
+         right,
+         text_color=color.white,
+         bgcolor=color.new(bg, 55),
+         text_size=size.small,
+         text_halign=text.align_right
+    )
+
+bool drawDashboard = (
+     showDashboard and
+     barstate.islast
+)
+
+if drawDashboard
+
+    table.clear(
+         dash,
+         0,
+         0,
+         1,
+         14
+    )
+
+    color statusColor = color.gray
+
+    if statusText == "ARMED" or statusText == "LONG"
+        statusColor := color.green
+    else if statusText == "SHORT" or statusText == "USE 1M"
+        statusColor := color.red
+    else if statusText == "BUILD PROBE"
+        statusColor := color.orange
+
+    color regimeColor = color.gray
+
+    if volRegime == 0
+        regimeColor := color.blue
+    else if volRegime == 1
+        regimeColor := color.green
+    else if volRegime == 2
+        regimeColor := color.orange
+    else if volRegime == 3
+        regimeColor := color.red
+
+    color longBlockColor = (
+         longBlocker == "CLEAR"
+              ? color.green
+              : color.orange
+    )
+
+    color shortBlockColor = (
+         shortBlocker == "CLEAR"
+              ? color.green
+              : color.orange
+    )
+
+    color posColor = color.gray
+
+    if strategy.position_size > 0
+        posColor := color.green
+    else if strategy.position_size < 0
+        posColor := color.red
+
+    f_cell(
+         0,
+         "TORB v1.5",
+         statusText,
+         statusColor
+    )
+
+    f_cell(
+         1,
+         "Vol Regime",
+         f_regimeName(volRegime) + " " + f_pct(volCompositeScore),
+         regimeColor
+    )
+
+    f_cell(
+         2,
+         "Buffer / Qty",
+         f_num(regimeBreakBufferATR) + " ATR / " + str.tostring(effectiveContracts),
+         regimeColor
+    )
+
+    f_cell(
+         3,
+         "Probe H / L",
+         f_price(probeHigh) + " / " + f_price(probeLow),
+         color.gray
+    )
+
+    f_cell(
+         4,
+         "Break H / L",
+         f_price(longBreakLevel) + " / " + f_price(shortBreakLevel),
+         color.gray
+    )
+
+    f_cell(
+         5,
+         "Long Block",
+         longBlocker,
+         longBlockColor
+    )
+
+    f_cell(
+         6,
+         "Short Block",
+         shortBlocker,
+         shortBlockColor
+    )
+
+    f_cell(
+         7,
+         "IV Budget",
+         volCapacityText,
+         volatilityCapacityOK ? color.green : color.red
+    )
+
+    f_cell(
+         8,
+         "Session / EM",
+         f_pct(sessionExhaustionRatio * 100.0),
+         sessionCapacityOK ? color.green : color.red
+    )
+
+    f_cell(
+         9,
+         "08:30 State",
+         preClass,
+         preClass == "BULL IMPULSE" ? color.green : preClass == "BEAR IMPULSE" ? color.red : color.gray
+    )
+
+    f_cell(
+         10,
+         "First Touch / Break",
+         firstTouchText + " / " + firstBreakText,
+         color.gray
+    )
+
+    f_cell(
+         11,
+         "Break Delay",
+         minutesToBreakText,
+         color.gray
+    )
+
+    f_cell(
+         12,
+         "Last MFE / MAE",
+         f_num(lastTradeMFEATR) + " / " + f_num(lastTradeMAEATR),
+         color.gray
+    )
+
+    f_cell(
+         13,
+         "Position",
+         strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT",
+         posColor
+    )
+
+    // MERGED: surfaces the "Enable Dynamic alert() Calls" toggle -- if
+    // this is off, entries/exits still fire and the alertcondition()
+    // rows still work, but no alert() message is ever sent, which looks
+    // identical to a broken alert.
+    f_cell(
+         14,
+         "Alerts (Ranger)",
+         enableDynamicAlerts ? "ON" : "OFF",
+         enableDynamicAlerts ? color.green : color.red
+    )
+
+//====================================================================
+// REDUCED DATA WINDOW
+//====================================================================
+
+plot(
+     volCompositeScore,
+     "Vol Regime Composite Score",
+     display=display.data_window
+)
+
+plot(
+     float(volRegime),
+     "Vol Regime ID",
+     display=display.data_window
+)
+
+plot(
+     realizedVolRank,
+     "Realized Vol Percentile",
+     display=display.data_window
+)
+
+plot(
+     downsideVolRank,
+     "Downside Vol Percentile",
+     display=display.data_window
+)
+
+plot(
+     atrRatioRank,
+     "ATR Ratio Percentile",
+     display=display.data_window
+)
+
+plot(
+     probeWidthATR,
+     "Probe Width ATR",
+     display=display.data_window
+)
+
+plot(
+     sessionExhaustionRatio,
+     "Session / Expected Move",
+     display=display.data_window
+)
+
+plot(
+     float(firstBreakDirection),
+     "First Break Direction",
+     display=display.data_window
+)
+
+//====================================================================
+// ALERTS
+//
+// MERGED: renamed to the standardized "Ranger" label/tag convention
+// (BULLISH ENTRY / BEARISH ENTRY / LONG EXIT / SHORT EXIT) and added
+// Long/Short Exit conditions -- matching the convention already applied
+// to Sweep_Trend_Continuation_SVP_Merged.pine and
+// Dynamic_Markov_Capacity_PDH_PDL_Liquidity_Retracements_v6.pine.
+//====================================================================
+
+alertcondition(
+     longSignal,
+     "Ranger TORB Long Entry (Bullish)",
+     "BULLISH ENTRY | Ranger — TORB Breakout Long | {{ticker}} {{interval}}"
+)
+
+alertcondition(
+     shortSignal,
+     "Ranger TORB Short Entry (Bearish)",
+     "BEARISH ENTRY | Ranger — TORB Breakout Short | {{ticker}} {{interval}}"
+)
+
+alertcondition(
+     blockedLongSignal,
+     "Ranger TORB Long Blocked",
+     "Ranger — TORB long breakout blocked by regime, IV, precondition, or risk. {{ticker}} {{interval}}"
+)
+
+alertcondition(
+     blockedShortSignal,
+     "Ranger TORB Short Blocked",
+     "Ranger — TORB short breakout blocked by regime, IV, precondition, or risk. {{ticker}} {{interval}}"
+)
+
+alertcondition(
+     longPositionClosed,
+     "Ranger TORB Long Exit",
+     "LONG EXIT | Ranger | {{ticker}} {{interval}}"
+)
+
+alertcondition(
+     shortPositionClosed,
+     "Ranger TORB Short Exit",
+     "SHORT EXIT | Ranger | {{ticker}} {{interval}}"
+)

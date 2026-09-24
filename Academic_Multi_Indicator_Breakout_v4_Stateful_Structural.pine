@@ -1,0 +1,1356 @@
+//@version=6
+strategy(
+     title = "Academic Multi-Indicator Breakout v4 - Stateful Structural",
+     shorttitle = "AMI Breakout v4",
+     overlay = true,
+     initial_capital = 100000,
+     pyramiding = 0,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.50,
+     slippage = 1,
+     process_orders_on_close = true,
+     calc_on_order_fills = true,
+     calc_on_every_tick = false
+)
+
+// ============================================================================
+// GROUPS
+// ============================================================================
+
+string G_BREAK = "1. Structural Breakout Anchor"
+string G_SCORE = "2. Academic Score"
+string G_IND   = "3. Indicator Parameters"
+string G_QUAL  = "4. Breakout Quality"
+string G_RISK  = "5. Risk Management"
+string G_FREQ  = "6. Trade Frequency"
+string G_SESS  = "7. Session"
+string G_DISP  = "8. Display"
+string G_ALERT = "9. Alerts"
+
+// ============================================================================
+// BREAKOUT INPUTS
+// ============================================================================
+
+string breakoutAnchor = input.string(
+     "Structural Swing Pivots",
+     "Breakout Anchor",
+     options = ["Prior Range (Classic)", "Structural Swing Pivots", "Keltner Channels (Volatility)"],
+     group = G_BREAK
+)
+
+int breakoutLength = input.int(
+     20,
+     "Prior Range / Keltner Length",
+     minval = 2,
+     maxval = 500,
+     group = G_BREAK
+)
+
+int pivotLookback = input.int(
+     5,
+     "Pivot Left/Right Strength",
+     minval = 1,
+     maxval = 50,
+     group = G_BREAK
+)
+
+float kcMultiplier = input.float(
+     1.5,
+     "Keltner ATR Multiplier",
+     minval = 0.5,
+     step = 0.1,
+     group = G_BREAK
+)
+
+bool requireCloseBreak = input.bool(
+     true,
+     "Require Close Beyond Breakout Level",
+     group = G_BREAK
+)
+
+bool requireFreshBreak = input.bool(
+     true,
+     "Require Fresh Breakout Event",
+     group = G_BREAK
+)
+
+int breakoutConfirmBars = input.int(
+     3,
+     "Confirmation Window After Breakout",
+     minval = 0,
+     maxval = 20,
+     group = G_BREAK,
+     tooltip = "0 = breakout candle must confirm. 3 = breakout candle plus up to 3 later bars may confirm while price remains beyond the frozen breakout level."
+)
+
+// ============================================================================
+// SCORE INPUTS
+// ============================================================================
+
+int wMA   = input.int(2, "MA20 / MA50 Weight", minval = 0, maxval = 4, group = G_SCORE)
+int wRSI  = input.int(1, "RSI Weight", minval = 0, maxval = 4, group = G_SCORE)
+int wMACD = input.int(2, "MACD Weight", minval = 0, maxval = 4, group = G_SCORE)
+int wBB   = input.int(1, "Bollinger Weight", minval = 0, maxval = 4, group = G_SCORE)
+int wOBV  = input.int(1, "OBV Weight", minval = 0, maxval = 4, group = G_SCORE)
+int wICHI = input.int(2, "Ichimoku Weight", minval = 0, maxval = 4, group = G_SCORE)
+
+float minimumScorePct = input.float(
+     50.0,
+     "Minimum Directional Score %",
+     minval = 0.0,
+     maxval = 100.0,
+     step = 5.0,
+     group = G_SCORE
+)
+
+// ============================================================================
+// INDICATOR INPUTS
+// ============================================================================
+
+int maFastLength = input.int(20, "Fast MA", minval = 2, group = G_IND)
+int maSlowLength = input.int(50, "Slow MA", minval = 3, group = G_IND)
+int rsiLength = input.int(14, "RSI Length", minval = 2, group = G_IND)
+float rsiBull = input.float(50.0, "RSI Bullish Threshold", minval = 0, maxval = 100, group = G_IND)
+float rsiBear = input.float(50.0, "RSI Bearish Threshold", minval = 0, maxval = 100, group = G_IND)
+int macdFast = input.int(12, "MACD Fast", minval = 1, group = G_IND)
+int macdSlow = input.int(26, "MACD Slow", minval = 2, group = G_IND)
+int macdSignalLength = input.int(9, "MACD Signal", minval = 1, group = G_IND)
+int bbLength = input.int(20, "BB Length", minval = 2, group = G_IND)
+float bbMult = input.float(2.0, "BB Standard Deviations", minval = 0.1, step = 0.1, group = G_IND)
+int obvEmaLength = input.int(20, "OBV EMA Length", minval = 2, group = G_IND)
+int ichiConversionLength = input.int(9, "Ichimoku Conversion", minval = 1, group = G_IND)
+int ichiBaseLength = input.int(26, "Ichimoku Base", minval = 2, group = G_IND)
+int ichiSpanBLength = input.int(52, "Ichimoku Span B", minval = 2, group = G_IND)
+
+// ============================================================================
+// BREAKOUT QUALITY
+// ============================================================================
+
+bool useAtrPenetration = input.bool(
+     true,
+     "Require ATR Penetration",
+     group = G_QUAL
+)
+
+float atrPenetrationMult = input.float(
+     0.20,
+     "Minimum Penetration x ATR",
+     minval = 0.0,
+     step = 0.05,
+     group = G_QUAL
+)
+
+bool requireDirectionalCandle = input.bool(
+     true,
+     "Require Directional Confirmation Candle",
+     group = G_QUAL
+)
+
+bool useWickFilter = input.bool(
+     true,
+     "Limit Rejection Wick",
+     group = G_QUAL
+)
+
+float maxRejectionWickPct = input.float(
+     40.0,
+     "Maximum Rejection Wick %",
+     minval = 0.0,
+     maxval = 100.0,
+     step = 5.0,
+     group = G_QUAL
+)
+
+bool useRelativeVolumeFilter = input.bool(
+     false,
+     "Require Relative Volume",
+     group = G_QUAL
+)
+
+int relativeVolumeLength = input.int(
+     20,
+     "Relative Volume Lookback",
+     minval = 2,
+     group = G_QUAL
+)
+
+float minimumRelativeVolume = input.float(
+     1.10,
+     "Minimum Relative Volume",
+     minval = 0.1,
+     step = 0.05,
+     group = G_QUAL
+)
+
+// ============================================================================
+// RISK
+// ============================================================================
+
+float contracts = input.float(1.0, "Contracts", minval = 1.0, step = 1.0, group = G_RISK)
+int atrLength = input.int(14, "ATR Length", minval = 1, group = G_RISK)
+float atrStop = input.float(1.50, "Stop x ATR", minval = 0.10, step = 0.05, group = G_RISK)
+float rewardRisk = input.float(2.0, "Reward / Risk", minval = 0.25, step = 0.25, group = G_RISK)
+bool useStructureStop = input.bool(true, "Use Wider Structure Stop", group = G_RISK)
+int structureLength = input.int(5, "Structure Lookback", minval = 1, maxval = 100, group = G_RISK)
+bool useBreakEven = input.bool(true, "Move Stop To Break-Even", group = G_RISK)
+float breakEvenAtR = input.float(1.0, "Break-Even Trigger R", minval = 0.25, step = 0.25, group = G_RISK)
+int maxBarsInTrade = input.int(40, "Maximum Bars In Trade", minval = 1, maxval = 500, group = G_RISK)
+
+// ============================================================================
+// TRADE FREQUENCY
+// ============================================================================
+
+int maxTradesPerDay = input.int(
+     2,
+     "Maximum Trades Per RTH Day",
+     minval = 1,
+     maxval = 20,
+     group = G_FREQ
+)
+
+int cooldownBars = input.int(
+     5,
+     "Cooldown Bars After Entry",
+     minval = 0,
+     maxval = 500,
+     group = G_FREQ
+)
+
+// ============================================================================
+// SESSION
+// ============================================================================
+
+string sessionTimezone = input.string("America/New_York", "Timezone", group = G_SESS)
+string executionSession = input.session("0935-1555", "Entry Session", group = G_SESS)
+string rthSession = input.session("0930-1600", "RTH Session", group = G_SESS)
+bool flattenAtClose = input.bool(true, "Flatten At RTH End", group = G_SESS)
+
+bool cancelArmedOutsideSession = input.bool(
+     true,
+     "Cancel Armed Breakout Outside Entry Session",
+     group = G_SESS
+)
+
+// ============================================================================
+// DISPLAY
+// ============================================================================
+
+bool showBreakout = input.bool(true, "Show Breakout Levels", group = G_DISP)
+bool showArmedLevel = input.bool(true, "Show Frozen Armed Level", group = G_DISP)
+bool showMA = input.bool(true, "Show MA20 / MA50", group = G_DISP)
+bool showBB = input.bool(false, "Show Bollinger Bands", group = G_DISP)
+bool showCloud = input.bool(false, "Show Ichimoku Cloud", group = G_DISP)
+bool showDashboard = input.bool(true, "Show Dashboard", group = G_DISP)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+bool enableDynamicAlerts = input.bool(
+     true,
+     "Enable Dynamic alert() Calls",
+     group = G_ALERT
+)
+
+string entryAlertFormat = input.string(
+     "Detailed",
+     "Entry Alert Format",
+     options = ["Compact", "Detailed"],
+     group = G_ALERT
+)
+
+bool enableExitAlerts = input.bool(
+     false,
+     "Enable Dynamic Exit Alerts",
+     group = G_ALERT
+)
+
+// ============================================================================
+// FUNCTIONS
+// ============================================================================
+
+f_anchorAlertName(string anchor) =>
+    string result = anchor == "Prior Range (Classic)" ?
+         "PRIOR RANGE BREAKOUT" :
+         anchor == "Structural Swing Pivots" ?
+         "STRUCTURAL SWING BREAKOUT" :
+         "KELTNER VOLATILITY BREAKOUT"
+    result
+
+f_entryAlertMsg(
+     bool bullish,
+     string entryType,
+     float px,
+     float scorePct,
+     float breakoutLevel,
+     float atrRef,
+     float penetrationAtr,
+     float relativeVol,
+     int confirmAge,
+     float plannedStop,
+     float plannedTarget,
+     float rr,
+     string alertFormat
+ ) =>
+    string direction = bullish ? "BULL" : "BEAR"
+    string side = bullish ? "LONG" : "SHORT"
+
+    string headline =
+         direction + " | " +
+         side + " ENTRY | " +
+         entryType + " | " +
+         syminfo.ticker + " " +
+         timeframe.period + " @ " +
+         str.tostring(px, format.mintick)
+
+    string detailed =
+         headline +
+         "\nAcademic Score: " + str.tostring(scorePct, "#.0") + "%" +
+         "\nBreakout Level: " + str.tostring(breakoutLevel, format.mintick) +
+         "\nPenetration: " + str.tostring(penetrationAtr, "#.##") + " ATR" +
+         "\nRelative Volume: " + str.tostring(relativeVol, "#.##") + "x" +
+         "\nConfirmation Age: " + str.tostring(confirmAge) + " bar(s)" +
+         "\nATR Reference: " + str.tostring(atrRef, format.mintick) +
+         "\nPlanned Stop: " + str.tostring(plannedStop, format.mintick) +
+         "\nPlanned Target: " + str.tostring(plannedTarget, format.mintick) +
+         "\nR:R: 1:" + str.tostring(rr, "#.##")
+
+    alertFormat == "Compact" ? headline : detailed
+
+f_exitAlertMsg(bool bullishTrade, string reason, float px) =>
+    string side = bullishTrade ? "LONG" : "SHORT"
+    side + " EXIT | " +
+         reason + " | " +
+         syminfo.ticker + " " +
+         timeframe.period + " @ " +
+         str.tostring(px, format.mintick)
+
+// ============================================================================
+// INDICATORS
+// ============================================================================
+
+float ma20 = ta.sma(close, maFastLength)
+float ma50 = ta.sma(close, maSlowLength)
+float rsi = ta.rsi(close, rsiLength)
+
+[macdLine, macdSignalLine, macdHistogram] =
+     ta.macd(close, macdFast, macdSlow, macdSignalLength)
+
+[bbBasis, bbUpper, bbLower] =
+     ta.bb(close, bbLength, bbMult)
+
+// OBV
+float obvStep = close > close[1] ? volume : close < close[1] ? -volume : 0.0
+float obv = ta.cum(obvStep)
+float obvEma = ta.ema(obv, obvEmaLength)
+
+// Ichimoku
+float conversionLine =
+     (ta.highest(high, ichiConversionLength) +
+      ta.lowest(low, ichiConversionLength)) / 2.0
+
+float baseLine =
+     (ta.highest(high, ichiBaseLength) +
+      ta.lowest(low, ichiBaseLength)) / 2.0
+
+float spanA = (conversionLine + baseLine) / 2.0
+
+float spanB =
+     (ta.highest(high, ichiSpanBLength) +
+      ta.lowest(low, ichiSpanBLength)) / 2.0
+
+float cloudTop = math.max(spanA, spanB)
+float cloudBottom = math.min(spanA, spanB)
+
+float atr = ta.atr(atrLength)
+
+// Use PRIOR average volume so current confirmation bar does not inflate
+// its own benchmark.
+float priorVolumeAverage = ta.sma(volume, relativeVolumeLength)[1]
+
+float relativeVolume =
+     not na(priorVolumeAverage) and priorVolumeAverage > 0 ?
+     volume / priorVolumeAverage :
+     0.0
+
+// ============================================================================
+// DIRECTIONAL INDICATOR SIGNALS
+// ============================================================================
+
+int maSignal = ma20 > ma50 and close > ma20 ? 1 :
+     ma20 < ma50 and close < ma20 ? -1 : 0
+
+int rsiSignal = rsi > rsiBull ? 1 :
+     rsi < rsiBear ? -1 : 0
+
+int macdDirection =
+     macdLine > macdSignalLine and macdHistogram > 0 ? 1 :
+     macdLine < macdSignalLine and macdHistogram < 0 ? -1 : 0
+
+int bbSignal = close > bbBasis ? 1 :
+     close < bbBasis ? -1 : 0
+
+int obvSignal =
+     obv > obvEma and obv > obv[1] ? 1 :
+     obv < obvEma and obv < obv[1] ? -1 : 0
+
+int ichiSignal =
+     close > cloudTop and conversionLine > baseLine ? 1 :
+     close < cloudBottom and conversionLine < baseLine ? -1 : 0
+
+// ============================================================================
+// ACADEMIC SCORE
+// ============================================================================
+
+float combinedSignal =
+     wMA * maSignal +
+     wRSI * rsiSignal +
+     wMACD * macdDirection +
+     wBB * bbSignal +
+     wOBV * obvSignal +
+     wICHI * ichiSignal
+
+float maximumPossibleWeight =
+     wMA + wRSI + wMACD + wBB + wOBV + wICHI
+
+float scorePercent =
+     maximumPossibleWeight > 0 ?
+     100.0 * combinedSignal / maximumPossibleWeight :
+     0.0
+
+bool academicBullish = scorePercent >= minimumScorePct
+bool academicBearish = scorePercent <= -minimumScorePct
+
+// ============================================================================
+// BREAKOUT LEVELS
+// ============================================================================
+
+float classicHigh = ta.highest(high[1], breakoutLength)
+float classicLow  = ta.lowest(low[1], breakoutLength)
+
+float pHigh = ta.pivothigh(high, pivotLookback, pivotLookback)
+float pLow  = ta.pivotlow(low, pivotLookback, pivotLookback)
+
+var float activePivotHigh = na
+var float activePivotLow = na
+
+if not na(pHigh)
+    activePivotHigh := pHigh
+
+if not na(pLow)
+    activePivotLow := pLow
+
+float kcBasis = ta.ema(close, breakoutLength)
+float kcAtr = ta.atr(breakoutLength)
+float kcUpper = kcBasis + kcAtr * kcMultiplier
+float kcLower = kcBasis - kcAtr * kcMultiplier
+
+float targetHighLevel = breakoutAnchor == "Prior Range (Classic)" ?
+     classicHigh :
+     breakoutAnchor == "Structural Swing Pivots" ?
+     activePivotHigh :
+     kcUpper
+
+float targetLowLevel = breakoutAnchor == "Prior Range (Classic)" ?
+     classicLow :
+     breakoutAnchor == "Structural Swing Pivots" ?
+     activePivotLow :
+     kcLower
+
+// ============================================================================
+// RAW BREAKOUT EVENTS
+// ============================================================================
+
+bool rawLongBreak =
+     not na(targetHighLevel) and
+     (requireCloseBreak ? close > targetHighLevel : high > targetHighLevel)
+
+bool rawShortBreak =
+     not na(targetLowLevel) and
+     (requireCloseBreak ? close < targetLowLevel : low < targetLowLevel)
+
+bool previousLongBreak =
+     not na(targetHighLevel[1]) and
+     close[1] > targetHighLevel[1]
+
+bool previousShortBreak =
+     not na(targetLowLevel[1]) and
+     close[1] < targetLowLevel[1]
+
+bool longBreakEvent =
+     requireFreshBreak ?
+     rawLongBreak and not previousLongBreak :
+     rawLongBreak
+
+bool shortBreakEvent =
+     requireFreshBreak ?
+     rawShortBreak and not previousShortBreak :
+     rawShortBreak
+
+// ============================================================================
+// SESSION
+// ============================================================================
+
+bool inEntrySession =
+     not na(time(timeframe.period, executionSession, sessionTimezone))
+
+bool inRth =
+     not na(time(timeframe.period, rthSession, sessionTimezone))
+
+bool wasInRth = inRth[1]
+bool rthStart = inRth and not wasInRth
+bool rthEnd = not inRth and wasInRth
+
+// ============================================================================
+// FREQUENCY STATE
+// ============================================================================
+
+var int tradesToday = 0
+var int lastEntryBar = na
+var int lastOrderSignalBar = na
+
+if rthStart
+    tradesToday := 0
+
+bool tradeLimitOK = tradesToday < maxTradesPerDay
+
+int barsSinceLastEntry =
+     na(lastEntryBar) ?
+     1000000 :
+     bar_index - lastEntryBar
+
+bool cooldownOK =
+     na(lastEntryBar) or
+     barsSinceLastEntry > cooldownBars
+
+bool orderSubmissionOK =
+     na(lastOrderSignalBar) or
+     bar_index != lastOrderSignalBar
+
+// ============================================================================
+// READINESS
+// ============================================================================
+
+bool indicatorReady =
+     not na(ma20) and
+     not na(ma50) and
+     not na(rsi) and
+     not na(macdLine) and
+     not na(macdSignalLine) and
+     not na(bbBasis) and
+     not na(obvEma) and
+     not na(spanA) and
+     not na(spanB) and
+     not na(atr) and
+     not na(targetHighLevel) and
+     not na(targetLowLevel)
+
+// ============================================================================
+// STATEFUL BREAKOUT CANDIDATES
+// ============================================================================
+
+var bool longArmed = false
+var bool shortArmed = false
+
+var float longArmedLevel = na
+var float shortArmedLevel = na
+
+var float longArmedAtr = na
+var float shortArmedAtr = na
+
+var int longArmBar = na
+var int shortArmBar = na
+
+if barstate.isconfirmed and
+   indicatorReady and
+   inEntrySession and
+   strategy.position_size == 0 and
+   longBreakEvent
+
+    longArmed := true
+    longArmedLevel := targetHighLevel
+    longArmedAtr := nz(atr[1], atr)
+    longArmBar := bar_index
+
+    shortArmed := false
+    shortArmedLevel := na
+    shortArmedAtr := na
+    shortArmBar := na
+
+if barstate.isconfirmed and
+   indicatorReady and
+   inEntrySession and
+   strategy.position_size == 0 and
+   shortBreakEvent
+
+    shortArmed := true
+    shortArmedLevel := targetLowLevel
+    shortArmedAtr := nz(atr[1], atr)
+    shortArmBar := bar_index
+
+    longArmed := false
+    longArmedLevel := na
+    longArmedAtr := na
+    longArmBar := na
+
+int longConfirmAge =
+     longArmed and not na(longArmBar) ?
+     bar_index - longArmBar :
+     1000000
+
+int shortConfirmAge =
+     shortArmed and not na(shortArmBar) ?
+     bar_index - shortArmBar :
+     1000000
+
+bool longWithinWindow =
+     longArmed and
+     longConfirmAge <= breakoutConfirmBars
+
+bool shortWithinWindow =
+     shortArmed and
+     shortConfirmAge <= breakoutConfirmBars
+
+// ============================================================================
+// BREAKOUT QUALITY
+// ============================================================================
+
+float candleRange = high - low
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+
+bool longDirectionalCandleOK =
+     not requireDirectionalCandle or
+     close > open
+
+bool shortDirectionalCandleOK =
+     not requireDirectionalCandle or
+     close < open
+
+bool longWickOK =
+     not useWickFilter or
+     candleRange <= 0 or
+     (upperWick / candleRange) * 100.0 <= maxRejectionWickPct
+
+bool shortWickOK =
+     not useWickFilter or
+     candleRange <= 0 or
+     (lowerWick / candleRange) * 100.0 <= maxRejectionWickPct
+
+bool relativeVolumeOK =
+     not useRelativeVolumeFilter or
+     relativeVolume >= minimumRelativeVolume
+
+float longPenetrationAtr =
+     longArmed and
+     not na(longArmedLevel) and
+     not na(longArmedAtr) and
+     longArmedAtr > 0 ?
+     (close - longArmedLevel) / longArmedAtr :
+     0.0
+
+float shortPenetrationAtr =
+     shortArmed and
+     not na(shortArmedLevel) and
+     not na(shortArmedAtr) and
+     shortArmedAtr > 0 ?
+     (shortArmedLevel - close) / shortArmedAtr :
+     0.0
+
+bool longPenetrationOK =
+     not useAtrPenetration or
+     longPenetrationAtr >= atrPenetrationMult
+
+bool shortPenetrationOK =
+     not useAtrPenetration or
+     shortPenetrationAtr >= atrPenetrationMult
+
+// During confirmation we require the CLOSE to remain beyond the frozen level.
+// This is intentionally stricter than the optional wick-based initial break.
+bool longStillBeyondLevel =
+     longArmed and
+     not na(longArmedLevel) and
+     close > longArmedLevel
+
+bool shortStillBeyondLevel =
+     shortArmed and
+     not na(shortArmedLevel) and
+     close < shortArmedLevel
+
+bool longQualityOK =
+     longDirectionalCandleOK and
+     longWickOK and
+     relativeVolumeOK and
+     longPenetrationOK
+
+bool shortQualityOK =
+     shortDirectionalCandleOK and
+     shortWickOK and
+     relativeVolumeOK and
+     shortPenetrationOK
+
+// ============================================================================
+// FINAL ENTRY LOGIC
+// ============================================================================
+
+bool flat = strategy.position_size == 0
+
+bool commonEntry =
+     barstate.isconfirmed and
+     indicatorReady and
+     inEntrySession and
+     flat and
+     tradeLimitOK and
+     cooldownOK and
+     orderSubmissionOK
+
+bool longSetupReady =
+     longWithinWindow and
+     longStillBeyondLevel and
+     academicBullish and
+     longQualityOK
+
+bool shortSetupReady =
+     shortWithinWindow and
+     shortStillBeyondLevel and
+     academicBearish and
+     shortQualityOK
+
+bool directionalConflict =
+     longSetupReady and
+     shortSetupReady
+
+bool longSignal =
+     commonEntry and
+     longSetupReady and
+     not directionalConflict
+
+bool shortSignal =
+     commonEntry and
+     shortSetupReady and
+     not directionalConflict
+
+// ============================================================================
+// STRUCTURE LEVELS / TRADE STATE
+// ============================================================================
+
+float recentLow = ta.lowest(low, structureLength)
+float recentHigh = ta.highest(high, structureLength)
+
+var float pendingStop = na
+var float pendingAtr = na
+
+var float activeEntry = na
+var float activeStop = na
+var float activeTarget = na
+var float initialRisk = na
+
+var int entryBar = na
+var bool breakEvenActive = false
+
+var string activeEntryType = ""
+
+// ============================================================================
+// EXECUTION
+// ============================================================================
+
+if longSignal
+    float atrBasedLongStop = close - atr * atrStop
+    float structuralLongStop = recentLow - syminfo.mintick * 2
+
+    pendingStop := useStructureStop ?
+         math.min(atrBasedLongStop, structuralLongStop) :
+         atrBasedLongStop
+
+    pendingAtr := atr
+
+    float plannedLongRisk = close - pendingStop
+    float plannedLongTarget = close + plannedLongRisk * rewardRisk
+
+    string longEntryType = f_anchorAlertName(breakoutAnchor)
+
+    string longAlert = f_entryAlertMsg(
+         true,
+         longEntryType,
+         close,
+         scorePercent,
+         longArmedLevel,
+         longArmedAtr,
+         longPenetrationAtr,
+         relativeVolume,
+         longConfirmAge,
+         pendingStop,
+         plannedLongTarget,
+         rewardRisk,
+         entryAlertFormat
+    )
+
+    tradesToday += 1
+    lastEntryBar := bar_index
+    lastOrderSignalBar := bar_index
+    activeEntryType := longEntryType
+
+    strategy.entry(
+         "Long",
+         strategy.long,
+         qty = contracts,
+         comment = "AMI Buy",
+         alert_message = longAlert
+    )
+
+    if enableDynamicAlerts
+        alert(longAlert, alert.freq_once_per_bar_close)
+
+    longArmed := false
+    shortArmed := false
+    longArmedLevel := na
+    shortArmedLevel := na
+    longArmedAtr := na
+    shortArmedAtr := na
+    longArmBar := na
+    shortArmBar := na
+
+if shortSignal
+    float atrBasedShortStop = close + atr * atrStop
+    float structuralShortStop = recentHigh + syminfo.mintick * 2
+
+    pendingStop := useStructureStop ?
+         math.max(atrBasedShortStop, structuralShortStop) :
+         atrBasedShortStop
+
+    pendingAtr := atr
+
+    float plannedShortRisk = pendingStop - close
+    float plannedShortTarget = close - plannedShortRisk * rewardRisk
+
+    string shortEntryType = f_anchorAlertName(breakoutAnchor)
+
+    string shortAlert = f_entryAlertMsg(
+         false,
+         shortEntryType,
+         close,
+         scorePercent,
+         shortArmedLevel,
+         shortArmedAtr,
+         shortPenetrationAtr,
+         relativeVolume,
+         shortConfirmAge,
+         pendingStop,
+         plannedShortTarget,
+         rewardRisk,
+         entryAlertFormat
+    )
+
+    tradesToday += 1
+    lastEntryBar := bar_index
+    lastOrderSignalBar := bar_index
+    activeEntryType := shortEntryType
+
+    strategy.entry(
+         "Short",
+         strategy.short,
+         qty = contracts,
+         comment = "AMI Short",
+         alert_message = shortAlert
+    )
+
+    if enableDynamicAlerts
+        alert(shortAlert, alert.freq_once_per_bar_close)
+
+    longArmed := false
+    shortArmed := false
+    longArmedLevel := na
+    shortArmedLevel := na
+    longArmedAtr := na
+    shortArmedAtr := na
+    longArmBar := na
+    shortArmBar := na
+
+// ============================================================================
+// CANDIDATE INVALIDATION
+// ============================================================================
+
+bool longExpired =
+     longArmed and
+     longConfirmAge > breakoutConfirmBars
+
+bool shortExpired =
+     shortArmed and
+     shortConfirmAge > breakoutConfirmBars
+
+bool longFailed =
+     longArmed and
+     not na(longArmedLevel) and
+     close <= longArmedLevel
+
+bool shortFailed =
+     shortArmed and
+     not na(shortArmedLevel) and
+     close >= shortArmedLevel
+
+if longExpired or longFailed
+    longArmed := false
+    longArmedLevel := na
+    longArmedAtr := na
+    longArmBar := na
+
+if shortExpired or shortFailed
+    shortArmed := false
+    shortArmedLevel := na
+    shortArmedAtr := na
+    shortArmBar := na
+
+if cancelArmedOutsideSession and not inEntrySession
+    longArmed := false
+    shortArmed := false
+    longArmedLevel := na
+    shortArmedLevel := na
+    longArmedAtr := na
+    shortArmedAtr := na
+    longArmBar := na
+    shortArmBar := na
+
+// ============================================================================
+// FILL DETECTION
+// ============================================================================
+
+bool newLong =
+     strategy.position_size > 0 and
+     strategy.position_size[1] <= 0
+
+bool newShort =
+     strategy.position_size < 0 and
+     strategy.position_size[1] >= 0
+
+if newLong
+    activeEntry := strategy.position_avg_price
+    activeStop := not na(pendingStop) ?
+         pendingStop :
+         activeEntry - atr * atrStop
+
+    initialRisk := activeEntry - activeStop
+
+    if initialRisk <= syminfo.mintick
+        strategy.close(
+             "Long",
+             immediately = true,
+             comment = "Invalid Long Risk"
+        )
+    else
+        activeTarget := activeEntry + initialRisk * rewardRisk
+        entryBar := bar_index
+        breakEvenActive := false
+
+if newShort
+    activeEntry := strategy.position_avg_price
+    activeStop := not na(pendingStop) ?
+         pendingStop :
+         activeEntry + atr * atrStop
+
+    initialRisk := activeStop - activeEntry
+
+    if initialRisk <= syminfo.mintick
+        strategy.close(
+             "Short",
+             immediately = true,
+             comment = "Invalid Short Risk"
+        )
+    else
+        activeTarget := activeEntry - initialRisk * rewardRisk
+        entryBar := bar_index
+        breakEvenActive := false
+
+// ============================================================================
+// RISK MANAGEMENT / EXITS
+// ============================================================================
+
+bool managementEligible =
+     strategy.position_size != 0 and
+     not na(entryBar) and
+     bar_index > entryBar
+
+if strategy.position_size > 0
+    if managementEligible and
+       useBreakEven and
+       not breakEvenActive and
+       not na(initialRisk) and
+       high >= activeEntry + initialRisk * breakEvenAtR
+
+        activeStop := math.max(activeStop, activeEntry)
+        breakEvenActive := true
+
+    strategy.exit(
+         "Long Exit",
+         from_entry = "Long",
+         stop = activeStop,
+         limit = activeTarget
+    )
+
+if strategy.position_size < 0
+    if managementEligible and
+       useBreakEven and
+       not breakEvenActive and
+       not na(initialRisk) and
+       low <= activeEntry - initialRisk * breakEvenAtR
+
+        activeStop := math.min(activeStop, activeEntry)
+        breakEvenActive := true
+
+    strategy.exit(
+         "Short Exit",
+         from_entry = "Short",
+         stop = activeStop,
+         limit = activeTarget
+    )
+
+int barsInTrade =
+     strategy.position_size != 0 and not na(entryBar) ?
+     bar_index - entryBar :
+     0
+
+if strategy.position_size != 0 and
+   barsInTrade >= maxBarsInTrade
+
+    strategy.close_all(
+         comment = "Time Exit",
+         immediately = true
+    )
+
+if flattenAtClose and
+   rthEnd and
+   strategy.position_size != 0
+
+    strategy.close_all(
+         comment = "RTH Close",
+         immediately = true
+    )
+
+// ============================================================================
+// POSITION CLOSE / EXIT ALERTS
+// ============================================================================
+
+bool longPositionClosed =
+     strategy.position_size == 0 and
+     strategy.position_size[1] > 0
+
+bool shortPositionClosed =
+     strategy.position_size == 0 and
+     strategy.position_size[1] < 0
+
+bool positionClosed =
+     longPositionClosed or
+     shortPositionClosed
+
+string lastExitReason =
+     strategy.closedtrades > 0 ?
+     strategy.closedtrades.exit_comment(strategy.closedtrades - 1) :
+     ""
+
+if longPositionClosed and enableExitAlerts
+    alert(
+         f_exitAlertMsg(
+              true,
+              lastExitReason == "" ? "POSITION CLOSED" : lastExitReason,
+              close
+         ),
+         alert.freq_once_per_bar_close
+    )
+
+if shortPositionClosed and enableExitAlerts
+    alert(
+         f_exitAlertMsg(
+              false,
+              lastExitReason == "" ? "POSITION CLOSED" : lastExitReason,
+              close
+         ),
+         alert.freq_once_per_bar_close
+    )
+
+if positionClosed
+    pendingStop := na
+    pendingAtr := na
+    activeEntry := na
+    activeStop := na
+    activeTarget := na
+    initialRisk := na
+    entryBar := na
+    breakEvenActive := false
+    activeEntryType := ""
+
+// ============================================================================
+// DASHBOARD STRINGS
+// ============================================================================
+
+string cooldownText =
+     cooldownOK ?
+     "READY" :
+     str.tostring(barsSinceLastEntry) + " / " + str.tostring(cooldownBars)
+
+string tradeLimitText =
+     str.tostring(tradesToday) + " / " + str.tostring(maxTradesPerDay)
+
+string scoreText =
+     str.tostring(scorePercent, "#.0") + "%"
+
+string positionText =
+     strategy.position_size > 0 ?
+     "LONG" :
+     strategy.position_size < 0 ?
+     "SHORT" :
+     "FLAT"
+
+string candidateText =
+     longArmed ?
+     "BULL " + str.tostring(longConfirmAge) + "/" + str.tostring(breakoutConfirmBars) :
+     shortArmed ?
+     "BEAR " + str.tostring(shortConfirmAge) + "/" + str.tostring(breakoutConfirmBars) :
+     "WAIT"
+
+// ============================================================================
+// VISUALS
+// ============================================================================
+
+plot(
+     showBreakout and not na(targetHighLevel) ? targetHighLevel : na,
+     "Structural High Boundary",
+     color = color.new(color.green, 25),
+     style = plot.style_stepline
+)
+
+plot(
+     showBreakout and not na(targetLowLevel) ? targetLowLevel : na,
+     "Structural Low Boundary",
+     color = color.new(color.red, 25),
+     style = plot.style_stepline
+)
+
+plot(
+     showArmedLevel and longArmed ? longArmedLevel : na,
+     "Armed Bull Level",
+     color = color.aqua,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     showArmedLevel and shortArmed ? shortArmedLevel : na,
+     "Armed Bear Level",
+     color = color.fuchsia,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(showMA ? ma20 : na, "MA20", color = color.orange)
+plot(showMA ? ma50 : na, "MA50", color = color.blue)
+
+pBBUpper = plot(showBB ? bbUpper : na, "BB Upper", color = color.new(color.gray, 60))
+pBBLower = plot(showBB ? bbLower : na, "BB Lower", color = color.new(color.gray, 60))
+fill(pBBUpper, pBBLower, color = color.new(color.gray, 95))
+
+pCloudTop = plot(showCloud ? cloudTop : na, "Cloud Top", color = color.new(color.green, 65))
+pCloudBottom = plot(showCloud ? cloudBottom : na, "Cloud Bottom", color = color.new(color.red, 65))
+fill(pCloudTop, pCloudBottom, color = color.new(color.gray, 92))
+
+plot(
+     strategy.position_size != 0 ? activeEntry : na,
+     "Active Entry",
+     color = color.white,
+     linewidth = 1,
+     style = plot.style_linebr
+)
+
+plot(
+     strategy.position_size != 0 ? activeStop : na,
+     "Active Stop",
+     color = color.red,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     strategy.position_size != 0 ? activeTarget : na,
+     "Active Target",
+     color = color.lime,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plotshape(
+     barstate.isconfirmed and inEntrySession and longBreakEvent,
+     title = "Bull Breakout Armed",
+     style = shape.square,
+     location = location.belowbar,
+     color = color.aqua,
+     size = size.tiny,
+     text = "ARM"
+)
+
+plotshape(
+     barstate.isconfirmed and inEntrySession and shortBreakEvent,
+     title = "Bear Breakout Armed",
+     style = shape.square,
+     location = location.abovebar,
+     color = color.fuchsia,
+     size = size.tiny,
+     text = "ARM"
+)
+
+plotshape(
+     longSignal,
+     title = "Long Breakout",
+     style = shape.triangleup,
+     location = location.belowbar,
+     color = color.lime,
+     size = size.small,
+     text = "BULL"
+)
+
+plotshape(
+     shortSignal,
+     title = "Short Breakout",
+     style = shape.triangledown,
+     location = location.abovebar,
+     color = color.red,
+     size = size.small,
+     text = "BEAR"
+)
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+var table dash =
+     table.new(
+          position.top_right,
+          2,
+          11,
+          border_width = 1
+     )
+
+if showDashboard and barstate.islast
+    color scoreColor =
+         academicBullish ? color.lime :
+         academicBearish ? color.red :
+         color.gray
+
+    color limitColor =
+         tradeLimitOK ? color.lime : color.red
+
+    color cooldownColor =
+         cooldownOK ? color.lime : color.orange
+
+    string sessionText =
+         inEntrySession ? "ENTRY OPEN" :
+         inRth ? "RTH" :
+         "CLOSED"
+
+    string qualityText =
+         longArmed ?
+         (longQualityOK ? "BULL READY" : "BULL WAIT") :
+         shortArmed ?
+         (shortQualityOK ? "BEAR READY" : "BEAR WAIT") :
+         "—"
+
+    table.cell(dash, 0, 0, "AMI BREAKOUT v4", text_color = color.white, bgcolor = color.black)
+    table.cell(dash, 1, 0, "STATUS", text_color = color.white, bgcolor = color.black)
+
+    table.cell(dash, 0, 1, "Score")
+    table.cell(dash, 1, 1, scoreText, text_color = scoreColor)
+
+    table.cell(dash, 0, 2, "Anchor")
+    table.cell(dash, 1, 2, breakoutAnchor)
+
+    table.cell(dash, 0, 3, "Candidate")
+    table.cell(
+         dash,
+         1,
+         3,
+         candidateText,
+         text_color = longArmed ? color.lime : shortArmed ? color.red : color.gray
+    )
+
+    table.cell(dash, 0, 4, "Quality")
+    table.cell(dash, 1, 4, qualityText)
+
+    table.cell(dash, 0, 5, "Trades Today")
+    table.cell(dash, 1, 5, tradeLimitText, text_color = limitColor)
+
+    table.cell(dash, 0, 6, "Trade Limit")
+    table.cell(dash, 1, 6, tradeLimitOK ? "READY" : "BLOCKED", text_color = limitColor)
+
+    table.cell(dash, 0, 7, "Cooldown")
+    table.cell(dash, 1, 7, cooldownText, text_color = cooldownColor)
+
+    table.cell(dash, 0, 8, "Position")
+    table.cell(dash, 1, 8, positionText)
+
+    table.cell(dash, 0, 9, "Entry Type")
+    table.cell(
+         dash,
+         1,
+         9,
+         activeEntryType == "" ?
+         f_anchorAlertName(breakoutAnchor) :
+         activeEntryType
+    )
+
+    table.cell(dash, 0, 10, "Session")
+    table.cell(dash, 1, 10, sessionText)
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+
+plot(combinedSignal, "Combined Academic Signal", display = display.data_window)
+plot(scorePercent, "Directional Score %", display = display.data_window)
+plot(float(tradesToday), "Trades Today", display = display.data_window)
+plot(relativeVolume, "Relative Volume", display = display.data_window)
+
+plot(
+     longArmed ? longPenetrationAtr : na,
+     "Bull Penetration ATR",
+     display = display.data_window
+)
+
+plot(
+     shortArmed ? shortPenetrationAtr : na,
+     "Bear Penetration ATR",
+     display = display.data_window
+)
+
+// ============================================================================
+// ALERT CONDITIONS
+// ============================================================================
+//
+// For detailed dynamic alerts:
+// Create Alert -> "Any alert() function call"
+//
+// For strategy order-fill alerts:
+// Message = {{strategy.order.alert_message}}
+// ============================================================================
+
+alertcondition(
+     longSignal,
+     title = "AMI Bull Breakout Entry",
+     message = "BULL | LONG ENTRY | AMI BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     shortSignal,
+     title = "AMI Bear Breakout Entry",
+     message = "BEAR | SHORT ENTRY | AMI BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     longPositionClosed,
+     title = "AMI Long Exit",
+     message = "LONG EXIT | AMI BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     shortPositionClosed,
+     title = "AMI Short Exit",
+     message = "SHORT EXIT | AMI BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
+)

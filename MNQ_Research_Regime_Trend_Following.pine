@@ -1,0 +1,1761 @@
+//@version=6
+// FIX ("Trades" counter climbs but Closed/Open always shows 0/0): this
+// strategy() declaration never set margin_long/margin_short. MNQ's
+// notional value per contract (price * $2/point) runs roughly $55,000-
+// $60,000+ at the levels seen in testing -- comfortably more than the
+// $50,000 initial_capital below. Without an explicit margin requirement,
+// Pine v6's default margin handling can effectively require close to
+// full notional value as margin, so every strategy.entry() call was being
+// silently rejected by the broker emulator: no error, no callback, the
+// script has no way to know the order never filled. That's why
+// tradesToday/plotshape counted "entries" that strategy.closedtrades and
+// strategy.opentrades never saw -- they were never real trades at all.
+// margin_long/margin_short are expressed as a percentage of position
+// value; 5% is comfortably inside real micro-futures day-trading margin
+// ratios and leaves plenty of headroom under $50,000 capital for 1
+// contract.
+strategy(
+     title                   = "MNQ Research Regime Trend Following",
+     shorttitle              = "MNQ Regime TF",
+     overlay                 = true,
+     initial_capital         = 50000,
+     pyramiding              = 0,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 0.62,
+     slippage                = 1,
+     margin_long             = 5,
+     margin_short            = 5,
+     process_orders_on_close = true,
+     calc_on_order_fills     = true,
+     calc_on_every_tick      = false,
+     max_labels_count        = 500,
+     max_lines_count         = 100)
+
+// ============================================================================
+// RESEARCH DESIGN
+//
+// Dai et al. (2016):
+// - latent bull/bear market regime
+// - estimate conditional bull probability
+// - BUY above upper boundary
+// - SELL below lower boundary
+// - NO-TRADE region between boundaries
+//
+// Haase & Neuenkirch (2023):
+// - two-regime representation
+// - parsimonious regime forecasting
+// - regime forecasting can be more useful than direct return prediction
+// - combining simple predictors can reduce model risk
+//
+// Pine adaptation:
+// - "bull probability" below is an observable score/proxy.
+// - It is NOT the exact Wonham/Hamilton filter or HJB solution.
+// ============================================================================
+
+// ============================================================================
+// GROUPS
+// ============================================================================
+
+const string G_SESSION = "01 — Session"
+const string G_REGIME  = "02 — Regime Model"
+const string G_HTF     = "03 — Higher Timeframes"
+const string G_ENTRY   = "04 — Entry Confirmation"
+const string G_VOL     = "05 — Trend Strength"
+const string G_RISK    = "06 — Risk Management"
+const string G_LIMITS  = "07 — Trade Limits"
+const string G_DISPLAY = "08 — Display"
+
+// ============================================================================
+// SESSION
+// ============================================================================
+
+string sessionTimezone = input.string(
+     "America/New_York",
+     "Session Timezone",
+     group = G_SESSION)
+
+string tradingSession = input.session(
+     "0930-1600",
+     "Trading Session",
+     group = G_SESSION)
+
+string entrySession = input.session(
+     "0940-1530",
+     "Entry Window",
+     group = G_SESSION)
+
+bool flattenAtSessionEnd = input.bool(
+     true,
+     "Flatten At Session End",
+     group = G_SESSION)
+
+// ============================================================================
+// REGIME MODEL
+// ============================================================================
+
+int fastLength = input.int(
+     20,
+     "Fast EMA",
+     minval = 2,
+     group = G_REGIME)
+
+int slowLength = input.int(
+     50,
+     "Slow EMA",
+     minval = 3,
+     group = G_REGIME)
+
+int regimeLength = input.int(
+     100,
+     "Long Regime EMA",
+     minval = 20,
+     group = G_REGIME)
+
+int momentumLength = input.int(
+     10,
+     "Momentum Lookback",
+     minval = 2,
+     group = G_REGIME)
+
+float buyProbability = input.float(
+     0.68,
+     "Bull Buy Threshold",
+     minval = 0.50,
+     maxval = 0.95,
+     step = 0.01,
+     tooltip = "Upper regime boundary. Long regime becomes actionable above this level.",
+     group = G_REGIME)
+
+float sellProbability = input.float(
+     0.42,
+     "Bull Sell Threshold",
+     minval = 0.05,
+     maxval = 0.50,
+     step = 0.01,
+     tooltip = "Lower regime boundary. Long regime is exited below this level.",
+     group = G_REGIME)
+
+bool allowShortRegime = input.bool(
+     true,
+     "Enable Symmetric Bear / Short Adaptation",
+     tooltip = "The Dai et al. paper is long/flat. Shorting here is a symmetric futures adaptation.",
+     group = G_REGIME)
+
+float shortProbability = input.float(
+     0.32,
+     "Short Entry — Maximum Bull Probability",
+     minval = 0.05,
+     maxval = 0.50,
+     step = 0.01,
+     group = G_REGIME)
+
+float shortExitProbability = input.float(
+     0.58,
+     "Short Exit — Bull Probability",
+     minval = 0.50,
+     maxval = 0.95,
+     step = 0.01,
+     group = G_REGIME)
+
+// ============================================================================
+// HIGHER TIMEFRAMES
+// ============================================================================
+
+string htf1 = input.timeframe(
+     "60",
+     "Higher Timeframe 1",
+     group = G_HTF)
+
+string htf2 = input.timeframe(
+     "240",
+     "Higher Timeframe 2",
+     group = G_HTF)
+
+int htfFastLength = input.int(
+     20,
+     "HTF Fast EMA",
+     minval = 2,
+     group = G_HTF)
+
+int htfSlowLength = input.int(
+     50,
+     "HTF Slow EMA",
+     minval = 3,
+     group = G_HTF)
+
+bool requireHtfAgreement = input.bool(
+     true,
+     "Require 1H + 4H Agreement",
+     group = G_HTF)
+
+// ============================================================================
+// ENTRY CONFIRMATION
+// ============================================================================
+
+string entryMode = input.string(
+     "Breakout",
+     "Entry Confirmation",
+     options = [
+          "Regime Only",
+          "Breakout",
+          "Pullback Reclaim",
+          "Breakout or Pullback"
+     ],
+     group = G_ENTRY)
+
+int breakoutLength = input.int(
+     10,
+     "Breakout Lookback",
+     minval = 2,
+     maxval = 100,
+     group = G_ENTRY)
+
+int breakoutBufferTicks = input.int(
+     1,
+     "Breakout Buffer — Ticks",
+     minval = 0,
+     maxval = 100,
+     group = G_ENTRY)
+
+float pullbackAtrDistance = input.float(
+     0.60,
+     "Maximum Pullback Distance — ATR",
+     minval = 0.05,
+     maxval = 5.0,
+     step = 0.05,
+     group = G_ENTRY)
+
+bool requireDirectionalCandle = input.bool(
+     true,
+     "Require Directional Entry Candle",
+     group = G_ENTRY)
+
+// ============================================================================
+// TREND STRENGTH
+// ============================================================================
+
+int atrLength = input.int(
+     14,
+     "ATR Length",
+     minval = 2,
+     group = G_VOL)
+
+int atrBaselineLength = input.int(
+     50,
+     "ATR Baseline",
+     minval = 10,
+     group = G_VOL)
+
+bool useAtrRegime = input.bool(
+     true,
+     "Use ATR Regime Guard",
+     group = G_VOL)
+
+float minimumAtrRatio = input.float(
+     0.70,
+     "Minimum ATR / Baseline",
+     minval = 0.10,
+     maxval = 5.0,
+     step = 0.05,
+     group = G_VOL)
+
+float maximumAtrRatio = input.float(
+     2.50,
+     "Maximum ATR / Baseline",
+     minval = 0.25,
+     maxval = 10,
+     step = 0.05,
+     group = G_VOL)
+
+bool useAdxFilter = input.bool(
+     true,
+     "Use ADX",
+     group = G_VOL)
+
+int adxLength = input.int(
+     14,
+     "ADX Length",
+     minval = 2,
+     group = G_VOL)
+
+float minimumAdx = input.float(
+     18.0,
+     "Minimum ADX",
+     minval = 1,
+     maxval = 100,
+     step = 0.5,
+     group = G_VOL)
+
+// ============================================================================
+// RISK
+// ============================================================================
+
+float contracts = input.float(
+     1,
+     "MNQ Contracts",
+     minval = 1,
+     step = 1,
+     group = G_RISK)
+
+float atrStopMultiple = input.float(
+     1.50,
+     "ATR Stop",
+     minval = 0.25,
+     maxval = 10,
+     step = 0.05,
+     group = G_RISK)
+
+float rewardRisk = input.float(
+     2.50,
+     "Profit Target — R",
+     minval = 0.50,
+     maxval = 20,
+     step = 0.25,
+     group = G_RISK)
+
+bool exitOnRegimeReversal = input.bool(
+     true,
+     "Exit On Regime Boundary",
+     group = G_RISK)
+
+bool useBreakEven = input.bool(
+     true,
+     "Use Break-Even",
+     group = G_RISK)
+
+float breakEvenTriggerR = input.float(
+     1.00,
+     "Break-Even Trigger — R",
+     minval = 0.25,
+     maxval = 10,
+     step = 0.25,
+     group = G_RISK)
+
+int breakEvenOffsetTicks = input.int(
+     1,
+     "Break-Even Offset — Ticks",
+     minval = 0,
+     maxval = 100,
+     group = G_RISK)
+
+bool useAtrTrail = input.bool(
+     true,
+     "Use ATR Trailing Stop",
+     group = G_RISK)
+
+float trailActivationR = input.float(
+     1.50,
+     "Trail Activation — R",
+     minval = 0.25,
+     maxval = 10,
+     step = 0.25,
+     group = G_RISK)
+
+float trailAtrMultiple = input.float(
+     1.75,
+     "Trailing ATR",
+     minval = 0.25,
+     maxval = 10,
+     step = 0.05,
+     group = G_RISK)
+
+bool useTimeExit = input.bool(
+     true,
+     "Use Time Exit",
+     group = G_RISK)
+
+int maximumHoldingBars = input.int(
+     48,
+     "Maximum Holding Bars",
+     minval = 1,
+     maxval = 1000,
+     group = G_RISK)
+
+// ============================================================================
+// TRADE LIMITS
+// ============================================================================
+
+int maximumTradesPerDay = input.int(
+     2,
+     "Maximum Trades Per Day",
+     minval = 1,
+     maxval = 20,
+     group = G_LIMITS)
+
+int cooldownBars = input.int(
+     5,
+     "Cooldown After Exit",
+     minval = 0,
+     maxval = 200,
+     group = G_LIMITS)
+
+// ============================================================================
+// DISPLAY
+// ============================================================================
+
+bool showRegimeBackground = input.bool(
+     true,
+     "Show Regime Background",
+     group = G_DISPLAY)
+
+bool showProbability = input.bool(
+     true,
+     "Show Regime Probability In Data Window",
+     group = G_DISPLAY)
+
+bool showEma = input.bool(
+     true,
+     "Show EMAs",
+     group = G_DISPLAY)
+
+bool showBreakoutLevels = input.bool(
+     true,
+     "Show Breakout Levels",
+     group = G_DISPLAY)
+
+bool showTradeLevels = input.bool(
+     true,
+     "Show Entry / Stop / Target",
+     group = G_DISPLAY)
+
+bool showDashboard = input.bool(
+     true,
+     "Show Dashboard",
+     group = G_DISPLAY)
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+f_clip(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_scale(float x, float bearishLevel, float bullishLevel) =>
+    bullishLevel == bearishLevel
+         ? 0.50
+         : f_clip(
+              (x - bearishLevel) /
+              (bullishLevel - bearishLevel),
+              0.0,
+              1.0)
+
+// ============================================================================
+// SESSION
+// ============================================================================
+
+bool inTradingSession =
+     not na(
+          time(
+               timeframe.period,
+               tradingSession,
+               sessionTimezone))
+
+bool inEntrySession =
+     not na(
+          time(
+               timeframe.period,
+               entrySession,
+               sessionTimezone))
+
+bool sessionStart =
+     inTradingSession and
+     not inTradingSession[1]
+
+bool sessionEnd =
+     not inTradingSession and
+     inTradingSession[1]
+
+// ============================================================================
+// EXECUTION-TIMEFRAME INDICATORS
+// ============================================================================
+
+float fastEma =
+     ta.ema(
+          close,
+          fastLength)
+
+float slowEma =
+     ta.ema(
+          close,
+          slowLength)
+
+float regimeEma =
+     ta.ema(
+          close,
+          regimeLength)
+
+float atr =
+     ta.atr(
+          atrLength)
+
+float atrBaseline =
+     ta.sma(
+          atr,
+          atrBaselineLength)
+
+float atrRatio =
+     not na(atrBaseline) and
+     atrBaseline > 0.0
+          ? atr / atrBaseline
+          : na
+
+float momentum =
+     ta.roc(
+          close,
+          momentumLength)
+
+[plusDI, minusDI, adx] =
+     ta.dmi(
+          adxLength,
+          adxLength)
+
+// ============================================================================
+// CONFIRMED HTF DATA
+//
+// Using [1] with lookahead_on intentionally retrieves only the last COMPLETED
+// higher-timeframe bar.
+// ============================================================================
+
+[htf1Close, htf1Fast, htf1Slow] =
+     request.security(
+          syminfo.tickerid,
+          htf1,
+          [
+               close[1],
+               ta.ema(close, htfFastLength)[1],
+               ta.ema(close, htfSlowLength)[1]
+          ],
+          gaps = barmerge.gaps_off,
+          lookahead = barmerge.lookahead_on)
+
+[htf2Close, htf2Fast, htf2Slow] =
+     request.security(
+          syminfo.tickerid,
+          htf2,
+          [
+               close[1],
+               ta.ema(close, htfFastLength)[1],
+               ta.ema(close, htfSlowLength)[1]
+          ],
+          gaps = barmerge.gaps_off,
+          lookahead = barmerge.lookahead_on)
+
+// ============================================================================
+// HTF REGIME COMPONENTS
+// ============================================================================
+
+bool htf1Bull =
+     not na(htf1Close) and
+     htf1Close > htf1Fast and
+     htf1Fast > htf1Slow
+
+bool htf1Bear =
+     not na(htf1Close) and
+     htf1Close < htf1Fast and
+     htf1Fast < htf1Slow
+
+bool htf2Bull =
+     not na(htf2Close) and
+     htf2Close > htf2Fast and
+     htf2Fast > htf2Slow
+
+bool htf2Bear =
+     not na(htf2Close) and
+     htf2Close < htf2Fast and
+     htf2Fast < htf2Slow
+
+float htf1Score =
+     htf1Bull
+          ? 1.0
+          : htf1Bear
+               ? 0.0
+               : 0.5
+
+float htf2Score =
+     htf2Bull
+          ? 1.0
+          : htf2Bear
+               ? 0.0
+               : 0.5
+
+// ============================================================================
+// OBSERVABLE REGIME-PROBABILITY PROXY
+//
+// Each component maps to [0,1].
+// 1 = strongly bull-like
+// 0 = strongly bear-like
+//
+// Simple averaging is intentional: the regime paper finds useful robustness
+// from combining parsimonious forecasts rather than relying on one large,
+// heavily parameterized specification.
+// ============================================================================
+
+// Price relative to slow trend
+float priceDistanceAtr =
+     atr > 0.0
+          ? (close - slowEma) / atr
+          : 0.0
+
+float priceScore =
+     f_scale(
+          priceDistanceAtr,
+          -1.0,
+          1.0)
+
+// Fast/slow EMA separation
+float emaSpreadAtr =
+     atr > 0.0
+          ? (fastEma - slowEma) / atr
+          : 0.0
+
+float emaScore =
+     f_scale(
+          emaSpreadAtr,
+          -0.75,
+          0.75)
+
+// Long-regime price location
+float regimeDistanceAtr =
+     atr > 0.0
+          ? (close - regimeEma) / atr
+          : 0.0
+
+float regimeScore =
+     f_scale(
+          regimeDistanceAtr,
+          -1.25,
+          1.25)
+
+// Momentum
+float momentumScore =
+     f_scale(
+          momentum,
+          -0.75,
+          0.75)
+
+// Directional movement
+float diTotal =
+     plusDI +
+     minusDI
+
+float directionalScore =
+     diTotal > 0.0
+          ? plusDI / diTotal
+          : 0.50
+
+// Volatility asymmetry.
+//
+// High volatility alone is not defined as bearish.
+// Instead we gently penalize elevated volatility only when price is already
+// below the long regime EMA.
+float volatilityScore = 0.50
+
+if not na(atrRatio)
+    if close >= regimeEma
+        volatilityScore :=
+             f_scale(
+                  atrRatio,
+                  1.80,
+                  0.60)
+    else
+        volatilityScore :=
+             f_scale(
+                  atrRatio,
+                  2.20,
+                  0.70)
+
+// Blend observable components
+float rawBullProbability =
+     (
+          priceScore +
+          emaScore +
+          regimeScore +
+          momentumScore +
+          directionalScore +
+          htf1Score +
+          htf2Score +
+          volatilityScore
+     ) / 8.0
+
+// Light smoothing reduces regime chatter.
+float bullProbability =
+     ta.ema(
+          rawBullProbability,
+          3)
+
+float bearProbability =
+     1.0 -
+     bullProbability
+
+// ============================================================================
+// RESEARCH-STYLE REGIME STATE WITH HYSTERESIS
+//
+// Upper threshold => bull regime
+// Lower threshold => leave bull regime
+// Between them => maintain prior state/no-trade region
+// ============================================================================
+
+const int REGIME_BEAR    = -1
+const int REGIME_NEUTRAL = 0
+const int REGIME_BULL    = 1
+
+var int regimeState =
+     REGIME_NEUTRAL
+
+bool bullThresholdCross =
+     bullProbability >= buyProbability and
+     bullProbability[1] < buyProbability
+
+bool bullExitThresholdCross =
+     bullProbability <= sellProbability and
+     bullProbability[1] > sellProbability
+
+bool bearThresholdCross =
+     bullProbability <= shortProbability and
+     bullProbability[1] > shortProbability
+
+bool bearExitThresholdCross =
+     bullProbability >= shortExitProbability and
+     bullProbability[1] < shortExitProbability
+
+if barstate.isconfirmed
+
+    if bullProbability >= buyProbability
+        regimeState := REGIME_BULL
+
+    else if allowShortRegime and bullProbability <= shortProbability
+        regimeState := REGIME_BEAR
+
+    else if regimeState == REGIME_BULL and bullProbability <= sellProbability
+        regimeState := REGIME_NEUTRAL
+
+    else if regimeState == REGIME_BEAR and bullProbability >= shortExitProbability
+        regimeState := REGIME_NEUTRAL
+
+// ============================================================================
+// HTF AGREEMENT FILTER
+// ============================================================================
+
+bool longHtfPass =
+     not requireHtfAgreement or
+     (
+          htf1Bull and
+          htf2Bull
+     )
+
+bool shortHtfPass =
+     not requireHtfAgreement or
+     (
+          htf1Bear and
+          htf2Bear
+     )
+
+// ============================================================================
+// ATR + ADX FILTERS
+// ============================================================================
+
+bool atrRegimePass =
+     not useAtrRegime or
+     (
+          not na(atrRatio) and
+          atrRatio >= minimumAtrRatio and
+          atrRatio <= maximumAtrRatio
+     )
+
+bool longAdxPass =
+     not useAdxFilter or
+     (
+          adx >= minimumAdx and
+          plusDI > minusDI
+     )
+
+bool shortAdxPass =
+     not useAdxFilter or
+     (
+          adx >= minimumAdx and
+          minusDI > plusDI
+     )
+
+// ============================================================================
+// BREAKOUT CONFIRMATION
+//
+// [1] excludes the current signal bar from its own breakout level.
+// ============================================================================
+
+float priorHigh =
+     ta.highest(
+          high[1],
+          breakoutLength)
+
+float priorLow =
+     ta.lowest(
+          low[1],
+          breakoutLength)
+
+float breakoutBuffer =
+     breakoutBufferTicks *
+     syminfo.mintick
+
+float longBreakoutLevel =
+     priorHigh +
+     breakoutBuffer
+
+float shortBreakoutLevel =
+     priorLow -
+     breakoutBuffer
+
+bool longBreakout =
+     not na(longBreakoutLevel) and
+     close > longBreakoutLevel
+
+bool shortBreakout =
+     not na(shortBreakoutLevel) and
+     close < shortBreakoutLevel
+
+// ============================================================================
+// PULLBACK / RECLAIM CONFIRMATION
+// ============================================================================
+
+float longPullbackDistance =
+     atr > 0.0
+          ? math.abs(low - fastEma) / atr
+          : na
+
+float shortPullbackDistance =
+     atr > 0.0
+          ? math.abs(high - fastEma) / atr
+          : na
+
+bool longPullback =
+     not na(longPullbackDistance) and
+     low <= fastEma and
+     close > fastEma and
+     longPullbackDistance <= pullbackAtrDistance
+
+bool shortPullback =
+     not na(shortPullbackDistance) and
+     high >= fastEma and
+     close < fastEma and
+     shortPullbackDistance <= pullbackAtrDistance
+
+// ============================================================================
+// SELECT ENTRY CONFIRMATION
+// ============================================================================
+
+// FIX (CE10156 risk): this nested ternary's indentation grows by 5 spaces
+// per level (5, 10, 15, 20...) and lands on a multiple of 4 at the 4th
+// level -- exactly the class of error already hit elsewhere in this file.
+// Collapsed to avoid depending on indentation at all.
+bool longEntryPattern = entryMode == "Regime Only" ? true : entryMode == "Breakout" ? longBreakout : entryMode == "Pullback Reclaim" ? longPullback : longBreakout or longPullback
+
+bool shortEntryPattern = entryMode == "Regime Only" ? true : entryMode == "Breakout" ? shortBreakout : entryMode == "Pullback Reclaim" ? shortPullback : shortBreakout or shortPullback
+
+bool longDirectionalPass =
+     not requireDirectionalCandle or
+     close > open
+
+bool shortDirectionalPass =
+     not requireDirectionalCandle or
+     close < open
+
+// ============================================================================
+// DAILY CONTROL
+// ============================================================================
+
+var int tradesToday =
+     0
+
+var int lastExitBar =
+     na
+
+var int lastOrderBar =
+     na
+
+if sessionStart
+    tradesToday :=
+         0
+
+int barsSinceExit =
+     na(lastExitBar)
+          ? 1000000
+          : bar_index - lastExitBar
+
+bool cooldownPass =
+     barsSinceExit >= cooldownBars
+
+bool tradeLimitPass =
+     tradesToday < maximumTradesPerDay
+
+bool duplicateOrderPass =
+     na(lastOrderBar) or
+     bar_index != lastOrderBar
+
+// ============================================================================
+// PRE-ENTRY RISK
+// ============================================================================
+
+float candidateLongStop =
+     close -
+     atr * atrStopMultiple
+
+float candidateShortStop =
+     close +
+     atr * atrStopMultiple
+
+float candidateLongRisk =
+     close -
+     candidateLongStop
+
+float candidateShortRisk =
+     candidateShortStop -
+     close
+
+bool longRiskPass =
+     not na(candidateLongRisk) and
+     candidateLongRisk >
+     syminfo.mintick
+
+bool shortRiskPass =
+     not na(candidateShortRisk) and
+     candidateShortRisk >
+     syminfo.mintick
+
+// ============================================================================
+// FINAL ENTRY CONDITIONS
+// ============================================================================
+
+bool flat =
+     strategy.position_size ==
+     0
+
+bool commonEntryPass =
+     barstate.isconfirmed and
+     flat and
+     inEntrySession and
+     atrRegimePass and
+     cooldownPass and
+     tradeLimitPass and
+     duplicateOrderPass
+
+bool longEntry =
+     commonEntryPass and
+     regimeState == REGIME_BULL and
+     bullProbability >= buyProbability and
+     longHtfPass and
+     longAdxPass and
+     longEntryPattern and
+     longDirectionalPass and
+     longRiskPass
+
+bool shortEntry =
+     commonEntryPass and
+     allowShortRegime and
+     regimeState == REGIME_BEAR and
+     bullProbability <= shortProbability and
+     shortHtfPass and
+     shortAdxPass and
+     shortEntryPattern and
+     shortDirectionalPass and
+     shortRiskPass and
+     not longEntry
+
+// ============================================================================
+// TRADE STATE
+// ============================================================================
+
+var float pendingStop =
+     na
+
+var float activeEntry =
+     na
+
+var float initialRisk =
+     na
+
+var float activeStop =
+     na
+
+var float activeTarget =
+     na
+
+var float highestSinceEntry =
+     na
+
+var float lowestSinceEntry =
+     na
+
+var int entryBar =
+     na
+
+var bool breakEvenActive =
+     false
+
+var bool trailActive =
+     false
+
+// ============================================================================
+// ORDERS
+// ============================================================================
+
+if longEntry
+
+    pendingStop :=
+         candidateLongStop
+
+    lastOrderBar :=
+         bar_index
+
+    tradesToday +=
+         1
+
+    strategy.entry(
+         "Long",
+         strategy.long,
+         qty = contracts,
+         comment = "Bull Regime Trend")
+
+if shortEntry
+
+    pendingStop :=
+         candidateShortStop
+
+    lastOrderBar :=
+         bar_index
+
+    tradesToday +=
+         1
+
+    strategy.entry(
+         "Short",
+         strategy.short,
+         qty = contracts,
+         comment = "Bear Regime Trend")
+
+// ============================================================================
+// FILL DETECTION
+// ============================================================================
+
+bool longFill =
+     strategy.position_size > 0 and
+     strategy.position_size[1] <= 0
+
+bool shortFill =
+     strategy.position_size < 0 and
+     strategy.position_size[1] >= 0
+
+if longFill
+
+    activeEntry :=
+         strategy.position_avg_price
+
+    // FIX (CE10156 risk): the "atr * atrStopMultiple" continuation landed
+    // at an indent that's a multiple of 4 -- collapsed to avoid it.
+    activeStop := not na(pendingStop) ? pendingStop : activeEntry - atr * atrStopMultiple
+
+    initialRisk :=
+         activeEntry -
+         activeStop
+
+    activeTarget :=
+         activeEntry +
+         initialRisk *
+         rewardRisk
+
+    highestSinceEntry :=
+         activeEntry
+
+    lowestSinceEntry :=
+         activeEntry
+
+    entryBar :=
+         bar_index
+
+    breakEvenActive :=
+         false
+
+    trailActive :=
+         false
+
+if shortFill
+
+    activeEntry :=
+         strategy.position_avg_price
+
+    // FIX (CE10156 risk): same collapse as the long-side fill handler above.
+    activeStop := not na(pendingStop) ? pendingStop : activeEntry + atr * atrStopMultiple
+
+    initialRisk :=
+         activeStop -
+         activeEntry
+
+    activeTarget :=
+         activeEntry -
+         initialRisk *
+         rewardRisk
+
+    highestSinceEntry :=
+         activeEntry
+
+    lowestSinceEntry :=
+         activeEntry
+
+    entryBar :=
+         bar_index
+
+    breakEvenActive :=
+         false
+
+    trailActive :=
+         false
+
+// ============================================================================
+// MANAGEMENT
+//
+// Management begins only after the fill bar to reduce same-bar historical
+// ambiguity.
+// ============================================================================
+
+bool managementEligible =
+     strategy.position_size != 0 and
+     not na(entryBar) and
+     bar_index > entryBar
+
+float breakEvenOffset =
+     breakEvenOffsetTicks *
+     syminfo.mintick
+
+// LONG
+if strategy.position_size > 0
+
+    if managementEligible
+
+        highestSinceEntry :=
+             math.max(
+                  nz(
+                       highestSinceEntry,
+                       high),
+                  high)
+
+        if useBreakEven and not breakEvenActive and high >= activeEntry + initialRisk * breakEvenTriggerR
+
+            activeStop :=
+                 math.max(
+                      activeStop,
+                      activeEntry +
+                      breakEvenOffset)
+
+            breakEvenActive :=
+                 true
+
+        if useAtrTrail and highestSinceEntry >= activeEntry + initialRisk * trailActivationR
+
+            float proposedLongTrail =
+                 highestSinceEntry -
+                 atr *
+                 trailAtrMultiple
+
+            activeStop :=
+                 math.max(
+                      activeStop,
+                      proposedLongTrail)
+
+            trailActive :=
+                 true
+
+    strategy.exit(
+         "Long Risk Exit",
+         from_entry = "Long",
+         stop = activeStop,
+         limit = activeTarget)
+
+// SHORT
+if strategy.position_size < 0
+
+    if managementEligible
+
+        lowestSinceEntry :=
+             math.min(
+                  nz(
+                       lowestSinceEntry,
+                       low),
+                  low)
+
+        if useBreakEven and not breakEvenActive and low <= activeEntry - initialRisk * breakEvenTriggerR
+
+            activeStop :=
+                 math.min(
+                      activeStop,
+                      activeEntry -
+                      breakEvenOffset)
+
+            breakEvenActive :=
+                 true
+
+        if useAtrTrail and lowestSinceEntry <= activeEntry - initialRisk * trailActivationR
+
+            float proposedShortTrail =
+                 lowestSinceEntry +
+                 atr *
+                 trailAtrMultiple
+
+            activeStop :=
+                 math.min(
+                      activeStop,
+                      proposedShortTrail)
+
+            trailActive :=
+                 true
+
+    strategy.exit(
+         "Short Risk Exit",
+         from_entry = "Short",
+         stop = activeStop,
+         limit = activeTarget)
+
+// ============================================================================
+// REGIME EXITS
+//
+// This is the closest practical Pine analogue to the lower sell boundary in
+// the source paper.
+// ============================================================================
+
+bool longRegimeExit =
+     exitOnRegimeReversal and
+     strategy.position_size > 0 and
+     barstate.isconfirmed and
+     bullProbability <= sellProbability
+
+bool shortRegimeExit =
+     exitOnRegimeReversal and
+     strategy.position_size < 0 and
+     barstate.isconfirmed and
+     bullProbability >= shortExitProbability
+
+if longRegimeExit
+
+    strategy.close(
+         "Long",
+         comment = "Bull Probability Exit",
+         immediately = true)
+
+if shortRegimeExit
+
+    strategy.close(
+         "Short",
+         comment = "Bear Probability Exit",
+         immediately = true)
+
+// ============================================================================
+// TIME EXIT
+// ============================================================================
+
+// FIX (CE10156 risk): "entryBar" continuation landed on an indent that's a
+// multiple of 4 -- collapsed.
+int barsHeld = strategy.position_size != 0 and not na(entryBar) ? bar_index - entryBar : 0
+
+if useTimeExit and strategy.position_size != 0 and barsHeld >= maximumHoldingBars
+
+    strategy.close_all(
+         comment = "Time Exit",
+         immediately = true)
+
+// ============================================================================
+// SESSION EXIT
+// ============================================================================
+
+if flattenAtSessionEnd and sessionEnd and strategy.position_size != 0
+
+    strategy.close_all(
+         comment = "Session Exit",
+         immediately = true)
+
+// ============================================================================
+// CLOSED POSITION RESET
+// ============================================================================
+
+bool positionJustClosed =
+     strategy.position_size == 0 and
+     strategy.position_size[1] != 0
+
+if positionJustClosed
+
+    lastExitBar :=
+         bar_index
+
+    pendingStop :=
+         na
+
+    activeEntry :=
+         na
+
+    initialRisk :=
+         na
+
+    activeStop :=
+         na
+
+    activeTarget :=
+         na
+
+    highestSinceEntry :=
+         na
+
+    lowestSinceEntry :=
+         na
+
+    entryBar :=
+         na
+
+    breakEvenActive :=
+         false
+
+    trailActive :=
+         false
+
+// ============================================================================
+// DIAGNOSTIC BLOCKERS
+// ============================================================================
+
+// FIX (CE10156 risk, the worst instance in this file): this 11/12-level
+// nested ternary grows indentation by 5 spaces per level (5, 10, 15, 20,
+// 25...), which lands on a multiple of 4 at levels 4, 8, and 12 -- three
+// separate places this would have failed to compile the same way line 712
+// did. Collapsed both chains entirely rather than hunt for safe indents at
+// every level.
+string longBlocker = not inEntrySession ? "SESSION" : not flat ? "POSITION" : not tradeLimitPass ? "TRADE LIMIT" : not cooldownPass ? "COOLDOWN" : regimeState != REGIME_BULL ? "NO BULL REGIME" : bullProbability < buyProbability ? "PROBABILITY" : not longHtfPass ? "HTF" : not atrRegimePass ? "ATR" : not longAdxPass ? "ADX" : not longEntryPattern ? "ENTRY PATTERN" : not longDirectionalPass ? "CANDLE" : "CLEAR"
+
+string shortBlocker = not allowShortRegime ? "SHORT OFF" : not inEntrySession ? "SESSION" : not flat ? "POSITION" : not tradeLimitPass ? "TRADE LIMIT" : not cooldownPass ? "COOLDOWN" : regimeState != REGIME_BEAR ? "NO BEAR REGIME" : bullProbability > shortProbability ? "PROBABILITY" : not shortHtfPass ? "HTF" : not atrRegimePass ? "ATR" : not shortAdxPass ? "ADX" : not shortEntryPattern ? "ENTRY PATTERN" : not shortDirectionalPass ? "CANDLE" : "CLEAR"
+
+// ============================================================================
+// VISUALS
+// ============================================================================
+
+color regimeBackground =
+     regimeState == REGIME_BULL
+          ? color.new(
+               color.green,
+               92)
+          : regimeState == REGIME_BEAR
+               ? color.new(
+                    color.red,
+                    92)
+               : color.new(
+                    color.gray,
+                    95)
+
+bgcolor(
+     showRegimeBackground
+          ? regimeBackground
+          : na,
+     title = "Regime Background")
+
+plot(
+     showEma
+          ? fastEma
+          : na,
+     "Fast EMA",
+     color = color.blue,
+     linewidth = 2)
+
+plot(
+     showEma
+          ? slowEma
+          : na,
+     "Slow EMA",
+     color = color.orange,
+     linewidth = 2)
+
+plot(
+     showEma
+          ? regimeEma
+          : na,
+     "Regime EMA",
+     color = color.aqua,
+     linewidth = 2)
+
+plot(
+     showBreakoutLevels
+          ? longBreakoutLevel
+          : na,
+     "Long Breakout",
+     color = color.new(
+          color.green,
+          60),
+     style = plot.style_linebr)
+
+plot(
+     showBreakoutLevels
+          ? shortBreakoutLevel
+          : na,
+     "Short Breakout",
+     color = color.new(
+          color.red,
+          60),
+     style = plot.style_linebr)
+
+plot(
+     showTradeLevels and
+     strategy.position_size != 0
+          ? activeEntry
+          : na,
+     "Active Entry",
+     color = color.white,
+     style = plot.style_linebr)
+
+plot(
+     showTradeLevels and
+     strategy.position_size != 0
+          ? activeStop
+          : na,
+     "Active Stop",
+     color = color.red,
+     linewidth = 2,
+     style = plot.style_linebr)
+
+plot(
+     showTradeLevels and
+     strategy.position_size != 0
+          ? activeTarget
+          : na,
+     "Active Target",
+     color = color.lime,
+     linewidth = 2,
+     style = plot.style_linebr)
+
+plotshape(
+     longEntry,
+     title = "Regime Trend Long",
+     style = shape.triangleup,
+     location = location.belowbar,
+     color = color.lime,
+     size = size.small,
+     text = "TF")
+
+plotshape(
+     shortEntry,
+     title = "Regime Trend Short",
+     style = shape.triangledown,
+     location = location.abovebar,
+     color = color.red,
+     size = size.small,
+     text = "TF")
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+
+plot(
+     showProbability
+          ? bullProbability
+          : na,
+     "Bull Regime Probability",
+     display = display.data_window)
+
+plot(
+     showProbability
+          ? bearProbability
+          : na,
+     "Bear Regime Probability",
+     display = display.data_window)
+
+plot(
+     float(regimeState),
+     "Regime State",
+     display = display.data_window)
+
+plot(
+     atrRatio,
+     "ATR Ratio",
+     display = display.data_window)
+
+plot(
+     adx,
+     "ADX",
+     display = display.data_window)
+
+plot(
+     float(tradesToday),
+     "Trades Today",
+     display = display.data_window)
+
+// The dashboard table (below) has grown to 13 rows and, on a phone-sized
+// chart pane, the bottom rows can end up taller than the pane itself --
+// table.new() isn't scrollable, so anything past that height is silently
+// clipped with no visible sign it's happening. The Data Window panel below
+// scrolls independently of chart height and can't be clipped this way, so
+// the same cooldown/trade-accounting numbers are duplicated here as the
+// reliable way to actually read them.
+plot(
+     float(strategy.closedtrades),
+     "Closed Trades (raw)",
+     display = display.data_window)
+
+plot(
+     float(strategy.opentrades),
+     "Open Trades (raw)",
+     display = display.data_window)
+
+plot(
+     na(lastExitBar) ? na : float(barsSinceExit),
+     "Bars Since Exit",
+     display = display.data_window)
+
+plot(
+     float(cooldownBars),
+     "Cooldown Bars Setting",
+     display = display.data_window)
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+var table dashboard =
+     table.new(
+          position.top_right,
+          2,
+          13,
+          border_width = 1)
+
+if showDashboard and barstate.islast
+
+    string regimeText =
+         regimeState == REGIME_BULL
+              ? "BULL"
+              : regimeState == REGIME_BEAR
+                   ? "BEAR"
+                   : "NO TRADE"
+
+    string positionText =
+         strategy.position_size > 0
+              ? "LONG"
+              : strategy.position_size < 0
+                   ? "SHORT"
+                   : "FLAT"
+
+    // FIX (CE10156/CE10013 -- same class of error hit before): this one has
+    // one more ternary level than regimeText/positionText right above it,
+    // and that extra level lands the "? \"BREAK EVEN\"" continuation at
+    // indent 24 -- a multiple of 4. I checked the two shorter ternaries
+    // above and wrongly assumed this one was the same depth; it wasn't.
+    // Collapsed to remove the indentation dependency entirely.
+    string managementText = strategy.position_size == 0 ? "OFF" : trailActive ? "TRAIL" : breakEvenActive ? "BREAK EVEN" : "INITIAL"
+
+    table.cell(
+         dashboard,
+         0,
+         0,
+         "MNQ REGIME")
+
+    table.cell(
+         dashboard,
+         1,
+         0,
+         regimeText)
+
+    table.cell(
+         dashboard,
+         0,
+         1,
+         "Bull Prob")
+
+    table.cell(
+         dashboard,
+         1,
+         1,
+         str.tostring(
+              bullProbability,
+              "#.000"))
+
+    // MOVED here from row 12: the table has consistently rendered rows
+    // 0-10 fine and clipped everything from row 11 down on the user's
+    // phone (table.new() isn't scrollable and doesn't fit the pane at
+    // 13 rows). This is the number actually needed right now, so it goes
+    // where it's guaranteed visible; the static Buy/Sell thresholds
+    // (rarely need to be re-checked mid-session) take its old spot at
+    // row 12 instead.
+    table.cell(
+         dashboard,
+         0,
+         2,
+         "Closed / Open")
+
+    table.cell(
+         dashboard,
+         1,
+         2,
+         str.tostring(strategy.closedtrades) + " / " + str.tostring(strategy.opentrades))
+
+    table.cell(
+         dashboard,
+         0,
+         3,
+         "HTF 1")
+
+    table.cell(
+         dashboard,
+         1,
+         3,
+         htf1Bull
+              ? "BULL"
+              : htf1Bear
+                   ? "BEAR"
+                   : "MIXED")
+
+    table.cell(
+         dashboard,
+         0,
+         4,
+         "HTF 2")
+
+    table.cell(
+         dashboard,
+         1,
+         4,
+         htf2Bull
+              ? "BULL"
+              : htf2Bear
+                   ? "BEAR"
+                   : "MIXED")
+
+    table.cell(
+         dashboard,
+         0,
+         5,
+         "Long")
+
+    table.cell(
+         dashboard,
+         1,
+         5,
+         longBlocker)
+
+    table.cell(
+         dashboard,
+         0,
+         6,
+         "Short")
+
+    table.cell(
+         dashboard,
+         1,
+         6,
+         shortBlocker)
+
+    table.cell(
+         dashboard,
+         0,
+         7,
+         "Position")
+
+    table.cell(
+         dashboard,
+         1,
+         7,
+         positionText)
+
+    table.cell(
+         dashboard,
+         0,
+         8,
+         "Trades")
+
+    table.cell(
+         dashboard,
+         1,
+         8,
+         str.tostring(
+              tradesToday) +
+         "/" +
+         str.tostring(
+              maximumTradesPerDay))
+
+    table.cell(
+         dashboard,
+         0,
+         9,
+         "Management")
+
+    table.cell(
+         dashboard,
+         1,
+         9,
+         managementText)
+
+    // Raw cooldown state -- added because "cooldown not working" can't be
+    // diagnosed from cooldownPass alone (a true/false doesn't say whether
+    // it's genuinely not gating, or just gating a gap too short to notice
+    // on a zoomed-out chart). This shows the actual bar count against the
+    // actual setting.
+    string cooldownStatusText =
+         na(lastExitBar)
+              ? "no exit yet"
+              : str.tostring(barsSinceExit) + " / " + str.tostring(cooldownBars) + " bars"
+
+    table.cell(
+         dashboard,
+         0,
+         10,
+         "Cooldown")
+
+    table.cell(
+         dashboard,
+         1,
+         10,
+         cooldownStatusText,
+         bgcolor = cooldownPass ? color.new(color.green, 30) : color.new(color.red, 30))
+
+    table.cell(
+         dashboard,
+         0,
+         11,
+         "Last Exit Bar")
+
+    table.cell(
+         dashboard,
+         1,
+         11,
+         na(lastExitBar) ? "n/a" : str.tostring(lastExitBar) + " (now " + str.tostring(bar_index) + ")")
+
+    table.cell(
+         dashboard,
+         0,
+         12,
+         "Buy / Sell")
+
+    table.cell(
+         dashboard,
+         1,
+         12,
+         str.tostring(
+              buyProbability,
+              "#.00") +
+         " / " +
+         str.tostring(
+              sellProbability,
+              "#.00"))
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(
+     longEntry,
+     title = "MNQ Research Trend Long",
+     message = "MNQ bull-regime trend-following LONG | {{ticker}} | {{interval}}")
+
+alertcondition(
+     shortEntry,
+     title = "MNQ Research Trend Short",
+     message = "MNQ bear-regime trend-following SHORT | {{ticker}} | {{interval}}")
+
+alertcondition(
+     bullThresholdCross,
+     title = "Bull Regime Activated",
+     message = "Bull probability crossed the upper regime threshold.")
+
+alertcondition(
+     bullExitThresholdCross,
+     title = "Bull Regime Exit",
+     message = "Bull probability crossed below the lower regime threshold.")

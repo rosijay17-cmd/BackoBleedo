@@ -1,0 +1,98 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © AutomatedTrader101
+
+//@version=6
+strategy("ES ORB 15min RTH",
+     shorttitle      = "ES ORB",
+     overlay         = true,
+     initial_capital = 1000000,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     commission_type   = strategy.commission.cash_per_contract,
+     commission_value  = 0.60,
+     slippage          = 1,
+     calc_on_every_tick = false)
+
+// ─── Inputs ───────────────────────────────────────────────────────────────────
+float target_pts = input.float(8.0,  "Target Points (1pt = $50)", minval=0.25, step=0.25)
+float stop_pts   = input.float(16.0, "Stop Points   (1pt = $50)", minval=0.25, step=0.25)
+
+// ─── Time helpers (ET) ────────────────────────────────────────────────────────
+var string TZ = "America/New_York"
+t_rth_open = timestamp(TZ, year, month, dayofmonth,  9, 30)
+t_or_end   = timestamp(TZ, year, month, dayofmonth, 10,  0)
+t_eod      = timestamp(TZ, year, month, dayofmonth, 15, 55)
+
+in_or   = time >= t_rth_open and time < t_or_end
+post_or = time >= t_or_end   and time < t_eod
+at_eod  = time >= t_eod
+
+// ─── Opening Range ────────────────────────────────────────────────────────────
+var float or_hi = na
+var float or_lo = na
+var bool  or_ok = false
+
+new_day = ta.change(time("D")) != 0
+if new_day
+    or_hi := na
+    or_lo := na
+    or_ok := false
+
+if in_or
+    or_hi := na(or_hi) ? high : math.max(or_hi, high)
+    or_lo := na(or_lo) ? low  : math.min(or_lo, low)
+
+if not in_or and not na(or_hi) and not or_ok
+    or_ok := true
+
+// ─── Entry ────────────────────────────────────────────────────────────────────
+var bool traded = false
+if new_day
+    traded := false
+
+long_sig  = or_ok and post_or and not traded and strategy.position_size == 0 and close > or_hi
+short_sig = or_ok and post_or and not traded and strategy.position_size == 0 and close < or_lo
+
+if long_sig
+    strategy.entry("L", strategy.long,  comment="ORB Long")
+    traded := true
+
+if short_sig
+    strategy.entry("S", strategy.short, comment="ORB Short")
+    traded := true
+
+// ─── Exits ────────────────────────────────────────────────────────────────────
+avg = strategy.position_avg_price
+
+if strategy.position_size > 0
+    strategy.exit("L_x", "L",
+         limit          = avg + target_pts,
+         stop           = avg - stop_pts,
+         comment_profit = "Target",
+         comment_loss   = "Stop")
+
+if strategy.position_size < 0
+    strategy.exit("S_x", "S",
+         limit          = avg - target_pts,
+         stop           = avg + stop_pts,
+         comment_profit = "Target",
+         comment_loss   = "Stop")
+
+if at_eod and strategy.position_size != 0
+    strategy.close_all(comment="EOD")
+
+// ─── Visuals ──────────────────────────────────────────────────────────────────
+plot(or_ok or in_or ? or_hi : na, "OR High",
+     color = color.new(color.teal,   0), linewidth = 2, style = plot.style_linebr)
+plot(or_ok or in_or ? or_lo : na, "OR Low",
+     color = color.new(color.maroon, 0), linewidth = 2, style = plot.style_linebr)
+
+float t_line = strategy.position_size > 0 ? avg + target_pts :
+               strategy.position_size < 0 ? avg - target_pts : na
+float s_line = strategy.position_size > 0 ? avg - stop_pts :
+               strategy.position_size < 0 ? avg + stop_pts  : na
+
+plot(t_line, "Target", color.new(color.lime,   30), 1, plot.style_linebr)
+plot(s_line, "Stop",   color.new(color.orange, 30), 1, plot.style_linebr)
+
+bgcolor(in_or ? color.new(color.yellow, 88) : na, title="OR Window")

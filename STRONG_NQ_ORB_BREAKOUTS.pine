@@ -1,0 +1,706 @@
+//@version=6
+indicator("STRONG NQ ORB BREAKOUTS", overlay = true,
+     max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500, max_bars_back = 1500)
+
+gS = "01 · Session / Opening Range"
+orMode = input.string("Auto (session open)", "Range Anchor", options = ["Auto (session open)", "Custom session"], group = gS, tooltip = "AUTO = range starts at this symbol's own daily session open (first bar of the day). Matches the NAS100 feed opening 01:00 server time. CUSTOM = your own window below.")
+orMin  = input.int(60, "Opening Range Minutes", minval = 5, maxval = 240, step = 5, group = gS, tooltip = "Length of the opening range. Validated: 60 (default), 45 (punchier).")
+tzIn   = input.string("Exchange", "Timezone (Custom)", options = ["Exchange", "America/New_York", "Europe/London", "UTC", "Asia/Tokyo"], group = gS)
+orSess = input.session("0100-0200", "Opening Range Window (Custom)", group = gS)
+twSess = input.session("0200-2355", "Trade Window (Custom)", group = gS)
+
+gT = "02 · Trade Model (R-based)"
+slMode  = input.string("ATR", "Stop Basis", options = ["ATR", "Opposite OR Edge", "OR Mid"], group = gT, tooltip = "Where risk (R) is measured. ATR×1.0 was strongest on NAS100 M5.")
+atrLen  = input.int(14, "ATR Length", minval = 1, group = gT)
+slAtr   = input.float(1.0, "ATR Stop Distance (×ATR)", minval = 0.2, maxval = 6.0, step = 0.1, group = gT)
+minRAtr = input.float(0.25, "Min Risk (×ATR) floor", minval = 0.1, maxval = 5.0, step = 0.05, group = gT)
+maxRAtr = input.float(6.0, "Max Risk (×ATR) cap", minval = 0.5, maxval = 12.0, step = 0.5, group = gT)
+tp1R    = input.float(1.0, "TP1 (R)", minval = 0.25, maxval = 20, step = 0.25, group = gT)
+tp2R    = input.float(2.0, "TP2 (R)", minval = 0.25, maxval = 20, step = 0.25, group = gT)
+tp3R    = input.float(3.0, "TP3 (R)", minval = 0.25, maxval = 20, step = 0.25, group = gT)
+beAfter1= input.bool(true, "Break-Even after TP1", group = gT, tooltip = "After the first ⅓ banks at TP1, the remaining ⅔ ride with the stop at entry.")
+breakMode = input.string("Close", "Breakout Trigger", options = ["Close", "Wick"], group = gT, tooltip = "Close = candle must CLOSE beyond the OR edge (validated). Wick = any touch.")
+oneTrade  = input.bool(true, "Max One Trade Per Day", group = gT)
+
+gFlt = "03 · Optional Filters (off by default — no day-skipping)"
+useAdrGate= input.bool(false, "Range-vs-ADR Gate (skips days)", group = gFlt, tooltip = "OFF by default so no days are skipped. When ON, skips days whose opening range is abnormally tight/wide vs the ADR.")
+adrDays   = input.int(14, "ADR Lookback (days)", minval = 3, maxval = 60, group = gFlt)
+minOrPct  = input.float(10.0, "Min OR (% of ADR)", minval = 0, maxval = 100, step = 1, group = gFlt)
+maxOrPct  = input.float(50.0, "Max OR (% of ADR)", minval = 5, maxval = 200, step = 1, group = gFlt)
+minStr    = input.float(0.0, "Min Strength to Trade (0-10)", minval = 0, maxval = 10, step = 0.5, group = gFlt, tooltip = "Filtering to 'strong only' REDUCED win rate on the test data — stars are best used as context. Defaults to 0.")
+useHtf    = input.bool(false, "Require HTF EMA Alignment", group = gFlt)
+htfTf     = input.timeframe("60", "HTF Timeframe", group = gFlt)
+htfLen    = input.int(50, "HTF EMA Length", minval = 5, maxval = 400, group = gFlt)
+
+gLiq = "04 · Liquidity Magnet"
+pivotLen   = input.int(8, "Liquidity Pivot Length", minval = 2, maxval = 50, group = gLiq, tooltip = "Bars each side to confirm a swing pivot pool. Larger = only major resting liquidity.")
+showPools  = input.bool(true, "Show Liquidity Pools", group = gLiq)
+useMagnet  = input.bool(true, "Show Opposing-Liquidity Magnet", group = gLiq, tooltip = "Projects the nearest opposing unswept liquidity pool — the target the breakout is drawn toward.")
+
+gVis = "05 · Visuals"
+theme      = input.string("Midnight", "Color Theme", options = ["Midnight", "Emerald", "Ice Blue", "Gold Black", "Aqua Violet"], group = gVis)
+showOR     = input.bool(true, "Show OR Box / Lines", group = gVis)
+showProj   = input.bool(true, "Show OR Projection", group = gVis)
+showLines  = input.bool(true, "Show SL / TP Lines", group = gVis)
+showBoxes  = input.bool(true, "Show SL / TP Zones", group = gVis)
+showLevelLbl= input.bool(true, "Label Level Prices", group = gVis)
+showExitLbl= input.bool(true, "Show Trade Result Labels", group = gVis)
+showSignal = input.bool(true, "Show Signal Labels (★ + prob)", group = gVis)
+showStars  = input.bool(true, "Show ★ Tier On Labels", group = gVis)
+levelLen   = input.int(14, "Level Shelf (bars)", minval = 2, maxval = 500, group = gVis, tooltip = "Forward shelf length for live SL/TP labels. On close the ticket snaps back to the exit bar so labels never float away.")
+lblSizeOpt = input.string("Small", "Label Size", options = ["Tiny", "Small", "Normal", "Large"], group = gVis)
+maxHist    = input.int(25, "Max Historical Trades (visual)", minval = 1, maxval = 80, group = gVis, tooltip = "Visual cap only. Statistics always count every closed trade.")
+
+gDash = "06 · Dashboard"
+showDash   = input.bool(true, "Show Dashboard", group = gDash)
+dashPosOpt = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group = gDash)
+dashSizeOpt= input.string("Normal", "Text Size", options = ["Tiny", "Small", "Normal"], group = gDash)
+showMeter  = input.bool(true, "Show Strength / Prob Meter Rows", group = gDash)
+showHeatRow= input.bool(true, "Show Per-Target Breakdown", group = gDash)
+ptMult     = input.int(1, "Point = mintick ×", minval = 1, maxval = 100, group = gDash)
+
+longCol = theme == "Ice Blue" ? color.rgb(0, 190, 255) : theme == "Gold Black" ? color.rgb(255, 196, 48) : theme == "Aqua Violet" ? color.rgb(0, 230, 200) : theme == "Emerald" ? color.rgb(0, 200, 120) : color.rgb(33, 211, 168)
+shortCol= theme == "Ice Blue" ? color.rgb(255, 120, 70) : theme == "Gold Black" ? color.rgb(255, 78, 60) : theme == "Aqua Violet" ? color.rgb(180, 110, 255) : theme == "Emerald" ? color.rgb(235, 64, 64) : color.rgb(255, 77, 109)
+tpFill  = theme == "Ice Blue" ? color.rgb(0, 90, 130) : theme == "Gold Black" ? color.rgb(96, 74, 0) : theme == "Aqua Violet" ? color.rgb(0, 95, 90) : theme == "Emerald" ? color.rgb(0, 96, 60) : color.rgb(0, 96, 76)
+slFill  = theme == "Ice Blue" ? color.rgb(150, 30, 70) : theme == "Gold Black" ? color.rgb(150, 40, 18) : theme == "Aqua Violet" ? color.rgb(110, 30, 120) : theme == "Emerald" ? color.rgb(150, 22, 30) : color.rgb(128, 24, 48)
+accentHi= theme == "Ice Blue" ? color.rgb(127, 233, 255) : theme == "Gold Black" ? color.rgb(255, 226, 122) : theme == "Aqua Violet" ? color.rgb(179, 136, 255) : theme == "Emerald" ? color.rgb(120, 240, 170) : color.rgb(255, 210, 63)
+
+color panelBg     = #0a0c12
+color panelBgAlt  = #0f131c
+color panelHdr    = #161b27
+color panelBorder = #2c3342
+color txtHi       = #ebeef5
+color txtLo       = #8791a2
+color neutralCol  = #69748a
+color goodCol     = #21c87a
+color warnCol     = #e6be46
+color badCol      = #e6435a
+
+f_size(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.small
+f_pos(string p) =>
+    switch p
+        "Top Left"     => position.top_left
+        "Top Right"    => position.top_right
+        "Bottom Left"  => position.bottom_left
+        "Bottom Right" => position.bottom_right
+        "Middle Right" => position.middle_right
+        => position.top_right
+clamp(v, lo, hi) => math.min(math.max(v, lo), hi)
+f_stars(float sc) => sc >= 8.5 ? "★★★★★" : sc >= 7 ? "★★★★" : sc >= 5.5 ? "★★★" : sc >= 4 ? "★★" : sc >= 2.5 ? "★" : "·"
+f_tier(float sc)  => sc >= 8.5 ? "ELITE" : sc >= 7 ? "VERY STRONG" : sc >= 5.5 ? "STRONG" : sc >= 4 ? "MODERATE" : sc >= 2.5 ? "WEAK" : "FORMING"
+f_signedR(float v) => (v >= 0 ? "+" : "") + str.tostring(v, "#.##") + "R"
+f_gauge(float v) =>
+    int fill = int(math.round(clamp(v, 0, 100) / 10.0))
+    str.repeat("█", fill) + str.repeat("░", 10 - fill)
+
+string tzUse = tzIn == "Exchange" ? syminfo.timezone : tzIn
+float ptSize = syminfo.mintick * ptMult
+f_pts(float d) => ptSize > 0 ? str.tostring(math.abs(d) / ptSize, "#.#") : "—"
+f_px(float p) => str.tostring(p, format.mintick)
+
+atr      = ta.atr(atrLen)
+safeAtr  = math.max(nz(atr, high - low), syminfo.mintick)
+rsi      = ta.rsi(close, 14)
+volSma   = ta.sma(volume, 20)
+volRatio = volSma > 0 ? volume / volSma : 1.0
+rng      = high - low
+bodyR    = rng > 0 ? math.abs(close - open) / rng : 0.5
+atrRatio = atr > 0 ? rng / atr : 0.0
+mom3     = close - close[3]
+mom5     = close - close[5]
+htfEma   = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen)[1], lookahead = barmerge.lookahead_off)
+adr      = request.security(syminfo.tickerid, "D", ta.sma(high - low, adrDays)[1], lookahead = barmerge.lookahead_off)
+
+bool autoM  = orMode == "Auto (session open)"
+dayStart    = time("D")
+inORauto    = not na(dayStart) and (time - dayStart) < orMin * 60000
+inORcust    = not na(time(timeframe.period, orSess, tzUse))
+inTWcust    = not na(time(timeframe.period, twSess, tzUse))
+bool inOR   = autoM ? inORauto : inORcust
+bool inTW   = autoM ? true : inTWcust
+bool newDay = ta.change(time("D")) != 0
+
+var float orH = na
+var float orL = na
+var float orMid = na
+var float orRange = na
+var float dayOpen = na
+var bool  orReady = false
+var int   orStartBar = na
+var int   tradesToday = 0
+var float adrAtOpen = na
+
+orOpen  = inOR and not inOR[1]
+orClose = not inOR and inOR[1]
+twClose = autoM ? newDay : (not inTW and inTW[1])
+
+if orOpen
+    orH := high
+    orL := low
+    orStartBar := bar_index
+    orReady := false
+    dayOpen := open
+    adrAtOpen := adr
+if inOR and not orOpen and not na(orH)
+    orH := math.max(orH, high)
+    orL := math.min(orL, low)
+if newDay
+    tradesToday := 0
+
+bool justFormed = false
+if orClose and not na(orH) and not na(orL)
+    orMid := (orH + orL) / 2
+    orRange := orH - orL
+    orReady := true
+    justFormed := true
+
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+var array<float> poolHighVal  = array.new<float>(0)
+var array<bool>  poolHighSwept= array.new<bool>(0)
+var array<float> poolLowVal   = array.new<float>(0)
+var array<bool>  poolLowSwept = array.new<bool>(0)
+var array<line>  poolLines    = array.new<line>(0)
+
+if not na(ph)
+    array.push(poolHighVal, ph)
+    array.push(poolHighSwept, false)
+    if showPools
+        array.push(poolLines, line.new(bar_index - pivotLen, ph, bar_index, ph, color = color.new(shortCol, 62), style = line.style_dotted, width = 1))
+if not na(pl)
+    array.push(poolLowVal, pl)
+    array.push(poolLowSwept, false)
+    if showPools
+        array.push(poolLines, line.new(bar_index - pivotLen, pl, bar_index, pl, color = color.new(longCol, 62), style = line.style_dotted, width = 1))
+if array.size(poolHighVal) > 120
+    array.shift(poolHighVal)
+    array.shift(poolHighSwept)
+if array.size(poolLowVal) > 120
+    array.shift(poolLowVal)
+    array.shift(poolLowSwept)
+if array.size(poolLines) > 80
+    line.delete(array.shift(poolLines))
+if array.size(poolHighVal) > 0
+    for i = 0 to array.size(poolHighVal) - 1
+        if not array.get(poolHighSwept, i) and high > array.get(poolHighVal, i)
+            array.set(poolHighSwept, i, true)
+if array.size(poolLowVal) > 0
+    for i = 0 to array.size(poolLowVal) - 1
+        if not array.get(poolLowSwept, i) and low < array.get(poolLowVal, i)
+            array.set(poolLowSwept, i, true)
+
+f_magnetUp() =>
+    float best = na
+    if array.size(poolHighVal) > 0
+        for i = array.size(poolHighVal) - 1 to 0
+            if not array.get(poolHighSwept, i) and array.get(poolHighVal, i) > close
+                best := array.get(poolHighVal, i)
+                break
+    best
+f_magnetDn() =>
+    float best = na
+    if array.size(poolLowVal) > 0
+        for i = array.size(poolLowVal) - 1 to 0
+            if not array.get(poolLowSwept, i) and array.get(poolLowVal, i) < close
+                best := array.get(poolLowVal, i)
+                break
+    best
+
+f_strength(bool isLong, float pen, float bdy, float atrR, float volR, float m3, float m5, float rsiv, bool htfOk, bool biasOk) =>
+    s = 0.0
+    s += bdy >= 0.85 ? 1.5 : bdy >= 0.70 ? 1.1 : bdy >= 0.55 ? 0.6 : 0.2
+    s += atrR >= 2.0 ? 1.5 : atrR >= 1.4 ? 1.0 : atrR >= 1.0 ? 0.6 : 0.2
+    s += volR >= 2.0 ? 1.5 : volR >= 1.5 ? 1.0 : volR >= 1.2 ? 0.5 : 0.0
+    m3ok = (isLong and m3 > 0) or (not isLong and m3 < 0)
+    m5ok = (isLong and m5 > 0) or (not isLong and m5 < 0)
+    s += m3ok and m5ok ? 1.5 : m3ok or m5ok ? 0.7 : -0.4
+    s += pen >= 0.5 ? 1.0 : pen >= 0.25 ? 0.6 : pen >= 0.1 ? 0.3 : 0.0
+    rsiOk = (isLong and rsiv > 52) or (not isLong and rsiv < 48)
+    s += rsiOk ? 0.5 : 0.0
+    s += htfOk ? 1.0 : 0.0
+    s += biasOk ? 0.5 : 0.0
+    s += 1.0
+    math.max(0.0, math.min(10.0, math.round(s * 10) / 10))
+
+f_bullProb(float penUp, float penDn, float m3, float m5, float rsiv, float px, float dOpen, float htf) =>
+    float bull = 0.0
+    float bear = 0.0
+    bull += penUp > 0 ? math.min(penUp, 1.0) * 30.0 : 0.0
+    bear += penDn > 0 ? math.min(penDn, 1.0) * 30.0 : 0.0
+    float ml = clamp((m3 + m5) / (safeAtr * 2.0), -1.0, 1.0)
+    bull += (ml > 0 ? ml : 0.0) * 25.0
+    bear += (ml < 0 ? -ml : 0.0) * 25.0
+    float rl = clamp((rsiv - 50.0) / 25.0, -1.0, 1.0)
+    bull += (rl > 0 ? rl : 0.0) * 20.0
+    bear += (rl < 0 ? -rl : 0.0) * 20.0
+    bull += not na(dOpen) and px > dOpen ? 15.0 : 0.0
+    bear += not na(dOpen) and px < dOpen ? 15.0 : 0.0
+    bull += px > htf ? 10.0 : 0.0
+    bear += px < htf ? 10.0 : 0.0
+    float t = bull + bear
+    t > 0 ? math.round(bull / t * 100.0) : 50.0
+
+var bool tActive = false
+bool flat = not tActive
+bool canBreak = orReady and inTW and flat and (not oneTrade or tradesToday == 0)
+
+float penUp = atr > 0 ? (close - orH) / atr : 0.0
+float penDn = atr > 0 ? (orL - close) / atr : 0.0
+bool htfOkUp = not useHtf or close > htfEma
+bool htfOkDn = not useHtf or close < htfEma
+bool biasUp  = not na(dayOpen) and close > dayOpen
+bool biasDn  = not na(dayOpen) and close < dayOpen
+
+bool rawUp = breakMode == "Close" ? close > orH : high > orH
+bool rawDn = breakMode == "Close" ? close < orL : low  < orL
+bool longBrk  = canBreak and rawUp and not rawDn
+bool shortBrk = canBreak and rawDn and not rawUp
+
+float coilPct = not na(adrAtOpen) and adrAtOpen > 0 and not na(orRange) ? orRange / adrAtOpen * 100.0 : na
+bool adrOk = not useAdrGate or (not na(coilPct) and coilPct >= minOrPct and coilPct <= maxOrPct)
+
+float scUp = longBrk  ? f_strength(true,  penUp, bodyR, atrRatio, volRatio, mom3, mom5, rsi, htfOkUp, biasUp) : 0.0
+float scDn = shortBrk ? f_strength(false, penDn, bodyR, atrRatio, volRatio, mom3, mom5, rsi, htfOkDn, biasDn) : 0.0
+
+bool fireLong  = longBrk  and htfOkUp and adrOk and scUp >= minStr and not na(atr)
+bool fireShort = shortBrk and htfOkDn and adrOk and scDn >= minStr and not na(atr)
+
+type ticket
+    line  e  = na
+    line  s  = na
+    line  t1 = na
+    line  t2 = na
+    line  t3 = na
+    line  mg = na
+    box   tb = na
+    box   sb = na
+    label sg = na
+    label le = na
+    label ls = na
+    label l1 = na
+    label l2 = na
+    label l3 = na
+    label ex = na
+var array<ticket> history = array.new<ticket>(0)
+
+var int   tSide = 0
+var int   tBar = na
+var float tEntry = na
+var float tStop = na
+var float tT1 = na
+var float tT2 = na
+var float tT3 = na
+var float tRisk = na
+var float tScore = na
+var float tProb = na
+var int   bestStage = 0
+var bool  beMoved = false
+var int   lastSide = 0
+var float lastScore = na
+var float lastProb = na
+
+var line  aE = na
+var line  aS = na
+var line  a1 = na
+var line  a2 = na
+var line  a3 = na
+var line  aM = na
+var box   aTB = na
+var box   aSB = na
+var label aSG = na
+var label lE = na
+var label lS = na
+var label l1 = na
+var label l2 = na
+var label l3 = na
+
+var int   sClosed = 0
+var int   sWins = 0
+var float sRsum = 0.0
+var float sGW = 0.0
+var float sGL = 0.0
+var int   sLong = 0
+var int   sLongW = 0
+var int   sShort = 0
+var int   sShortW = 0
+var int   sTp1 = 0
+var int   sTp2 = 0
+var int   sTp3 = 0
+var int   sSl = 0
+var int   sEod = 0
+var int   sStrongT = 0
+var int   sStrongW = 0
+var int   sCurW = 0
+var int   sCurL = 0
+var int   sMaxW = 0
+var int   sMaxL = 0
+var int   sStreak = 0
+
+aRight = tActive and not na(tBar) ? math.max(bar_index, tBar + levelLen) : na
+if tActive
+    if not na(aE)
+        line.set_x2(aE, aRight)
+    if not na(aS)
+        line.set_x2(aS, aRight)
+    if not na(a1)
+        line.set_x2(a1, aRight)
+    if not na(a2)
+        line.set_x2(a2, aRight)
+    if not na(a3)
+        line.set_x2(a3, aRight)
+    if not na(aM)
+        line.set_x2(aM, aRight)
+    if not na(aTB)
+        box.set_right(aTB, aRight)
+    if not na(aSB)
+        box.set_right(aSB, aRight)
+    if not na(lE)
+        label.set_x(lE, aRight)
+    if not na(lS)
+        label.set_x(lS, aRight)
+    if not na(l1)
+        label.set_x(l1, aRight)
+    if not na(l2)
+        label.set_x(l2, aRight)
+    if not na(l3)
+        label.set_x(l3, aRight)
+
+bool closedTp3 = false
+bool closedSl  = false
+bool closedTp  = false
+bool closedEod = false
+
+if tActive and bar_index > tBar
+    isL = tSide == 1
+    bool tp1Hit = isL ? high >= tT1 : low <= tT1
+    bool tp2Hit = isL ? high >= tT2 : low <= tT2
+    bool tp3Hit = isL ? high >= tT3 : low <= tT3
+    bool slHit  = isL ? low  <= tStop : high >= tStop
+
+    if beAfter1 and not beMoved and tp1Hit and not slHit
+        tStop := tEntry
+        beMoved := true
+
+    int stage = tp3Hit ? 3 : tp2Hit ? 2 : tp1Hit ? 1 : 0
+    bool sameBarSl = slHit and stage > 0
+    if stage > bestStage and not sameBarSl
+        bestStage := stage
+    bool finalTp3 = not sameBarSl and bestStage == 3
+    bool finalSl  = slHit and (bestStage == 0 or (sameBarSl and not beMoved))
+    bool finalTp  = slHit and not finalSl and bestStage > 0 and bestStage < 3
+    bool finalEod = twClose and not (finalTp3 or finalSl or finalTp)
+
+    if finalTp3 or finalSl or finalTp or finalEod
+        float r1 = bestStage >= 1 ? tp1R : -1.0
+        float r2 = bestStage >= 2 ? tp2R : (beMoved ? 0.0 : (finalSl ? -1.0 : (isL ? (close - tEntry) / tRisk : (tEntry - close) / tRisk)))
+        float r3 = bestStage >= 3 ? tp3R : (beMoved ? 0.0 : (finalSl ? -1.0 : (isL ? (close - tEntry) / tRisk : (tEntry - close) / tRisk)))
+        if finalSl and bestStage == 0
+            r1 := -1.0
+            r2 := -1.0
+            r3 := -1.0
+        float resR = (r1 + r2 + r3) / 3.0
+        bool isWin = resR > 0
+        closedTp3 := finalTp3
+        closedSl  := finalSl and bestStage == 0
+        closedTp  := finalTp or (finalSl and bestStage > 0)
+        closedEod := finalEod
+
+        sClosed += 1
+        sRsum += resR
+        if isWin
+            sWins += 1
+            sGW += resR
+            sCurW += 1
+            sCurL := 0
+            sMaxW := math.max(sMaxW, sCurW)
+            sStreak := sCurW
+            if tScore >= 7
+                sStrongW += 1
+        else
+            sGL += math.abs(resR)
+            sCurL += 1
+            sCurW := 0
+            sMaxL := math.max(sMaxL, sCurL)
+            sStreak := -sCurL
+        if isL
+            sLong += 1
+            sLongW += isWin ? 1 : 0
+        else
+            sShort += 1
+            sShortW += isWin ? 1 : 0
+        int stageDash = finalTp3 ? 3 : bestStage
+        if finalSl and bestStage == 0
+            sSl += 1
+        else if finalEod and bestStage == 0
+            sEod += 1
+        else if stageDash >= 3
+            sTp3 += 1
+        else if stageDash == 2
+            sTp2 += 1
+        else
+            sTp1 += 1
+
+        int closeEdge = math.max(bar_index, tBar + 3)
+        if not na(aE)
+            line.set_x2(aE, closeEdge)
+        if not na(aS)
+            line.set_x2(aS, closeEdge)
+        if not na(a1)
+            line.set_x2(a1, closeEdge)
+        if not na(a2)
+            line.set_x2(a2, closeEdge)
+        if not na(a3)
+            line.set_x2(a3, closeEdge)
+        if not na(aM)
+            line.set_x2(aM, closeEdge)
+        if not na(aTB)
+            box.set_right(aTB, closeEdge)
+        if not na(aSB)
+            box.set_right(aSB, closeEdge)
+        if not na(lE)
+            label.set_x(lE, closeEdge)
+        if not na(lS)
+            label.set_x(lS, closeEdge)
+        if not na(l1)
+            label.set_x(l1, closeEdge)
+        if not na(l2)
+            label.set_x(l2, closeEdge)
+        if not na(l3)
+            label.set_x(l3, closeEdge)
+
+        label exLbl = na
+        if showExitLbl
+            float resPx = finalTp3 ? tT3 : stageDash == 2 ? tT2 : stageDash == 1 ? tT1 : (finalSl ? tStop : close)
+            string exTxt = closedSl ? "SL ✘ " + f_signedR(resR) : closedEod and bestStage == 0 ? "EOD ⏱ " + f_signedR(resR) : "TP" + str.tostring(math.max(stageDash, 1)) + " ✔ " + f_signedR(resR)
+            color exCol = isWin ? goodCol : badCol
+            bool up = isL == isWin
+            exLbl := label.new(closeEdge, resPx, exTxt, style = up ? label.style_label_down : label.style_label_up, color = color.new(exCol, 6), textcolor = color.white, size = f_size(lblSizeOpt))
+
+        array.push(history, ticket.new(aE, aS, a1, a2, a3, aM, aTB, aSB, aSG, lE, lS, l1, l2, l3, exLbl))
+        while array.size(history) > maxHist
+            ticket old = array.shift(history)
+            line.delete(old.e)
+            line.delete(old.s)
+            line.delete(old.t1)
+            line.delete(old.t2)
+            line.delete(old.t3)
+            line.delete(old.mg)
+            box.delete(old.tb)
+            box.delete(old.sb)
+            label.delete(old.sg)
+            label.delete(old.le)
+            label.delete(old.ls)
+            label.delete(old.l1)
+            label.delete(old.l2)
+            label.delete(old.l3)
+            label.delete(old.ex)
+
+        aE := na
+        aS := na
+        a1 := na
+        a2 := na
+        a3 := na
+        aM := na
+        aTB := na
+        aSB := na
+        aSG := na
+        lE := na
+        lS := na
+        l1 := na
+        l2 := na
+        l3 := na
+        tActive := false
+        tSide := 0
+        tBar := na
+        bestStage := 0
+        beMoved := false
+
+if (fireLong or fireShort) and not tActive
+    isL = fireLong
+    side = isL ? 1 : -1
+    sc = isL ? scUp : scDn
+    prob = f_bullProb(penUp, penDn, mom3, mom5, rsi, close, dayOpen, htfEma)
+    ent = close
+    rawStop = slMode == "ATR" ? (isL ? ent - atr * slAtr : ent + atr * slAtr) : slMode == "OR Mid" ? orMid : (isL ? orL : orH)
+    risk0 = math.abs(ent - rawStop)
+    risk = math.min(math.max(risk0, minRAtr * atr), maxRAtr * atr)
+    if risk > 0
+        stp = isL ? ent - risk : ent + risk
+        t1  = isL ? ent + risk * tp1R : ent - risk * tp1R
+        t2  = isL ? ent + risk * tp2R : ent - risk * tp2R
+        t3  = isL ? ent + risk * tp3R : ent - risk * tp3R
+        tActive := true
+        tSide := side
+        tBar := bar_index
+        tEntry := ent
+        tStop := stp
+        tT1 := t1
+        tT2 := t2
+        tT3 := t3
+        tRisk := risk
+        tScore := sc
+        tProb := prob
+        bestStage := 0
+        beMoved := false
+        lastSide := side
+        lastScore := sc
+        lastProb := prob
+        tradesToday += 1
+        if sc >= 7
+            sStrongT += 1
+
+        col = isL ? longCol : shortCol
+        xr = bar_index + levelLen
+        if showBoxes
+            aTB := box.new(bar_index, isL ? t3 : ent, xr, isL ? ent : t3, xloc = xloc.bar_index, bgcolor = color.new(tpFill, 80), border_color = color.new(col, 40), border_width = 1)
+            aSB := box.new(bar_index, isL ? ent : stp, xr, isL ? stp : ent, xloc = xloc.bar_index, bgcolor = color.new(slFill, 80), border_color = color.new(shortCol, 50), border_width = 1)
+        if showLines
+            aE := line.new(bar_index, ent, xr, ent, xloc = xloc.bar_index, color = color.new(col, 0), width = 2)
+            aS := line.new(bar_index, stp, xr, stp, xloc = xloc.bar_index, color = color.new(badCol, 5), width = 1, style = line.style_dashed)
+            a1 := line.new(bar_index, t1, xr, t1, xloc = xloc.bar_index, color = color.new(col, 15), width = 1)
+            a2 := line.new(bar_index, t2, xr, t2, xloc = xloc.bar_index, color = color.new(col, 32), width = 1)
+            a3 := line.new(bar_index, t3, xr, t3, xloc = xloc.bar_index, color = color.new(col, 48), width = 1)
+            if useMagnet
+                mg = isL ? f_magnetUp() : f_magnetDn()
+                if not na(mg)
+                    aM := line.new(bar_index, mg, xr, mg, xloc = xloc.bar_index, color = color.new(accentHi, 25), width = 1, style = line.style_dotted)
+        if showSignal
+            probTxt = (prob >= 50 ? "▲" : "▼") + str.tostring(prob >= 50 ? prob : 100 - prob, "#") + "%"
+            sgTxt = (isL ? "NQ ORB LONG" : "NQ ORB SHORT") + (showStars ? "  " + f_stars(sc) + " " + str.tostring(sc, "#.#") : "") + "  " + probTxt
+            aSG := label.new(bar_index, isL ? low : high, sgTxt, style = isL ? label.style_label_up : label.style_label_down, color = color.new(col, 8), textcolor = color.white, size = f_size(lblSizeOpt))
+        if showLevelLbl
+            dw = (isL ? "LONG " : "SHORT ") + f_stars(sc) + " " + str.tostring(sc, "#.#")
+            lE := label.new(xr, ent, dw + " @ " + f_px(ent), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(col, 0), textcolor = color.white, size = f_size(lblSizeOpt))
+            lS := label.new(xr, stp, "SL @ " + f_px(stp), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(badCol, 5), textcolor = color.white, size = f_size(lblSizeOpt))
+            l1 := label.new(xr, t1, "TP1 " + str.tostring(tp1R, "#.#") + "R @ " + f_px(t1), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(col, 12), textcolor = color.white, size = f_size(lblSizeOpt))
+            l2 := label.new(xr, t2, "TP2 " + str.tostring(tp2R, "#.#") + "R @ " + f_px(t2), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(col, 28), textcolor = color.white, size = f_size(lblSizeOpt))
+            l3 := label.new(xr, t3, "TP3 " + str.tostring(tp3R, "#.#") + "R @ " + f_px(t3), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(col, 44), textcolor = color.white, size = f_size(lblSizeOpt))
+
+var box  orBox = na
+var line orHL = na
+var line orLL = na
+var line orML = na
+var line orHP = na
+var line orLP = na
+var array<box> orBoxHist = array.new<box>(0)
+var array<line> orLineHist = array.new<line>(0)
+
+if justFormed and showOR and not na(orH)
+    orEndBar = bar_index - 1
+    xrO = orStartBar + levelLen * 4
+    orBox := box.new(orStartBar, orH, orEndBar, orL, bgcolor = color.new(accentHi, 90), border_color = color.new(accentHi, 45), border_width = 1)
+    orHL := line.new(orStartBar, orH, orEndBar, orH, color = color.new(accentHi, 0), width = 2)
+    orLL := line.new(orStartBar, orL, orEndBar, orL, color = color.new(accentHi, 0), width = 2)
+    orML := line.new(orStartBar, orMid, orEndBar, orMid, color = color.new(accentHi, 55), width = 1, style = line.style_dotted)
+    if showProj
+        orHP := line.new(orEndBar, orH, xrO, orH, color = color.new(accentHi, 30), width = 1, style = line.style_dashed)
+        orLP := line.new(orEndBar, orL, xrO, orL, color = color.new(accentHi, 30), width = 1, style = line.style_dashed)
+    array.push(orBoxHist, orBox)
+    array.push(orLineHist, orHL)
+    array.push(orLineHist, orLL)
+    array.push(orLineHist, orML)
+    if not na(orHP)
+        array.push(orLineHist, orHP)
+    if not na(orLP)
+        array.push(orLineHist, orLP)
+    while array.size(orBoxHist) > maxHist
+        box.delete(array.shift(orBoxHist))
+    while array.size(orLineHist) > maxHist * 5
+        line.delete(array.shift(orLineHist))
+
+if showOR and orReady and not na(orHP) and (autoM or inTW)
+    line.set_x2(orHP, bar_index)
+    line.set_x2(orLP, bar_index)
+
+bgcolor(inOR ? color.new(accentHi, 93) : na, title = "OR Window")
+plotshape(fireLong,  "Long Signal",  shape.triangleup,   location.belowbar, longCol,  size = size.tiny)
+plotshape(fireShort, "Short Signal", shape.triangledown, location.abovebar, shortCol, size = size.tiny)
+
+winRate = sClosed > 0 ? sWins / sClosed * 100.0 : 0.0
+avgR    = sClosed > 0 ? sRsum / sClosed : 0.0
+pf      = sGL > 0 ? sGW / sGL : sGW > 0 ? 999.0 : 0.0
+longWR  = sLong  > 0 ? sLongW  / sLong  * 100.0 : 0.0
+shortWR = sShort > 0 ? sShortW / sShort * 100.0 : 0.0
+tp1Rate = sClosed > 0 ? (sTp1 + sTp2 + sTp3) / sClosed * 100.0 : 0.0
+tp2Rate = sClosed > 0 ? (sTp2 + sTp3) / sClosed * 100.0 : 0.0
+tp3Rate = sClosed > 0 ? sTp3 / sClosed * 100.0 : 0.0
+slRate  = sClosed > 0 ? sSl / sClosed * 100.0 : 0.0
+
+statusTxt = tActive ? "TRADE ACTIVE" : orReady ? (inTW ? "ARMED" : "RANGE SET") : inOR ? "FORMING OR" : "WAITING"
+statusC   = tActive ? accentHi : orReady ? goodCol : inOR ? warnCol : neutralCol
+domBias = tActive ? (tSide == 1 ? "LONG ACTIVE" : "SHORT ACTIVE") : orReady and inTW ? "ARMED ▲▼" : "— IDLE —"
+domCol  = tActive ? (tSide == 1 ? longCol : shortCol) : orReady ? txtHi : neutralCol
+lastRank = na(lastScore) ? "—" : f_stars(lastScore) + " " + str.tostring(lastScore, "#.#")
+orTxt = na(orRange) ? "—" : f_pts(orRange) + "pt" + (na(coilPct) ? "" : "  " + str.tostring(coilPct, "#") + "%ADR")
+magUp = f_magnetUp()
+magDn = f_magnetDn()
+distTxt = (not na(magUp) ? str.tostring(math.round((magUp - close) / safeAtr * 10) / 10, "#.#") : "—") + "↑ / " + (not na(magDn) ? str.tostring(math.round((close - magDn) / safeAtr * 10) / 10, "#.#") : "—") + "↓"
+bestDir = sLong == 0 and sShort == 0 ? "—" : longWR > shortWR ? "LONG" : shortWR > longWR ? "SHORT" : "EVEN"
+streakTxt = sStreak > 0 ? "W" + str.tostring(sStreak) : sStreak < 0 ? "L" + str.tostring(math.abs(sStreak)) : "—"
+pfTxt = pf >= 999 ? "INF" : str.tostring(pf, "#.##")
+liveScore = tActive ? tScore : lastScore
+liveProb  = tActive ? tProb : lastProb
+color wrC = winRate >= 55 ? goodCol : winRate >= 45 ? warnCol : badCol
+color pfC = pf >= 1.5 ? goodCol : pf >= 1.0 ? warnCol : badCol
+
+var int meterRows = showMeter ? 4 : 0
+var int baseRows  = 11
+var int dashRows  = baseRows + meterRows + (showHeatRow ? 1 : 0)
+var table dash = table.new(f_pos(dashPosOpt), 2, dashRows, frame_color = color.new(panelBorder, 0), frame_width = 1, border_color = color.new(panelBorder, 30), border_width = 1)
+
+f_row(int r, string k, string v, color vc, color bg) =>
+    ps = f_size(dashSizeOpt)
+    table.cell(dash, 0, r, k, text_color = txtLo, text_size = ps, text_halign = text.align_left,   bgcolor = bg)
+    table.cell(dash, 1, r, v, text_color = vc,    text_size = ps, text_halign = text.align_center, bgcolor = bg)
+
+if barstate.islast and showDash
+    ps = f_size(dashSizeOpt)
+    table.clear(dash, 0, 0, 1, dashRows - 1)
+    table.cell(dash, 0, 0, "◈ STRONG NQ ORB", text_color = txtHi, text_size = ps, text_halign = text.align_left, bgcolor = panelHdr)
+    table.cell(dash, 1, 0, "BREAKOUTS", text_color = accentHi, text_size = ps, text_halign = text.align_center, bgcolor = panelHdr)
+
+    int r = 1
+    f_row(r, "Bias", domBias, domCol, panelBg)
+    r += 1
+    f_row(r, "Status", statusTxt, statusC, panelBgAlt)
+    r += 1
+    if showMeter
+        f_row(r, "Signal Strength", na(liveScore) ? "—" : f_gauge(liveScore * 10) + " " + str.tostring(liveScore, "#.#"), na(liveScore) ? txtLo : liveScore >= 7 ? accentHi : liveScore >= 5.5 ? goodCol : warnCol, panelBg)
+        r += 1
+        f_row(r, "Direction Prob", na(liveProb) ? "—" : f_gauge(liveProb >= 50 ? liveProb : 100 - liveProb) + " " + (liveProb >= 50 ? "▲" : "▼") + str.tostring(liveProb >= 50 ? liveProb : 100 - liveProb, "#") + "%", na(liveProb) ? txtLo : liveProb >= 50 ? longCol : shortCol, panelBgAlt)
+        r += 1
+        f_row(r, "OR Range", orTxt, txtHi, panelBg)
+        r += 1
+        f_row(r, "Magnet Dist (ATR)", distTxt, txtHi, panelBgAlt)
+        r += 1
+    f_row(r, "Active Trade", tActive ? (tSide == 1 ? "LONG OPEN" : "SHORT OPEN") : "FLAT", tActive ? domCol : neutralCol, panelBg)
+    r += 1
+    f_row(r, "Win Rate", sClosed > 0 ? str.tostring(winRate, "#.#") + "%  (" + str.tostring(sWins) + "/" + str.tostring(sClosed) + ")" : "—", sClosed > 0 ? wrC : neutralCol, panelBgAlt)
+    r += 1
+    f_row(r, "Profit Factor", sClosed > 0 ? pfTxt : "—", sClosed > 0 ? pfC : neutralCol, panelBg)
+    r += 1
+    f_row(r, "Avg R / Trade", sClosed > 0 ? f_signedR(avgR) : "—", sClosed > 0 ? (avgR >= 0 ? goodCol : badCol) : neutralCol, panelBgAlt)
+    r += 1
+    f_row(r, "Total R", sClosed > 0 ? f_signedR(sRsum) : "—", sRsum >= 0 ? goodCol : badCol, panelBg)
+    r += 1
+    f_row(r, "Best Direction", bestDir, bestDir == "LONG" ? longCol : bestDir == "SHORT" ? shortCol : neutralCol, panelBgAlt)
+    r += 1
+    f_row(r, "L / S Win%", sClosed > 0 ? str.tostring(longWR, "#") + " / " + str.tostring(shortWR, "#") : "—", txtHi, panelBg)
+    r += 1
+    f_row(r, "Streak", streakTxt + "  (max W" + str.tostring(sMaxW) + "/L" + str.tostring(sMaxL) + ")", sStreak >= 0 ? goodCol : badCol, panelBgAlt)
+    r += 1
+    if showHeatRow
+        table.cell(dash, 0, r, "TP1/2/3 · SL", text_color = txtLo, text_size = ps, text_halign = text.align_left, bgcolor = panelHdr)
+        table.cell(dash, 1, r, str.tostring(tp1Rate, "#") + "/" + str.tostring(tp2Rate, "#") + "/" + str.tostring(tp3Rate, "#") + " · " + str.tostring(slRate, "#") + "%", text_color = txtHi, text_size = ps, text_halign = text.align_center, bgcolor = panelHdr)
+
+alertcondition(fireLong,  "ORB Long",  "STRONG NQ ORB: LONG breakout on {{ticker}} {{interval}}")
+alertcondition(fireShort, "ORB Short", "STRONG NQ ORB: SHORT breakout on {{ticker}} {{interval}}")
+alertcondition(closedTp3, "TP3 Hit",   "STRONG NQ ORB: TP3 reached on {{ticker}} {{interval}}")
+alertcondition(closedTp,  "Partial TP","STRONG NQ ORB: protected TP exit on {{ticker}} {{interval}}")
+alertcondition(closedSl,  "SL Hit",    "STRONG NQ ORB: stop-loss on {{ticker}} {{interval}}")

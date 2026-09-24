@@ -1,0 +1,2118 @@
+//@version=6
+strategy(
+     title = "Dynamic P0 Delta + DBR Change-Point Merged Strategy",
+     shorttitle = "P0 Delta + DBR CP",
+     overlay = true,
+     initial_capital = 100000,
+     pyramiding = 2,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.50,
+     slippage = 1,
+     process_orders_on_close = true,
+     calc_on_order_fills = true,
+     calc_on_every_tick = true,
+     use_bar_magnifier = false,
+     max_bars_back = 5000,
+     max_boxes_count = 500,
+     max_lines_count = 500,
+     max_labels_count = 500,
+     margin_long = 3,
+     margin_short = 3
+)
+
+//=============================================================================
+// MERGED STRATEGY -- READ FIRST
+//-----------------------------------------------------------------------------
+// This file merges two previously separate strategies into one script, per
+// explicit request:
+//   1. Dynamic P0 Delta Profile Strategy v1.0.4 (Anchor Trail Proxy entries,
+//      Structural Profile / Dynamic P0 / Acceptance-Rejection scoring,
+//      "Architecture Histogram" dashboard table).
+//   2. Delta Break & Retest - Stage 9 Change Point + Volume Pressure &
+//      DeltaFlow VP (CUSUM change-point/retest entries, 4H/1H MTF filters,
+//      DeltaFlow Volume Profile [BigBeluga] histogram).
+//
+// KEPT FROM EACH, PER REQUEST:
+//   - DeltaFlow Volume Profile [BigBeluga] histogram (from script 2) is the
+//     ONLY histogram in this file. Script 1's own right-side "Structural
+//     Histogram" (its box-based delta-by-price bars) was dropped since it
+//     served the same visual role -- its underlying computation (POC, VAH/
+//     VAL, Delta Support/Resistance lines, Liquidity Zones) is NOT part of
+//     that histogram and is kept, since the Anchor entry engine's structural
+//     filter/target logic depends on it.
+//   - The "Architecture Histogram" dashboard table (from script 1) is the
+//     ONLY dashboard table in this file. Script 2's own Status + Change-
+//     Point Funnel tables were dropped as separate table objects, but their
+//     information is not lost -- summarized as 7 extra rows appended to the
+//     Architecture table (toggle: "Show DBR Change-Point Status Rows In
+//     Dashboard", section 07). The Funnel's full per-gate fail-count
+//     breakdown is still available via Data Window plots, same as this
+//     script's existing diagnostic pattern.
+//   - Everything else from both scripts -- both full entry engines, all
+//     scoring/filter machinery, all MTF context, cooldown/risk logic --
+//     is kept and computed, exactly as each original script did it.
+//
+// ENTRY INDEPENDENCE:
+// Requested: entries from the Anchor Trail Flip engine and the Change-Point
+// Retest engine must work independently of one another. This is implemented
+// as fully as TradingView's strategy() model allows:
+//   - Separate decision-making: neither engine's cooldown, armed-state, or
+//     fresh-signal gate reads anything from the other engine. Each has its
+//     own "in trade" flag (anchorFlat / dbrInTrade) derived from its OWN
+//     entry ids, NOT from strategy.position_size, specifically so one
+//     engine's open trade can never make the other think it's flat (or vice
+//     versa) just because the NET account position happens to net out.
+//   - Separate order/bracket management: each engine uses its own unique
+//     entry ids ("Anchor Long"/"Anchor Short" vs "CP Long"/"CP Short") and
+//     manages its own stop/target purely through its own from_entry id, so
+//     one engine's exit can never touch the other's bracket.
+//   - Each engine's closed-trade detection walks strategy.closedtrades with
+//     its own cursor and filters by its own entry ids, so a same-bar close
+//     from the OTHER engine is correctly skipped rather than mis-read.
+//   - pyramiding is raised from each original script's own value (0) to 2,
+//     so one entry from EACH engine can be open at the same time without
+//     either order being rejected for exceeding the position-count limit.
+//
+// PLATFORM LIMIT THIS CANNOT WORK AROUND: TradingView's strategy() broker
+// emulator only ever tracks a SINGLE NET position per script -- there is no
+// hedging mode. If both engines want the SAME direction at once, both can
+// hold (that's what the pyramiding=2 change is for). If they want OPPOSITE
+// directions at once, the second order will net against/reduce/flip the
+// first engine's open quantity, exactly like any other opposite-direction
+// order would on a real single, non-hedged account -- no Pine code can make
+// one script hold a simultaneous hedged long AND short. Each engine's own
+// decision-making, cooldown, and bracket management remain fully
+// independent regardless; only the shared account's NET fill quantity is
+// unavoidably shared.
+//
+// Pine does not expose native bid/ask aggressor volume here. Delta (in both
+// engines) is estimated from OHLCV candle pressure.
+//=============================================================================
+
+
+//=============================================================================
+// 00 — Master Visibility
+//=============================================================================
+
+string G_MASTER = "00 — Master Visibility"
+
+bool showAllChartObjectsInput = input.bool(true, "Show All Chart Objects", tooltip = "Master switch for everything this script draws ON THE CHART PANE -- plots, labels, lines, boxes, setup/entry markers, bar coloring, the DeltaFlow histogram, and the Architecture dashboard table. Uncheck to hide all of it at once instead of unticking every individual 'Show ...' toggle below. Does NOT affect the diagnostic plots under Data Window at the bottom of this script -- those never draw on the chart itself.", group = G_MASTER)
+
+
+//=============================================================================
+// 01 — Structural Profile (Anchor / P0 Delta engine)
+//=============================================================================
+
+string G_STRUCT = "01 — Structural Profile"
+
+int structuralDays = input.int(120, "Lookback Days", minval = 1, maxval = 120, group = G_STRUCT)
+int structuralRows = input.int(80, "Histogram / Profile Price Bars", minval = 20, maxval = 160, step = 10, tooltip = "Controls the number of actual price bins used by the structural delta profile. Higher values provide finer POC, VAH/VAL, delta-node, support/resistance, and liquidity-zone resolution. Higher values also require more processing.", group = G_STRUCT)
+int maxStoredBars = input.int(25000, "Maximum Stored Chart Bars", minval = 1000, maxval = 50000, step = 1000, group = G_STRUCT)
+float structuralValueArea = input.float(70.0, "Value Area %", minval = 50.0, maxval = 95.0, step = 1.0, group = G_STRUCT)
+float minNodeVolume = input.float(25.0, "Minimum Node Volume (% Of POC)", minval = 0.0, maxval = 100.0, step = 5.0, group = G_STRUCT)
+float minNodeDelta = input.float(10.0, "Minimum Absolute Delta %", minval = 0.0, maxval = 100.0, step = 1.0, group = G_STRUCT)
+int liquidityNodeCount = input.int(4, "High-Delta Liquidity Zones", minval = 1, maxval = 8, group = G_STRUCT)
+
+
+//=============================================================================
+// 02 — Dynamic P0
+//=============================================================================
+
+string G_P0 = "02 — Dynamic P0"
+
+int equilibriumMinutes = input.int(240, "Equilibrium Window (Minutes)", minval = 60, maxval = 1440, step = 30, group = G_P0)
+int equilibriumRows = input.int(32, "Dynamic P0 Price Rows", minval = 16, maxval = 64, group = G_P0)
+int maximumEquilibriumBars = input.int(500, "Maximum Bars In Dynamic Profile", minval = 50, maxval = 1000, group = G_P0)
+float dynamicValueAreaPercent = input.float(70.0, "Dynamic Value Area %", minval = 50.0, maxval = 95.0, step = 1.0, group = G_P0)
+int coherenceRadius = input.int(2, "P0 Coherence Radius (Rows)", minval = 1, maxval = 5, group = G_P0)
+float equilibriumBandATR = input.float(0.35, "Equilibrium Band (ATR)", minval = 0.10, maxval = 1.0, step = 0.05, group = G_P0)
+float minimumDistanceATR = input.float(0.80, "Minimum Entry Distance From P0 (ATR)", minval = 0.25, maxval = 3.0, step = 0.05, group = G_P0)
+
+
+//=============================================================================
+// 03 — Acceptance / Rejection Metrics
+//=============================================================================
+
+string G_METRICS = "03 — Acceptance / Rejection Metrics"
+
+int migrationLookback = input.int(4, "P0 / Value Migration Lookback", minval = 1, maxval = 20, group = G_METRICS)
+float migrationTargetATR = input.float(0.15, "Strong P0 Migration (ATR)", minval = 0.02, maxval = 1.0, step = 0.01, group = G_METRICS)
+float catchUpTargetPercent = input.float(40.0, "Strong P0 Catch-Up %", minval = 10.0, maxval = 100.0, step = 5.0, group = G_METRICS)
+float newLocationBandATR = input.float(0.25, "New-Location Volume Band (ATR)", minval = 0.10, maxval = 1.0, step = 0.05, group = G_METRICS)
+float newLocationTargetPercent = input.float(35.0, "Strong New-Location Volume %", minval = 10.0, maxval = 80.0, step = 5.0, group = G_METRICS)
+int newLocationRecentBars = input.int(20, "New-Location Recency Window (Bars)", minval = 3, maxval = 100, tooltip = "New-Location Volume only counts volume from the most recent N bars, not the entire multi-hour rolling profile -- measures whether volume is NEWLY piling in at the current price right now.", group = G_METRICS)
+float valueMigrationTargetATR = input.float(0.10, "Strong Value-Area Migration (ATR)", minval = 0.02, maxval = 1.0, step = 0.01, group = G_METRICS)
+int deltaWindow = input.int(3, "Delta State Window", minval = 1, maxval = 10, group = G_METRICS)
+int deltaPersistenceBars = input.int(3, "Delta Persistence Bars", minval = 2, maxval = 8, group = G_METRICS)
+float alignedDeltaTarget = input.float(20.0, "Strong Aligned Delta %", minval = 5.0, maxval = 80.0, step = 1.0, group = G_METRICS)
+float opposingDeltaTarget = input.float(20.0, "Strong Opposing Delta %", minval = 5.0, maxval = 80.0, step = 1.0, group = G_METRICS)
+int efficiencyLookback = input.int(3, "Efficiency Lookback", minval = 1, maxval = 10, group = G_METRICS)
+float efficiencyTargetATR = input.float(0.30, "Efficient Price Progress (ATR)", minval = 0.05, maxval = 1.50, step = 0.05, group = G_METRICS)
+float absorptionDeltaTarget = input.float(25.0, "Absorption Delta Magnitude %", minval = 5.0, maxval = 100.0, step = 1.0, group = G_METRICS)
+float absorptionMaximumProgressATR = input.float(0.12, "Absorption Maximum Price Progress (ATR)", minval = 0.02, maxval = 0.50, step = 0.01, group = G_METRICS)
+int dwellMeasurementBars = input.int(4, "Dwell Measurement Bars", minval = 2, maxval = 12, group = G_METRICS)
+float minimumCoherence = input.float(55.0, "Minimum Profile Coherence", minval = 0.0, maxval = 100.0, step = 1.0, group = G_METRICS)
+
+// The four inputs below no longer gate any entry (the anchor trail-flip
+// proxy in section 04 does that) -- they only tune when the dashboard's
+// ACCEPT/REJECT/READ columns and marketState read "dominant" for display.
+
+float acceptanceThresholdLong = input.float(65.0, "Acceptance Score Threshold (Long, Informational)", minval = 40.0, maxval = 95.0, step = 1.0, group = G_METRICS)
+float acceptanceThresholdShort = input.float(65.0, "Acceptance Score Threshold (Short, Informational)", minval = 40.0, maxval = 95.0, step = 1.0, group = G_METRICS)
+float rejectionThresholdLong = input.float(50.0, "Rejection Score Threshold (Long, Informational)", minval = 40.0, maxval = 95.0, step = 1.0, group = G_METRICS)
+float rejectionThresholdShort = input.float(50.0, "Rejection Score Threshold (Short, Informational)", minval = 40.0, maxval = 95.0, step = 1.0, group = G_METRICS)
+float scoreDominanceLong = input.float(24.0, "Required Score Dominance (Long, Informational)", minval = 0.0, maxval = 40.0, step = 1.0, group = G_METRICS)
+float scoreDominanceShort = input.float(24.0, "Required Score Dominance (Short, Informational)", minval = 0.0, maxval = 40.0, step = 1.0, group = G_METRICS)
+float signalStabilityMargin = input.float(0.0, "Signal Stability Margin (Informational)", minval = 0.0, maxval = 20.0, step = 0.5, group = G_METRICS)
+
+
+//=============================================================================
+// 04 — Entry Engine (Anchor Trail Proxy)
+//=============================================================================
+
+string G_ENTRY = "04 — Entry Engine (Anchor Trail Proxy)"
+
+int anchorAtrLenInput = input.int(14, "Anchor ATR Length", minval = 1, group = G_ENTRY)
+anchorSrcInput = input.source(close, "Anchor Source", group = G_ENTRY)
+float anchorBandMultInput = input.float(6.5, "Anchor Band Offset (Base)", minval = 1.0, maxval = 20.0, step = 0.1, group = G_ENTRY)
+bool anchorUseAdaptiveInput = input.bool(true, "Anchor Adaptive Band Scaling", group = G_ENTRY)
+float anchorAdaptMinInput = input.float(0.85, "Anchor Adaptive Min Scale", minval = 0.5, maxval = 1.0, step = 0.05, group = G_ENTRY)
+float anchorAdaptMaxInput = input.float(1.15, "Anchor Adaptive Max Scale", minval = 1.0, maxval = 1.5, step = 0.05, group = G_ENTRY)
+bool useStructuralFilterInput = input.bool(true, "Block Entries Through Structural Resistance/Support", group = G_ENTRY)
+bool useStructuralTargetInput = input.bool(true, "Cap Target At Nearest Structural Level", group = G_ENTRY)
+bool requireFreshState = input.bool(true, "Require Fresh Anchor Flip State", group = G_ENTRY)
+int cooldownBarsLongInput = input.int(20, "Cooldown After Long Exit", minval = 0, maxval = 50, group = G_ENTRY)
+int cooldownBarsShortInput = input.int(20, "Cooldown After Short Exit", minval = 0, maxval = 50, group = G_ENTRY)
+
+
+//=============================================================================
+// 05 — Risk (Anchor)
+//=============================================================================
+
+string G_RISK = "05 — Risk (Anchor)"
+
+float contracts = input.float(1.0, "Contracts", minval = 1.0, step = 1.0, group = G_RISK)
+float stopATR = input.float(1.0, "Initial Stop (ATR)", minval = 0.25, maxval = 5.0, step = 0.05, group = G_RISK)
+float targetRR = input.float(1.75, "Target (R)", minval = 0.50, maxval = 5.0, step = 0.05, group = G_RISK)
+bool useBreakEven = input.bool(false, "Move Stop To Break-Even", group = G_RISK)
+float breakEvenAtR = input.float(1.0, "Break-Even Trigger (R)", minval = 0.25, maxval = 3.0, step = 0.25, group = G_RISK)
+
+
+//=============================================================================
+// 06 — P0 / Key Levels
+//=============================================================================
+
+string G_STYLE = "06 — P0 / Key Levels"
+
+bool showDynamicP0 = input.bool(true, "Show Dynamic P0", group = G_STYLE)
+bool showDynamicP0LabelInput = input.bool(true, "Label The Dynamic P0 Line", group = G_STYLE)
+color dynamicP0Color = input.color(color.aqua, "Dynamic P0 Color", group = G_STYLE)
+int dynamicP0Width = input.int(3, "Dynamic P0 Width", minval = 1, maxval = 5, group = G_STYLE)
+bool showDynamicValueArea = input.bool(true, "Show Dynamic VAH / VAL", group = G_STYLE)
+color dynamicValueAreaColor = input.color(color.rgb(70, 115, 255), "Dynamic Value Area Color", group = G_STYLE)
+bool showStructuralPOC = input.bool(true, "Show Structural POC", group = G_STYLE)
+color structuralPOCColor = input.color(color.rgb(229, 57, 53), "Structural POC Color", group = G_STYLE)
+bool showStructuralValueArea = input.bool(true, "Show Structural VAH / VAL", group = G_STYLE)
+color structuralValueAreaColor = input.color(color.rgb(70, 115, 255), "Structural Value Area Color", group = G_STYLE)
+bool showSupportResistance = input.bool(true, "Show Delta Support / Resistance", group = G_STYLE)
+color supportColor = input.color(color.rgb(0, 200, 140), "Support Color", group = G_STYLE)
+color resistanceColor = input.color(color.rgb(245, 75, 85), "Resistance Color", group = G_STYLE)
+bool showLiquidityZones = input.bool(true, "Show High-Delta Liquidity Zones", group = G_STYLE)
+int liquidityZoneTransparency = input.int(90, "Liquidity Zone Transparency", minval = 70, maxval = 98, group = G_STYLE)
+color positiveDeltaColor = input.color(color.rgb(18, 181, 166), "Positive Delta (Liquidity Zones)", group = G_STYLE)
+color negativeDeltaColor = input.color(color.rgb(230, 150, 30), "Negative Delta (Liquidity Zones)", group = G_STYLE)
+
+
+//=============================================================================
+// 07 — Architecture Histogram (unified dashboard)
+//=============================================================================
+
+string G_DASH = "07 — Architecture Histogram"
+
+bool showArchitectureHistogram = input.bool(true, "Show Acceptance / Rejection Histogram", group = G_DASH)
+string architecturePosition = input.string("Top Right", "Position", options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group = G_DASH)
+string dashboardTextSize = input.string("Small", "Dashboard Text Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = G_DASH)
+bool showLiveColumnInput = input.bool(false, "Show LIVE Value Column", group = G_DASH)
+color acceptanceColor = input.color(color.rgb(0, 200, 140), "Acceptance Color", group = G_DASH)
+color rejectionColor = input.color(color.rgb(245, 75, 85), "Rejection Color", group = G_DASH)
+
+
+//=============================================================================
+// 08 — Signals / Alerts (Anchor)
+//=============================================================================
+
+string G_ALERT = "08 — Signals / Alerts (Anchor)"
+
+bool showSetupMarkers = input.bool(true, "Show Setup Armed Hollow Triangles", group = G_ALERT)
+bool showEntryMarkers = input.bool(true, "Show Actual Entry Solid Triangles", group = G_ALERT)
+bool showCooldownGapLabelsInput = input.bool(true, "Show Bars-Since-Last-Exit Label On Each Entry", group = G_ALERT)
+color entryLongColor = input.color(color.aqua, "Long Entry Marker Color", group = G_ALERT)
+color entryShortColor = input.color(color.orange, "Short Entry Marker Color", group = G_ALERT)
+bool showEntryBarColorInput = input.bool(true, "Highlight Entry Bar Color", group = G_ALERT)
+color entryLongBarColor = input.color(color.new(color.aqua, 40), "Long Entry Bar Color", group = G_ALERT)
+color entryShortBarColor = input.color(color.new(color.orange, 40), "Short Entry Bar Color", group = G_ALERT)
+bool enableDynamicAlerts = input.bool(true, "Enable Dynamic alert() Calls", group = G_ALERT)
+bool alertEntries = input.bool(true, "Alert On Entries", group = G_ALERT)
+bool alertExits = input.bool(true, "Alert On Exits", group = G_ALERT)
+
+
+//=============================================================================
+// 09 — DBR Change Point (CUSUM)
+//=============================================================================
+
+string G_CUSUM = "09 — DBR Change Point (CUSUM)"
+
+int lengthInput = input.int(50, "Lookback Period", minval = 10, group = G_CUSUM)
+float thresholdInput = input.float(4.0, "Threshold (h)", minval = 0.1, step = 0.1, group = G_CUSUM)
+float slackInput = input.float(0.5, "Slack (k)", minval = 0.0, step = 0.1, group = G_CUSUM)
+
+
+//=============================================================================
+// 10 — DBR Volume Pressure
+//=============================================================================
+
+string G_PRESSURE = "10 — DBR Volume Pressure"
+
+int executionDeltaWindowInput = input.int(3, "Execution Pressure Window", minval = 1, maxval = 8, group = G_PRESSURE)
+bool requireVolumePressureConfirmationInput = input.bool(true, "Require Volume Pressure Confirmation", group = G_PRESSURE)
+float minimumVolumePressureInput = input.float(5.0, "Minimum Volume Pressure %", minval = 0.0, maxval = 60.0, step = 1.0, group = G_PRESSURE)
+bool requireRvolOnTriggerInput = input.bool(false, "Require RVOL On Trigger", group = G_PRESSURE)
+int triggerRvolLengthInput = input.int(20, "Trigger RVOL Length", minval = 5, maxval = 100, group = G_PRESSURE)
+float minimumTriggerRvolInput = input.float(1.05, "Minimum Trigger RVOL", minval = 0.50, maxval = 3.0, step = 0.05, group = G_PRESSURE)
+
+
+//=============================================================================
+// 11 — DBR Regime Zone / Retest
+//=============================================================================
+
+string G_EXEC = "11 — DBR Regime Zone / Retest"
+
+float regimeZoneAtrMultInput = input.float(0.25, "Regime Zone Half-Width (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = G_EXEC)
+float retestWindowHoursInput = input.float(6.0, "Maximum Change-Point-To-Retest Window (Hours)", minval = 0.5, maxval = 48.0, step = 0.5, group = G_EXEC)
+int minBarsAfterRetestInput = input.int(0, "Minimum Bars After Retest Before Trigger", minval = 0, maxval = 5, group = G_EXEC)
+int maxBarsAfterRetestInput = input.int(4, "Maximum Bars After Retest To Trigger", minval = 1, maxval = 12, group = G_EXEC)
+float maxRetestOvershootAtrInput = input.float(0.10, "Maximum Retest Overshoot Beyond Far Edge (ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = G_EXEC)
+float reclaimBufferAtrInput = input.float(0.05, "Minimum Reclaim Beyond Zone Edge (ATR)", minval = 0.0, maxval = 0.50, step = 0.01, group = G_EXEC)
+float maxEntryExtensionAtrInput = input.float(0.50, "Maximum Entry Extension From Zone (ATR)", minval = 0.10, maxval = 1.50, step = 0.05, group = G_EXEC)
+float minimumTriggerBodyFractionInput = input.float(0.30, "Minimum Trigger Candle Body / Range", minval = 0.0, maxval = 1.0, step = 0.05, group = G_EXEC)
+float minimumTriggerCloseLocationInput = input.float(0.58, "Minimum Trigger Close Location", minval = 0.50, maxval = 0.95, step = 0.05, group = G_EXEC)
+
+
+//=============================================================================
+// 12 — DBR MTF Context
+//=============================================================================
+
+string G_MTF = "12 — DBR MTF Context"
+
+string biasTimeframeInput = input.timeframe("240", "4H Bias Timeframe", group = G_MTF)
+int pivotLeftInput = input.int(3, "4H Pivot Left", minval = 1, maxval = 20, group = G_MTF)
+int pivotRightInput = input.int(3, "4H Pivot Right", minval = 1, maxval = 20, group = G_MTF)
+int biasEmaLengthInput = input.int(50, "4H EMA Length", minval = 2, group = G_MTF)
+int biasSlopeLookbackInput = input.int(5, "4H EMA Slope Lookback", minval = 1, maxval = 50, group = G_MTF)
+string trendTimeframeInput = input.timeframe("60", "1H Trend Timeframe", group = G_MTF)
+int adxLengthInput = input.int(14, "1H ADX / DI Length", minval = 1, group = G_MTF)
+float adxMinimumInput = input.float(20.0, "1H Minimum ADX", minval = 0.0, step = 0.5, group = G_MTF)
+int fastEmaInput = input.int(21, "1H Fast EMA", minval = 1, group = G_MTF)
+int slowEmaInput = input.int(50, "1H Slow EMA", minval = 2, group = G_MTF)
+int erLengthInput = input.int(10, "1H Efficiency Ratio Length", minval = 2, group = G_MTF)
+float erMinimumInput = input.float(0.30, "1H Minimum Efficiency Ratio", minval = 0.0, maxval = 1.0, step = 0.05, group = G_MTF)
+bool require1hTrendAgreementInput = input.bool(true, "Require 1H Trend Agreement", group = G_MTF)
+
+
+//=============================================================================
+// 13 — DBR Cooldown / Orders / Risk
+//=============================================================================
+
+string G_DBR_RISK = "13 — DBR Cooldown / Orders / Risk"
+
+int globalCooldownWinBarsInput = input.int(6, "Global Cooldown After Win", minval = 0, group = G_DBR_RISK)
+int globalCooldownLossBarsInput = input.int(12, "Global Cooldown After Loss", minval = 0, group = G_DBR_RISK)
+int directionCooldownBarsInput = input.int(12, "Direction Cooldown After Loss", minval = 0, group = G_DBR_RISK)
+int consecutiveLossLimitInput = input.int(2, "Consecutive Loss Session Limit", minval = 1, group = G_DBR_RISK)
+bool requireAlignedEntryInput = input.bool(true, "Require Full Trend Alignment", group = G_DBR_RISK)
+float stopBufferAtrMultInput = input.float(0.10, "Stop Buffer Beyond Zone (x ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = G_DBR_RISK)
+float maximumEntryRiskAtrInput = input.float(1.25, "Maximum Entry-To-Stop Risk (ATR)", minval = 0.25, maxval = 4.0, step = 0.05, group = G_DBR_RISK)
+float rMultipleInput = input.float(2.0, "Target R-Multiple", minval = 0.5, maxval = 10.0, step = 0.5, group = G_DBR_RISK)
+int contractsInput = input.int(1, "Contracts Per Entry", minval = 1, maxval = 100, group = G_DBR_RISK)
+
+
+//=============================================================================
+// 14 — DBR Signal Visuals
+//=============================================================================
+
+string G_SIG = "14 — DBR Signal Visuals"
+
+bool showChangePointVisualInput = input.bool(true, "Show CUSUM Regime Line + Pressure Fill", group = G_SIG)
+bool showRetestTouchMarkerInput = input.bool(true, "Show Retest Touch Marker", group = G_SIG)
+bool showEntrySignalInput = input.bool(true, "Show Actual Entry Signal", group = G_SIG)
+bool showQualifiedTriggerInput = input.bool(true, "Show Qualified Retest Trigger", tooltip = "Diamond = price/pressure retest trigger. Triangle = actual strategy entry after trend, cooldown, and risk gates.", group = G_SIG)
+color longEntryColorInput = input.color(color.aqua, "Long Entry Color", group = G_SIG)
+color shortEntryColorInput = input.color(color.orange, "Short Entry Color", group = G_SIG)
+color longTriggerColorInput = input.color(color.rgb(70, 160, 255), "Long Qualified Trigger Color", group = G_SIG)
+color shortTriggerColorInput = input.color(color.rgb(255, 120, 70), "Short Qualified Trigger Color", group = G_SIG)
+color retestLongColorInput = input.color(color.new(color.aqua, 20), "Long Retest Touch Color", group = G_SIG)
+color retestShortColorInput = input.color(color.new(color.orange, 20), "Short Retest Touch Color", group = G_SIG)
+bool highlightEntryBarInput = input.bool(true, "Highlight Entry Candle", group = G_SIG)
+
+
+//=============================================================================
+// 15 — DeltaFlow Volume Profile [BigBeluga]
+//=============================================================================
+
+string G_VP = "15 — DeltaFlow Volume Profile [BigBeluga]"
+
+lookBack     = input.int(200, "LookBack", group = G_VP)
+binsAmount   = input.int(30, "Bins", maxval = 100, minval = 10, group = G_VP)
+offset       = input.int(5, "Offset", group = G_VP)
+deltaHeatMap = input.bool(true, "Delta Heat Map", group = G_VP)
+deltaDisplay = input.bool(true, "Delta", group = G_VP)
+volumeBars   = input.bool(true, "Volume Bars", group = G_VP)
+pocDisplay   = input.bool(true, "Show PoC", inline = "poc", group = G_VP)
+pocColor     = input.color(color.rgb(0, 183, 255), "PoC Color", inline = "poc", group = G_VP)
+bullcolor    = input.color(color.teal, "Volume +/-", inline = "vol", group = G_VP)
+bearcolor    = input.color(color.rgb(230, 150, 30), "", inline = "vol", group = G_VP)
+
+type vp_
+    array<float> volumeArry
+    array<float> bearVolume
+    array<float> bullVolume
+
+vp = vp_.new(array.new<float>(binsAmount, 0.), array.new<float>(binsAmount, 0.), array.new<float>(binsAmount, 0.))
+MaxMin     = array.new<float>()
+var boxes  = array.new<box>()
+
+
+//=============================================================================
+// HELPERS (shared by both engines)
+//=============================================================================
+
+int MS_DAY = 86400000
+
+f_clamp(float value, float lowValue, float highValue) =>
+    math.max(lowValue, math.min(highValue, value))
+
+f_delta(float o, float h, float l, float c, float v) =>
+    float safeRange = math.max(h - l, syminfo.mintick)
+    float pressure = f_clamp((c - o) / safeRange, -1.0, 1.0)
+    v * pressure
+
+f_score(float value, float target) =>
+    target <= 0 ? 0.0 : f_clamp(value / target * 100.0, 0.0, 100.0)
+
+f_price(float value) =>
+    na(value) ? "—" : str.tostring(value, format.mintick)
+
+f_pct(float value) =>
+    na(value) ? "—" : str.tostring(value, "#.0") + "%"
+
+f_bar(float value) =>
+    int filled = int(math.round(f_clamp(value, 0.0, 100.0) / 10.0))
+    string result = ""
+    for i = 1 to 10
+        result += i <= filled ? "█" : "·"
+    result
+
+f_rowVerdict(float acceptValue, float rejectValue, string acceptWord, string rejectWord, string neutralWord) => acceptValue >= rejectValue + 15.0 ? acceptWord : rejectValue >= acceptValue + 15.0 ? rejectWord : neutralWord
+
+f_dashboardSize(string sizeName) =>
+    (sizeName == "Tiny" ? size.tiny :
+     sizeName == "Normal" ? size.normal :
+     sizeName == "Large" ? size.large :
+     sizeName == "Huge" ? size.huge :
+     size.small)
+
+f_entryMessage(
+     string setup,
+     float entry,
+     float stop,
+     float target,
+     float p0Value,
+     float distanceATR,
+     float deltaPercent,
+     float acceptance,
+     float rejection,
+     float coherence
+) =>
+    (setup +
+     " | " + syminfo.ticker + " " + timeframe.period +
+     " @ " + f_price(entry) +
+     "\nP0: " + f_price(p0Value) +
+     "\nDistance: " + str.tostring(distanceATR, "#.##") + " ATR" +
+     "\nDelta: " + f_pct(deltaPercent) +
+     "\nAcceptance: " + str.tostring(acceptance, "#") + "/100" +
+     "\nRejection: " + str.tostring(rejection, "#") + "/100" +
+     "\nCoherence: " + f_pct(coherence) +
+     "\nStop: " + f_price(stop) +
+     "\nTarget: " + f_price(target))
+
+
+//=============================================================================
+// STRUCTURAL LEVEL STATE (Anchor engine -- only holds a real value from the
+// current/most-recent bar onward; see STRUCTURAL PROFILE OBJECTS below)
+//=============================================================================
+
+var float structuralPOC = na
+var float structuralVAH = na
+var float structuralVAL = na
+var float structuralSupport = na
+var float structuralResistance = na
+
+//=============================================================================
+// DYNAMIC P0 PROFILE
+//=============================================================================
+
+float atr = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
+float timeframeSeconds = nz(timeframe.in_seconds(timeframe.period), 60.0)
+
+int equilibriumBarsRaw = int(math.ceil(equilibriumMinutes * 60.0 / timeframeSeconds))
+int equilibriumBars = math.max(4, math.min(maximumEquilibriumBars, equilibriumBarsRaw))
+
+float equilibriumHigh = ta.highest(high, equilibriumBars)
+float equilibriumLow = ta.lowest(low, equilibriumBars)
+float equilibriumStep = math.max((equilibriumHigh - equilibriumLow) / equilibriumRows, syminfo.mintick)
+
+array<float> dynamicTotal = array.new_float(equilibriumRows, 0.0)
+array<float> dynamicBuy = array.new_float(equilibriumRows, 0.0)
+array<float> dynamicSell = array.new_float(equilibriumRows, 0.0)
+
+for i = 0 to equilibriumBars - 1
+    if not na(high[i])
+        float barOpen = open[i]
+        float barHigh = high[i]
+        float barLow = low[i]
+        float barClose = close[i]
+        float barVolume = nz(volume[i], 0.0)
+        float barRange = barHigh - barLow
+        float safeRange = math.max(barRange, syminfo.mintick)
+
+        float pressure = f_clamp((barClose - barOpen) / safeRange, -1.0, 1.0)
+        float buyShare = (1.0 + pressure) * 0.5
+        float sellShare = 1.0 - buyShare
+
+        if barRange <= syminfo.mintick
+            int row = int(math.floor((barClose - equilibriumLow) / equilibriumStep))
+            row := math.max(0, math.min(equilibriumRows - 1, row))
+
+            array.set(dynamicTotal, row, array.get(dynamicTotal, row) + barVolume)
+            array.set(dynamicBuy, row, array.get(dynamicBuy, row) + barVolume * buyShare)
+            array.set(dynamicSell, row, array.get(dynamicSell, row) + barVolume * sellShare)
+
+        else
+            int firstRow = int(math.floor((barLow - equilibriumLow) / equilibriumStep))
+            int lastRow = int(math.floor((barHigh - equilibriumLow) / equilibriumStep))
+
+            firstRow := math.max(0, math.min(equilibriumRows - 1, firstRow))
+            lastRow := math.max(0, math.min(equilibriumRows - 1, lastRow))
+
+            for row = firstRow to lastRow
+                float rowLow = equilibriumLow + row * equilibriumStep
+                float rowHigh = rowLow + equilibriumStep
+
+                float overlap = math.max(0.0, math.min(barHigh, rowHigh) - math.max(barLow, rowLow))
+                float fraction = overlap / barRange
+
+                if fraction > 0
+                    float rowVolume = barVolume * fraction
+
+                    array.set(dynamicTotal, row, array.get(dynamicTotal, row) + rowVolume)
+                    array.set(dynamicBuy, row, array.get(dynamicBuy, row) + rowVolume * buyShare)
+                    array.set(dynamicSell, row, array.get(dynamicSell, row) + rowVolume * sellShare)
+
+
+//=============================================================================
+// DYNAMIC P0 / VALUE AREA
+//=============================================================================
+
+float totalDynamicVolume = 0.0
+float maximumDynamicVolume = 0.0
+int dynamicP0Index = 0
+
+for row = 0 to equilibriumRows - 1
+    float rowVolume = array.get(dynamicTotal, row)
+    totalDynamicVolume += rowVolume
+
+    if rowVolume > maximumDynamicVolume
+        maximumDynamicVolume := rowVolume
+        dynamicP0Index := row
+
+float dynamicP0 = equilibriumLow + (dynamicP0Index + 0.5) * equilibriumStep
+
+int dynamicVALIndex = dynamicP0Index
+int dynamicVAHIndex = dynamicP0Index
+
+float valueAreaVolume = array.get(dynamicTotal, dynamicP0Index)
+float valueAreaTarget = totalDynamicVolume * dynamicValueAreaPercent / 100.0
+
+while valueAreaVolume < valueAreaTarget and (dynamicVALIndex > 0 or dynamicVAHIndex < equilibriumRows - 1)
+    float leftVolume = dynamicVALIndex > 0 ? array.get(dynamicTotal, dynamicVALIndex - 1) : -1.0
+    float rightVolume = dynamicVAHIndex < equilibriumRows - 1 ? array.get(dynamicTotal, dynamicVAHIndex + 1) : -1.0
+
+    if rightVolume > leftVolume
+        dynamicVAHIndex += 1
+        valueAreaVolume += array.get(dynamicTotal, dynamicVAHIndex)
+    else
+        if dynamicVALIndex > 0
+            dynamicVALIndex -= 1
+            valueAreaVolume += array.get(dynamicTotal, dynamicVALIndex)
+        else if dynamicVAHIndex < equilibriumRows - 1
+            dynamicVAHIndex += 1
+            valueAreaVolume += array.get(dynamicTotal, dynamicVAHIndex)
+
+float dynamicVAL = equilibriumLow + dynamicVALIndex * equilibriumStep
+float dynamicVAH = equilibriumLow + (dynamicVAHIndex + 1.0) * equilibriumStep
+float dynamicValueCenter = (dynamicVAH + dynamicVAL) * 0.5
+
+
+//=============================================================================
+// PROFILE COHERENCE
+//=============================================================================
+
+int coherenceLow = math.max(0, dynamicP0Index - coherenceRadius)
+int coherenceHigh = math.min(equilibriumRows - 1, dynamicP0Index + coherenceRadius)
+
+float coherenceVolume = 0.0
+
+for row = coherenceLow to coherenceHigh
+    coherenceVolume += array.get(dynamicTotal, row)
+
+int coherenceRowCount = coherenceHigh - coherenceLow + 1
+
+float coherenceShare = totalDynamicVolume > 0 ? coherenceVolume / totalDynamicVolume * 100.0 : 0.0
+float uniformShare = 100.0 * coherenceRowCount / equilibriumRows
+
+float profileCoherence = (coherenceShare + uniformShare > 0 ?
+     100.0 * coherenceShare / (coherenceShare + uniformShare) :
+     0.0)
+
+
+//=============================================================================
+// NEW-LOCATION VOLUME
+//=============================================================================
+
+float newLocationBand = atr * newLocationBandATR
+float newLocationRecentVolume = 0.0
+float newLocationRecentTotal = 0.0
+
+for i = 0 to newLocationRecentBars - 1
+    float barVolume = nz(volume[i], 0.0)
+    newLocationRecentTotal += barVolume
+
+    if math.abs(close[i] - close) <= newLocationBand
+        newLocationRecentVolume += barVolume
+
+float newLocationShare = (newLocationRecentTotal > 0 ?
+     newLocationRecentVolume / newLocationRecentTotal * 100.0 :
+     0.0)
+
+
+//=============================================================================
+// DELTA STATE
+//=============================================================================
+
+float aggregateDelta = 0.0
+float aggregateVolume = 0.0
+
+for i = 0 to deltaWindow - 1
+    float barVolume = nz(volume[i], 0.0)
+    aggregateDelta += f_delta(open[i], high[i], low[i], close[i], barVolume)
+    aggregateVolume += barVolume
+
+float deltaPercent = (aggregateVolume > 0 ? aggregateDelta / aggregateVolume * 100.0 : 0.0)
+float distanceFromP0ATR = (close - dynamicP0) / atr
+
+int displacementDirection = (distanceFromP0ATR > 0 ? 1 : distanceFromP0ATR < 0 ? -1 : 0)
+
+int alignedDeltaBars = 0
+
+for i = 0 to deltaPersistenceBars - 1
+    float deltaBar = f_delta(open[i], high[i], low[i], close[i], nz(volume[i], 0.0))
+
+    if displacementDirection > 0 and deltaBar > 0
+        alignedDeltaBars += 1
+
+    if displacementDirection < 0 and deltaBar < 0
+        alignedDeltaBars += 1
+
+float deltaPersistence = 100.0 * alignedDeltaBars / deltaPersistenceBars
+
+
+//=============================================================================
+// P0 MIGRATION / CATCH-UP
+//=============================================================================
+
+float priorP0 = dynamicP0[migrationLookback]
+float priorValueCenter = dynamicValueCenter[migrationLookback]
+
+float p0MigrationATR = (not na(priorP0) ? (dynamicP0 - priorP0) / atr : 0.0)
+float valueMigrationATR = (not na(priorValueCenter) ? (dynamicValueCenter - priorValueCenter) / atr : 0.0)
+
+bool p0MigrationAligned = displacementDirection != 0 and displacementDirection * p0MigrationATR > 0
+
+float catchUpDenominator = (not na(priorP0) ? math.max(math.abs(close - priorP0), syminfo.mintick) : syminfo.mintick)
+
+float p0CatchUpPercent = (p0MigrationAligned and not na(priorP0) ?
+     math.abs(dynamicP0 - priorP0) / catchUpDenominator * 100.0 :
+     0.0)
+
+p0CatchUpPercent := f_clamp(p0CatchUpPercent, 0.0, 150.0)
+
+
+//=============================================================================
+// PRICE / DELTA EFFICIENCY
+//=============================================================================
+
+float priceProgressATR = (not na(close[efficiencyLookback]) ? (close - close[efficiencyLookback]) / atr : 0.0)
+
+float alignedPriceProgress = displacementDirection * priceProgressATR
+float alignedDeltaMagnitude = displacementDirection * deltaPercent
+
+float alignedDeltaScore = f_score(alignedDeltaMagnitude, alignedDeltaTarget)
+float opposingDeltaScore = f_score(-alignedDeltaMagnitude, opposingDeltaTarget)
+
+float efficiencyScore = (alignedDeltaMagnitude > 0 ? f_score(math.max(alignedPriceProgress, 0.0), efficiencyTargetATR) : 0.0)
+
+float absorptionDeltaScore = f_score(math.abs(deltaPercent), absorptionDeltaTarget)
+
+float absorptionProgressScore = (absorptionMaximumProgressATR > 0 ?
+     f_clamp((absorptionMaximumProgressATR - math.max(alignedPriceProgress, 0.0)) / absorptionMaximumProgressATR * 100.0, 0.0, 100.0) :
+     0.0)
+
+float absorptionScore = absorptionDeltaScore * absorptionProgressScore / 100.0
+
+
+//=============================================================================
+// DWELL / RETURN
+//=============================================================================
+
+int dwellCount = 0
+
+for i = 0 to dwellMeasurementBars - 1
+    if not na(dynamicP0[i])
+        float band = atr[i] * equilibriumBandATR
+
+        if displacementDirection > 0 and close[i] > dynamicP0[i] + band
+            dwellCount += 1
+
+        if displacementDirection < 0 and close[i] < dynamicP0[i] - band
+            dwellCount += 1
+
+float dwellPercent = 100.0 * dwellCount / dwellMeasurementBars
+
+float currentDistance = math.abs(close - dynamicP0)
+float previousDistance = (not na(dynamicP0[1]) ? math.abs(close[1] - dynamicP0[1]) : currentDistance)
+
+bool returningTowardP0 = currentDistance < previousDistance
+bool candleTowardP0 = (displacementDirection > 0 ? close < open : displacementDirection < 0 ? close > open : false)
+
+float returnTowardP0Score = (returningTowardP0 and candleTowardP0 ? 100.0 : returningTowardP0 ? 50.0 : 0.0)
+
+
+//=============================================================================
+// ACCEPTANCE SCORE
+//=============================================================================
+
+float acceptanceMigration = f_score(displacementDirection * p0MigrationATR, migrationTargetATR)
+float acceptanceCatchUp = f_score(p0CatchUpPercent, catchUpTargetPercent)
+float acceptanceNewLocation = f_score(newLocationShare, newLocationTargetPercent)
+float acceptanceValueMigration = f_score(displacementDirection * valueMigrationATR, valueMigrationTargetATR)
+
+float acceptanceDelta = (alignedDeltaScore + deltaPersistence) * 0.5
+float acceptanceEfficiency = efficiencyScore
+
+float acceptanceRaw = (
+     acceptanceMigration * 0.20 +
+     acceptanceCatchUp * 0.15 +
+     acceptanceNewLocation * 0.20 +
+     acceptanceValueMigration * 0.15 +
+     acceptanceDelta * 0.15 +
+     dwellPercent * 0.10 +
+     acceptanceEfficiency * 0.05)
+
+float coherenceMultiplier = 0.55 + 0.45 * profileCoherence / 100.0
+
+float acceptanceScore = f_clamp(acceptanceRaw * coherenceMultiplier, 0.0, 100.0)
+
+
+//=============================================================================
+// REJECTION SCORE
+//=============================================================================
+
+float rejectionP0Stall = 100.0 - acceptanceMigration
+float rejectionValueNonMigration = 100.0 - acceptanceValueMigration
+float rejectionWeakNewLocation = 100.0 - acceptanceNewLocation
+
+float rejectionRaw = (
+     rejectionP0Stall * 0.20 +
+     opposingDeltaScore * 0.25 +
+     absorptionScore * 0.15 +
+     returnTowardP0Score * 0.15 +
+     rejectionValueNonMigration * 0.10 +
+     rejectionWeakNewLocation * 0.15)
+
+float rejectionScore = f_clamp(rejectionRaw * coherenceMultiplier, 0.0, 100.0)
+
+
+//=============================================================================
+// MARKET STATE
+//=============================================================================
+
+bool meaningfulDisplacement = math.abs(distanceFromP0ATR) >= minimumDistanceATR
+bool coherenceOK = profileCoherence >= minimumCoherence
+
+bool bullAcceptanceDominant = (acceptanceScore >= acceptanceThresholdLong + signalStabilityMargin and acceptanceScore >= rejectionScore + scoreDominanceLong)
+bool bearAcceptanceDominant = (acceptanceScore >= acceptanceThresholdShort + signalStabilityMargin and acceptanceScore >= rejectionScore + scoreDominanceShort)
+bool bullRejectionDominant = (rejectionScore >= rejectionThresholdLong + signalStabilityMargin and rejectionScore >= acceptanceScore + scoreDominanceLong)
+bool bearRejectionDominant = (rejectionScore >= rejectionThresholdShort + signalStabilityMargin and rejectionScore >= acceptanceScore + scoreDominanceShort)
+
+bool bullishAcceptance = (meaningfulDisplacement and coherenceOK and displacementDirection > 0 and bullAcceptanceDominant)
+bool bearishAcceptance = (meaningfulDisplacement and coherenceOK and displacementDirection < 0 and bearAcceptanceDominant)
+bool bullishRejection = (meaningfulDisplacement and coherenceOK and displacementDirection < 0 and bullRejectionDominant)
+bool bearishRejection = (meaningfulDisplacement and coherenceOK and displacementDirection > 0 and bearRejectionDominant)
+
+string marketState = "EQUILIBRIUM"
+
+if meaningfulDisplacement
+    marketState := "TRANSITION"
+
+if bullishAcceptance
+    marketState := "BULL ACCEPTANCE"
+
+if bearishAcceptance
+    marketState := "BEAR ACCEPTANCE"
+
+if bullishRejection
+    marketState := "BULL REJECTION"
+
+if bearishRejection
+    marketState := "BEAR REJECTION"
+
+
+//=============================================================================
+// ANCHOR TRAIL FLIP ENTRY SIGNAL
+//-----------------------------------------------------------------------------
+// bullishAcceptance/bearishAcceptance/bullishRejection/bearishRejection
+// above are no longer read by any entry logic; they remain fully computed
+// and displayed on the Architecture dashboard as live market-structure
+// context only. The anchor band flip below IS the entry trigger.
+//=============================================================================
+
+float anchorAtr = ta.atr(anchorAtrLenInput)
+float anchorBbBasis = ta.sma(anchorSrcInput, 20)
+float anchorBbDev = 2.0 * ta.stdev(anchorSrcInput, 20)
+float anchorBbUpper = anchorBbBasis + anchorBbDev
+float anchorBbLower = anchorBbBasis - anchorBbDev
+float anchorKcBasis = ta.ema(anchorSrcInput, 20)
+float anchorKcRange = ta.atr(20)
+float anchorKcUpper = anchorKcBasis + 1.5 * anchorKcRange
+float anchorKcLower = anchorKcBasis - 1.5 * anchorKcRange
+bool anchorSqzOn = anchorBbUpper < anchorKcUpper and anchorBbLower > anchorKcLower
+
+float anchorAtrPct = ta.percentrank(anchorAtr, 100)
+float anchorAdaptScale = anchorUseAdaptiveInput ? (anchorSqzOn ? anchorAdaptMinInput : anchorAtrPct > 75 ? anchorAdaptMaxInput : 1.0) : 1.0
+float anchorEffMult = anchorBandMultInput * anchorAdaptScale
+float anchorMult4 = anchorEffMult + 3.0
+
+float anchorUpper4 = anchorSrcInput - anchorAtr * anchorMult4
+float anchorLower4 = anchorSrcInput + anchorAtr * anchorMult4
+
+var float anchorTs4 = na
+var int anchorTrend = 1
+
+if anchorTrend == 1
+    if anchorSrcInput < nz(anchorTs4[1], anchorUpper4)
+        anchorTrend := -1
+        anchorTs4 := anchorLower4
+    else
+        anchorTs4 := math.max(anchorUpper4, nz(anchorTs4[1], anchorUpper4))
+else
+    if anchorSrcInput > nz(anchorTs4[1], anchorLower4)
+        anchorTrend := 1
+        anchorTs4 := anchorUpper4
+    else
+        anchorTs4 := math.min(anchorLower4, nz(anchorTs4[1], anchorLower4))
+
+bool anchorTrendChange = anchorTrend != anchorTrend[1]
+
+bool anchorLongRaw = anchorTrendChange and anchorTrend == 1
+bool anchorShortRaw = anchorTrendChange and anchorTrend == -1
+
+plot(anchorTs4, title = "Anchor Band", color = showAllChartObjectsInput ? (anchorTrend == 1 ? color.new(color.lime, 0) : color.new(color.red, 0)) : na, linewidth = 2, style = plot.style_linebr)
+
+
+//=============================================================================
+// ANCHOR TRADE STATE
+//-----------------------------------------------------------------------------
+// Hoisted above the entry-engine gating below (rather than left in the
+// ORDERS section further down, as in the original single-engine script) so
+// anchorFlat can read activeTradeType here -- Pine requires declare-before-
+// use, and anchorFlat must NOT read strategy.position_size (that is now the
+// NET account position shared with the DBR engine; see the merge header).
+//=============================================================================
+
+var float activeEntry = na
+var float activeStop = na
+var float activeTarget = na
+var float activeRisk = na
+var string activeTradeType = ""
+var bool breakEvenActive = false
+
+bool anchorFlat = activeTradeType == ""
+
+
+//=============================================================================
+// ANCHOR ENTRY ENGINE
+//=============================================================================
+
+var int lastLongExitBar = -10000
+var int lastShortExitBar = -10000
+
+bool cooldownOkLong = bar_index - lastLongExitBar >= cooldownBarsLongInput
+bool cooldownOkShort = bar_index - lastShortExitBar >= cooldownBarsShortInput
+
+// Cumulative NET account position-size change log, for diagnostics only --
+// with two engines sharing one account this traces total fill activity,
+// not just the Anchor engine's own trades.
+var array<string> positionChangeLog = array.new_string()
+
+if strategy.position_size != strategy.position_size[1]
+    string posChangeEntry = str.tostring(strategy.position_size[1]) + "->" + str.tostring(strategy.position_size) + "@" + str.tostring(bar_index)
+    array.unshift(positionChangeLog, posChangeEntry)
+    if array.size(positionChangeLog) > 6
+        array.pop(positionChangeLog)
+
+var bool longCooldownArmed = true
+var bool shortCooldownArmed = true
+
+if not anchorLongRaw
+    longCooldownArmed := true
+
+if not anchorShortRaw
+    shortCooldownArmed := true
+
+bool longFresh = (not requireFreshState or not anchorLongRaw[1])
+bool shortFresh = (not requireFreshState or not anchorShortRaw[1])
+
+bool structuralFilterLongOk = not useStructuralFilterInput or na(structuralResistance) or close < structuralResistance
+bool structuralFilterShortOk = not useStructuralFilterInput or na(structuralSupport) or close > structuralSupport
+
+bool longArmed = (anchorFlat and cooldownOkLong and longCooldownArmed and anchorLongRaw and longFresh and structuralFilterLongOk)
+bool shortArmed = (anchorFlat and cooldownOkShort and shortCooldownArmed and anchorShortRaw and shortFresh and structuralFilterShortOk)
+
+bool longSetupArmed = longArmed
+bool shortSetupArmed = shortArmed
+
+bool longSignal = (barstate.isconfirmed and longArmed)
+bool shortSignal = (barstate.isconfirmed and shortArmed)
+
+
+//=============================================================================
+// ANCHOR ORDERS
+//=============================================================================
+
+if strategy.position_size != strategy.position_size[1]
+    log.info("POS CHANGE bar=" + str.tostring(bar_index) + " prev=" + str.tostring(strategy.position_size[1]) + " now=" + str.tostring(strategy.position_size) + " activeTradeType(incoming)='" + activeTradeType + "'")
+
+if longSignal
+    activeEntry := close
+    activeRisk := atr * stopATR
+    activeStop := activeEntry - activeRisk
+    float longRMultipleTarget = activeEntry + activeRisk * targetRR
+    bool structuralLongTargetValid = not na(structuralResistance) and structuralResistance > activeEntry and structuralResistance < longRMultipleTarget
+    activeTarget := useStructuralTargetInput and structuralLongTargetValid ? structuralResistance : longRMultipleTarget
+    activeTradeType := "ANCHOR LONG"
+    breakEvenActive := false
+
+    string message = f_entryMessage("BULL | LONG ENTRY | ANCHOR TRAIL FLIP", activeEntry, activeStop, activeTarget, dynamicP0, distanceFromP0ATR, deltaPercent, acceptanceScore, rejectionScore, profileCoherence)
+
+    strategy.entry(id = "Anchor Long", direction = strategy.long, qty = contracts, comment = "ANCHOR LONG", alert_message = message)
+
+    if showAllChartObjectsInput and showCooldownGapLabelsInput
+        int barsSinceLastLongExit = bar_index - lastLongExitBar
+        label.new(bar_index, high, "Δ" + str.tostring(barsSinceLastLongExit), style = label.style_label_down, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
+
+    if enableDynamicAlerts and alertEntries
+        alert(message, alert.freq_once_per_bar_close)
+
+
+if shortSignal
+    activeEntry := close
+    activeRisk := atr * stopATR
+    activeStop := activeEntry + activeRisk
+    float shortRMultipleTarget = activeEntry - activeRisk * targetRR
+    bool structuralShortTargetValid = not na(structuralSupport) and structuralSupport < activeEntry and structuralSupport > shortRMultipleTarget
+    activeTarget := useStructuralTargetInput and structuralShortTargetValid ? structuralSupport : shortRMultipleTarget
+    activeTradeType := "ANCHOR SHORT"
+    breakEvenActive := false
+
+    string message = f_entryMessage("BEAR | SHORT ENTRY | ANCHOR TRAIL FLIP", activeEntry, activeStop, activeTarget, dynamicP0, distanceFromP0ATR, deltaPercent, acceptanceScore, rejectionScore, profileCoherence)
+
+    strategy.entry(id = "Anchor Short", direction = strategy.short, qty = contracts, comment = "ANCHOR SHORT", alert_message = message)
+
+    if showAllChartObjectsInput and showCooldownGapLabelsInput
+        int barsSinceLastShortExit = bar_index - lastShortExitBar
+        label.new(bar_index, low, "Δ" + str.tostring(barsSinceLastShortExit), style = label.style_label_up, color = color.new(color.gray, 70), textcolor = color.white, size = size.tiny)
+
+    if enableDynamicAlerts and alertEntries
+        alert(message, alert.freq_once_per_bar_close)
+
+
+//=============================================================================
+// ANCHOR POSITION MANAGEMENT
+//-----------------------------------------------------------------------------
+// Gated on activeTradeType (this engine's OWN trade state), not on
+// strategy.position_size -- the net account position can be offset by the
+// DBR engine's own open trade, and must never suppress Anchor's own
+// stop/target management.
+//=============================================================================
+
+if activeTradeType == "ANCHOR LONG"
+    if barstate.isconfirmed and useBreakEven and not breakEvenActive and high >= activeEntry + activeRisk * breakEvenAtR
+        activeStop := math.max(activeStop, activeEntry)
+        breakEvenActive := true
+
+    strategy.exit(id = "Anchor Long Exit", from_entry = "Anchor Long", stop = activeStop, limit = activeTarget, alert_message = "LONG EXIT | ANCHOR LONG")
+
+
+if activeTradeType == "ANCHOR SHORT"
+    if barstate.isconfirmed and useBreakEven and not breakEvenActive and low <= activeEntry - activeRisk * breakEvenAtR
+        activeStop := math.min(activeStop, activeEntry)
+        breakEvenActive := true
+
+    strategy.exit(id = "Anchor Short Exit", from_entry = "Anchor Short", stop = activeStop, limit = activeTarget, alert_message = "SHORT EXIT | ANCHOR SHORT")
+
+
+//=============================================================================
+// ANCHOR EXIT DETECTION / COOLDOWN
+//-----------------------------------------------------------------------------
+// Walks strategy.closedtrades with its OWN cursor and filters by its OWN
+// entry ids ("Anchor Long"/"Anchor Short"), inside a while loop rather than
+// a single "last index" check -- with two engines sharing one account, a
+// single bar update can close a DBR trade and an Anchor trade at once, and
+// the old single-index assumption (valid when Anchor was the only engine)
+// would silently miss whichever one wasn't last.
+//=============================================================================
+
+var int anchorProcessedClosedTrades = 0
+var array<string> exitLog = array.new_string()
+
+bool longClosed = false
+bool shortClosed = false
+string closedEntryIdThisUpdate = ""
+int closedExitBarThisUpdate = na
+
+while anchorProcessedClosedTrades < strategy.closedtrades
+    int closedIdx = anchorProcessedClosedTrades
+    string thisClosedId = strategy.closedtrades.entry_id(closedIdx)
+
+    if thisClosedId == "Anchor Long" or thisClosedId == "Anchor Short"
+        int thisClosedExitBar = strategy.closedtrades.exit_bar_index(closedIdx)
+        bool thisLongClosed = thisClosedId == "Anchor Long"
+
+        if thisLongClosed
+            lastLongExitBar := thisClosedExitBar
+            longCooldownArmed := false
+            longClosed := true
+        else
+            lastShortExitBar := thisClosedExitBar
+            shortCooldownArmed := false
+            shortClosed := true
+
+        closedEntryIdThisUpdate := thisClosedId
+        closedExitBarThisUpdate := thisClosedExitBar
+
+        string exitLogEntry = (thisLongClosed ? "L" : "S") + "|'" + thisClosedId + "'|bar" + str.tostring(thisClosedExitBar)
+        array.unshift(exitLog, exitLogEntry)
+        if array.size(exitLog) > 4
+            array.pop(exitLog)
+
+        if showAllChartObjectsInput and showCooldownGapLabelsInput
+            label.new(bar_index, thisLongClosed ? low : high, "EXIT id='" + thisClosedId + "'", style = thisLongClosed ? label.style_label_down : label.style_label_up, color = color.new(color.red, 60), textcolor = color.white, size = size.tiny)
+
+        if enableDynamicAlerts and alertExits
+            string side = thisLongClosed ? "LONG EXIT" : "SHORT EXIT"
+            alert(side + " | " + thisClosedId + " | " + syminfo.ticker + " " + timeframe.period + " @ " + f_price(close), alert.freq_once_per_bar_close)
+
+        activeEntry := na
+        activeStop := na
+        activeTarget := na
+        activeRisk := na
+        activeTradeType := ""
+        breakEvenActive := false
+
+    anchorProcessedClosedTrades += 1
+
+
+//=============================================================================
+// DYNAMIC P0 / VA DISPLAY
+//=============================================================================
+
+dynamicP0Plot = plot(showAllChartObjectsInput and showDynamicP0 ? dynamicP0 : na, title = "Dynamic P0", color = dynamicP0Color, linewidth = dynamicP0Width)
+
+var label dynamicP0Label = na
+if showAllChartObjectsInput and showDynamicP0 and showDynamicP0LabelInput
+    if na(dynamicP0Label)
+        dynamicP0Label := label.new(bar_index, dynamicP0, "P0 " + f_price(dynamicP0), xloc = xloc.bar_index, style = label.style_label_left, color = color.new(dynamicP0Color, 0), textcolor = color.black, size = size.small)
+    else
+        label.set_xy(dynamicP0Label, bar_index, dynamicP0)
+        label.set_text(dynamicP0Label, "P0 " + f_price(dynamicP0))
+
+dynamicVAHPlot = plot(showAllChartObjectsInput and showDynamicValueArea ? dynamicVAH : na, title = "Dynamic VAH", color = color.new(dynamicValueAreaColor, 25), linewidth = 1)
+dynamicVALPlot = plot(showAllChartObjectsInput and showDynamicValueArea ? dynamicVAL : na, title = "Dynamic VAL", color = color.new(dynamicValueAreaColor, 25), linewidth = 1)
+
+fill(dynamicVAHPlot, dynamicVALPlot, color = showAllChartObjectsInput and showDynamicValueArea ? color.new(dynamicValueAreaColor, 93) : na, title = "Dynamic Value Area")
+
+
+//=============================================================================
+// ANCHOR SETUP ARMED + ACTUAL ENTRY SIGNALS
+//=============================================================================
+
+bool actualLongEntry = longSignal
+bool actualShortEntry = shortSignal
+
+barcolor(showAllChartObjectsInput and showEntryBarColorInput and actualLongEntry ? entryLongBarColor : showAllChartObjectsInput and showEntryBarColorInput and actualShortEntry ? entryShortBarColor : na, title = "Anchor Entry Bar Highlight")
+
+plotchar(showAllChartObjectsInput and showSetupMarkers and longSetupArmed and not actualLongEntry, title = "Bull Setup Armed", char = "△", location = location.belowbar, size = size.small, color = color.aqua)
+plotchar(showAllChartObjectsInput and showSetupMarkers and shortSetupArmed and not actualShortEntry, title = "Bear Setup Armed", char = "▽", location = location.abovebar, size = size.small, color = color.orange)
+
+bool showLongEntryMarker = showAllChartObjectsInput and showEntryMarkers and actualLongEntry
+bool showShortEntryMarker = showAllChartObjectsInput and showEntryMarkers and actualShortEntry
+
+plotshape(showLongEntryMarker, title = "Bull Actual Entry", style = shape.triangleup, location = location.belowbar, size = size.normal, color = entryLongColor)
+plotshape(showShortEntryMarker, title = "Bear Actual Entry", style = shape.triangledown, location = location.abovebar, size = size.normal, color = entryShortColor)
+
+
+//=============================================================================
+// STRUCTURAL PROFILE STORAGE — REALTIME SAFE
+//=============================================================================
+
+varip array<float> storedOpen = array.new_float()
+varip array<float> storedHigh = array.new_float()
+varip array<float> storedLow = array.new_float()
+varip array<float> storedClose = array.new_float()
+varip array<float> storedVolume = array.new_float()
+varip array<int> storedTime = array.new_int()
+
+varip int lastStoredBarTime = na
+
+bool newStorageBar = na(lastStoredBarTime) or time != lastStoredBarTime
+
+if newStorageBar
+    array.push(storedOpen, open)
+    array.push(storedHigh, high)
+    array.push(storedLow, low)
+    array.push(storedClose, close)
+    array.push(storedVolume, nz(volume, 0.0))
+    array.push(storedTime, time)
+
+    lastStoredBarTime := time
+
+else
+    int liveIndex = array.size(storedTime) - 1
+
+    if liveIndex >= 0
+        array.set(storedOpen, liveIndex, open)
+        array.set(storedHigh, liveIndex, high)
+        array.set(storedLow, liveIndex, low)
+        array.set(storedClose, liveIndex, close)
+        array.set(storedVolume, liveIndex, nz(volume, 0.0))
+        array.set(storedTime, liveIndex, time)
+
+int structuralCutoff = time - structuralDays * MS_DAY
+
+while array.size(storedTime) > 0 and array.get(storedTime, 0) < structuralCutoff
+    array.shift(storedOpen)
+    array.shift(storedHigh)
+    array.shift(storedLow)
+    array.shift(storedClose)
+    array.shift(storedVolume)
+    array.shift(storedTime)
+
+while array.size(storedTime) > maxStoredBars
+    array.shift(storedOpen)
+    array.shift(storedHigh)
+    array.shift(storedLow)
+    array.shift(storedClose)
+    array.shift(storedVolume)
+    array.shift(storedTime)
+
+
+//=============================================================================
+// STRUCTURAL PROFILE OBJECTS
+//-----------------------------------------------------------------------------
+// The original box-based right-side delta histogram (its own "showHistogram"
+// draw loop) is intentionally NOT ported here -- the DeltaFlow Volume
+// Profile [BigBeluga] below is this file's one and only histogram, per
+// request. POC / VAH-VAL / Support-Resistance / Liquidity Zones are kept
+// since the Anchor engine's structural filter/target logic depends on them.
+//=============================================================================
+
+var array<box> structuralBoxes = array.new_box()
+var array<line> structuralLines = array.new_line()
+
+if barstate.islast
+
+    if array.size(structuralBoxes) > 0
+        for i = 0 to array.size(structuralBoxes) - 1
+            box.delete(array.get(structuralBoxes, i))
+
+    array.clear(structuralBoxes)
+
+    if array.size(structuralLines) > 0
+        for i = 0 to array.size(structuralLines) - 1
+            line.delete(array.get(structuralLines, i))
+
+    array.clear(structuralLines)
+
+    int storedBars = array.size(storedTime)
+
+    if storedBars >= 2
+
+        float profileHigh = -1.0e20
+        float profileLow = 1.0e20
+
+        for i = 0 to storedBars - 1
+            profileHigh := math.max(profileHigh, array.get(storedHigh, i))
+            profileLow := math.min(profileLow, array.get(storedLow, i))
+
+        float profileStep = math.max((profileHigh - profileLow) / structuralRows, syminfo.mintick)
+
+        array<float> profileTotal = array.new_float(structuralRows, 0.0)
+        array<float> profileBuy = array.new_float(structuralRows, 0.0)
+        array<float> profileSell = array.new_float(structuralRows, 0.0)
+        array<float> profileDelta = array.new_float(structuralRows, 0.0)
+        array<float> profileDeltaPercent = array.new_float(structuralRows, 0.0)
+
+        for i = 0 to storedBars - 1
+
+            float barOpen = array.get(storedOpen, i)
+            float barHigh = array.get(storedHigh, i)
+            float barLow = array.get(storedLow, i)
+            float barClose = array.get(storedClose, i)
+            float barVolume = array.get(storedVolume, i)
+
+            float barRange = barHigh - barLow
+            float safeRange = math.max(barRange, syminfo.mintick)
+
+            float pressure = f_clamp((barClose - barOpen) / safeRange, -1.0, 1.0)
+            float buyShare = (1.0 + pressure) * 0.5
+
+            if barRange <= syminfo.mintick
+
+                int row = int(math.floor((barClose - profileLow) / profileStep))
+                row := math.max(0, math.min(structuralRows - 1, row))
+
+                array.set(profileTotal, row, array.get(profileTotal, row) + barVolume)
+                array.set(profileBuy, row, array.get(profileBuy, row) + barVolume * buyShare)
+                array.set(profileSell, row, array.get(profileSell, row) + barVolume * (1.0 - buyShare))
+
+            else
+
+                int firstRow = int(math.floor((barLow - profileLow) / profileStep))
+                int lastRow = int(math.floor((barHigh - profileLow) / profileStep))
+
+                firstRow := math.max(0, math.min(structuralRows - 1, firstRow))
+                lastRow := math.max(0, math.min(structuralRows - 1, lastRow))
+
+                for row = firstRow to lastRow
+
+                    float rowLow = profileLow + row * profileStep
+                    float rowHigh = rowLow + profileStep
+
+                    float overlap = math.max(0.0, math.min(barHigh, rowHigh) - math.max(barLow, rowLow))
+                    float fraction = overlap / barRange
+
+                    if fraction > 0
+
+                        float rowVolume = barVolume * fraction
+
+                        array.set(profileTotal, row, array.get(profileTotal, row) + rowVolume)
+                        array.set(profileBuy, row, array.get(profileBuy, row) + rowVolume * buyShare)
+                        array.set(profileSell, row, array.get(profileSell, row) + rowVolume * (1.0 - buyShare))
+
+        float maximumVolume = 0.0
+        float maximumAbsoluteDelta = 0.0
+        float totalProfileVolume = 0.0
+        int profilePOCIndex = 0
+
+        for row = 0 to structuralRows - 1
+
+            float rowVolume = array.get(profileTotal, row)
+            float rowDelta = (array.get(profileBuy, row) - array.get(profileSell, row))
+            float rowDeltaPercent = (rowVolume > 0 ? rowDelta / rowVolume * 100.0 : 0.0)
+
+            array.set(profileDelta, row, rowDelta)
+            array.set(profileDeltaPercent, row, rowDeltaPercent)
+
+            totalProfileVolume += rowVolume
+            maximumAbsoluteDelta := math.max(maximumAbsoluteDelta, math.abs(rowDelta))
+
+            if rowVolume > maximumVolume
+                maximumVolume := rowVolume
+                profilePOCIndex := row
+
+        structuralPOC := profileLow + (profilePOCIndex + 0.5) * profileStep
+
+        int profileVALIndex = profilePOCIndex
+        int profileVAHIndex = profilePOCIndex
+
+        float profileValueVolume = array.get(profileTotal, profilePOCIndex)
+        float profileValueTarget = totalProfileVolume * structuralValueArea / 100.0
+
+        while profileValueVolume < profileValueTarget and (profileVALIndex > 0 or profileVAHIndex < structuralRows - 1)
+
+            float leftVolume = (profileVALIndex > 0 ? array.get(profileTotal, profileVALIndex - 1) : -1.0)
+            float rightVolume = (profileVAHIndex < structuralRows - 1 ? array.get(profileTotal, profileVAHIndex + 1) : -1.0)
+
+            if rightVolume > leftVolume
+                profileVAHIndex += 1
+                profileValueVolume += array.get(profileTotal, profileVAHIndex)
+
+            else
+                if profileVALIndex > 0
+                    profileVALIndex -= 1
+                    profileValueVolume += array.get(profileTotal, profileVALIndex)
+
+                else if profileVAHIndex < structuralRows - 1
+                    profileVAHIndex += 1
+                    profileValueVolume += array.get(profileTotal, profileVAHIndex)
+
+        structuralVAL := profileLow + profileVALIndex * profileStep
+        structuralVAH := profileLow + (profileVAHIndex + 1.0) * profileStep
+
+        float bestSupportScore = -1.0
+        float bestResistanceScore = -1.0
+
+        structuralSupport := na
+        structuralResistance := na
+
+        for row = 0 to structuralRows - 1
+
+            float rowVolume = array.get(profileTotal, row)
+            float rowDelta = array.get(profileDelta, row)
+            float rowDeltaPercent = array.get(profileDeltaPercent, row)
+
+            float rowMid = profileLow + (row + 0.5) * profileStep
+            float volumePercent = (maximumVolume > 0 ? rowVolume / maximumVolume * 100.0 : 0.0)
+
+            bool quality = (volumePercent >= minNodeVolume and math.abs(rowDeltaPercent) >= minNodeDelta)
+
+            if quality and rowMid < close and rowDelta > 0
+                float score = (math.abs(rowDelta) * (0.5 + 0.5 * volumePercent / 100.0))
+                if score > bestSupportScore
+                    bestSupportScore := score
+                    structuralSupport := rowMid
+
+            if quality and rowMid > close and rowDelta < 0
+                float score = (math.abs(rowDelta) * (0.5 + 0.5 * volumePercent / 100.0))
+                if score > bestResistanceScore
+                    bestResistanceScore := score
+                    structuralResistance := rowMid
+
+        int profileStartTime = array.get(storedTime, 0)
+        int futureTime = time_close + int(timeframeSeconds * 1000.0 * 40)
+
+        if showAllChartObjectsInput and showStructuralPOC
+            line pocLine = line.new(profileStartTime, structuralPOC, futureTime, structuralPOC, xloc = xloc.bar_time, color = structuralPOCColor, width = 2)
+            array.push(structuralLines, pocLine)
+
+        if showAllChartObjectsInput and showStructuralValueArea
+            array.push(structuralLines, line.new(profileStartTime, structuralVAH, futureTime, structuralVAH, xloc = xloc.bar_time, color = structuralValueAreaColor))
+            array.push(structuralLines, line.new(profileStartTime, structuralVAL, futureTime, structuralVAL, xloc = xloc.bar_time, color = structuralValueAreaColor))
+
+        if showAllChartObjectsInput and showSupportResistance and not na(structuralSupport)
+            array.push(structuralLines, line.new(profileStartTime, structuralSupport, futureTime, structuralSupport, xloc = xloc.bar_time, color = supportColor, width = 3))
+
+        if showAllChartObjectsInput and showSupportResistance and not na(structuralResistance)
+            array.push(structuralLines, line.new(profileStartTime, structuralResistance, futureTime, structuralResistance, xloc = xloc.bar_time, color = resistanceColor, width = 3))
+
+        if showAllChartObjectsInput and showLiquidityZones
+
+            array<bool> usedNodes = array.new_bool(structuralRows, false)
+
+            for node = 0 to liquidityNodeCount - 1
+
+                float bestScore = -1.0
+                int bestIndex = -1
+
+                for row = 0 to structuralRows - 1
+
+                    if not array.get(usedNodes, row)
+
+                        float rowVolume = array.get(profileTotal, row)
+                        float rowDelta = array.get(profileDelta, row)
+                        float rowDeltaPercent = array.get(profileDeltaPercent, row)
+
+                        float volumePercent = (maximumVolume > 0 ? rowVolume / maximumVolume * 100.0 : 0.0)
+                        bool quality = (volumePercent >= minNodeVolume and math.abs(rowDeltaPercent) >= minNodeDelta)
+
+                        float nodeScore = (quality and maximumAbsoluteDelta > 0 ? math.abs(rowDelta) / maximumAbsoluteDelta * 70.0 + volumePercent * 0.30 : -1.0)
+
+                        if nodeScore > bestScore
+                            bestScore := nodeScore
+                            bestIndex := row
+
+                if bestIndex >= 0
+
+                    array.set(usedNodes, bestIndex, true)
+
+                    if bestIndex > 0
+                        array.set(usedNodes, bestIndex - 1, true)
+
+                    if bestIndex < structuralRows - 1
+                        array.set(usedNodes, bestIndex + 1, true)
+
+                    float zoneLow = profileLow + bestIndex * profileStep
+                    float zoneHigh = zoneLow + profileStep
+                    float zoneDelta = array.get(profileDelta, bestIndex)
+
+                    color zoneColor = (zoneDelta >= 0 ? positiveDeltaColor : negativeDeltaColor)
+
+                    box zone = box.new(left = profileStartTime, top = zoneHigh, right = futureTime, bottom = zoneLow, xloc = xloc.bar_time, border_color = color.new(zoneColor, 70), bgcolor = color.new(zoneColor, liquidityZoneTransparency))
+
+                    array.push(structuralBoxes, zone)
+
+
+//=============================================================================
+// DBR CHANGE POINT DETECTION (CUSUM)
+//=============================================================================
+
+float barDelta = f_delta(open, high, low, close, nz(volume, 0.0))
+float atrExec = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
+
+float src = close
+
+float logReturns = math.log(src / nz(src[1], src))
+float rollingMean = ta.sma(logReturns, lengthInput)
+float rollingStd = ta.stdev(logReturns, lengthInput)
+float zScore = (logReturns - rollingMean) / (rollingStd == 0 ? 1.0 : rollingStd)
+
+var float sPos = 0.0
+var float sNeg = 0.0
+var int trend = 0
+
+bool changeUp = false
+bool changeDn = false
+
+if barstate.isconfirmed
+    if not na(zScore)
+        sPos := math.max(0, sPos + zScore - slackInput)
+        sNeg := math.min(0, sNeg + zScore + slackInput)
+
+    changeUp := sPos > thresholdInput
+    changeDn := sNeg < -thresholdInput
+
+bool isChange = changeUp or changeDn
+
+var float regimePrice = na
+var int regimeStartBar = bar_index
+
+if barstate.isconfirmed and (isChange or bar_index == lengthInput)
+    trend := changeUp ? 1 : (changeDn ? -1 : trend)
+    regimePrice := src
+    regimeStartBar := bar_index
+    sPos := 0.0
+    sNeg := 0.0
+
+int barsInRegime = bar_index - regimeStartBar
+
+
+//=============================================================================
+// DBR VOLUME PRESSURE / CANDLE QUALITY
+//=============================================================================
+
+float executionDeltaSum = 0.0
+float executionVolumeSum = 0.0
+
+for i = 0 to executionDeltaWindowInput - 1
+    float execVolume = nz(volume[i], 0.0)
+    executionDeltaSum += f_delta(open[i], high[i], low[i], close[i], execVolume)
+    executionVolumeSum += execVolume
+
+float executionDeltaPressure = (executionVolumeSum > 0 ? executionDeltaSum / executionVolumeSum * 100.0 : 0.0)
+
+float triggerVolumeAverage = ta.sma(volume, triggerRvolLengthInput)
+float triggerRvol = triggerVolumeAverage > 0 ? volume / triggerVolumeAverage : 0.0
+float triggerRange = math.max(high - low, syminfo.mintick)
+float triggerBodyFraction = math.abs(close - open) / triggerRange
+float triggerCloseLocation = (close - low) / triggerRange
+
+
+//=============================================================================
+// DBR CHANGE-POINT ZONE (Native Timeframe)
+//=============================================================================
+
+float cpHalfWidth = atrExec * regimeZoneAtrMultInput
+float cpZoneLow = src - cpHalfWidth
+float cpZoneHigh = src + cpHalfWidth
+int cpDirection = changeUp ? 1 : (changeDn ? -1 : 0)
+
+
+//=============================================================================
+// DBR 4H BIAS
+//=============================================================================
+
+f_get4hContext() =>
+    float ph = ta.pivothigh(high, pivotLeftInput, pivotRightInput)
+    float pl = ta.pivotlow(low, pivotLeftInput, pivotRightInput)
+
+    float latestHigh = ta.valuewhen(not na(ph), ph, 0)
+    float previousHigh = ta.valuewhen(not na(ph), ph, 1)
+    float latestLow = ta.valuewhen(not na(pl), pl, 0)
+    float previousLow = ta.valuewhen(not na(pl), pl, 1)
+
+    float ema = ta.ema(close, biasEmaLengthInput)
+    bool aboveEma = close > ema
+    bool slopeUp = ema > ema[biasSlopeLookbackInput]
+    bool slopeDown = ema < ema[biasSlopeLookbackInput]
+
+    [latestHigh[1], previousHigh[1], latestLow[1], previousLow[1], aboveEma[1], slopeUp[1], slopeDown[1]]
+
+[lastPivotHigh, prevPivotHigh, lastPivotLow, prevPivotLow, closeAboveEma4h, emaSlopeUp4h, emaSlopeDown4h] = request.security(syminfo.tickerid, biasTimeframeInput, f_get4hContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool haveEnoughPivots = (not na(lastPivotHigh) and not na(prevPivotHigh) and not na(lastPivotLow) and not na(prevPivotLow))
+
+bool higherHigh = haveEnoughPivots and lastPivotHigh > prevPivotHigh
+bool lowerHigh = haveEnoughPivots and lastPivotHigh < prevPivotHigh
+bool higherLow = haveEnoughPivots and lastPivotLow > prevPivotLow
+bool lowerLow = haveEnoughPivots and lastPivotLow < prevPivotLow
+
+bool structureUp = higherHigh and higherLow
+bool structureDown = lowerHigh and lowerLow
+bool slowFilterUp = closeAboveEma4h and emaSlopeUp4h
+bool slowFilterDown = not closeAboveEma4h and emaSlopeDown4h
+
+string bias = (structureUp and slowFilterUp ? "LONG_ONLY" : structureDown and slowFilterDown ? "SHORT_ONLY" : "NO_TRADE")
+
+
+//=============================================================================
+// DBR 1H TREND
+//=============================================================================
+
+f_efficiencyRatio(int length) =>
+    float netMove = math.abs(close - close[length])
+    float sumMoves = 0.0
+
+    for i = 0 to length - 1
+        sumMoves += math.abs(close[i] - close[i + 1])
+
+    sumMoves > 0 ? netMove / sumMoves : 0.0
+
+f_get1hContext() =>
+    [plusDi, minusDi, adx] = ta.dmi(adxLengthInput, adxLengthInput)
+    float emaFast = ta.ema(close, fastEmaInput)
+    float emaSlow = ta.ema(close, slowEmaInput)
+    float er = f_efficiencyRatio(erLengthInput)
+
+    [adx[1], emaFast[1], emaSlow[1], er[1]]
+
+[adx1h, emaFast1h, emaSlow1h, er1h] = request.security(syminfo.tickerid, trendTimeframeInput, f_get1hContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool adxOk = adx1h >= adxMinimumInput
+bool erOk = er1h >= erMinimumInput
+bool emaStackBullish1h = emaFast1h > emaSlow1h
+bool emaStackBearish1h = emaFast1h < emaSlow1h
+
+bool long1hTrendOk = (emaStackBullish1h and adxOk and erOk)
+bool short1hTrendOk = (emaStackBearish1h and adxOk and erOk)
+
+bool fullLongContext = (bias == "LONG_ONLY" and (not require1hTrendAgreementInput or long1hTrendOk))
+bool fullShortContext = (bias == "SHORT_ONLY" and (not require1hTrendAgreementInput or short1hTrendOk))
+
+
+//=============================================================================
+// DBR COOLDOWN MODULE
+//=============================================================================
+
+type CooldownState
+    int lastExitBarIndex = na
+    bool lastExitWasWin = false
+    int lastLongLossBar = na
+    int lastShortLossBar = na
+    int lossesThisSession = 0
+    array<string> usedEventIds
+
+f_eventUsed(array<string> usedIds, string eventId) =>
+    bool found = false
+
+    if array.size(usedIds) > 0
+        for i = 0 to array.size(usedIds) - 1
+            if array.get(usedIds, i) == eventId
+                found := true
+
+    found
+
+f_canTrade(CooldownState state, string direction, string eventId, int barIdx, int winBars, int lossBars, int dirBars, int lossLimit) =>
+    string reason = "OK"
+    bool tradeable = true
+
+    if state.lossesThisSession >= lossLimit
+        tradeable := false
+        reason := "CONSECUTIVE_LOSS_LOCKOUT"
+
+    if tradeable and not na(state.lastExitBarIndex)
+        int requiredBars = state.lastExitWasWin ? winBars : lossBars
+
+        if barIdx - state.lastExitBarIndex <= requiredBars
+            tradeable := false
+            reason := "GLOBAL_POST_TRADE"
+
+    if tradeable and f_eventUsed(state.usedEventIds, eventId)
+        tradeable := false
+        reason := "EVENT_LOCKOUT"
+
+    if tradeable
+        int lastDirLoss = (direction == "long" ? state.lastLongLossBar : state.lastShortLossBar)
+
+        if not na(lastDirLoss) and barIdx - lastDirLoss <= dirBars
+            tradeable := false
+            reason := "DIRECTION_LOCKOUT"
+
+    [tradeable, reason]
+
+f_recordExit(CooldownState state, int barIdx, bool isWin, string direction, string eventId) =>
+    state.lastExitBarIndex := barIdx
+    state.lastExitWasWin := isWin
+
+    if not isWin
+        if direction == "long"
+            state.lastLongLossBar := barIdx
+        else
+            state.lastShortLossBar := barIdx
+
+        state.lossesThisSession += 1
+
+    if not f_eventUsed(state.usedEventIds, eventId)
+        array.push(state.usedEventIds, eventId)
+
+f_resetSession(CooldownState state) =>
+    state.lossesThisSession := 0
+    array.clear(state.usedEventIds)
+
+var CooldownState cd = CooldownState.new(usedEventIds = array.new_string())
+
+bool newDayExec = ta.change(time("D")) != 0
+
+if barstate.isconfirmed and newDayExec
+    f_resetSession(cd)
+
+
+//=============================================================================
+// DBR RETEST / TRIGGER STATE MACHINE
+//=============================================================================
+
+var float activeZoneLow = na
+var float activeZoneHigh = na
+var int activeDirection = 0
+var int activeEventTime = na
+var string retestState = "NONE"
+var bool activeTriggerAligned = false
+var int retestTouchBar = na
+var float retestTouchPressure = na
+
+var int cEvents = 0
+var int cRetested = 0
+var int cTriggered = 0
+var int cExpired = 0
+var int cInvalidated = 0
+var int cEvalBars = 0
+var int cReclaimFail = 0
+var int cExtensionFail = 0
+var int cBodyFail = 0
+var int cLocationFail = 0
+var int cPressureFail = 0
+var int cRvolFail = 0
+
+bool newChangePointEvent = barstate.isconfirmed and cpDirection != 0
+
+if newChangePointEvent
+    cEvents += 1
+    activeZoneLow := cpZoneLow
+    activeZoneHigh := cpZoneHigh
+    activeDirection := cpDirection
+    activeEventTime := int(time)
+    retestState := "WATCHING"
+    activeTriggerAligned := false
+    retestTouchBar := na
+    retestTouchPressure := na
+
+int hoursSinceEvent = (na(activeEventTime) ? na : int((time - activeEventTime) / (60 * 60 * 1000)))
+bool windowExpired = (not na(activeEventTime) and hoursSinceEvent > retestWindowHoursInput)
+
+bool retestLongTouchNow = false
+bool retestShortTouchNow = false
+
+if retestState == "WATCHING"
+    if windowExpired
+        retestState := "EXPIRED"
+        cExpired += 1
+    else
+        bool failedBeforeRetestLong = (activeDirection == 1 and close < activeZoneLow)
+        bool failedBeforeRetestShort = (activeDirection == -1 and close > activeZoneHigh)
+
+        if failedBeforeRetestLong or failedBeforeRetestShort
+            retestState := "INVALIDATED"
+            cInvalidated += 1
+        else
+            bool validLongTouch = (activeDirection == 1 and close[1] > activeZoneHigh and low <= activeZoneHigh and high >= activeZoneLow and low >= activeZoneLow - atrExec * maxRetestOvershootAtrInput)
+            bool validShortTouch = (activeDirection == -1 and close[1] < activeZoneLow and high >= activeZoneLow and low <= activeZoneHigh and high <= activeZoneHigh + atrExec * maxRetestOvershootAtrInput)
+
+            if validLongTouch or validShortTouch
+                retestState := "RETESTED"
+                cRetested += 1
+                retestTouchBar := bar_index
+                retestTouchPressure := executionDeltaPressure
+                retestLongTouchNow := validLongTouch
+                retestShortTouchNow := validShortTouch
+
+bool triggerUpNow = false
+bool triggerDownNow = false
+
+if retestState == "RETESTED"
+    int barsAfterRetest = (na(retestTouchBar) ? 100000 : bar_index - retestTouchBar)
+    bool retestTooOld = (barsAfterRetest > maxBarsAfterRetestInput)
+
+    bool invalidateLong = (activeDirection == 1 and close < activeZoneLow - atrExec * maxRetestOvershootAtrInput)
+    bool invalidateShort = (activeDirection == -1 and close > activeZoneHigh + atrExec * maxRetestOvershootAtrInput)
+
+    if windowExpired or retestTooOld
+        retestState := "EXPIRED"
+        cExpired += 1
+    else if invalidateLong or invalidateShort
+        retestState := "INVALIDATED"
+        cInvalidated += 1
+    else if barsAfterRetest >= minBarsAfterRetestInput
+        float reclaimBuffer = atrExec * reclaimBufferAtrInput
+        float maxExtension = atrExec * maxEntryExtensionAtrInput
+
+        bool priceReclaimLong = (activeDirection == 1 and close > activeZoneHigh + reclaimBuffer)
+        bool priceReclaimShort = (activeDirection == -1 and close < activeZoneLow - reclaimBuffer)
+
+        bool extensionLongOk = (close - activeZoneHigh <= maxExtension)
+        bool extensionShortOk = (activeZoneLow - close <= maxExtension)
+
+        bool candleBodyOk = (triggerBodyFraction >= minimumTriggerBodyFractionInput)
+        bool candleLocationLongOk = (triggerCloseLocation >= minimumTriggerCloseLocationInput)
+        bool candleLocationShortOk = (triggerCloseLocation <= 1.0 - minimumTriggerCloseLocationInput)
+
+        bool pressureLongOk = (not requireVolumePressureConfirmationInput or executionDeltaPressure >= minimumVolumePressureInput)
+        bool pressureShortOk = (not requireVolumePressureConfirmationInput or executionDeltaPressure <= -minimumVolumePressureInput)
+
+        bool rvolOk = (not requireRvolOnTriggerInput or triggerRvol >= minimumTriggerRvolInput)
+
+        triggerUpNow := (priceReclaimLong and extensionLongOk and candleBodyOk and candleLocationLongOk and pressureLongOk and rvolOk)
+        triggerDownNow := (priceReclaimShort and extensionShortOk and candleBodyOk and candleLocationShortOk and pressureShortOk and rvolOk)
+
+        cEvalBars += 1
+
+        bool reclaimOkDir = activeDirection == 1 ? priceReclaimLong : priceReclaimShort
+        bool extensionOkDir = activeDirection == 1 ? extensionLongOk : extensionShortOk
+        bool locationOkDir = activeDirection == 1 ? candleLocationLongOk : candleLocationShortOk
+        bool pressureOkDir = activeDirection == 1 ? pressureLongOk : pressureShortOk
+
+        if not reclaimOkDir
+            cReclaimFail += 1
+        if not extensionOkDir
+            cExtensionFail += 1
+        if not candleBodyOk
+            cBodyFail += 1
+        if not locationOkDir
+            cLocationFail += 1
+        if not pressureOkDir
+            cPressureFail += 1
+        if not rvolOk
+            cRvolFail += 1
+
+        if triggerUpNow or triggerDownNow
+            retestState := "TRIGGERED"
+            cTriggered += 1
+
+            activeTriggerAligned := ((triggerUpNow and fullLongContext) or (triggerDownNow and fullShortContext))
+
+
+//=============================================================================
+// DBR ORDERS & EXECUTION
+//-----------------------------------------------------------------------------
+// dbrInTrade is this engine's OWN in-trade flag (mirrors anchorFlat above),
+// read instead of strategy.position_size == 0 -- the net account position
+// can be offset by the Anchor engine's own open trade. Entry ids renamed
+// from the original "Long"/"Short" to "CP Long"/"CP Short" so they can
+// never collide with the Anchor engine's own ids, and so the dashboard can
+// filter strategy.opentrades/closedtrades per engine.
+//=============================================================================
+
+var int lastActedEventTime = na
+var string openTradeDirection = ""
+var string openTradeEventId = ""
+var int entryCallCount = 0
+var bool dbrInTrade = false
+
+bool actualLongEntrySignal = false
+bool actualShortEntrySignal = false
+
+bool freshTrigger = (retestState == "TRIGGERED" and (na(lastActedEventTime) or activeEventTime != lastActedEventTime))
+
+if barstate.isconfirmed and freshTrigger and not dbrInTrade
+    string directionStr = (activeDirection == 1 ? "long" : "short")
+    string eventId = ("CP_" + directionStr + "_" + str.tostring(activeEventTime))
+
+    bool alignedOk = (not requireAlignedEntryInput or (directionStr == "long" ? fullLongContext : fullShortContext))
+
+    [tradeable, reason] = f_canTrade(cd, directionStr, eventId, bar_index, globalCooldownWinBarsInput, globalCooldownLossBarsInput, directionCooldownBarsInput, consecutiveLossLimitInput)
+
+    lastActedEventTime := activeEventTime
+
+    float stopPrice = (directionStr == "long" ? activeZoneLow - stopBufferAtrMultInput * atrExec : activeZoneHigh + stopBufferAtrMultInput * atrExec)
+    float riskPerUnit = math.abs(close - stopPrice)
+    float riskAtr = (atrExec > 0 ? riskPerUnit / atrExec : 999.0)
+    bool riskOk = (riskAtr <= maximumEntryRiskAtrInput)
+
+    if alignedOk and tradeable and riskOk
+        float targetPrice = (directionStr == "long" ? close + riskPerUnit * rMultipleInput : close - riskPerUnit * rMultipleInput)
+        string entryId = (directionStr == "long" ? "CP Long" : "CP Short")
+
+        openTradeDirection := directionStr
+        openTradeEventId := eventId
+        dbrInTrade := true
+
+        if directionStr == "long"
+            strategy.entry(entryId, strategy.long, qty = contractsInput)
+            actualLongEntrySignal := true
+        else
+            strategy.entry(entryId, strategy.short, qty = contractsInput)
+            actualShortEntrySignal := true
+
+        strategy.exit(entryId + " Exit", entryId, stop = stopPrice, limit = targetPrice)
+
+        entryCallCount += 1
+
+
+//=============================================================================
+// DBR BROKER-VERIFIED EXIT DETECTION
+//=============================================================================
+
+var int dbrProcessedClosedTrades = 0
+bool cpLongClosed = false
+bool cpShortClosed = false
+
+while dbrProcessedClosedTrades < strategy.closedtrades
+    int closedIdx = dbrProcessedClosedTrades
+    string thisClosedId = strategy.closedtrades.entry_id(closedIdx)
+
+    if thisClosedId == "CP Long" or thisClosedId == "CP Short"
+        int thisClosedExitBar = strategy.closedtrades.exit_bar_index(closedIdx)
+        float thisClosedProfit = strategy.closedtrades.profit(closedIdx)
+        bool thisIsWin = thisClosedProfit > 0
+        string thisClosedDirection = thisClosedId == "CP Long" ? "long" : "short"
+
+        f_recordExit(cd, thisClosedExitBar, thisIsWin, thisClosedDirection, openTradeEventId)
+
+        dbrInTrade := false
+
+        if thisClosedId == "CP Long"
+            cpLongClosed := true
+        else
+            cpShortClosed := true
+
+    dbrProcessedClosedTrades += 1
+
+
+//=============================================================================
+// DBR ACTIVE RETEST ZONE VISUAL
+//=============================================================================
+
+var box activeZoneBox = na
+
+if barstate.islast
+    if not na(activeZoneBox)
+        box.delete(activeZoneBox)
+
+    if showAllChartObjectsInput and (retestState == "WATCHING" or retestState == "RETESTED")
+        color zoneColor = (activeDirection == 1 ? retestLongColorInput : retestShortColorInput)
+
+        activeZoneBox := box.new(left = bar_index - 40, top = activeZoneHigh, right = bar_index + 5, bottom = activeZoneLow, xloc = xloc.bar_index, bgcolor = color.new(zoneColor, 87), border_color = zoneColor)
+
+
+//=============================================================================
+// DBR CHANGE-POINT REGIME VISUAL
+//=============================================================================
+
+color trendColor = trend == 1 ? longEntryColorInput : (trend == -1 ? shortEntryColorInput : color.gray)
+bool isLevelChange = regimePrice != regimePrice[1]
+
+pRegime = plot(regimePrice, "Regime Price", color = showAllChartObjectsInput and showChangePointVisualInput and not isLevelChange ? trendColor : na, style = plot.style_linebr, linewidth = 2)
+
+float priceVol = ta.stdev(src, lengthInput)
+float cusumLevelPos = regimePrice + sPos * priceVol
+float cusumLevelNeg = regimePrice + sNeg * priceVol
+
+pCusumPos = plot(cusumLevelPos, "Bullish Pressure", color = showAllChartObjectsInput and showChangePointVisualInput and not isLevelChange ? color.new(longEntryColorInput, 80) : na, style = plot.style_linebr)
+pCusumNeg = plot(cusumLevelNeg, "Bearish Pressure", color = showAllChartObjectsInput and showChangePointVisualInput and not isLevelChange ? color.new(shortEntryColorInput, 80) : na, style = plot.style_linebr)
+
+fill(pRegime, pCusumPos, color = showAllChartObjectsInput and showChangePointVisualInput ? color.new(longEntryColorInput, 90) : na, title = "Bullish CUSUM Fill")
+fill(pRegime, pCusumNeg, color = showAllChartObjectsInput and showChangePointVisualInput ? color.new(shortEntryColorInput, 90) : na, title = "Bearish CUSUM Fill")
+
+plotshape(showAllChartObjectsInput and showChangePointVisualInput and changeUp, title = "Change Up", style = shape.triangleup, location = location.belowbar, color = longEntryColorInput, size = size.tiny)
+plotshape(showAllChartObjectsInput and showChangePointVisualInput and changeDn, title = "Change Down", style = shape.triangledown, location = location.abovebar, color = shortEntryColorInput, size = size.tiny)
+
+
+//=============================================================================
+// DBR QUALIFIED RETEST TRIGGER + TOUCH + ENTRY MARKERS
+//=============================================================================
+
+plotshape(showAllChartObjectsInput and showQualifiedTriggerInput and triggerUpNow, title = "Qualified Long Retest Trigger", style = shape.diamond, location = location.belowbar, size = size.small, color = longTriggerColorInput, text = "T", textcolor = color.white)
+plotshape(showAllChartObjectsInput and showQualifiedTriggerInput and triggerDownNow, title = "Qualified Short Retest Trigger", style = shape.diamond, location = location.abovebar, size = size.small, color = shortTriggerColorInput, text = "T", textcolor = color.white)
+
+plotshape(showAllChartObjectsInput and showRetestTouchMarkerInput and retestLongTouchNow, title = "Long Retest Touch", style = shape.circle, location = location.belowbar, size = size.tiny, color = retestLongColorInput)
+plotshape(showAllChartObjectsInput and showRetestTouchMarkerInput and retestShortTouchNow, title = "Short Retest Touch", style = shape.circle, location = location.abovebar, size = size.tiny, color = retestShortColorInput)
+
+bool showLongEntry = showAllChartObjectsInput and showEntrySignalInput and actualLongEntrySignal
+bool showShortEntry = showAllChartObjectsInput and showEntrySignalInput and actualShortEntrySignal
+
+plotshape(showLongEntry, title = "CP Long Entry", style = shape.triangleup, location = location.belowbar, size = size.normal, color = longEntryColorInput, text = "LONG", textcolor = color.white)
+plotshape(showShortEntry, title = "CP Short Entry", style = shape.triangledown, location = location.abovebar, size = size.normal, color = shortEntryColorInput, text = "SHORT", textcolor = color.white)
+
+barcolor(showAllChartObjectsInput and highlightEntryBarInput and actualLongEntrySignal ? color.new(longEntryColorInput, 35) : showAllChartObjectsInput and highlightEntryBarInput and actualShortEntrySignal ? color.new(shortEntryColorInput, 35) : na, title = "CP Entry Bar Highlight")
+
+
+//=============================================================================
+// DELTAFLOW VOLUME PROFILE [BIGBELUGA] — THE ONE HISTOGRAM IN THIS FILE
+//=============================================================================
+
+if barstate.islast and showAllChartObjectsInput
+    if boxes.size() > 0
+        for b in boxes
+            b.delete()
+    // Guard added: the original code read high[i]/low[i]/volume[i] back
+    // `lookBack` bars with no check that that much history actually
+    // exists yet. When it doesn't (early on a fresh symbol/session, or
+    // any feed with fewer than `lookBack` bars loaded), high[i] etc.
+    // return na, which poisons MaxMin/vp's arrays with na and eventually
+    // reaches box.new() with an na coordinate -- a runtime error that
+    // halts the ENTIRE script for that bar, freezing every plot/table
+    // downstream (including the Architecture dashboard) at whatever it
+    // last computed. Skipping this block until bar_index >= lookBack
+    // prevents that; the histogram simply doesn't draw until then.
+    if bar_index >= lookBack
+        for i = 0 to lookBack
+            MaxMin.push(high[i])
+            MaxMin.push(low[i])
+        top = MaxMin.max()
+        bot = MaxMin.min()
+        step = (top - bot) / binsAmount
+        for i = 0 to lookBack
+            price = close[i]
+            isBear = close[i] < open[i]
+            voll = volume[i]
+            for k = 0 to binsAmount - 1
+                lower = bot + step * k
+                mid   = lower + step / 2
+                if math.abs(mid - price) <= step
+                    vp.volumeArry.set(k, vp.volumeArry.get(k) + voll)
+                    if isBear
+                        vp.bearVolume.set(k, vp.bearVolume.get(k) + voll)
+                    else
+                        vp.bullVolume.set(k, vp.bullVolume.get(k) + voll)
+
+        // Guard added: vp.volumeArry.max() can legitimately be 0 (a
+        // window with no recorded volume) -- dividing by it directly, as
+        // the original code did 3 times over, produces na and the same
+        // box.new()-halts-the-script failure mode described above.
+        float maxVolumeArry = vp.volumeArry.max()
+
+        for i = 0 to binsAmount - 1
+            start = bar_index + 100 + offset
+            volumeArryvalue = vp.volumeArry.get(i)
+            lower = bot + step * i
+            upper = lower + step
+            mid   = lower + step / 2
+            vol   = maxVolumeArry > 0 ? int(vp.volumeArry.get(i) / maxVolumeArry * 100) : 0
+            bullV = maxVolumeArry > 0 ? int(math.floor(vp.bullVolume.get(i) / maxVolumeArry * 100)) : 0
+            bearV = maxVolumeArry > 0 ? int(math.floor(vp.bearVolume.get(i) / maxVolumeArry * 100)) : 0
+            size  = (start - start - vol)
+            bullsPercent = math.abs(bullV / size * 100)
+            bearsPercent = math.abs(bearV / size * 100)
+            bullsPercent := bullsPercent > 100 ? 100 : bullsPercent
+            delta       = bullsPercent - bearsPercent
+            deltaColor  = color.from_gradient(delta, -30, 30, bearcolor, bullcolor)
+            box poc      = na
+            box labelBox = na
+            box MapBody  = na
+            box bulls    = na
+            box bears    = na
+            if deltaHeatMap
+                MapBody  := box.new(start - lookBack - 50 - vol, upper, start, lower, border_color = chart.bg_color, border_width = 0, bgcolor = color.from_gradient(vol, 0, 100, color.new(deltaColor, 100), color.new(deltaColor, 70)))
+            if vol == 100 and pocDisplay
+                poc := box.new(start - lookBack - 50 - vol, upper, start, lower, border_color = pocColor, border_width = 1, bgcolor = na, text = str.tostring(volumeArryvalue, format.volume), text_color = chart.fg_color)
+            if deltaDisplay
+                labelBox := box.new(start + 15, upper, start, lower, border_color = chart.bg_color, border_width = 1, bgcolor = color.new(deltaColor, 80), text = "Δ " + str.tostring(delta, format.percent), text_color = deltaColor)
+            body        = box.new(start - vol, upper, start, lower, border_color = chart.bg_color, border_width = 1, bgcolor = color.new(deltaColor, 50))
+            if volumeBars
+                bulls  := box.new(start - bullV, mid, start, lower, bgcolor = bullcolor, border_color = chart.bg_color, border_width = 1, text = str.tostring(bullsPercent, format = format.percent), text_halign = text.align_right)
+                bears  := box.new(start - bearV, upper, start, mid, bgcolor = bearcolor, border_color = chart.bg_color, border_width = 1, text = str.tostring(bearsPercent, format = format.percent), text_halign = text.align_right)
+
+            boxes.push(poc)
+            boxes.push(labelBox)
+            boxes.push(MapBody)
+            boxes.push(body)
+            boxes.push(bulls)
+            boxes.push(bears)
+
+
+//=============================================================================
+// ACCEPTANCE / REJECTION COMPONENT HISTOGRAM — UNIFIED ARCHITECTURE DASHBOARD
+//-----------------------------------------------------------------------------
+// The ONE dashboard table in this file (per request), rows 0-9: the
+// original P0 Delta Architecture table. The Long/Short Cooldown rows and
+// the 7-row DBR Change-Point status summary that previously followed them
+// (rows 10-18) were removed per request -- the underlying cooldown state
+// and DBR engine computations are untouched and still drive both engines'
+// entries, only these display rows are gone.
+//=============================================================================
+
+architectureTablePosition = (
+     architecturePosition == "Top Left" ?
+     position.top_left :
+     architecturePosition == "Bottom Left" ?
+     position.bottom_left :
+     architecturePosition == "Bottom Right" ?
+     position.bottom_right :
+     position.top_right)
+
+var table architectureTable = table.new(architectureTablePosition, 5, 10, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast
+
+    if showAllChartObjectsInput and showArchitectureHistogram
+
+        int readCol = showLiveColumnInput ? 4 : 3
+
+        table.cell(architectureTable, 0, 0, "ARCHITECTURE", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+        table.cell(architectureTable, 1, 0, "ACCEPT", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+        table.cell(architectureTable, 2, 0, "REJECT", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+        if showLiveColumnInput
+            table.cell(architectureTable, 3, 0, "LIVE", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+        table.cell(architectureTable, readCol, 0, "READ", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+
+        string readMigration = f_rowVerdict(acceptanceMigration, rejectionP0Stall, "MIGRATING", "STALLING", "FLAT")
+        table.cell(architectureTable, 0, 1, "P0 Mig / Stall", text_color = color.white)
+        table.cell(architectureTable, 1, 1, f_bar(acceptanceMigration), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 1, f_bar(rejectionP0Stall), text_color = rejectionColor)
+        if showLiveColumnInput
+            table.cell(architectureTable, 3, 1, str.tostring(p0MigrationATR, "#.##") + "A", text_color = color.white)
+        table.cell(architectureTable, readCol, 1, readMigration, text_color = readMigration == "MIGRATING" ? acceptanceColor : readMigration == "STALLING" ? rejectionColor : color.gray)
+
+        string readCatchUp = f_rowVerdict(acceptanceCatchUp, 100.0 - acceptanceCatchUp, "CONVERGING", "LAGGING", "MIXED")
+        table.cell(architectureTable, 0, 2, "Catch-Up", text_color = color.white)
+        table.cell(architectureTable, 1, 2, f_bar(acceptanceCatchUp), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 2, f_bar(100.0 - acceptanceCatchUp), text_color = rejectionColor)
+        if showLiveColumnInput
+            table.cell(architectureTable, 3, 2, f_pct(p0CatchUpPercent), text_color = color.white)
+        table.cell(architectureTable, readCol, 2, readCatchUp, text_color = readCatchUp == "CONVERGING" ? acceptanceColor : readCatchUp == "LAGGING" ? rejectionColor : color.gray)
+
+        string readNewValue = f_rowVerdict(acceptanceNewLocation, rejectionWeakNewLocation, "ACCEPTED", "REJECTED", "MIXED")
+        table.cell(architectureTable, 0, 3, "New Value", text_color = color.white)
+        table.cell(architectureTable, 1, 3, f_bar(acceptanceNewLocation), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 3, f_bar(rejectionWeakNewLocation), text_color = rejectionColor)
+        if showLiveColumnInput
+            table.cell(architectureTable, 3, 3, f_pct(newLocationShare), text_color = color.white)
+        table.cell(architectureTable, readCol, 3, readNewValue, text_color = readNewValue == "ACCEPTED" ? acceptanceColor : readNewValue == "REJECTED" ? rejectionColor : color.gray)
+
+        string readVaMigration = f_rowVerdict(acceptanceValueMigration, rejectionValueNonMigration, "SHIFTING", "ANCHORED", "MIXED")
+        table.cell(architectureTable, 0, 4, "VA Migration", text_color = color.white)
+        table.cell(architectureTable, 1, 4, f_bar(acceptanceValueMigration), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 4, f_bar(rejectionValueNonMigration), text_color = rejectionColor)
+        if showLiveColumnInput
+            table.cell(architectureTable, 3, 4, str.tostring(valueMigrationATR, "#.##") + "A", text_color = color.white)
+        table.cell(architectureTable, readCol, 4, readVaMigration, text_color = readVaMigration == "SHIFTING" ? acceptanceColor : readVaMigration == "ANCHORED" ? rejectionColor : color.gray)
+
+        string readDelta = f_rowVerdict(acceptanceDelta, opposingDeltaScore, "ALIGNED", "OPPOSING", "MIXED")
+        table.cell(architectureTable, 0, 5, "Delta", text_color = color.white)
+        table.cell(architectureTable, 1, 5, f_bar(acceptanceDelta), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 5, f_bar(opposingDeltaScore), text_color = rejectionColor)
+        if showLiveColumnInput
+            table.cell(architectureTable, 3, 5, f_pct(deltaPercent), text_color = color.white)
+        table.cell(architectureTable, readCol, 5, readDelta, text_color = readDelta == "ALIGNED" ? acceptanceColor : readDelta == "OPPOSING" ? rejectionColor : color.gray)
+
+        string readEfficiency = f_rowVerdict(acceptanceEfficiency, absorptionScore, "EFFICIENT", "ABSORBED", "MIXED")
+        table.cell(architectureTable, 0, 6, "Efficiency", text_color = color.white)
+        table.cell(architectureTable, 1, 6, f_bar(acceptanceEfficiency), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 6, f_bar(absorptionScore), text_color = rejectionColor)
+        if showLiveColumnInput
+            table.cell(architectureTable, 3, 6, str.tostring(priceProgressATR, "#.##") + "A", text_color = color.white)
+        table.cell(architectureTable, readCol, 6, readEfficiency, text_color = readEfficiency == "EFFICIENT" ? acceptanceColor : readEfficiency == "ABSORBED" ? rejectionColor : color.gray)
+
+        string readDwell = f_rowVerdict(dwellPercent, returnTowardP0Score, "HOLDING", "RETURNING", "MIXED")
+        table.cell(architectureTable, 0, 7, "Dwell / Return", text_color = color.white)
+        table.cell(architectureTable, 1, 7, f_bar(dwellPercent), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 7, f_bar(returnTowardP0Score), text_color = rejectionColor)
+        if showLiveColumnInput
+            table.cell(architectureTable, 3, 7, str.tostring(dwellCount) + "/" + str.tostring(dwellMeasurementBars), text_color = color.white)
+        table.cell(architectureTable, readCol, 7, readDwell, text_color = readDwell == "HOLDING" ? acceptanceColor : readDwell == "RETURNING" ? rejectionColor : color.gray)
+
+        string readTotal = marketState == "BULL ACCEPTANCE" ? "BULL BREAK" : marketState == "BEAR ACCEPTANCE" ? "BEAR BREAK" : marketState == "BULL REJECTION" ? "BULL BOUNCE" : marketState == "BEAR REJECTION" ? "BEAR BOUNCE" : marketState
+        table.cell(architectureTable, 0, 8, "TOTAL", text_color = color.white)
+        table.cell(architectureTable, 1, 8, f_bar(acceptanceScore) + " " + str.tostring(acceptanceScore, "#"), text_color = acceptanceColor)
+        table.cell(architectureTable, 2, 8, f_bar(rejectionScore) + " " + str.tostring(rejectionScore, "#"), text_color = rejectionColor)
+        if showLiveColumnInput
+            table.cell(architectureTable, 3, 8, marketState, text_color = color.white)
+        table.cell(architectureTable, readCol, 8, readTotal, text_color = str.contains(readTotal, "BULL") ? acceptanceColor : str.contains(readTotal, "BEAR") ? rejectionColor : color.gray)
+
+        table.cell(architectureTable, 0, 9, "P0 / Dist / Coh", text_color = color.white)
+        table.cell(architectureTable, 1, 9, f_price(dynamicP0), text_color = dynamicP0Color)
+        table.cell(architectureTable, 2, 9, str.tostring(distanceFromP0ATR, "#.##") + "A", text_color = color.white)
+        if showLiveColumnInput
+            table.cell(architectureTable, 3, 9, f_pct(profileCoherence), text_color = color.white)
+        table.cell(architectureTable, readCol, 9, profileCoherence >= minimumCoherence ? "STRUCTURED" : "NOISY", text_color = profileCoherence >= minimumCoherence ? acceptanceColor : color.gray)
+
+        dashboardSizeValue = f_dashboardSize(dashboardTextSize)
+
+        for dashboardRow = 0 to 9
+            for dashboardCol = 0 to 4
+                table.cell_set_text_size(architectureTable, dashboardCol, dashboardRow, dashboardSizeValue)
+
+
+//=============================================================================
+// ALERT CONDITIONS
+//=============================================================================
+
+alertcondition(longSignal, title = "Anchor Long", message = "BULL | LONG ENTRY | ANCHOR TRAIL FLIP | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(shortSignal, title = "Anchor Short", message = "BEAR | SHORT ENTRY | ANCHOR TRAIL FLIP | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(longClosed, title = "Anchor Long Exit", message = "LONG EXIT | ANCHOR TRAIL FLIP | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(shortClosed, title = "Anchor Short Exit", message = "SHORT EXIT | ANCHOR TRAIL FLIP | {{ticker}} {{interval}} @ {{close}}")
+
+alertcondition(actualLongEntrySignal, title = "CP Long Entry", message = "BULL | LONG ENTRY | CHANGE POINT RETEST | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(actualShortEntrySignal, title = "CP Short Entry", message = "BEAR | SHORT ENTRY | CHANGE POINT RETEST | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(cpLongClosed, title = "CP Long Exit", message = "LONG EXIT | CHANGE POINT RETEST | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(cpShortClosed, title = "CP Short Exit", message = "SHORT EXIT | CHANGE POINT RETEST | {{ticker}} {{interval}} @ {{close}}")
+
+
+//=============================================================================
+// DATA WINDOW
+//-----------------------------------------------------------------------------
+// Removed. Pine caps a single script at 64 total plot()/plotshape()/
+// plotchar()/fill()/barcolor() outputs combined; merging two previously
+// separate scripts pushed this file's true count to 135 (RE10140: "The
+// script creates too many plots"), even though only ~40 of those ever
+// drew anything on the chart pane -- Data Window plots still count
+// against that same 64-slot budget despite never being visible there.
+// This whole block of ~54 diagnostic-only Data Window plots was the
+// single largest contributor and added nothing to the chart itself, so
+// it was cut entirely rather than trimmed. All the values it exposed
+// (acceptance/rejection scores, structural levels, anchor/CUSUM state,
+// funnel counters, etc.) are still fully computed and still visible on
+// the Architecture dashboard table or via log.info() where already
+// present -- only the raw Data Window plot rows are gone.
+//=============================================================================
+
+// REALTIME VISUALS:
+// Dashboard, dynamic P0, value area, structural levels, and the DeltaFlow
+// profile histogram refresh on every realtime tick. Both engines' entries
+// remain bar-close confirmed through barstate.isconfirmed.
+//
+// Detailed dynamic alerts:
+// Create Alert -> this strategy -> Any alert() function call
+//
+// Order-fill alerts:
+// {{strategy.order.alert_message}}
