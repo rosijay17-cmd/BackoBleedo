@@ -1103,6 +1103,14 @@ if showDashboardInput and barstate.islast
 // =============================================================================
 // ALERTS
 // =============================================================================
+//
+// A TradingView alert is bound to the exact contract symbol it was created
+// on -- that's why the alert went dead after the September contract expired,
+// not a bug in this script. No Pine code fixes that; it's how alerts bind on
+// the platform. Chart and alert off the CONTINUOUS ticker (e.g. MNQ1!/NQ1!)
+// instead of a dated contract (MNQU2026, MNQZ2026, ...) so the alert keeps
+// firing across every roll instead of going silent again next quarter.
+// =============================================================================
 
 alertcondition(
      longSignal,
