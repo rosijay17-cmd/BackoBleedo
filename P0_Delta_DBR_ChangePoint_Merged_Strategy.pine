@@ -1777,13 +1777,14 @@ if barstate.isconfirmed and freshTrigger and not dbrInTrade
         dbrInTrade := true
 
         if directionStr == "long"
-            strategy.entry(entryId, strategy.long, qty = contractsInput)
+            strategy.entry(entryId, strategy.long, qty = contractsInput, alert_message = "BULL | LONG ENTRY | CHANGE POINT RETEST | {{ticker}} {{interval}} @ {{close}}")
             actualLongEntrySignal := true
         else
-            strategy.entry(entryId, strategy.short, qty = contractsInput)
+            strategy.entry(entryId, strategy.short, qty = contractsInput, alert_message = "BEAR | SHORT ENTRY | CHANGE POINT RETEST | {{ticker}} {{interval}} @ {{close}}")
             actualShortEntrySignal := true
 
-        strategy.exit(entryId + " Exit", entryId, stop = stopPrice, limit = targetPrice)
+        string cpExitAlertMessage = directionStr == "long" ? "LONG EXIT | CHANGE POINT RETEST | {{ticker}} {{interval}} @ {{close}}" : "SHORT EXIT | CHANGE POINT RETEST | {{ticker}} {{interval}} @ {{close}}"
+        strategy.exit(entryId + " Exit", entryId, stop = stopPrice, limit = targetPrice, alert_message = cpExitAlertMessage)
 
         entryCallCount += 1
 
