@@ -760,24 +760,24 @@ bool srUseHybrid = srSourceInput == "Hybrid - Nearest Valid"
 
 if srUseHybrid or srSourceInput == "Lux Pivot Step-Line"
     if not srUseHybrid or srIncludeLuxInput
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, lsrHighUsePivot, "Lux Pivot High", 1, 0)
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, lsrLowUsePivot, "Lux Pivot Low", -1, 0)
+        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, lsrHighUsePivot, "Pivot Hi", 1, 0)
+        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, lsrLowUsePivot, "Pivot Lo", -1, 0)
 
 if srUseHybrid or srSourceInput == "Native Swing"
     if not srUseHybrid or srIncludeNativeInput
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, recentSwingHigh, "Native Swing High", 1, 0)
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, recentSwingLow, "Native Swing Low", -1, 0)
+        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, recentSwingHigh, "Swing Hi", 1, 0)
+        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, recentSwingLow, "Swing Lo", -1, 0)
 
 if srUseHybrid or srSourceInput == "Session High / Low"
     if not srUseHybrid or srIncludeAsiaInput
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, asiaHigh, "Asia High", 1, 1)
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, asiaLow, "Asia Low", -1, 1)
+        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, asiaHigh, "Asia Hi", 1, 1)
+        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, asiaLow, "Asia Lo", -1, 1)
     if not srUseHybrid or srIncludeLondonInput
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, londonHigh, "London High", 1, 1)
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, londonLow, "London Low", -1, 1)
+        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, londonHigh, "London Hi", 1, 1)
+        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, londonLow, "London Lo", -1, 1)
     if not srUseHybrid or srIncludeNyInput
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, nyHigh, "NY High", 1, 1)
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, nyLow, "NY Low", -1, 1)
+        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, nyHigh, "NY Hi", 1, 1)
+        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, nyLow, "NY Lo", -1, 1)
 
 if srUseHybrid or srSourceInput == "PDH / PDL"
     if not srUseHybrid or srIncludePdhPdlInput
