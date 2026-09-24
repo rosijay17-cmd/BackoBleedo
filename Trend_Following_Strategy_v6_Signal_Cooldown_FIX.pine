@@ -714,6 +714,33 @@ if strategy.position_size == 0
         shortStop := na
 
 // =============================================================================
+// BROKER-VERIFIED EXIT DETECTION
+//-----------------------------------------------------------------------------
+// Walks strategy.closedtrades with its own cursor, same pattern already used
+// in the P0 Delta + DBR CP merged strategy -- this catches EVERY exit that
+// actually happened at the broker (ATR stop hit intrabar, or the channel
+// close), not just the two script-side branches that call strategy.exit()/
+// strategy.close() above. Feeds the "Long Trend Exit"/"Short Trend Exit"
+// alertconditions below.
+// =============================================================================
+
+var int tfProcessedClosedTrades = 0
+
+bool longTrendClosed = false
+bool shortTrendClosed = false
+
+while tfProcessedClosedTrades < strategy.closedtrades
+    int closedIdx = tfProcessedClosedTrades
+    string thisClosedId = strategy.closedtrades.entry_id(closedIdx)
+
+    if thisClosedId == "Long"
+        longTrendClosed := true
+    else if thisClosedId == "Short"
+        shortTrendClosed := true
+
+    tfProcessedClosedTrades += 1
+
+// =============================================================================
 // EMA
 // =============================================================================
 
@@ -1123,3 +1150,24 @@ alertcondition(
      "Short Trend Entry",
      "BEAR | SHORT ENTRY | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
      )
+
+alertcondition(
+     longTrendClosed,
+     "Long Trend Exit",
+     "LONG EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
+     )
+
+alertcondition(
+     shortTrendClosed,
+     "Short Trend Exit",
+     "SHORT EXIT | DONCHIAN BREAKOUT | {{ticker}} {{interval}} @ {{close}}"
+     )
+
+// Detailed dynamic alerts (BULL/BEAR entries, LONG/SHORT exits, real prices):
+// Create Alert -> this strategy -> Any alert() function call
+// Message -> {{strategy.order.alert_message}}
+//
+// Or pick one specific signal type (only fires for that one):
+// Create Alert -> this strategy -> "Long Trend Entry" / "Short Trend Entry" /
+// "Long Trend Exit" / "Short Trend Exit" -- Message auto-fills, no
+// placeholder needed.
