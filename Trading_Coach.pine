@@ -795,42 +795,16 @@ bool shortSignalNow = lsrBreakDown
 
 // ============================================================================
 // 05a - S/R LEVEL SELECTION
+//-----------------------------------------------------------------------------
+// Anchored to the prior session's high/low (PDH/PDL) only -- no hybrid
+// pivot/swing/session-high-low candidate pool or nearest/priority
+// selection logic. One resistance candidate (PDH), one support candidate
+// (PDL), full stop. selectedResistanceNominalRole/selectedResistanceClass
+// stay as fixed constants (1/2 and -1/2) purely so every downstream
+// reaction-probability calculation in 05b keeps working unchanged.
 // ============================================================================
 
 string G_SR_SELECT = "05a - S/R Level Selection"
-
-srSourceInput =
-     input.string(
-         "Hybrid - Nearest Valid",
-         "Probability S/R Source",
-         options = [
-             "Hybrid - Nearest Valid",
-             "Lux Pivot Step-Line",
-             "Native Swing",
-             "Session High / Low",
-             "PDH / PDL"
-         ],
-         group = G_SR_SELECT
-     )
-
-srSelectionInput =
-     input.string(
-         "Nearest To Price",
-         "Hybrid Selection",
-         options = ["Nearest To Price", "Priority Then Nearest"],
-         group = G_SR_SELECT
-     )
-
-srPriorityInput =
-     input.string(
-         "Session First",
-         "Hybrid Priority",
-         options = ["Session First", "Pivot First", "PDH/PDL First"],
-         group = G_SR_SELECT
-     )
-
-srUseRoleReversalInput =
-     input.bool(true, "Allow Broken Levels To Flip Role", group = G_SR_SELECT)
 
 srMaxDistanceAtrInput =
      input.float(
@@ -838,207 +812,36 @@ srMaxDistanceAtrInput =
          minval = 0.25, maxval = 30.0, step = 0.25, group = G_SR_SELECT
      )
 
-srIncludeLuxInput = input.bool(true, "Hybrid: Include Lux Pivot Levels", group = G_SR_SELECT)
-srIncludeNativeInput = input.bool(true, "Hybrid: Include Native Swing Levels", group = G_SR_SELECT)
-srIncludeAsiaInput = input.bool(true, "Hybrid: Include Asia High / Low", group = G_SR_SELECT)
-srIncludeLondonInput = input.bool(true, "Hybrid: Include London High / Low", group = G_SR_SELECT)
-srIncludeNyInput = input.bool(true, "Hybrid: Include NY High / Low", group = G_SR_SELECT)
-srIncludePdhPdlInput = input.bool(true, "Hybrid: Include PDH / PDL", group = G_SR_SELECT)
-
 srShowSelectedLevelsInput =
-     input.bool(true, "Plot Selected Probability S/R", group = G_SR_SELECT)
+     input.bool(true, "Plot PDH/PDL", group = G_SR_SELECT)
 
 srResistanceColorInput =
-     input.color(color.fuchsia, "Selected Resistance Color", group = G_SR_SELECT)
+     input.color(color.fuchsia, "PDH Probability Color", group = G_SR_SELECT)
 
 srSupportColorInput =
-     input.color(color.aqua, "Selected Support Color", group = G_SR_SELECT)
-
-f_srPriority(int sourceClass, string priorityMode) =>
-    int priority = 9
-
-    if priorityMode == "Session First"
-        priority := sourceClass == 1 ? 0 : sourceClass == 0 ? 1 : 2
-    else if priorityMode == "Pivot First"
-        priority := sourceClass == 0 ? 0 : sourceClass == 1 ? 1 : 2
-    else
-        priority := sourceClass == 2 ? 0 : sourceClass == 1 ? 1 : 2
-
-    priority
-
-f_addSrCandidate(
-     array<float> levels,
-     array<string> sources,
-     array<int> roles,
-     array<int> classes,
-     float level,
-     string sourceName,
-     int nominalRole,
-     int sourceClass
-) =>
-    if not na(level)
-        array.push(levels, level)
-        array.push(sources, sourceName)
-        array.push(roles, nominalRole)
-        array.push(classes, sourceClass)
-
-    true
-
-f_selectSr(
-     array<float> levels,
-     array<string> sources,
-     array<int> roles,
-     array<int> classes,
-     bool wantResistance,
-     bool allowRoleReversal,
-     float maxDistance,
-     string selectionMode,
-     string priorityMode,
-     float currentPrice
-) =>
-    float bestLevel = na
-    string bestSource = "--"
-    float bestDistance = 1e10
-    int bestRole = 0
-    int bestClass = -1
-    int bestPriority = 99
-
-    if array.size(levels) > 0
-        for idx = 0 to array.size(levels) - 1
-            float candidateLevel = array.get(levels, idx)
-            string candidateSource = array.get(sources, idx)
-            int candidateRole = array.get(roles, idx)
-            int candidateClass = array.get(classes, idx)
-
-            bool correctSide =
-                 wantResistance ?
-                 candidateLevel > currentPrice :
-                 candidateLevel < currentPrice
-
-            bool nominalRoleOk =
-                 wantResistance ?
-                 candidateRole == 1 :
-                 candidateRole == -1
-
-            bool roleOk =
-                 allowRoleReversal or nominalRoleOk
-
-            float candidateDistance =
-                 math.abs(candidateLevel - currentPrice)
-
-            bool distanceOk =
-                 candidateDistance <= maxDistance
-
-            int candidatePriority =
-                 f_srPriority(candidateClass, priorityMode)
-
-            bool betterNearest =
-                 candidateDistance < bestDistance
-
-            bool betterPriority =
-                 candidatePriority < bestPriority or
-                 (
-                     candidatePriority == bestPriority and
-                     candidateDistance < bestDistance
-                 )
-
-            bool better =
-                 selectionMode == "Nearest To Price" ?
-                 betterNearest :
-                 betterPriority
-
-            if correctSide and roleOk and distanceOk and better
-                bestLevel := candidateLevel
-                bestSource := candidateSource
-                bestDistance := candidateDistance
-                bestRole := candidateRole
-                bestClass := candidateClass
-                bestPriority := candidatePriority
-
-    [bestLevel, bestSource, bestDistance, bestRole, bestClass]
-
-var array<float> srCandidateLevels = array.new_float()
-var array<string> srCandidateSources = array.new_string()
-var array<int> srCandidateRoles = array.new_int()
-var array<int> srCandidateClasses = array.new_int()
-
-array.clear(srCandidateLevels)
-array.clear(srCandidateSources)
-array.clear(srCandidateRoles)
-array.clear(srCandidateClasses)
-
-bool srUseHybrid = srSourceInput == "Hybrid - Nearest Valid"
-
-if srUseHybrid or srSourceInput == "Lux Pivot Step-Line"
-    if not srUseHybrid or srIncludeLuxInput
-        f_addSrCandidate(
-             srCandidateLevels, srCandidateSources,
-             srCandidateRoles, srCandidateClasses,
-             lsrHighUsePivot, "Pivot Hi", 1, 0
-        )
-
-        f_addSrCandidate(
-             srCandidateLevels, srCandidateSources,
-             srCandidateRoles, srCandidateClasses,
-             lsrLowUsePivot, "Pivot Lo", -1, 0
-        )
-
-if srUseHybrid or srSourceInput == "Native Swing"
-    if not srUseHybrid or srIncludeNativeInput
-        f_addSrCandidate(
-             srCandidateLevels, srCandidateSources,
-             srCandidateRoles, srCandidateClasses,
-             recentSwingHigh, "Swing Hi", 1, 0
-        )
-
-        f_addSrCandidate(
-             srCandidateLevels, srCandidateSources,
-             srCandidateRoles, srCandidateClasses,
-             recentSwingLow, "Swing Lo", -1, 0
-        )
-
-if srUseHybrid or srSourceInput == "Session High / Low"
-    if not srUseHybrid or srIncludeAsiaInput
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses,
-             asiaHigh, "Asia Hi", 1, 1)
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses,
-             asiaLow, "Asia Lo", -1, 1)
-
-    if not srUseHybrid or srIncludeLondonInput
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses,
-             londonHigh, "London Hi", 1, 1)
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses,
-             londonLow, "London Lo", -1, 1)
-
-    if not srUseHybrid or srIncludeNyInput
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses,
-             nyHigh, "NY Hi", 1, 1)
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses,
-             nyLow, "NY Lo", -1, 1)
-
-if srUseHybrid or srSourceInput == "PDH / PDL"
-    if not srUseHybrid or srIncludePdhPdlInput
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses,
-             prevDayHigh, "PDH", 1, 2)
-        f_addSrCandidate(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses,
-             prevDayLow, "PDL", -1, 2)
+     input.color(color.aqua, "PDL Probability Color", group = G_SR_SELECT)
 
 float srMaxDistancePoints =
      srMaxDistanceAtrInput * atrCoach
 
-[selectedResistanceLevel, selectedResistanceSourceRaw, selectedResistanceDistance, selectedResistanceNominalRole, selectedResistanceClass] = f_selectSr(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, true, srUseRoleReversalInput, srMaxDistancePoints, srSelectionInput, srPriorityInput, close)
+float selectedResistanceLevel =
+     not na(prevDayHigh) and math.abs(prevDayHigh - close) <= srMaxDistancePoints ?
+     prevDayHigh :
+     na
 
-[selectedSupportLevel, selectedSupportSourceRaw, selectedSupportDistance, selectedSupportNominalRole, selectedSupportClass] = f_selectSr(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, false, srUseRoleReversalInput, srMaxDistancePoints, srSelectionInput, srPriorityInput, close)
+float selectedSupportLevel =
+     not na(prevDayLow) and math.abs(close - prevDayLow) <= srMaxDistancePoints ?
+     prevDayLow :
+     na
 
-string selectedResistanceSource =
-     selectedResistanceNominalRole == -1 ?
-     selectedResistanceSourceRaw + " -> RES" :
-     selectedResistanceSourceRaw
+string selectedResistanceSource = "PDH"
+string selectedSupportSource = "PDL"
 
-string selectedSupportSource =
-     selectedSupportNominalRole == 1 ?
-     selectedSupportSourceRaw + " -> SUP" :
-     selectedSupportSourceRaw
+int selectedResistanceNominalRole = 1
+int selectedSupportNominalRole = -1
+
+int selectedResistanceClass = 2
+int selectedSupportClass = 2
 
 plot(
      srShowSelectedLevelsInput ? selectedResistanceLevel : na,
@@ -1180,9 +983,6 @@ breakProbResLabelOffsetInput =
 
 breakProbSupLabelOffsetInput =
      input.int(3, "Support Label Offset (Bars)", minval = -100, maxval = 100, group = G_BREAK_PROB)
-
-breakProbShowCalibrationInput =
-     input.bool(true, "Show Rolling Brier Calibration", group = G_BREAK_PROB)
 
 // Outcome coding.
 int OUT_EXPIRE = 0
@@ -2083,83 +1883,20 @@ float supBrier =
      array.avg(supBrierHist) :
      na
 
-string resStat =
-     resAction == "LEARNING" ?
-     "rolling n=" + str.tostring(resGlobalTrials) :
-     resShowContext and
-     (
-         resAction == "BREAK BIAS" or
-         resAction == "FADE BIAS" or
-         resAction == "WATCH BREAK" or
-         resAction == "WATCH FADE"
-     ) ?
-     str.tostring(resFocusPct, "#.0") + "% vs LOO " +
-     str.tostring(resFocusBase, "#.0") + "% (" +
-     f_pp(resShownLift) + "pp, z " +
-     str.tostring(resShownZ, "#.00") + ") ・" +
-     resKind + " n=" + str.tostring(resCtxTrials) + " " + resQuality :
-     resShowContext ?
-     "B " + str.tostring(resCtxBreakPct, "#") +
-     " Fd " + str.tostring(resCtxFadePct, "#") +
-     " Fl " + str.tostring(resCtxFailPct, "#") +
-     " Ex " + str.tostring(resCtxExpirePct, "#") +
-     "% ・" + resKind +
-     " n=" + str.tostring(resCtxTrials) + " " + resQuality :
-     "B " + str.tostring(resGlobalBreakPct, "#") +
-     " Fd " + str.tostring(resGlobalFadePct, "#") +
-     " Fl " + str.tostring(resGlobalFailPct, "#") +
-     " Ex " + str.tostring(resGlobalExpirePct, "#") +
-     "% ・all n=" + str.tostring(resGlobalTrials) + " " + resQuality
-
-string supStat =
-     supAction == "LEARNING" ?
-     "rolling n=" + str.tostring(supGlobalTrials) :
-     supShowContext and
-     (
-         supAction == "BREAK BIAS" or
-         supAction == "FADE BIAS" or
-         supAction == "WATCH BREAK" or
-         supAction == "WATCH FADE"
-     ) ?
-     str.tostring(supFocusPct, "#.0") + "% vs LOO " +
-     str.tostring(supFocusBase, "#.0") + "% (" +
-     f_pp(supShownLift) + "pp, z " +
-     str.tostring(supShownZ, "#.00") + ") ・" +
-     supKind + " n=" + str.tostring(supCtxTrials) + " " + supQuality :
-     supShowContext ?
-     "B " + str.tostring(supCtxBreakPct, "#") +
-     " Fd " + str.tostring(supCtxFadePct, "#") +
-     " Fl " + str.tostring(supCtxFailPct, "#") +
-     " Ex " + str.tostring(supCtxExpirePct, "#") +
-     "% ・" + supKind +
-     " n=" + str.tostring(supCtxTrials) + " " + supQuality :
-     "B " + str.tostring(supGlobalBreakPct, "#") +
-     " Fd " + str.tostring(supGlobalFadePct, "#") +
-     " Fl " + str.tostring(supGlobalFailPct, "#") +
-     " Ex " + str.tostring(supGlobalExpirePct, "#") +
-     "% ・all n=" + str.tostring(supGlobalTrials) + " " + supQuality
-
-string resCalibrationText =
-     breakProbShowCalibrationInput ?
-     " ・Brier " + (na(resBrier) ? "--" : str.tostring(resBrier, "#.000")) :
-     ""
-
-string supCalibrationText =
-     breakProbShowCalibrationInput ?
-     " ・Brier " + (na(supBrier) ? "--" : str.tostring(supBrier, "#.000")) :
-     ""
+// Simple, one-line, always-live label: just the level, a call word (BREAK/
+// FADE) when the model has a confident context call, and its percent --
+// no source name, ATR distance, touch count, LOO/lift/z stats, quality
+// tag, or Brier score. Still recalculates and redraws every bar.
+string resCallWord = resFocusFade ? "FADE" : "BREAK"
+string supCallWord = supFocusFade ? "FADE" : "BREAK"
 
 string resDisplayText =
-     "RES " + str.tostring(selectedResistanceLevel, format.mintick) +
-     " ・" + selectedResistanceSource +
-     " ・" + str.tostring(resDistAtr, "#.0") + " ATR ・" + resTouch +
-     "\n" + resAction + " ・" + resStat + resCalibrationText
+     "PDH " + str.tostring(selectedResistanceLevel, format.mintick) + " ・" +
+     (resShowContext ? resCallWord + " " + str.tostring(resFocusPct, "#") + "%" : resAction)
 
 string supDisplayText =
-     "SUP " + str.tostring(selectedSupportLevel, format.mintick) +
-     " ・" + selectedSupportSource +
-     " ・" + str.tostring(supDistAtr, "#.0") + " ATR ・" + supTouch +
-     "\n" + supAction + " ・" + supStat + supCalibrationText
+     "PDL " + str.tostring(selectedSupportLevel, format.mintick) + " ・" +
+     (supShowContext ? supCallWord + " " + str.tostring(supFocusPct, "#") + "%" : supAction)
 
 color resLabelColor =
      resAction == "BREAK BIAS" or resAction == "WATCH BREAK" ?
