@@ -859,6 +859,33 @@ plot(
      style = plot.style_stepline
 )
 
+// --------------------------------------------------------------------------
+// SWEEP FIRST (DISTANCE-BASED)
+//-----------------------------------------------------------------------------
+// Not a learned probability -- a simple inverse-distance split between PDH
+// and PDL: whichever level price currently sits closer to gets the larger
+// share. Recalculates every bar as price moves. Resolves to an "already
+// swept" status once either level has actually been touched today.
+// --------------------------------------------------------------------------
+
+float sweepFirstDistRes = not na(prevDayHigh) ? math.abs(prevDayHigh - close) : na
+float sweepFirstDistSup = not na(prevDayLow) ? math.abs(close - prevDayLow) : na
+
+float sweepFirstPdhPct =
+     not na(sweepFirstDistRes) and not na(sweepFirstDistSup) and (sweepFirstDistRes + sweepFirstDistSup) > 0 ?
+     sweepFirstDistSup / (sweepFirstDistRes + sweepFirstDistSup) * 100.0 :
+     na
+
+float sweepFirstPdlPct =
+     na(sweepFirstPdhPct) ? na : 100.0 - sweepFirstPdhPct
+
+string sweepFirstText =
+     sweptPdhToday and sweptPdlToday ? "both swept" :
+     sweptPdhToday ? "PDH swept -- PDL next" :
+     sweptPdlToday ? "PDL swept -- PDH next" :
+     na(sweepFirstPdhPct) ? "--" :
+     "PDH " + str.tostring(sweepFirstPdhPct, "#") + "% ・PDL " + str.tostring(sweepFirstPdlPct, "#") + "%"
+
 
 // ============================================================================
 // 05b - S/R REACTION PROBABILITY v1.4
@@ -2551,7 +2578,7 @@ string coachMessage =
 var table coachTable =
      table.new(
          f_tablePosition(dashboardPositionInput),
-         2, 11,
+         2, 12,
          bgcolor = color.new(color.rgb(15, 20, 27), 10),
          border_width = 1
      )
@@ -2637,22 +2664,32 @@ if barstate.islast and showDashboardInput
     table.cell(coachTable, 1, 8, dashSup,
          text_color = srSupportColorInput, text_size = dashTextSize)
 
-    table.cell(coachTable, 0, 9, "Reaction Model",
+    table.cell(coachTable, 0, 9, "Sweep First (Dist)",
          text_color = color.white, text_size = dashTextSize)
 
     table.cell(
          coachTable, 1, 9,
+         sweepFirstText,
+         text_color = sweptPdhToday or sweptPdlToday ? color.orange : color.white,
+         text_size = dashTextSize
+    )
+
+    table.cell(coachTable, 0, 10, "Reaction Model",
+         text_color = color.white, text_size = dashTextSize)
+
+    table.cell(
+         coachTable, 1, 10,
          "RES n=" + str.tostring(resGlobalTrials) +
          " | SUP n=" + str.tostring(supGlobalTrials),
          text_color = color.white,
          text_size = dashTextSize
     )
 
-    table.cell(coachTable, 0, 10, "Calibration",
+    table.cell(coachTable, 0, 11, "Calibration",
          text_color = color.white, text_size = dashTextSize)
 
     table.cell(
-         coachTable, 1, 10,
+         coachTable, 1, 11,
          "Brier R " + (na(resBrier) ? "--" : str.tostring(resBrier, "#.000")) +
          " | S " + (na(supBrier) ? "--" : str.tostring(supBrier, "#.000")),
          text_color = color.white,
