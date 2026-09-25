@@ -1026,45 +1026,9 @@ if srUseHybrid or srSourceInput == "PDH / PDL"
 float srMaxDistancePoints =
      srMaxDistanceAtrInput * atrCoach
 
-[
- selectedResistanceLevel,
- selectedResistanceSourceRaw,
- selectedResistanceDistance,
- selectedResistanceNominalRole,
- selectedResistanceClass
-] =
-     f_selectSr(
-         srCandidateLevels,
-         srCandidateSources,
-         srCandidateRoles,
-         srCandidateClasses,
-         true,
-         srUseRoleReversalInput,
-         srMaxDistancePoints,
-         srSelectionInput,
-         srPriorityInput,
-         close
-     )
+[selectedResistanceLevel, selectedResistanceSourceRaw, selectedResistanceDistance, selectedResistanceNominalRole, selectedResistanceClass] = f_selectSr(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, true, srUseRoleReversalInput, srMaxDistancePoints, srSelectionInput, srPriorityInput, close)
 
-[
- selectedSupportLevel,
- selectedSupportSourceRaw,
- selectedSupportDistance,
- selectedSupportNominalRole,
- selectedSupportClass
-] =
-     f_selectSr(
-         srCandidateLevels,
-         srCandidateSources,
-         srCandidateRoles,
-         srCandidateClasses,
-         false,
-         srUseRoleReversalInput,
-         srMaxDistancePoints,
-         srSelectionInput,
-         srPriorityInput,
-         close
-     )
+[selectedSupportLevel, selectedSupportSourceRaw, selectedSupportDistance, selectedSupportNominalRole, selectedSupportClass] = f_selectSr(srCandidateLevels, srCandidateSources, srCandidateRoles, srCandidateClasses, false, srUseRoleReversalInput, srMaxDistancePoints, srSelectionInput, srPriorityInput, close)
 
 string selectedResistanceSource =
      selectedResistanceNominalRole == -1 ?
@@ -2044,47 +2008,9 @@ float supDistAtr =
      math.abs(selectedSupportLevel - close) / atrCoach :
      na
 
-[
- resAction,
- resShowContext,
- resShownLift,
- resShownZ
-] =
-     f_probCall(
-         breakProbEnableInput,
-         resHasLevel,
-         resGlobalTrials,
-         resCtxTrials,
-         resBaseTrials,
-         resBreakLift,
-         resFadeLift,
-         resBreakZ,
-         resFadeZ,
-         resDistAtr,
-         structureTrend == "RANGE",
-         breakProbDisplayInput
-     )
+[resAction, resShowContext, resShownLift, resShownZ] = f_probCall(breakProbEnableInput, resHasLevel, resGlobalTrials, resCtxTrials, resBaseTrials, resBreakLift, resFadeLift, resBreakZ, resFadeZ, resDistAtr, structureTrend == "RANGE", breakProbDisplayInput)
 
-[
- supAction,
- supShowContext,
- supShownLift,
- supShownZ
-] =
-     f_probCall(
-         breakProbEnableInput,
-         supHasLevel,
-         supGlobalTrials,
-         supCtxTrials,
-         supBaseTrials,
-         supBreakLift,
-         supFadeLift,
-         supBreakZ,
-         supFadeZ,
-         supDistAtr,
-         structureTrend == "RANGE",
-         breakProbDisplayInput
-     )
+[supAction, supShowContext, supShownLift, supShownZ] = f_probCall(breakProbEnableInput, supHasLevel, supGlobalTrials, supCtxTrials, supBaseTrials, supBreakLift, supFadeLift, supBreakZ, supFadeZ, supDistAtr, structureTrend == "RANGE", breakProbDisplayInput)
 
 float resTouchTol =
      math.max(atrCoach * 0.25, syminfo.mintick * 4)
