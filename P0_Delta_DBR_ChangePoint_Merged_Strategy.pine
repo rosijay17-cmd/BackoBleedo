@@ -363,6 +363,7 @@ bool highlightEntryBarInput = input.bool(true, "Highlight Entry Candle", group =
 
 string G_VP = "15 — DeltaFlow Volume Profile [BigBeluga]"
 
+bool showDeltaFlowHistogramInput = input.bool(true, "Show DeltaFlow Histogram", group = G_VP)
 lookBack     = input.int(200, "LookBack", group = G_VP)
 binsAmount   = input.int(30, "Bins", maxval = 100, minval = 10, group = G_VP)
 offset       = input.int(5, "Offset", group = G_VP)
@@ -1881,10 +1882,17 @@ barcolor(showAllChartObjectsInput and highlightEntryBarInput and actualLongEntry
 // DELTAFLOW VOLUME PROFILE [BIGBELUGA] — THE ONE HISTOGRAM IN THIS FILE
 //=============================================================================
 
-if barstate.islast and showAllChartObjectsInput
+// showDeltaFlowHistogramInput lets this histogram be hidden on its own
+// without unchecking Master Visibility for everything else. Box cleanup
+// below still always runs on the last bar (its own if barstate.islast, not
+// gated on the new input) so unchecking it actually clears any boxes
+// already drawn, instead of leaving them stuck on the chart.
+if barstate.islast
     if boxes.size() > 0
         for b in boxes
             b.delete()
+
+if barstate.islast and showAllChartObjectsInput and showDeltaFlowHistogramInput
     // Guard added: the original code read high[i]/low[i]/volume[i] back
     // `lookBack` bars with no check that that much history actually
     // exists yet. When it doesn't (early on a fresh symbol/session, or
