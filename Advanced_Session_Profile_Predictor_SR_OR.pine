@@ -496,8 +496,16 @@ var int longLabelState = na
 var string shortStateText = "No Short"
 var string longStateText = "No Long"
 
+// ta.atr() must run on every bar to build its rolling average correctly --
+// calling it only inside `if barstate.islast` (as an earlier version of this
+// section did) starves it of that per-bar history and returns a wrong,
+// unstably large value, which made the TESTING zone cover far more price
+// than 0.10x ATR should -- e.g. both the SHORT and LONG labels reading
+// TESTING at once despite one level being over 100 points further away
+// than the other. Computed unconditionally here instead.
+float labelAtr = ta.atr(14)
+
 if barstate.islast
-    float labelAtr = ta.atr(14)
     float labelBuffer = labelAtr * triggerBufferAtrInput
 
     // A level swap (e.g. Profile 2 handing off from asiaHigh to londonHigh

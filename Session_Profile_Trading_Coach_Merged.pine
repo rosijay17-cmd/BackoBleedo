@@ -1319,10 +1319,9 @@ var int longLabelState = na
 var string shortStateText = "No Short"
 var string longStateText = "No Long"
 
-if barstate.islast
-    float labelAtr = ta.atr(14)
-    float labelBuffer = labelAtr * triggerBufferAtrInput
+float labelBuffer = atrCoach * triggerBufferAtrInput
 
+if barstate.islast
     if not na(shortLevelSticky) and (na(shortStickyPrevLevel) or math.abs(shortLevelSticky - shortStickyPrevLevel) > syminfo.mintick)
         shortEverTriggered := false
     if not na(longLevelSticky) and (na(longStickyPrevLevel) or math.abs(longLevelSticky - longStickyPrevLevel) > syminfo.mintick)
