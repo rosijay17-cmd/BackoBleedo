@@ -1304,6 +1304,27 @@ if barstate.islast
         shortLevelTag := ""
         longLevelTag := ""
 
+    // Prefer a closer PDH/PDL level over the session-extreme target above, but
+    // only when the Reaction Probability engine actually found edge there
+    // (resShowContext/supShowContext) -- a nearby level with "NO EDGE" is left
+    // alone and the session extreme stays the trigger.
+    bool longOverrideEligible = resShowContext and resHasLevel and not na(selectedResistanceLevel) and not na(longLevelSticky) and selectedResistanceLevel > close and selectedResistanceLevel < longLevelSticky
+    bool shortOverrideEligible = supShowContext and supHasLevel and not na(selectedSupportLevel) and not na(shortLevelSticky) and selectedSupportLevel < close and selectedSupportLevel > shortLevelSticky
+
+    if longOverrideEligible
+        float sessionLongLevel = longLevelSticky
+        longLevelSticky := selectedResistanceLevel
+        longLevelTag := "(PDH " + resAction + ")"
+        longTriggerPrice := close < selectedResistanceLevel ? selectedResistanceLevel : na
+        longCondition := close < selectedResistanceLevel ? "IF price hits " + str.tostring(selectedResistanceLevel) + " LONG (PDH, closer than " + str.tostring(sessionLongLevel) + ")" : "No Long (over " + str.tostring(selectedResistanceLevel) + ")"
+
+    if shortOverrideEligible
+        float sessionShortLevel = shortLevelSticky
+        shortLevelSticky := selectedSupportLevel
+        shortLevelTag := "(PDL " + supAction + ")"
+        shortTriggerPrice := close > selectedSupportLevel ? selectedSupportLevel : na
+        shortCondition := close > selectedSupportLevel ? "IF price hits " + str.tostring(selectedSupportLevel) + " SHORT (PDL, closer than " + str.tostring(sessionShortLevel) + ")" : "No Short (under " + str.tostring(selectedSupportLevel) + ")"
+
 var bool shortEverTriggered = false
 var bool longEverTriggered = false
 var float shortStickyPrevLevel = na
