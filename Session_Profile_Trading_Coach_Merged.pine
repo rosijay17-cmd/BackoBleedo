@@ -343,8 +343,6 @@ if not na(nyHigh) and close > nyHigh
 if not na(nyLow) and close < nyLow
     nyLowBroken := true
 
-int zonesBrokenCount = (asiaHighBroken ? 1 : 0) + (asiaLowBroken ? 1 : 0) + (londonHighBroken ? 1 : 0) + (londonLowBroken ? 1 : 0) + (nyHighBroken ? 1 : 0) + (nyLowBroken ? 1 : 0)
-
 float pdhSweepRate = pdhSweepDaysTotal > 0 ? pdhSweepDaysHit * 100.0 / pdhSweepDaysTotal : na
 float pdlSweepRate = pdlSweepDaysTotal > 0 ? pdlSweepDaysHit * 100.0 / pdlSweepDaysTotal : na
 
@@ -459,7 +457,6 @@ bool tdiBearishMove = tdiFastMa < tdiLowerBand and tdiFastMa < 32
 bool tdiConfirmsLong = tdiBullishMove and momentumRising
 bool tdiConfirmsShort = tdiBearishMove and momentumFalling
 
-plot(tdiSlowMa, "TDI Signal Line (Slow MA)", color = color.orange, display = display.data_window)
 plotshape(showAllChartObjectsInput and tdiBullishMove and momentumRising ? high : na, style = shape.arrowup, color = color.new(color.lime, 0), size = size.small, location = location.abovebar, title = "Bullish Arrow")
 plotshape(showAllChartObjectsInput and tdiBearishMove and momentumFalling ? low : na, style = shape.arrowdown, color = color.new(color.red, 0), size = size.small, location = location.belowbar, title = "Bearish Arrow")
 
@@ -1002,9 +999,6 @@ bool resFocusFade = resAction == "FADE BIAS" or resAction == "WATCH FADE"
 bool supFocusFade = supAction == "FADE BIAS" or supAction == "WATCH FADE"
 float resFocusPct = resFocusFade ? resCtxFadePct : resCtxBreakPct
 float supFocusPct = supFocusFade ? supCtxFadePct : supCtxBreakPct
-
-float resBrier = array.size(resBrierHist) > 0 ? array.avg(resBrierHist) : na
-float supBrier = array.size(supBrierHist) > 0 ? array.avg(supBrierHist) : na
 
 string resCallWord = resFocusFade ? "FADE" : "BREAK"
 string supCallWord = supFocusFade ? "FADE" : "BREAK"
@@ -2071,24 +2065,6 @@ alertcondition(triggerDownNow, title = "CP Retest Trigger Down", message = "BEAR
 // ============================================================================
 // DATA WINDOW
 // ============================================================================
-
-plot(structureTrend == "UP" ? 1 : structureTrend == "DOWN" ? -1 : 0, title = "Structure Trend", display = display.data_window)
-plot(atrCoach, title = "ATR", display = display.data_window)
-plot(nextProfile == "Ukendt" ? -1 : currentProfileCode, title = "Session Profile Code", display = display.data_window)
-plot(shortLabelState, title = "Short Label State (0=Wait 1=Test 2=Trig 3=Retest)", display = display.data_window)
-plot(longLabelState, title = "Long Label State (0=Wait 1=Test 2=Trig 3=Retest)", display = display.data_window)
-plot(resCtxBreakPct, title = "RES Context Break %", display = display.data_window)
-plot(resCtxFadePct, title = "RES Context Fade %", display = display.data_window)
-plot(supCtxBreakPct, title = "SUP Context Break %", display = display.data_window)
-plot(supCtxFadePct, title = "SUP Context Fade %", display = display.data_window)
-plot(resGlobalTrials, title = "RES Rolling Global Sample", display = display.data_window)
-plot(supGlobalTrials, title = "SUP Rolling Global Sample", display = display.data_window)
-plot(resBrier, title = "RES Rolling Multiclass Brier", display = display.data_window)
-plot(supBrier, title = "SUP Rolling Multiclass Brier", display = display.data_window)
-plot(prevDayHigh, title = "Prior Day High", display = display.data_window)
-plot(prevDayLow, title = "Prior Day Low", display = display.data_window)
-plot(zonesBrokenCount, title = "Zones Broken Count", display = display.data_window)
-plot(zScore, title = "Range Z-Score", display = display.data_window)
-plot(cusumZScore, title = "CUSUM Z-Score", display = display.data_window)
-plot(sPos, title = "CUSUM sPos", display = display.data_window)
-plot(sNeg, title = "CUSUM sNeg", display = display.data_window)
+// Diagnostic-only plots removed to keep the plot-family count well under
+// Pine's 64 limit -- none of these drew on the chart (display.data_window
+// only), and the CP/Regime table already surfaces the live state.
