@@ -971,6 +971,17 @@ if barstate.isconfirmed and manipulationConfirmed
 
     //-------------------------------------------------------------------------
     // Legacy strict HTF direction filter.
+    //
+    // Previously this only checked confirmed HTF close against the HTF fast
+    // EMA -- a single MA on a single timeframe, with no requirement that the
+    // HTF EMA stack (fast vs slow) or the execution-timeframe trend agree.
+    // That let a reversal pass "strict" bias purely because the last
+    // confirmed HTF close happened to sit on the right side of one EMA, even
+    // while the broader HTF stack and the 5m trend both disagreed -- exactly
+    // the gap that let counter-trend entries through with this filter ON.
+    // Strict mode now requires full structural agreement: HTF close beyond
+    // the HTF EMA stack (fast vs slow, both ordered correctly) AND the
+    // execution-timeframe close on the matching side of its own trend EMA.
     //-------------------------------------------------------------------------
 
     bool strictHtfBiasOK = (
@@ -978,10 +989,19 @@ if barstate.isconfirmed and manipulationConfirmed
          (
              not na(htfClose) and
              not na(htfEmaFast) and
+             not na(htfEmaSlow) and
              (
                  projectedDirection == 1 ?
-                 htfClose > htfEmaFast :
-                 htfClose < htfEmaFast
+                 (
+                     htfClose > htfEmaFast and
+                     htfEmaFast > htfEmaSlow and
+                     close > localTrendEma
+                 ) :
+                 (
+                     htfClose < htfEmaFast and
+                     htfEmaFast < htfEmaSlow and
+                     close < localTrendEma
+                 )
              )
          )
     )
@@ -1018,6 +1038,23 @@ if barstate.isconfirmed and manipulationConfirmed
     if not entryTrendOK
         blockedLongSignal := projectedDirection == 1
         blockedShortSignal := projectedDirection == -1
+
+        if showTrendDebugTableInput
+            string blockedDebugText = "BLOCKED" +
+                 "\nStrict Bias " + (useHtfBiasInput ? f_flagText(strictHtfBiasOK) : "OFF") +
+                 "\nHTF Bull " + f_flagText(htfStrongBull) + " Bear " + f_flagText(htfStrongBear) +
+                 "\nLocal Bull " + f_flagText(localStrongBull) + " Bear " + f_flagText(localStrongBear) +
+                 "\nHTF Slope " + str.tostring(htfSlopeAtr, "#.###") +
+                 "\nLocal Slope " + str.tostring(localSlopeAtr, "#.###")
+
+            label.new(
+                 bar_index,
+                 projectedDirection == 1 ? low : high,
+                 blockedDebugText,
+                 style = projectedDirection == 1 ? label.style_label_up : label.style_label_down,
+                 color = color.new(color.red, 20),
+                 textcolor = color.white,
+                 size = size.tiny)
 
         if enableDynamicAlertsInput and alertBlockedInput
             string blockedSide = projectedDirection == 1 ? "LONG" : "SHORT"
@@ -1115,7 +1152,9 @@ if barstate.isconfirmed and manipulationConfirmed
                  alert.freq_once_per_bar_close)
 
         if showTrendDebugTableInput
-            string entryDebugText = "HTF Bull " + f_flagText(htfStrongBull) +
+            string entryDebugText = "ENTERED" +
+                 "\nStrict Bias " + (useHtfBiasInput ? f_flagText(strictHtfBiasOK) : "OFF") +
+                 "\nHTF Bull " + f_flagText(htfStrongBull) +
                  " Bear " + f_flagText(htfStrongBear) +
                  "\nLocal Bull " + f_flagText(localStrongBull) +
                  " Bear " + f_flagText(localStrongBear) +
