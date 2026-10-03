@@ -1,0 +1,2903 @@
+//@version=6
+indicator(
+     "Trading Coach - Hybrid S/R Reaction Probability v1.4",
+     shorttitle = "Coach Hybrid S/R P v1.4",
+     overlay = true,
+     max_boxes_count = 150,
+     max_lines_count = 150,
+     max_labels_count = 250
+)
+import TradingView/ta/14 as tvta
+
+// ============================================================================
+// TRADING COACH + HIERARCHICAL S/R REACTION PROBABILITY v1.4
+// ----------------------------------------------------------------------------
+// Core changes from v1.3:
+//
+// 1) A probability trial is armed from the PREVIOUSLY KNOWN selected level.
+//    This prevents the S/R selector from hopping away from a level on the
+//    breakout bar before that breakout can be learned.
+//
+// 2) Test-zone and follow-distance ATR are frozen from information known before
+//    the trial bar. The event candle cannot widen its own hurdle.
+//
+// 3) One trial resolves into exactly ONE of four mutually exclusive outcomes:
+//      BREAK  = close through level, then on a LATER chart bar extend Follow ATR
+//               beyond it before a chart-bar close returns inside.
+//      FADE   = travel Follow ATR away from the level before any chart-bar close
+//               through it.
+//      FAIL   = close through, then close back inside or run out of follow bars
+//               without the required extension.
+//      EXPIRE = test horizon ends without FADE or close-through.
+//
+// 4) Same breakout bar cannot use its own high/low as "post-close" extension.
+//    Historical OHLC does not tell us price action after the close.
+//
+// 5) 12 context buckets:
+//      level class: pivot / session / PDH-PDL / flipped
+//      structure : RANGE / aligned / opposed
+//
+// 6) Four-outcome Dirichlet model with:
+//      - symmetric prior
+//      - leave-one-bucket-out baseline
+//      - hierarchical shrinkage toward that baseline
+//      - minimum lift AND approximate uncertainty Z gate
+//
+// 7) Rolling resolved-trial history. Old regimes can age out.
+//
+// 8) Trial forecasts are frozen before the outcome and scored with a rolling
+//    multiclass Brier score for calibration monitoring.
+//
+// 9) Actual trade outcome tracking does NOT resolve on the entry/signal bar.
+//    A confirmed-close signal cannot retroactively use earlier intrabar prices.
+//
+// IMPORTANT:
+// This is an empirical event model, not a guarantee of future outcomes.
+// Backtest and walk-forward test every symbol/timeframe separately.
+// ============================================================================
+
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+f_tablePosition(string label) =>
+    switch label
+        "Top Left" => position.top_left
+        "Top Center" => position.top_center
+        "Top Right" => position.top_right
+        "Middle Left" => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right" => position.middle_right
+        "Bottom Left" => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Bottom Right" => position.bottom_right
+        => position.bottom_right
+
+f_tableTextSize(string label) =>
+    switch label
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        => size.small
+
+f_labelTextSize(string label) =>
+    label == "Tiny" ? size.tiny :
+     label == "Small" ? size.small :
+     label == "Normal" ? size.normal : size.tiny
+
+f_pp(float x) =>
+    (x >= 0 ? "+" : "") + str.tostring(x, "#.0")
+
+f_safeDiv(float num, float den, float fallback) =>
+    den != 0.0 ? num / den : fallback
+
+
+// ============================================================================
+// 00 - SESSIONS & TIMEZONE
+// ============================================================================
+
+string G_SESSION = "00 - Sessions & Timezone"
+
+timezoneInput = input.string(
+     "UTC",
+     "Timezone",
+     options = ["UTC", "Europe/London", "America/New_York"],
+     group = G_SESSION
+)
+
+asiaSessionInput = input.session("0000-0800", "Asia Session", group = G_SESSION)
+londonSessionInput = input.session("0800-1600", "London Session", group = G_SESSION)
+newYorkSessionInput = input.session("1300-2100", "New York Session", group = G_SESSION)
+
+favorForLondonInput = input.bool(true, "Favorable Session: London", group = G_SESSION)
+favorForNyInput = input.bool(true, "Favorable Session: New York", group = G_SESSION)
+favorForAsiaInput = input.bool(false, "Favorable Session: Asia", group = G_SESSION)
+
+sessionBgTransparencyInput = input.int(
+     85, "Session Background Tint Transparency",
+     minval = 0, maxval = 100, group = G_SESSION
+)
+
+showSessionStartLinesInput = input.bool(true, "Show Session Start Lines", group = G_SESSION)
+showSessionLabelsInput = input.bool(true, "Show Session Name Labels", group = G_SESSION)
+showSessionBoxesInput = input.bool(true, "Show Session Boxes", group = G_SESSION)
+sessionBoxTransparencyInput = input.int(
+     88, "Session Box Fill Transparency",
+     minval = 0, maxval = 100, group = G_SESSION
+)
+
+int localDayKey =
+     year(time, timezoneInput) * 10000 +
+     month(time, timezoneInput) * 100 +
+     dayofmonth(time, timezoneInput)
+
+bool newDayCoach =
+     not na(localDayKey[1]) and
+     localDayKey != localDayKey[1]
+
+bool asiaInSession = nz(time(timeframe.period, asiaSessionInput, timezoneInput), 0) != 0
+bool londonInSession = nz(time(timeframe.period, londonSessionInput, timezoneInput), 0) != 0
+bool nyInSession = nz(time(timeframe.period, newYorkSessionInput, timezoneInput), 0) != 0
+
+bool asiaSessionStart = asiaInSession and not asiaInSession[1]
+bool londonSessionStart = londonInSession and not londonInSession[1]
+bool nySessionStart = nyInSession and not nyInSession[1]
+
+bool sessionFavorable =
+     (asiaInSession and favorForAsiaInput) or
+     (londonInSession and favorForLondonInput) or
+     (nyInSession and favorForNyInput)
+
+string activeSessionLabel =
+     asiaInSession and londonInSession ? "Asia+London" :
+     londonInSession and nyInSession ? "London+NY" :
+     asiaInSession ? "Asia" :
+     londonInSession ? "London" :
+     nyInSession ? "New York" : "Off-Session"
+
+bgcolor(asiaInSession ? color.new(color.yellow, sessionBgTransparencyInput) : na, title = "Asia Session")
+bgcolor(londonInSession ? color.new(color.red, sessionBgTransparencyInput) : na, title = "London Session")
+bgcolor(nyInSession ? color.new(color.blue, sessionBgTransparencyInput) : na, title = "New York Session")
+
+if asiaSessionStart and showSessionStartLinesInput
+    line.new(bar_index, low, bar_index, high, xloc = xloc.bar_index, extend = extend.both,
+         color = color.new(color.yellow, 40), style = line.style_dashed, width = 1)
+
+if londonSessionStart and showSessionStartLinesInput
+    line.new(bar_index, low, bar_index, high, xloc = xloc.bar_index, extend = extend.both,
+         color = color.new(color.red, 40), style = line.style_dashed, width = 1)
+
+if nySessionStart and showSessionStartLinesInput
+    line.new(bar_index, low, bar_index, high, xloc = xloc.bar_index, extend = extend.both,
+         color = color.new(color.blue, 40), style = line.style_dashed, width = 1)
+
+if asiaSessionStart and showSessionLabelsInput
+    label.new(bar_index, high, "ASIA", style = label.style_label_down,
+         color = color.new(color.yellow, 20), textcolor = color.black, size = size.tiny)
+
+if londonSessionStart and showSessionLabelsInput
+    label.new(bar_index, high, "LONDON", style = label.style_label_down,
+         color = color.new(color.red, 20), textcolor = color.white, size = size.tiny)
+
+if nySessionStart and showSessionLabelsInput
+    label.new(bar_index, high, "NEW YORK", style = label.style_label_down,
+         color = color.new(color.blue, 20), textcolor = color.white, size = size.tiny)
+
+
+// ============================================================================
+// 01 - SESSION ZONES & DAY PROFILE
+// ============================================================================
+
+string G_ZONES = "01 - Session Zones & Day Profile"
+
+zoneToleranceAtrInput = input.float(
+     0.30, "Zone Confluence Tolerance (x ATR)",
+     minval = 0.05, maxval = 2.0, step = 0.05, group = G_ZONES
+)
+
+profileTrendThresholdInput = input.float(
+     1.5, "Day Profile Trend Threshold",
+     minval = 1.0, step = 0.1, group = G_ZONES
+)
+
+showPdhPdlInput = input.bool(true, "Show PDH/PDL", group = G_ZONES)
+pdhColorInput = input.color(color.orange, "PDH Color", group = G_ZONES, inline = "pdhpdl")
+pdlColorInput = input.color(color.aqua, "PDL Color", group = G_ZONES, inline = "pdhpdl")
+
+var float asiaOpen = na
+var float asiaClose = na
+var float asiaHigh = na
+var float asiaLow = na
+
+var float londonOpen = na
+var float londonClose = na
+var float londonHigh = na
+var float londonLow = na
+
+var float nyOpen = na
+var float nyClose = na
+var float nyHigh = na
+var float nyLow = na
+
+var bool asiaHighBroken = false
+var bool asiaLowBroken = false
+var bool londonHighBroken = false
+var bool londonLowBroken = false
+var bool nyHighBroken = false
+var bool nyLowBroken = false
+
+var float dayHigh = na
+var float dayLow = na
+var float prevDayHigh = na
+var float prevDayLow = na
+
+var bool sweptPdhToday = false
+var bool sweptPdlToday = false
+var int pdhSweepDaysTotal = 0
+var int pdhSweepDaysHit = 0
+var int pdlSweepDaysTotal = 0
+var int pdlSweepDaysHit = 0
+
+// Finish the previous day BEFORE accumulating today's first bar.
+if newDayCoach
+    if not na(prevDayHigh)
+        pdhSweepDaysTotal += 1
+        if sweptPdhToday
+            pdhSweepDaysHit += 1
+
+    if not na(prevDayLow)
+        pdlSweepDaysTotal += 1
+        if sweptPdlToday
+            pdlSweepDaysHit += 1
+
+    prevDayHigh := dayHigh
+    prevDayLow := dayLow
+
+    dayHigh := na
+    dayLow := na
+    sweptPdhToday := false
+    sweptPdlToday := false
+
+    asiaOpen := na
+    asiaClose := na
+    asiaHigh := na
+    asiaLow := na
+
+    londonOpen := na
+    londonClose := na
+    londonHigh := na
+    londonLow := na
+
+    nyOpen := na
+    nyClose := na
+    nyHigh := na
+    nyLow := na
+
+    asiaHighBroken := false
+    asiaLowBroken := false
+    londonHighBroken := false
+    londonLowBroken := false
+    nyHighBroken := false
+    nyLowBroken := false
+
+dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+dayLow := na(dayLow) ? low : math.min(dayLow, low)
+
+if asiaInSession
+    asiaOpen := na(asiaOpen) ? open : asiaOpen
+    asiaClose := close
+    asiaHigh := na(asiaHigh) ? high : math.max(asiaHigh, high)
+    asiaLow := na(asiaLow) ? low : math.min(asiaLow, low)
+
+if londonInSession
+    londonOpen := na(londonOpen) ? open : londonOpen
+    londonClose := close
+    londonHigh := na(londonHigh) ? high : math.max(londonHigh, high)
+    londonLow := na(londonLow) ? low : math.min(londonLow, low)
+
+if nyInSession
+    nyOpen := na(nyOpen) ? open : nyOpen
+    nyClose := close
+    nyHigh := na(nyHigh) ? high : math.max(nyHigh, high)
+    nyLow := na(nyLow) ? low : math.min(nyLow, low)
+
+if not na(prevDayHigh) and not sweptPdhToday and high >= prevDayHigh
+    sweptPdhToday := true
+
+if not na(prevDayLow) and not sweptPdlToday and low <= prevDayLow
+    sweptPdlToday := true
+
+if not na(asiaHigh) and close > asiaHigh
+    asiaHighBroken := true
+if not na(asiaLow) and close < asiaLow
+    asiaLowBroken := true
+if not na(londonHigh) and close > londonHigh
+    londonHighBroken := true
+if not na(londonLow) and close < londonLow
+    londonLowBroken := true
+if not na(nyHigh) and close > nyHigh
+    nyHighBroken := true
+if not na(nyLow) and close < nyLow
+    nyLowBroken := true
+
+int zonesBrokenCount =
+     (asiaHighBroken ? 1 : 0) +
+     (asiaLowBroken ? 1 : 0) +
+     (londonHighBroken ? 1 : 0) +
+     (londonLowBroken ? 1 : 0) +
+     (nyHighBroken ? 1 : 0) +
+     (nyLowBroken ? 1 : 0)
+
+float pdhSweepRate =
+     pdhSweepDaysTotal > 0 ?
+     pdhSweepDaysHit * 100.0 / pdhSweepDaysTotal : na
+
+float pdlSweepRate =
+     pdlSweepDaysTotal > 0 ?
+     pdlSweepDaysHit * 100.0 / pdlSweepDaysTotal : na
+
+float asiaRangeCoach = asiaHigh - asiaLow
+float londonRangeCoach = londonHigh - londonLow
+
+int asiaDirectionCoach =
+     nz(asiaClose, 0) > nz(asiaOpen, 0) ? 1 :
+     nz(asiaClose, 0) < nz(asiaOpen, 0) ? -1 : 0
+
+int londonDirectionCoach =
+     nz(londonClose, 0) > nz(londonOpen, 0) ? 1 :
+     nz(londonClose, 0) < nz(londonOpen, 0) ? -1 : 0
+
+bool asiaTrendingCoach =
+     nz(asiaRangeCoach, 0) >
+     nz(ta.sma(asiaRangeCoach, 5), 0) * profileTrendThresholdInput
+
+bool londonTrendingCoach =
+     nz(londonRangeCoach, 0) >
+     nz(ta.sma(londonRangeCoach, 5), 0) * profileTrendThresholdInput
+
+bool londonConsolidatingCoach =
+     nz(londonRangeCoach, 0) <
+     nz(ta.sma(londonRangeCoach, 5), 0)
+
+bool londonManipulatesAsiaHighCoach =
+     nz(londonHigh, 0) > nz(asiaHigh, 0) and
+     nz(londonLow, 0) < nz(asiaClose, 0)
+
+bool londonManipulatesAsiaLowCoach =
+     nz(londonLow, 0) < nz(asiaLow, 0) and
+     nz(londonHigh, 0) > nz(asiaClose, 0)
+
+var string dayProfile = "Unknown"
+
+if newDayCoach
+    dayProfile := "Unknown"
+
+if barstate.isconfirmed and not nyInSession and londonInSession and not na(asiaHigh)
+    if asiaTrendingCoach and londonTrendingCoach and asiaDirectionCoach == londonDirectionCoach
+        dayProfile := "Trend Continuation"
+    else if asiaTrendingCoach and londonConsolidatingCoach
+        dayProfile := "NY Manipulation"
+    else if not asiaTrendingCoach and (londonManipulatesAsiaHighCoach or londonManipulatesAsiaLowCoach)
+        dayProfile := londonManipulatesAsiaHighCoach ?
+             "London+NY Manipulation" :
+             "Consolidation+Continuation"
+    else
+        dayProfile := "No Clear Profile"
+
+bool dayShowsManipulation =
+     dayProfile == "NY Manipulation" or
+     dayProfile == "London+NY Manipulation"
+
+var line pdhLine = na
+var line pdlLine = na
+var label pdhLabel = na
+var label pdlLabel = na
+
+if barstate.islast
+    if showPdhPdlInput and not na(prevDayHigh)
+        if na(pdhLine)
+            pdhLine := line.new(bar_index - 1, prevDayHigh, bar_index + 1, prevDayHigh,
+                 color = pdhColorInput, style = line.style_dashed)
+        else
+            line.set_xy1(pdhLine, math.max(bar_index - 100, 0), prevDayHigh)
+            line.set_xy2(pdhLine, bar_index + 1, prevDayHigh)
+
+        string txtH = "PDH " + str.tostring(prevDayHigh, format.mintick) +
+             (sweptPdhToday ? " SWEPT" :
+             " | historical sweep " +
+             (na(pdhSweepRate) ? "--" : str.tostring(pdhSweepRate, "#.0") + "%"))
+
+        if na(pdhLabel)
+            pdhLabel := label.new(bar_index + 2, prevDayHigh, txtH,
+                 style = label.style_label_left, color = color.new(pdhColorInput, 20),
+                 textcolor = color.white, size = size.tiny)
+        else
+            label.set_xy(pdhLabel, bar_index + 2, prevDayHigh)
+            label.set_text(pdhLabel, txtH)
+
+    if showPdhPdlInput and not na(prevDayLow)
+        if na(pdlLine)
+            pdlLine := line.new(bar_index - 1, prevDayLow, bar_index + 1, prevDayLow,
+                 color = pdlColorInput, style = line.style_dashed)
+        else
+            line.set_xy1(pdlLine, math.max(bar_index - 100, 0), prevDayLow)
+            line.set_xy2(pdlLine, bar_index + 1, prevDayLow)
+
+        string txtL = "PDL " + str.tostring(prevDayLow, format.mintick) +
+             (sweptPdlToday ? " SWEPT" :
+             " | historical sweep " +
+             (na(pdlSweepRate) ? "--" : str.tostring(pdlSweepRate, "#.0") + "%"))
+
+        if na(pdlLabel)
+            pdlLabel := label.new(bar_index + 2, prevDayLow, txtL,
+                 style = label.style_label_left, color = color.new(pdlColorInput, 20),
+                 textcolor = color.white, size = size.tiny)
+        else
+            label.set_xy(pdlLabel, bar_index + 2, prevDayLow)
+            label.set_text(pdlLabel, txtL)
+
+var box asiaSessionBox = na
+var box londonSessionBox = na
+var box nySessionBox = na
+
+if asiaSessionStart and showSessionBoxesInput
+    if not na(asiaSessionBox)
+        box.delete(asiaSessionBox)
+    asiaSessionBox := box.new(
+         left = bar_index, top = high, right = bar_index + 1, bottom = low,
+         xloc = xloc.bar_index,
+         bgcolor = color.new(color.yellow, sessionBoxTransparencyInput),
+         border_color = color.yellow, text = "ASIA",
+         text_color = color.black, text_size = size.tiny
+    )
+else if asiaInSession and showSessionBoxesInput and not na(asiaSessionBox)
+    box.set_top(asiaSessionBox, asiaHigh)
+    box.set_bottom(asiaSessionBox, asiaLow)
+    box.set_right(asiaSessionBox, bar_index + 1)
+
+if londonSessionStart and showSessionBoxesInput
+    if not na(londonSessionBox)
+        box.delete(londonSessionBox)
+    londonSessionBox := box.new(
+         left = bar_index, top = high, right = bar_index + 1, bottom = low,
+         xloc = xloc.bar_index,
+         bgcolor = color.new(color.red, sessionBoxTransparencyInput),
+         border_color = color.red, text = "LONDON",
+         text_color = color.white, text_size = size.tiny
+    )
+else if londonInSession and showSessionBoxesInput and not na(londonSessionBox)
+    box.set_top(londonSessionBox, londonHigh)
+    box.set_bottom(londonSessionBox, londonLow)
+    box.set_right(londonSessionBox, bar_index + 1)
+
+if nySessionStart and showSessionBoxesInput
+    if not na(nySessionBox)
+        box.delete(nySessionBox)
+    nySessionBox := box.new(
+         left = bar_index, top = high, right = bar_index + 1, bottom = low,
+         xloc = xloc.bar_index,
+         bgcolor = color.new(color.blue, sessionBoxTransparencyInput),
+         border_color = color.blue, text = "NEW YORK",
+         text_color = color.white, text_size = size.tiny
+    )
+else if nyInSession and showSessionBoxesInput and not na(nySessionBox)
+    box.set_top(nySessionBox, nyHigh)
+    box.set_bottom(nySessionBox, nyLow)
+    box.set_right(nySessionBox, bar_index + 1)
+
+
+// ============================================================================
+// 02 - MARKET STRUCTURE
+// ============================================================================
+
+string G_STRUCTURE = "02 - Market Structure"
+
+structureTimeframeInput = input.timeframe("60", "Structure Timeframe", group = G_STRUCTURE)
+structurePivotLeftInput = input.int(3, "Structure Pivot Left", minval = 1, maxval = 20, group = G_STRUCTURE)
+structurePivotRightInput = input.int(3, "Structure Pivot Right", minval = 1, maxval = 20, group = G_STRUCTURE)
+
+nativePivotLeftInput = input.int(3, "Native Swing Pivot Left", minval = 1, maxval = 20, group = G_STRUCTURE)
+nativePivotRightInput = input.int(3, "Native Swing Pivot Right", minval = 1, maxval = 20, group = G_STRUCTURE)
+
+f_getStructureContextRaw() =>
+    float ph = ta.pivothigh(high, structurePivotLeftInput, structurePivotRightInput)
+    float pl = ta.pivotlow(low, structurePivotLeftInput, structurePivotRightInput)
+
+    float latestHigh = ta.valuewhen(not na(ph), ph, 0)
+    float previousHigh = ta.valuewhen(not na(ph), ph, 1)
+    float latestLow = ta.valuewhen(not na(pl), pl, 0)
+    float previousLow = ta.valuewhen(not na(pl), pl, 1)
+
+    [latestHigh, previousHigh, latestLow, previousLow]
+
+// [1] requests the last CONFIRMED HTF result while lookahead_on maps it cleanly
+// across the lower-timeframe bars.
+f_getStructureContextConfirmed() =>
+    [lh, ph, ll, pl] = f_getStructureContextRaw()
+    [lh[1], ph[1], ll[1], pl[1]]
+
+[htfLastHigh, htfPrevHigh, htfLastLow, htfPrevLow] = request.security(syminfo.tickerid, structureTimeframeInput, f_getStructureContextConfirmed(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool structureHaveEnoughPivots =
+     not na(htfLastHigh) and
+     not na(htfPrevHigh) and
+     not na(htfLastLow) and
+     not na(htfPrevLow)
+
+bool structureHigherHigh =
+     structureHaveEnoughPivots and htfLastHigh > htfPrevHigh
+
+bool structureHigherLow =
+     structureHaveEnoughPivots and htfLastLow > htfPrevLow
+
+bool structureLowerHigh =
+     structureHaveEnoughPivots and htfLastHigh < htfPrevHigh
+
+bool structureLowerLow =
+     structureHaveEnoughPivots and htfLastLow < htfPrevLow
+
+string structureTrend =
+     structureHigherHigh and structureHigherLow ? "UP" :
+     structureLowerHigh and structureLowerLow ? "DOWN" :
+     "RANGE"
+
+float nativePivotHigh = ta.pivothigh(high, nativePivotLeftInput, nativePivotRightInput)
+float nativePivotLow = ta.pivotlow(low, nativePivotLeftInput, nativePivotRightInput)
+
+var float recentSwingHigh = na
+var float recentSwingLow = na
+
+if not na(nativePivotHigh)
+    recentSwingHigh := nativePivotHigh
+
+if not na(nativePivotLow)
+    recentSwingLow := nativePivotLow
+
+
+// ============================================================================
+// 03 - MOMENTUM (TDI)
+// ============================================================================
+
+string G_TDI = "03 - Momentum (TDI)"
+
+tdiSourceInput = input.source(close, "TDI Source", group = G_TDI)
+tdiRsiPeriodInput = input.int(21, "RSI Period", minval = 1, group = G_TDI)
+tdiBandLengthInput = input.int(34, "Band Length", minval = 1, group = G_TDI)
+tdiFastMaLengthInput = input.int(2, "Fast MA on RSI", minval = 1, group = G_TDI)
+momentumLengthInput = input.int(12, "Momentum Length", minval = 1, group = G_TDI)
+
+requireTdiAbsoluteLevelInput =
+     input.bool(false, "Require Additional Fixed 68/32 Level", group = G_TDI)
+
+float tdiRsi = ta.rsi(tdiSourceInput, tdiRsiPeriodInput)
+float tdiMa = ta.sma(tdiRsi, tdiBandLengthInput)
+float tdiOffset = 1.6185 * ta.stdev(tdiRsi, tdiBandLengthInput)
+
+float tdiUpperBand = tdiMa + tdiOffset
+float tdiLowerBand = tdiMa - tdiOffset
+float tdiFastMa = ta.sma(tdiRsi, tdiFastMaLengthInput)
+
+float momentum = tdiSourceInput - tdiSourceInput[momentumLengthInput]
+
+bool momentumRising = momentum > momentum[1]
+bool momentumFalling = momentum < momentum[1]
+
+bool tdiBullishMove =
+     tdiFastMa > tdiUpperBand and
+     (not requireTdiAbsoluteLevelInput or tdiFastMa > 68)
+
+bool tdiBearishMove =
+     tdiFastMa < tdiLowerBand and
+     (not requireTdiAbsoluteLevelInput or tdiFastMa < 32)
+
+bool tdiConfirmsLong = tdiBullishMove and momentumRising
+bool tdiConfirmsShort = tdiBearishMove and momentumFalling
+
+
+// ============================================================================
+// 04 - LOWER-TIMEFRAME VOLUME PRESSURE
+// ============================================================================
+
+string G_VOLUME = "04 - Volume Pressure"
+
+executionDeltaWindowInput =
+     input.int(3, "Execution Pressure Window", minval = 1, maxval = 8, group = G_VOLUME)
+
+executionLtfInput =
+     input.timeframe(
+         "5",
+         "Lower Timeframe For Volume",
+         tooltip = "If the setting is above the chart timeframe, the script falls back to the chart timeframe.",
+         group = G_VOLUME
+     )
+
+requireVolumePressureInput =
+     input.bool(false, "Require Volume Pressure Agreement", group = G_VOLUME)
+
+minimumVolumePressureInput =
+     input.float(
+         5.0, "Minimum Volume Pressure %",
+         minval = 0.0, maxval = 60.0, step = 1.0, group = G_VOLUME
+     )
+
+string effectiveExecutionLtf =
+     timeframe.in_seconds(executionLtfInput) >
+     timeframe.in_seconds(timeframe.period) ?
+     timeframe.period :
+     executionLtfInput
+
+[executionUpVolume, executionDownVolume, executionDeltaVolume] = tvta.requestUpAndDownVolume(effectiveExecutionLtf)
+
+float executionDeltaSum = 0.0
+float executionVolumeSum = 0.0
+
+for i = 0 to executionDeltaWindowInput - 1
+    executionDeltaSum += nz(executionDeltaVolume[i], 0.0)
+    executionVolumeSum += nz(executionUpVolume[i], 0.0) + nz(executionDownVolume[i], 0.0)
+
+float executionDeltaPressure =
+     executionVolumeSum > 0 ?
+     executionDeltaSum / executionVolumeSum * 100.0 :
+     0.0
+
+bool pressureOkLong =
+     not requireVolumePressureInput or
+     executionDeltaPressure >= minimumVolumePressureInput
+
+bool pressureOkShort =
+     not requireVolumePressureInput or
+     executionDeltaPressure <= -minimumVolumePressureInput
+
+
+// ============================================================================
+// 04c - RANGE & Z-SCORE CONTEXT
+// ============================================================================
+
+string G_ZSCORE = "04c - Range & Z-Score"
+
+zscoreLengthInput = input.int(21, "Z-Score Length", minval = 5, group = G_ZSCORE)
+zscoreObThresholdInput = input.float(1.5, "Z-Score OB/OS", minval = 0.5, step = 0.1, group = G_ZSCORE)
+showZscoreSignalsInput = input.bool(true, "Show Z-Score Re-entry Signals", group = G_ZSCORE)
+
+float zMean = ta.sma(close, zscoreLengthInput)
+float zDev = ta.stdev(close, zscoreLengthInput)
+float zScore = zDev > 0 ? (close - zMean) / zDev : 0.0
+
+bool zscoreOversold = zScore <= -zscoreObThresholdInput
+bool zscoreOverbought = zScore >= zscoreObThresholdInput
+
+bool zscoreCrossoverLong = ta.crossover(zScore, -zscoreObThresholdInput)
+bool zscoreCrossunderShort = ta.crossunder(zScore, zscoreObThresholdInput)
+
+plotshape(
+     showZscoreSignalsInput and zscoreCrossoverLong,
+     title = "Z-Score Long Signal",
+     style = shape.diamond,
+     location = location.belowbar,
+     color = color.blue,
+     size = size.tiny
+)
+
+plotshape(
+     showZscoreSignalsInput and zscoreCrossunderShort,
+     title = "Z-Score Short Signal",
+     style = shape.diamond,
+     location = location.abovebar,
+     color = color.fuchsia,
+     size = size.tiny
+)
+
+
+// ============================================================================
+// 05 - ENTRY SETUP (LUX-STYLE S/R BREAKS)
+// ============================================================================
+
+string G_ENTRY = "05 - Entry Setup (Lux-Style S/R Breaks)"
+
+lsrToggleBreaksInput = input.bool(true, "Show Breaks", group = G_ENTRY)
+lsrLeftBarsInput = input.int(15, "Left Bars", minval = 1, group = G_ENTRY)
+lsrRightBarsInput = input.int(15, "Right Bars", minval = 1, group = G_ENTRY)
+lsrVolumeThreshInput = input.int(20, "Volume Threshold", group = G_ENTRY)
+
+cooldownBarsInput =
+     input.int(12, "Cooldown Bars Between Setups (Per Direction)", minval = 0, group = G_ENTRY)
+
+requireMomentumInput =
+     input.bool(true, "Require Momentum Confirmation", group = G_ENTRY)
+
+requireFavorableSessionInput =
+     input.bool(true, "Require Favorable Session", group = G_ENTRY)
+
+float atrCoach = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
+
+float lsrPivotHighRaw = ta.pivothigh(lsrLeftBarsInput, lsrRightBarsInput)
+float lsrPivotLowRaw = ta.pivotlow(lsrLeftBarsInput, lsrRightBarsInput)
+
+float lsrHighUsePivot = fixnan(lsrPivotHighRaw[1])
+float lsrLowUsePivot = fixnan(lsrPivotLowRaw[1])
+
+plot(
+     lsrHighUsePivot,
+     title = "Resistance",
+     color = ta.change(lsrHighUsePivot) != 0 ? na : color.red,
+     linewidth = 2,
+     offset = -(lsrRightBarsInput + 1)
+)
+
+plot(
+     lsrLowUsePivot,
+     title = "Support",
+     color = ta.change(lsrLowUsePivot) != 0 ? na : color.blue,
+     linewidth = 2,
+     offset = -(lsrRightBarsInput + 1)
+)
+
+float lsrShortEma = ta.ema(volume, 5)
+float lsrLongEma = ta.ema(volume, 10)
+
+float lsrOsc =
+     lsrLongEma != 0 ?
+     100.0 * (lsrShortEma - lsrLongEma) / lsrLongEma :
+     0.0
+
+bool lsrCrossUnderSupport = ta.crossunder(close, lsrLowUsePivot)
+bool lsrCrossOverResistance = ta.crossover(close, lsrHighUsePivot)
+
+bool lsrBreakDown =
+     lsrToggleBreaksInput and
+     lsrCrossUnderSupport and
+     not (open - close < high - open) and
+     lsrOsc > lsrVolumeThreshInput
+
+bool lsrBreakUp =
+     lsrToggleBreaksInput and
+     lsrCrossOverResistance and
+     not (open - low > close - open) and
+     lsrOsc > lsrVolumeThreshInput
+
+bool lsrBullWick =
+     lsrToggleBreaksInput and
+     lsrCrossOverResistance and
+     open - low > close - open
+
+bool lsrBearWick =
+     lsrToggleBreaksInput and
+     lsrCrossUnderSupport and
+     open - close < high - open
+
+plotshape(
+     lsrBreakDown,
+     title = "Break Down",
+     text = "B",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.red,
+     textcolor = color.white,
+     size = size.tiny
+)
+
+plotshape(
+     lsrBreakUp,
+     title = "Break Up",
+     text = "B",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.green,
+     textcolor = color.white,
+     size = size.tiny
+)
+
+bool longSignalNow = lsrBreakUp
+bool shortSignalNow = lsrBreakDown
+
+
+// ============================================================================
+// 05a - S/R LEVEL SELECTION
+//-----------------------------------------------------------------------------
+// Anchored to the prior session's high/low (PDH/PDL) only -- no hybrid
+// pivot/swing/session-high-low candidate pool or nearest/priority
+// selection logic. One resistance candidate (PDH), one support candidate
+// (PDL), full stop. selectedResistanceNominalRole/selectedResistanceClass
+// stay as fixed constants (1/2 and -1/2) purely so every downstream
+// reaction-probability calculation in 05b keeps working unchanged.
+// ============================================================================
+
+string G_SR_SELECT = "05a - S/R Level Selection"
+
+srMaxDistanceAtrInput =
+     input.float(
+         5.0, "Maximum S/R Distance (ATR)",
+         minval = 0.25, maxval = 30.0, step = 0.25, group = G_SR_SELECT
+     )
+
+srShowSelectedLevelsInput =
+     input.bool(true, "Plot PDH/PDL", group = G_SR_SELECT)
+
+srResistanceColorInput =
+     input.color(color.fuchsia, "PDH Probability Color", group = G_SR_SELECT)
+
+srSupportColorInput =
+     input.color(color.aqua, "PDL Probability Color", group = G_SR_SELECT)
+
+float srMaxDistancePoints =
+     srMaxDistanceAtrInput * atrCoach
+
+float selectedResistanceLevel =
+     not na(prevDayHigh) and math.abs(prevDayHigh - close) <= srMaxDistancePoints ?
+     prevDayHigh :
+     na
+
+float selectedSupportLevel =
+     not na(prevDayLow) and math.abs(close - prevDayLow) <= srMaxDistancePoints ?
+     prevDayLow :
+     na
+
+string selectedResistanceSource = "PDH"
+string selectedSupportSource = "PDL"
+
+int selectedResistanceNominalRole = 1
+int selectedSupportNominalRole = -1
+
+int selectedResistanceClass = 2
+int selectedSupportClass = 2
+
+plot(
+     srShowSelectedLevelsInput ? selectedResistanceLevel : na,
+     title = "Selected Probability Resistance",
+     color = srResistanceColorInput,
+     linewidth = 2,
+     style = plot.style_stepline
+)
+
+plot(
+     srShowSelectedLevelsInput ? selectedSupportLevel : na,
+     title = "Selected Probability Support",
+     color = srSupportColorInput,
+     linewidth = 2,
+     style = plot.style_stepline
+)
+
+// --------------------------------------------------------------------------
+// SWEEP FIRST (DISTANCE-BASED)
+//-----------------------------------------------------------------------------
+// Not a learned probability -- a simple inverse-distance split between PDH
+// and PDL: whichever level price currently sits closer to gets the larger
+// share. Recalculates every bar as price moves. Resolves to an "already
+// swept" status once either level has actually been touched today.
+// --------------------------------------------------------------------------
+
+float sweepFirstDistRes = not na(prevDayHigh) ? math.abs(prevDayHigh - close) : na
+float sweepFirstDistSup = not na(prevDayLow) ? math.abs(close - prevDayLow) : na
+
+float sweepFirstPdhPct =
+     not na(sweepFirstDistRes) and not na(sweepFirstDistSup) and (sweepFirstDistRes + sweepFirstDistSup) > 0 ?
+     sweepFirstDistSup / (sweepFirstDistRes + sweepFirstDistSup) * 100.0 :
+     na
+
+float sweepFirstPdlPct =
+     na(sweepFirstPdhPct) ? na : 100.0 - sweepFirstPdhPct
+
+string sweepFirstText =
+     sweptPdhToday and sweptPdlToday ? "both swept" :
+     sweptPdhToday ? "PDH swept -- PDL next" :
+     sweptPdlToday ? "PDL swept -- PDH next" :
+     na(sweepFirstPdhPct) ? "--" :
+     "PDH " + str.tostring(sweepFirstPdhPct, "#") + "% ・PDL " + str.tostring(sweepFirstPdlPct, "#") + "%"
+
+
+// ============================================================================
+// 05b - S/R REACTION PROBABILITY v1.4
+// ============================================================================
+
+string G_BREAK_PROB = "05b - S/R Reaction Probability v1.4"
+
+breakProbEnableInput =
+     input.bool(true, "Enable Reaction Probability", group = G_BREAK_PROB)
+
+breakProbTestZoneAtrInput =
+     input.float(
+         0.35, "Test Zone Distance (ATR)",
+         minval = 0.05, maxval = 2.0, step = 0.05,
+         group = G_BREAK_PROB
+     )
+
+breakProbHorizonBarsInput =
+     input.int(
+         12, "Pre-Break Test Horizon (Bars)",
+         minval = 1, maxval = 100,
+         tooltip = "Bars after the test starts to FADE or produce a close-through. After close-through, Follow Bars may extend beyond this horizon.",
+         group = G_BREAK_PROB
+     )
+
+breakProbFollowAtrInput =
+     input.float(
+         0.75, "Follow Distance (ATR)",
+         minval = 0.25, maxval = 5.0, step = 0.25,
+         group = G_BREAK_PROB
+     )
+
+breakProbFollowBarsInput =
+     input.int(
+         6, "Follow Bars After Close-Through",
+         minval = 1, maxval = 50,
+         group = G_BREAK_PROB
+     )
+
+breakProbRollingTrialsInput =
+     input.int(
+         500, "Rolling Resolved Trials Per Side",
+         minval = 50, maxval = 5000, step = 50,
+         tooltip = "Only the newest N resolved resistance trials and N resolved support trials are retained.",
+         group = G_BREAK_PROB
+     )
+
+breakProbPriorEachInput =
+     input.float(
+         1.0, "Dirichlet Prior Per Outcome",
+         minval = 0.1, maxval = 20.0, step = 0.1,
+         tooltip = "Symmetric prior for BREAK, FADE, FAIL and EXPIRE.",
+         group = G_BREAK_PROB
+     )
+
+breakProbShrinkStrengthInput =
+     input.float(
+         20.0, "Context Shrinkage To LOO Baseline",
+         minval = 0.0, maxval = 200.0, step = 1.0,
+         group = G_BREAK_PROB
+     )
+
+breakProbMinSampleInput =
+     input.int(
+         25, "Minimum Context Sample",
+         minval = 5, maxval = 500,
+         group = G_BREAK_PROB
+     )
+
+breakProbMinBaselineInput =
+     input.int(
+         30, "Minimum Leave-One-Out Baseline Sample",
+         minval = 5, maxval = 1000,
+         group = G_BREAK_PROB
+     )
+
+breakProbMinLiftInput =
+     input.float(
+         8.0, "Minimum Lift For A Call (percentage points)",
+         minval = 1.0, maxval = 40.0, step = 0.5,
+         group = G_BREAK_PROB
+     )
+
+breakProbMinEdgeZInput =
+     input.float(
+         1.64, "Minimum Approx Edge Z",
+         minval = 0.0, maxval = 4.0, step = 0.05,
+         tooltip = "Approximate uncertainty gate comparing context posterior with a disjoint leave-one-bucket-out baseline.",
+         group = G_BREAK_PROB
+     )
+
+breakProbActionDistAtrInput =
+     input.float(
+         0.5, "Action Distance (ATR)",
+         minval = 0.1, maxval = 5.0, step = 0.1,
+         group = G_BREAK_PROB
+     )
+
+breakProbRangeBlocksInput =
+     input.bool(true, "RANGE Structure Forces Stand Aside", group = G_BREAK_PROB)
+
+breakProbDisplayInput =
+     input.string(
+         "Context + Global",
+         "Probability Display",
+         options = ["Context Only", "Global Only", "Context + Global"],
+         group = G_BREAK_PROB
+     )
+
+breakProbShowLabelsInput =
+     input.bool(true, "Show Probability Labels At Selected S/R", group = G_BREAK_PROB)
+
+breakProbLabelSizeInput =
+     input.string(
+         "Tiny", "Probability Label Size",
+         options = ["Tiny", "Small", "Normal"],
+         group = G_BREAK_PROB
+     )
+
+breakProbResLabelOffsetInput =
+     input.int(3, "Resistance Label Offset (Bars)", minval = -100, maxval = 100, group = G_BREAK_PROB)
+
+breakProbSupLabelOffsetInput =
+     input.int(3, "Support Label Offset (Bars)", minval = -100, maxval = 100, group = G_BREAK_PROB)
+
+// Outcome coding.
+int OUT_EXPIRE = 0
+int OUT_BREAK = 1
+int OUT_FADE = 2
+int OUT_FAIL = 3
+
+f_structureState(bool wantResistance, string trend) =>
+    bool aligned =
+         wantResistance ?
+         trend == "UP" :
+         trend == "DOWN"
+
+    bool opposed =
+         wantResistance ?
+         trend == "DOWN" :
+         trend == "UP"
+
+    aligned ? 1 : opposed ? 2 : 0
+
+f_srStatBucketV2(
+     int sourceClass,
+     int nominalRole,
+     bool wantResistance,
+     string trend
+) =>
+    bool flipped =
+         wantResistance ?
+         nominalRole == -1 :
+         nominalRole == 1
+
+    int levelClass = flipped ? 3 : sourceClass
+    int structureState = f_structureState(wantResistance, trend)
+
+    math.max(0, math.min(11, levelClass + structureState * 4))
+
+f_bucketKindV2(
+     int sourceClass,
+     int nominalRole,
+     bool wantResistance,
+     string trend
+) =>
+    bool flipped =
+         wantResistance ?
+         nominalRole == -1 :
+         nominalRole == 1
+
+    string kind =
+         flipped ? "flipped" :
+         sourceClass == 0 ? "pivot" :
+         sourceClass == 1 ? "session" :
+         sourceClass == 2 ? "pdh/pdl" :
+         "level"
+
+    int st = f_structureState(wantResistance, trend)
+
+    string stText =
+         st == 1 ? "aligned" :
+         st == 2 ? "opposed" :
+         "range"
+
+    kind + "+" + stText
+
+f_quality(int trials) =>
+    trials >= breakProbMinSampleInput * 4 ? "DEEP" :
+     trials >= breakProbMinSampleInput * 2 ? "MATURE" :
+     trials >= breakProbMinSampleInput ? "USABLE" :
+     trials >= math.max(5, int(math.round(breakProbMinSampleInput * 0.5))) ? "DEVELOPING" :
+     "EARLY"
+
+f_dirichletPct(int count, int total, float priorEach) =>
+    float denom = total + 4.0 * priorEach
+    denom > 0 ?
+         (count + priorEach) / denom * 100.0 :
+         25.0
+
+f_dirichletVar(int count, int total, float priorEach) =>
+    float alphaI = count + priorEach
+    float alphaTotal = total + 4.0 * priorEach
+
+    alphaTotal > 0 ?
+         alphaI * (alphaTotal - alphaI) /
+         (alphaTotal * alphaTotal * (alphaTotal + 1.0)) :
+         na
+
+f_hierPct(
+     int ctxCount,
+     int ctxTrials,
+     float basePct,
+     float shrink,
+     float priorEach
+) =>
+    float alpha =
+         ctxCount +
+         priorEach +
+         shrink * basePct / 100.0
+
+    float alphaTotal =
+         ctxTrials +
+         4.0 * priorEach +
+         shrink
+
+    alphaTotal > 0 ?
+         alpha / alphaTotal * 100.0 :
+         25.0
+
+f_hierVar(
+     int ctxCount,
+     int ctxTrials,
+     float basePct,
+     float shrink,
+     float priorEach
+) =>
+    float alpha =
+         ctxCount +
+         priorEach +
+         shrink * basePct / 100.0
+
+    float alphaTotal =
+         ctxTrials +
+         4.0 * priorEach +
+         shrink
+
+    alphaTotal > 0 ?
+         alpha * (alphaTotal - alpha) /
+         (alphaTotal * alphaTotal * (alphaTotal + 1.0)) :
+         na
+
+f_edgeZ(
+     float ctxPct,
+     float basePct,
+     float ctxVar,
+     float baseVar
+) =>
+    float se =
+         math.sqrt(math.max(nz(ctxVar, 0.0) + nz(baseVar, 0.0), 0.0))
+
+    se > 0 ?
+         (ctxPct / 100.0 - basePct / 100.0) / se :
+         0.0
+
+f_probCall(
+     bool enabled,
+     bool hasLevel,
+     int globalTrials,
+     int ctxTrials,
+     int baseTrials,
+     float breakLift,
+     float fadeLift,
+     float breakZ,
+     float fadeZ,
+     float distAtr,
+     bool isRange,
+     string displayMode
+) =>
+    string action = "NO EDGE"
+    bool showCtx = false
+    float shownLift = 0.0
+    float shownZ = 0.0
+
+    bool contextAllowed = displayMode != "Global Only"
+
+    bool breakOk =
+         hasLevel and
+         contextAllowed and
+         ctxTrials >= breakProbMinSampleInput and
+         baseTrials >= breakProbMinBaselineInput and
+         breakLift >= breakProbMinLiftInput and
+         breakZ >= breakProbMinEdgeZInput
+
+    bool fadeOk =
+         hasLevel and
+         contextAllowed and
+         ctxTrials >= breakProbMinSampleInput and
+         baseTrials >= breakProbMinBaselineInput and
+         fadeLift >= breakProbMinLiftInput and
+         fadeZ >= breakProbMinEdgeZInput
+
+    bool near =
+         hasLevel and
+         not na(distAtr) and
+         distAtr <= breakProbActionDistAtrInput
+
+    if not enabled
+        action := "OFF"
+    else if globalTrials < 10
+        action := "LEARNING"
+    else if breakProbRangeBlocksInput and isRange
+        action := "STAND ASIDE"
+    else if breakOk and (not fadeOk or breakZ >= fadeZ)
+        action := near ? "BREAK BIAS" : "WATCH BREAK"
+        showCtx := true
+        shownLift := breakLift
+        shownZ := breakZ
+    else if fadeOk
+        action := near ? "FADE BIAS" : "WATCH FADE"
+        showCtx := true
+        shownLift := fadeLift
+        shownZ := fadeZ
+    else
+        action := "NO EDGE"
+
+    if displayMode == "Context Only" and enabled and globalTrials >= 10
+        showCtx := true
+
+    [action, showCtx, shownLift, shownZ]
+
+// 12 buckets per side.
+var array<int> resTrials = array.new_int(12, 0)
+var array<int> resBreaks = array.new_int(12, 0)
+var array<int> resFades = array.new_int(12, 0)
+var array<int> resFails = array.new_int(12, 0)
+
+var array<int> supTrials = array.new_int(12, 0)
+var array<int> supBreaks = array.new_int(12, 0)
+var array<int> supFades = array.new_int(12, 0)
+var array<int> supFails = array.new_int(12, 0)
+
+// Rolling resolved history needed so old trials can be removed exactly.
+var array<int> resHistBucket = array.new_int()
+var array<int> resHistOutcome = array.new_int()
+
+var array<int> supHistBucket = array.new_int()
+var array<int> supHistOutcome = array.new_int()
+
+// Rolling calibration.
+var array<float> resBrierHist = array.new_float()
+var array<float> supBrierHist = array.new_float()
+
+f_addResolvedTrial(
+     array<int> trials,
+     array<int> breaks,
+     array<int> fades,
+     array<int> fails,
+     array<int> histBucket,
+     array<int> histOutcome,
+     int bucket,
+     int outcome,
+     int maxTrials
+) =>
+    int b = math.max(0, math.min(11, bucket))
+
+    array.set(trials, b, array.get(trials, b) + 1)
+
+    if outcome == OUT_BREAK
+        array.set(breaks, b, array.get(breaks, b) + 1)
+    else if outcome == OUT_FADE
+        array.set(fades, b, array.get(fades, b) + 1)
+    else if outcome == OUT_FAIL
+        array.set(fails, b, array.get(fails, b) + 1)
+
+    array.push(histBucket, b)
+    array.push(histOutcome, outcome)
+
+    if array.size(histBucket) > maxTrials
+        int oldB = array.shift(histBucket)
+        int oldO = array.shift(histOutcome)
+
+        array.set(trials, oldB, math.max(0, array.get(trials, oldB) - 1))
+
+        if oldO == OUT_BREAK
+            array.set(breaks, oldB, math.max(0, array.get(breaks, oldB) - 1))
+        else if oldO == OUT_FADE
+            array.set(fades, oldB, math.max(0, array.get(fades, oldB) - 1))
+        else if oldO == OUT_FAIL
+            array.set(fails, oldB, math.max(0, array.get(fails, oldB) - 1))
+
+    true
+
+f_pushBrier(array<float> hist, float score, int maxTrials) =>
+    array.push(hist, score)
+
+    if array.size(hist) > maxTrials
+        array.shift(hist)
+
+    true
+
+f_multiclassBrier(
+     float pBreak,
+     float pFade,
+     float pFail,
+     float pExpire,
+     int outcome
+) =>
+    float yBreak = outcome == OUT_BREAK ? 1.0 : 0.0
+    float yFade = outcome == OUT_FADE ? 1.0 : 0.0
+    float yFail = outcome == OUT_FAIL ? 1.0 : 0.0
+    float yExpire = outcome == OUT_EXPIRE ? 1.0 : 0.0
+
+    math.pow(pBreak / 100.0 - yBreak, 2) +
+     math.pow(pFade / 100.0 - yFade, 2) +
+     math.pow(pFail / 100.0 - yFail, 2) +
+     math.pow(pExpire / 100.0 - yExpire, 2)
+
+
+// --------------------------------------------------------------------------
+// CURRENT LIVE CONTEXT
+// --------------------------------------------------------------------------
+
+bool resHasLevel =
+     selectedResistanceClass >= 0 and
+     not na(selectedResistanceLevel)
+
+bool supHasLevel =
+     selectedSupportClass >= 0 and
+     not na(selectedSupportLevel)
+
+int resCurrentBucket =
+     resHasLevel ?
+     f_srStatBucketV2(
+         selectedResistanceClass,
+         selectedResistanceNominalRole,
+         true,
+         structureTrend
+     ) :
+     0
+
+int supCurrentBucket =
+     supHasLevel ?
+     f_srStatBucketV2(
+         selectedSupportClass,
+         selectedSupportNominalRole,
+         false,
+         structureTrend
+     ) :
+     0
+
+string resKind =
+     resHasLevel ?
+     f_bucketKindV2(
+         selectedResistanceClass,
+         selectedResistanceNominalRole,
+         true,
+         structureTrend
+     ) :
+     "level"
+
+string supKind =
+     supHasLevel ?
+     f_bucketKindV2(
+         selectedSupportClass,
+         selectedSupportNominalRole,
+         false,
+         structureTrend
+     ) :
+     "level"
+
+
+// --------------------------------------------------------------------------
+// MODEL COUNTS + POSTERIORS - RESISTANCE
+// --------------------------------------------------------------------------
+
+int resGlobalTrials = array.sum(resTrials)
+int resGlobalBreaks = array.sum(resBreaks)
+int resGlobalFades = array.sum(resFades)
+int resGlobalFails = array.sum(resFails)
+int resGlobalExpires =
+     math.max(
+         0,
+         resGlobalTrials -
+         resGlobalBreaks -
+         resGlobalFades -
+         resGlobalFails
+     )
+
+int resCtxTrials = array.get(resTrials, resCurrentBucket)
+int resCtxBreaks = array.get(resBreaks, resCurrentBucket)
+int resCtxFades = array.get(resFades, resCurrentBucket)
+int resCtxFails = array.get(resFails, resCurrentBucket)
+int resCtxExpires =
+     math.max(
+         0,
+         resCtxTrials -
+         resCtxBreaks -
+         resCtxFades -
+         resCtxFails
+     )
+
+int resBaseTrials = math.max(0, resGlobalTrials - resCtxTrials)
+int resBaseBreaks = math.max(0, resGlobalBreaks - resCtxBreaks)
+int resBaseFades = math.max(0, resGlobalFades - resCtxFades)
+int resBaseFails = math.max(0, resGlobalFails - resCtxFails)
+int resBaseExpires = math.max(0, resGlobalExpires - resCtxExpires)
+
+float resGlobalBreakPct = f_dirichletPct(resGlobalBreaks, resGlobalTrials, breakProbPriorEachInput)
+float resGlobalFadePct = f_dirichletPct(resGlobalFades, resGlobalTrials, breakProbPriorEachInput)
+float resGlobalFailPct = f_dirichletPct(resGlobalFails, resGlobalTrials, breakProbPriorEachInput)
+float resGlobalExpirePct = f_dirichletPct(resGlobalExpires, resGlobalTrials, breakProbPriorEachInput)
+
+float resBaseBreakPct = f_dirichletPct(resBaseBreaks, resBaseTrials, breakProbPriorEachInput)
+float resBaseFadePct = f_dirichletPct(resBaseFades, resBaseTrials, breakProbPriorEachInput)
+float resBaseFailPct = f_dirichletPct(resBaseFails, resBaseTrials, breakProbPriorEachInput)
+float resBaseExpirePct = f_dirichletPct(resBaseExpires, resBaseTrials, breakProbPriorEachInput)
+
+float resCtxBreakPct = f_hierPct(resCtxBreaks, resCtxTrials, resBaseBreakPct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float resCtxFadePct = f_hierPct(resCtxFades, resCtxTrials, resBaseFadePct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float resCtxFailPct = f_hierPct(resCtxFails, resCtxTrials, resBaseFailPct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float resCtxExpirePct = f_hierPct(resCtxExpires, resCtxTrials, resBaseExpirePct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+
+float resCtxBreakVar = f_hierVar(resCtxBreaks, resCtxTrials, resBaseBreakPct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float resCtxFadeVar = f_hierVar(resCtxFades, resCtxTrials, resBaseFadePct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+
+float resBaseBreakVar = f_dirichletVar(resBaseBreaks, resBaseTrials, breakProbPriorEachInput)
+float resBaseFadeVar = f_dirichletVar(resBaseFades, resBaseTrials, breakProbPriorEachInput)
+
+float resBreakLift = resCtxBreakPct - resBaseBreakPct
+float resFadeLift = resCtxFadePct - resBaseFadePct
+
+float resBreakZ = f_edgeZ(resCtxBreakPct, resBaseBreakPct, resCtxBreakVar, resBaseBreakVar)
+float resFadeZ = f_edgeZ(resCtxFadePct, resBaseFadePct, resCtxFadeVar, resBaseFadeVar)
+
+
+// --------------------------------------------------------------------------
+// MODEL COUNTS + POSTERIORS - SUPPORT
+// --------------------------------------------------------------------------
+
+int supGlobalTrials = array.sum(supTrials)
+int supGlobalBreaks = array.sum(supBreaks)
+int supGlobalFades = array.sum(supFades)
+int supGlobalFails = array.sum(supFails)
+int supGlobalExpires =
+     math.max(
+         0,
+         supGlobalTrials -
+         supGlobalBreaks -
+         supGlobalFades -
+         supGlobalFails
+     )
+
+int supCtxTrials = array.get(supTrials, supCurrentBucket)
+int supCtxBreaks = array.get(supBreaks, supCurrentBucket)
+int supCtxFades = array.get(supFades, supCurrentBucket)
+int supCtxFails = array.get(supFails, supCurrentBucket)
+int supCtxExpires =
+     math.max(
+         0,
+         supCtxTrials -
+         supCtxBreaks -
+         supCtxFades -
+         supCtxFails
+     )
+
+int supBaseTrials = math.max(0, supGlobalTrials - supCtxTrials)
+int supBaseBreaks = math.max(0, supGlobalBreaks - supCtxBreaks)
+int supBaseFades = math.max(0, supGlobalFades - supCtxFades)
+int supBaseFails = math.max(0, supGlobalFails - supCtxFails)
+int supBaseExpires = math.max(0, supGlobalExpires - supCtxExpires)
+
+float supGlobalBreakPct = f_dirichletPct(supGlobalBreaks, supGlobalTrials, breakProbPriorEachInput)
+float supGlobalFadePct = f_dirichletPct(supGlobalFades, supGlobalTrials, breakProbPriorEachInput)
+float supGlobalFailPct = f_dirichletPct(supGlobalFails, supGlobalTrials, breakProbPriorEachInput)
+float supGlobalExpirePct = f_dirichletPct(supGlobalExpires, supGlobalTrials, breakProbPriorEachInput)
+
+float supBaseBreakPct = f_dirichletPct(supBaseBreaks, supBaseTrials, breakProbPriorEachInput)
+float supBaseFadePct = f_dirichletPct(supBaseFades, supBaseTrials, breakProbPriorEachInput)
+float supBaseFailPct = f_dirichletPct(supBaseFails, supBaseTrials, breakProbPriorEachInput)
+float supBaseExpirePct = f_dirichletPct(supBaseExpires, supBaseTrials, breakProbPriorEachInput)
+
+float supCtxBreakPct = f_hierPct(supCtxBreaks, supCtxTrials, supBaseBreakPct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float supCtxFadePct = f_hierPct(supCtxFades, supCtxTrials, supBaseFadePct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float supCtxFailPct = f_hierPct(supCtxFails, supCtxTrials, supBaseFailPct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float supCtxExpirePct = f_hierPct(supCtxExpires, supCtxTrials, supBaseExpirePct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+
+float supCtxBreakVar = f_hierVar(supCtxBreaks, supCtxTrials, supBaseBreakPct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float supCtxFadeVar = f_hierVar(supCtxFades, supCtxTrials, supBaseFadePct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+
+float supBaseBreakVar = f_dirichletVar(supBaseBreaks, supBaseTrials, breakProbPriorEachInput)
+float supBaseFadeVar = f_dirichletVar(supBaseFades, supBaseTrials, breakProbPriorEachInput)
+
+float supBreakLift = supCtxBreakPct - supBaseBreakPct
+float supFadeLift = supCtxFadePct - supBaseFadePct
+
+float supBreakZ = f_edgeZ(supCtxBreakPct, supBaseBreakPct, supCtxBreakVar, supBaseBreakVar)
+float supFadeZ = f_edgeZ(supCtxFadePct, supBaseFadePct, supCtxFadeVar, supBaseFadeVar)
+
+
+// --------------------------------------------------------------------------
+// TRIAL STATE
+// --------------------------------------------------------------------------
+
+var bool resActive = false
+var bool supActive = false
+
+var float resFrozenLevel = na
+var float supFrozenLevel = na
+
+var float resFrozenDist = na
+var float supFrozenDist = na
+
+var int resStartBar = na
+var int supStartBar = na
+
+var int resFrozenBucket = 0
+var int supFrozenBucket = 0
+
+var bool resBroken = false
+var bool supBroken = false
+
+var int resBreakBar = na
+var int supBreakBar = na
+
+// Forecast frozen at TRIAL START, before the result is learned.
+var float resFrozenPBreak = 25.0
+var float resFrozenPFade = 25.0
+var float resFrozenPFail = 25.0
+var float resFrozenPExpire = 25.0
+
+var float supFrozenPBreak = 25.0
+var float supFrozenPFade = 25.0
+var float supFrozenPFail = 25.0
+var float supFrozenPExpire = 25.0
+
+// Daily touch tracking for display only.
+var array<float> resTouched = array.new_float()
+var array<float> supTouched = array.new_float()
+
+if newDayCoach
+    array.clear(resTouched)
+    array.clear(supTouched)
+
+f_touchWord(array<float> levels, float level, float tol, bool countingActive) =>
+    int n = 0
+
+    if array.size(levels) > 0 and not na(level)
+        for i = 0 to array.size(levels) - 1
+            if math.abs(array.get(levels, i) - level) <= tol
+                n += 1
+
+    bool retest = countingActive ? n >= 2 : n >= 1
+    retest ? "retest" : "1st"
+
+
+// --------------------------------------------------------------------------
+// ARM NEW TRIALS FROM PREVIOUSLY KNOWN LEVELS
+// --------------------------------------------------------------------------
+
+// ATR known before current event bar.
+float probAtrRef =
+     math.max(nz(atrCoach[1], atrCoach), syminfo.mintick)
+
+float probZoneDist =
+     breakProbTestZoneAtrInput * probAtrRef
+
+// The previous bar's selected level survives even if current close crosses it.
+float resArmLevel = selectedResistanceLevel[1]
+float supArmLevel = selectedSupportLevel[1]
+
+int resArmClass = selectedResistanceClass[1]
+int supArmClass = selectedSupportClass[1]
+
+int resArmRole = selectedResistanceNominalRole[1]
+int supArmRole = selectedSupportNominalRole[1]
+
+// Require the selection to have existed for two completed bars.
+bool resArmStable =
+     breakProbEnableInput and
+     resArmClass >= 0 and
+     not na(resArmLevel) and
+     not na(selectedResistanceLevel[2]) and
+     math.abs(resArmLevel - selectedResistanceLevel[2]) <= syminfo.mintick
+
+bool supArmStable =
+     breakProbEnableInput and
+     supArmClass >= 0 and
+     not na(supArmLevel) and
+     not na(selectedSupportLevel[2]) and
+     math.abs(supArmLevel - selectedSupportLevel[2]) <= syminfo.mintick
+
+// Previous bar must have been outside the test zone.
+bool resWasOutside =
+     resArmStable and
+     high[1] < resArmLevel - probZoneDist
+
+bool supWasOutside =
+     supArmStable and
+     low[1] > supArmLevel + probZoneDist
+
+// Current bar physically intersects the level's test area.
+// Requiring low <= resistance / high >= support avoids treating a pure gap
+// completely beyond the level as a physical test.
+bool resIntersectsNow =
+     resArmStable and
+     high >= resArmLevel - probZoneDist and
+     low <= resArmLevel
+
+bool supIntersectsNow =
+     supArmStable and
+     low <= supArmLevel + probZoneDist and
+     high >= supArmLevel
+
+bool resEnteredZone =
+     resWasOutside and
+     resIntersectsNow
+
+bool supEnteredZone =
+     supWasOutside and
+     supIntersectsNow
+
+if barstate.isconfirmed and resEnteredZone and not resActive
+    string frozenTrend = structureTrend[1]
+
+    resActive := true
+    resFrozenLevel := resArmLevel
+    resStartBar := bar_index
+    resFrozenBucket := f_srStatBucketV2(resArmClass, resArmRole, true, frozenTrend)
+    resFrozenDist := breakProbFollowAtrInput * probAtrRef
+    resBroken := false
+    resBreakBar := na
+
+    // Freeze PRE-TRIAL forecast for calibration.
+    int b = resFrozenBucket
+
+    int cTrials = array.get(resTrials, b)
+    int cBreaks = array.get(resBreaks, b)
+    int cFades = array.get(resFades, b)
+    int cFails = array.get(resFails, b)
+    int cExpires = math.max(0, cTrials - cBreaks - cFades - cFails)
+
+    int gTrials = array.sum(resTrials)
+    int gBreaks = array.sum(resBreaks)
+    int gFades = array.sum(resFades)
+    int gFails = array.sum(resFails)
+    int gExpires = math.max(0, gTrials - gBreaks - gFades - gFails)
+
+    int bTrials = math.max(0, gTrials - cTrials)
+    int bBreaks = math.max(0, gBreaks - cBreaks)
+    int bFades = math.max(0, gFades - cFades)
+    int bFails = math.max(0, gFails - cFails)
+    int bExpires = math.max(0, gExpires - cExpires)
+
+    float bpBreak = f_dirichletPct(bBreaks, bTrials, breakProbPriorEachInput)
+    float bpFade = f_dirichletPct(bFades, bTrials, breakProbPriorEachInput)
+    float bpFail = f_dirichletPct(bFails, bTrials, breakProbPriorEachInput)
+    float bpExpire = f_dirichletPct(bExpires, bTrials, breakProbPriorEachInput)
+
+    resFrozenPBreak := f_hierPct(cBreaks, cTrials, bpBreak, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+    resFrozenPFade := f_hierPct(cFades, cTrials, bpFade, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+    resFrozenPFail := f_hierPct(cFails, cTrials, bpFail, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+    resFrozenPExpire := f_hierPct(cExpires, cTrials, bpExpire, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+
+    array.push(resTouched, resArmLevel)
+
+    if array.size(resTouched) > 80
+        array.shift(resTouched)
+
+if barstate.isconfirmed and supEnteredZone and not supActive
+    string frozenTrend = structureTrend[1]
+
+    supActive := true
+    supFrozenLevel := supArmLevel
+    supStartBar := bar_index
+    supFrozenBucket := f_srStatBucketV2(supArmClass, supArmRole, false, frozenTrend)
+    supFrozenDist := breakProbFollowAtrInput * probAtrRef
+    supBroken := false
+    supBreakBar := na
+
+    int b = supFrozenBucket
+
+    int cTrials = array.get(supTrials, b)
+    int cBreaks = array.get(supBreaks, b)
+    int cFades = array.get(supFades, b)
+    int cFails = array.get(supFails, b)
+    int cExpires = math.max(0, cTrials - cBreaks - cFades - cFails)
+
+    int gTrials = array.sum(supTrials)
+    int gBreaks = array.sum(supBreaks)
+    int gFades = array.sum(supFades)
+    int gFails = array.sum(supFails)
+    int gExpires = math.max(0, gTrials - gBreaks - gFades - gFails)
+
+    int bTrials = math.max(0, gTrials - cTrials)
+    int bBreaks = math.max(0, gBreaks - cBreaks)
+    int bFades = math.max(0, gFades - cFades)
+    int bFails = math.max(0, gFails - cFails)
+    int bExpires = math.max(0, gExpires - cExpires)
+
+    float bpBreak = f_dirichletPct(bBreaks, bTrials, breakProbPriorEachInput)
+    float bpFade = f_dirichletPct(bFades, bTrials, breakProbPriorEachInput)
+    float bpFail = f_dirichletPct(bFails, bTrials, breakProbPriorEachInput)
+    float bpExpire = f_dirichletPct(bExpires, bTrials, breakProbPriorEachInput)
+
+    supFrozenPBreak := f_hierPct(cBreaks, cTrials, bpBreak, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+    supFrozenPFade := f_hierPct(cFades, cTrials, bpFade, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+    supFrozenPFail := f_hierPct(cFails, cTrials, bpFail, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+    supFrozenPExpire := f_hierPct(cExpires, cTrials, bpExpire, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+
+    array.push(supTouched, supArmLevel)
+
+    if array.size(supTouched) > 80
+        array.shift(supTouched)
+
+
+// --------------------------------------------------------------------------
+// RESOLVE RESISTANCE TRIALS
+// --------------------------------------------------------------------------
+
+if barstate.isconfirmed and resActive
+    int age = bar_index - resStartBar
+    float lvl = resFrozenLevel
+    float dist = resFrozenDist
+    int outcome = -1
+
+    if not resBroken
+        // With chart-bar semantics, this excursion occurred before the bar's
+        // final close. Therefore a qualifying fade wins over a same-bar
+        // close-through.
+        if low <= lvl - dist
+            outcome := OUT_FADE
+        else if close > lvl
+            resBroken := true
+            resBreakBar := bar_index
+        else if age >= breakProbHorizonBarsInput
+            outcome := OUT_EXPIRE
+
+    // Never use the breakout bar's own high as evidence of movement AFTER its
+    // closing breakout. Follow begins on the next chart bar.
+    if outcome == -1 and resBroken and bar_index > resBreakBar
+        int sinceBreak = bar_index - resBreakBar
+
+        if high >= lvl + dist
+            outcome := OUT_BREAK
+        else if close < lvl
+            outcome := OUT_FAIL
+        else if sinceBreak >= breakProbFollowBarsInput
+            outcome := OUT_FAIL
+
+    if outcome >= 0
+        f_addResolvedTrial(
+             resTrials, resBreaks, resFades, resFails,
+             resHistBucket, resHistOutcome,
+             resFrozenBucket, outcome,
+             breakProbRollingTrialsInput
+        )
+
+        float score =
+             f_multiclassBrier(
+                 resFrozenPBreak,
+                 resFrozenPFade,
+                 resFrozenPFail,
+                 resFrozenPExpire,
+                 outcome
+             )
+
+        f_pushBrier(resBrierHist, score, breakProbRollingTrialsInput)
+
+        resActive := false
+        resFrozenLevel := na
+        resFrozenDist := na
+        resStartBar := na
+        resFrozenBucket := 0
+        resBroken := false
+        resBreakBar := na
+
+
+// --------------------------------------------------------------------------
+// RESOLVE SUPPORT TRIALS
+// --------------------------------------------------------------------------
+
+if barstate.isconfirmed and supActive
+    int age = bar_index - supStartBar
+    float lvl = supFrozenLevel
+    float dist = supFrozenDist
+    int outcome = -1
+
+    if not supBroken
+        if high >= lvl + dist
+            outcome := OUT_FADE
+        else if close < lvl
+            supBroken := true
+            supBreakBar := bar_index
+        else if age >= breakProbHorizonBarsInput
+            outcome := OUT_EXPIRE
+
+    if outcome == -1 and supBroken and bar_index > supBreakBar
+        int sinceBreak = bar_index - supBreakBar
+
+        if low <= lvl - dist
+            outcome := OUT_BREAK
+        else if close > lvl
+            outcome := OUT_FAIL
+        else if sinceBreak >= breakProbFollowBarsInput
+            outcome := OUT_FAIL
+
+    if outcome >= 0
+        f_addResolvedTrial(
+             supTrials, supBreaks, supFades, supFails,
+             supHistBucket, supHistOutcome,
+             supFrozenBucket, outcome,
+             breakProbRollingTrialsInput
+        )
+
+        float score =
+             f_multiclassBrier(
+                 supFrozenPBreak,
+                 supFrozenPFade,
+                 supFrozenPFail,
+                 supFrozenPExpire,
+                 outcome
+             )
+
+        f_pushBrier(supBrierHist, score, breakProbRollingTrialsInput)
+
+        supActive := false
+        supFrozenLevel := na
+        supFrozenDist := na
+        supStartBar := na
+        supFrozenBucket := 0
+        supBroken := false
+        supBreakBar := na
+
+
+// --------------------------------------------------------------------------
+// LIVE CALLS
+// --------------------------------------------------------------------------
+
+float resDistAtr =
+     resHasLevel and atrCoach > 0 ?
+     math.abs(selectedResistanceLevel - close) / atrCoach :
+     na
+
+float supDistAtr =
+     supHasLevel and atrCoach > 0 ?
+     math.abs(selectedSupportLevel - close) / atrCoach :
+     na
+
+[resAction, resShowContext, resShownLift, resShownZ] = f_probCall(breakProbEnableInput, resHasLevel, resGlobalTrials, resCtxTrials, resBaseTrials, resBreakLift, resFadeLift, resBreakZ, resFadeZ, resDistAtr, structureTrend == "RANGE", breakProbDisplayInput)
+
+[supAction, supShowContext, supShownLift, supShownZ] = f_probCall(breakProbEnableInput, supHasLevel, supGlobalTrials, supCtxTrials, supBaseTrials, supBreakLift, supFadeLift, supBreakZ, supFadeZ, supDistAtr, structureTrend == "RANGE", breakProbDisplayInput)
+
+float resTouchTol =
+     math.max(atrCoach * 0.25, syminfo.mintick * 4)
+
+float supTouchTol = resTouchTol
+
+bool resCountingActive =
+     resActive and
+     not na(resFrozenLevel) and
+     resHasLevel and
+     math.abs(resFrozenLevel - selectedResistanceLevel) <= resTouchTol
+
+bool supCountingActive =
+     supActive and
+     not na(supFrozenLevel) and
+     supHasLevel and
+     math.abs(supFrozenLevel - selectedSupportLevel) <= supTouchTol
+
+string resTouch =
+     resHasLevel ?
+     f_touchWord(resTouched, selectedResistanceLevel, resTouchTol, resCountingActive) :
+     "1st"
+
+string supTouch =
+     supHasLevel ?
+     f_touchWord(supTouched, selectedSupportLevel, supTouchTol, supCountingActive) :
+     "1st"
+
+bool resFocusFade =
+     resAction == "FADE BIAS" or
+     resAction == "WATCH FADE"
+
+bool supFocusFade =
+     supAction == "FADE BIAS" or
+     supAction == "WATCH FADE"
+
+float resFocusPct =
+     resFocusFade ?
+     resCtxFadePct :
+     resCtxBreakPct
+
+float resFocusBase =
+     resFocusFade ?
+     resBaseFadePct :
+     resBaseBreakPct
+
+float supFocusPct =
+     supFocusFade ?
+     supCtxFadePct :
+     supCtxBreakPct
+
+float supFocusBase =
+     supFocusFade ?
+     supBaseFadePct :
+     supBaseBreakPct
+
+string resQuality =
+     f_quality(resShowContext ? resCtxTrials : resGlobalTrials)
+
+string supQuality =
+     f_quality(supShowContext ? supCtxTrials : supGlobalTrials)
+
+float resBrier =
+     array.size(resBrierHist) > 0 ?
+     array.avg(resBrierHist) :
+     na
+
+float supBrier =
+     array.size(supBrierHist) > 0 ?
+     array.avg(supBrierHist) :
+     na
+
+// Simple, one-line, always-live label: just the level, a call word (BREAK/
+// FADE) when the model has a confident context call, and its percent --
+// no source name, ATR distance, touch count, LOO/lift/z stats, quality
+// tag, or Brier score. Still recalculates and redraws every bar.
+string resCallWord = resFocusFade ? "FADE" : "BREAK"
+string supCallWord = supFocusFade ? "FADE" : "BREAK"
+
+string resDisplayText =
+     "PDH " + str.tostring(selectedResistanceLevel, format.mintick) + " ・" +
+     (resShowContext ? resCallWord + " " + str.tostring(resFocusPct, "#") + "%" : resAction)
+
+string supDisplayText =
+     "PDL " + str.tostring(selectedSupportLevel, format.mintick) + " ・" +
+     (supShowContext ? supCallWord + " " + str.tostring(supFocusPct, "#") + "%" : supAction)
+
+color resLabelColor =
+     resAction == "BREAK BIAS" or resAction == "WATCH BREAK" ?
+     color.new(srResistanceColorInput, 0) :
+     resAction == "FADE BIAS" or resAction == "WATCH FADE" ?
+     color.new(color.orange, 0) :
+     color.new(color.gray, 25)
+
+color supLabelColor =
+     supAction == "FADE BIAS" or supAction == "WATCH FADE" ?
+     color.new(srSupportColorInput, 0) :
+     supAction == "BREAK BIAS" or supAction == "WATCH BREAK" ?
+     color.new(color.orange, 0) :
+     color.new(color.gray, 25)
+
+var label resProbLabel = na
+var label supProbLabel = na
+
+if barstate.islast
+    if breakProbEnableInput and breakProbShowLabelsInput and resHasLevel
+        if na(resProbLabel)
+            resProbLabel := label.new(
+                 bar_index + breakProbResLabelOffsetInput,
+                 selectedResistanceLevel,
+                 resDisplayText,
+                 style = label.style_label_left,
+                 color = resLabelColor,
+                 textcolor = color.white,
+                 size = f_labelTextSize(breakProbLabelSizeInput)
+            )
+        else
+            label.set_xy(
+                 resProbLabel,
+                 bar_index + breakProbResLabelOffsetInput,
+                 selectedResistanceLevel
+            )
+            label.set_text(resProbLabel, resDisplayText)
+            label.set_color(resProbLabel, resLabelColor)
+            label.set_size(resProbLabel, f_labelTextSize(breakProbLabelSizeInput))
+    else if not na(resProbLabel)
+        label.delete(resProbLabel)
+        resProbLabel := na
+
+    if breakProbEnableInput and breakProbShowLabelsInput and supHasLevel
+        if na(supProbLabel)
+            supProbLabel := label.new(
+                 bar_index + breakProbSupLabelOffsetInput,
+                 selectedSupportLevel,
+                 supDisplayText,
+                 style = label.style_label_left,
+                 color = supLabelColor,
+                 textcolor = color.white,
+                 size = f_labelTextSize(breakProbLabelSizeInput)
+            )
+        else
+            label.set_xy(
+                 supProbLabel,
+                 bar_index + breakProbSupLabelOffsetInput,
+                 selectedSupportLevel
+            )
+            label.set_text(supProbLabel, supDisplayText)
+            label.set_color(supProbLabel, supLabelColor)
+            label.set_size(supProbLabel, f_labelTextSize(breakProbLabelSizeInput))
+    else if not na(supProbLabel)
+        label.delete(supProbLabel)
+        supProbLabel := na
+
+
+// ============================================================================
+// ENTRY GATES
+// ============================================================================
+
+bool longStructureOk = structureTrend == "UP"
+bool shortStructureOk = structureTrend == "DOWN"
+
+bool momentumOkLong =
+     not requireMomentumInput or
+     tdiConfirmsLong
+
+bool momentumOkShort =
+     not requireMomentumInput or
+     tdiConfirmsShort
+
+bool sessionOkForLong =
+     not requireFavorableSessionInput or
+     sessionFavorable
+
+bool sessionOkForShort =
+     not requireFavorableSessionInput or
+     sessionFavorable
+
+var int lastLongSetupBar = na
+var int lastShortSetupBar = na
+
+bool longCooldownOk =
+     na(lastLongSetupBar) or
+     bar_index - lastLongSetupBar > cooldownBarsInput
+
+bool shortCooldownOk =
+     na(lastShortSetupBar) or
+     bar_index - lastShortSetupBar > cooldownBarsInput
+
+bool longSetupNow =
+     barstate.isconfirmed and
+     longSignalNow and
+     longStructureOk and
+     momentumOkLong and
+     pressureOkLong and
+     sessionOkForLong and
+     longCooldownOk
+
+bool shortSetupNow =
+     barstate.isconfirmed and
+     shortSignalNow and
+     shortStructureOk and
+     momentumOkShort and
+     pressureOkShort and
+     sessionOkForShort and
+     shortCooldownOk
+
+if longSetupNow
+    lastLongSetupBar := bar_index
+
+if shortSetupNow
+    lastShortSetupBar := bar_index
+
+
+// ============================================================================
+// ZONE CONFLUENCE + SETUP GRADE
+// ============================================================================
+
+f_nearZone(float price, float level, bool broken) =>
+    not broken and
+     not na(level) and
+     math.abs(price - level) <= zoneToleranceAtrInput * atrCoach
+
+f_nearBrokenZone(float price, float level, bool broken) =>
+    broken and
+     not na(level) and
+     math.abs(price - level) <= zoneToleranceAtrInput * atrCoach
+
+bool longZoneConfluenceOriginal =
+     f_nearZone(close, asiaLow, asiaLowBroken) or
+     f_nearZone(close, londonLow, londonLowBroken) or
+     f_nearZone(close, nyLow, nyLowBroken)
+
+bool shortZoneConfluenceOriginal =
+     f_nearZone(close, asiaHigh, asiaHighBroken) or
+     f_nearZone(close, londonHigh, londonHighBroken) or
+     f_nearZone(close, nyHigh, nyHighBroken)
+
+bool longZoneConfluenceReversed =
+     f_nearBrokenZone(close, asiaHigh, asiaHighBroken) or
+     f_nearBrokenZone(close, londonHigh, londonHighBroken) or
+     f_nearBrokenZone(close, nyHigh, nyHighBroken)
+
+bool shortZoneConfluenceReversed =
+     f_nearBrokenZone(close, asiaLow, asiaLowBroken) or
+     f_nearBrokenZone(close, londonLow, londonLowBroken) or
+     f_nearBrokenZone(close, nyLow, nyLowBroken)
+
+bool longZoneConfluence =
+     longZoneConfluenceOriginal or
+     longZoneConfluenceReversed
+
+bool shortZoneConfluence =
+     shortZoneConfluenceOriginal or
+     shortZoneConfluenceReversed
+
+bool longPressureBonus =
+     executionDeltaPressure >= minimumVolumePressureInput
+
+bool shortPressureBonus =
+     executionDeltaPressure <= -minimumVolumePressureInput
+
+bool longZscoreBonus = zscoreOversold
+bool shortZscoreBonus = zscoreOverbought
+
+int longBonusPoints =
+     (longZoneConfluence ? 1 : 0) +
+     (longPressureBonus ? 1 : 0) +
+     (longZscoreBonus ? 1 : 0)
+
+int shortBonusPoints =
+     (shortZoneConfluence ? 1 : 0) +
+     (shortPressureBonus ? 1 : 0) +
+     (shortZscoreBonus ? 1 : 0)
+
+string longSetupGrade =
+     longBonusPoints >= 3 ? "A" :
+     longBonusPoints >= 1 ? "B" : "C"
+
+string shortSetupGrade =
+     shortBonusPoints >= 3 ? "A" :
+     shortBonusPoints >= 1 ? "B" : "C"
+
+
+// ============================================================================
+// 06 - RISK MANAGEMENT
+// ============================================================================
+
+string G_RISK = "06 - Risk Management"
+
+accountSizeInput =
+     input.float(10000.0, "Account Size ($)", minval = 0.0, group = G_RISK)
+
+riskPercentInput =
+     input.float(
+         1.0, "Risk Per Trade (%)",
+         minval = 0.0, maxval = 100.0, step = 0.1, group = G_RISK
+     )
+
+pointValueInput =
+     input.float(
+         2.0, "Dollar Value Per Point",
+         minval = 0.0, group = G_RISK
+     )
+
+stopBufferAtrMultInput =
+     input.float(
+         0.15, "Stop Buffer Beyond Broken Level (x ATR)",
+         minval = 0.0, maxval = 1.0, step = 0.05, group = G_RISK
+     )
+
+rMultipleInput =
+     input.float(
+         2.0, "Target R-Multiple",
+         minval = 0.5, maxval = 10.0, step = 0.5, group = G_RISK
+     )
+
+maximumEntryRiskAtrInput =
+     input.float(
+         1.5, "Maximum Entry Risk (x ATR)",
+         minval = 0.25, maxval = 5.0, step = 0.05, group = G_RISK
+     )
+
+float longStopPrice = na
+float longTargetPrice = na
+float longRiskPerUnit = na
+float longRiskAtr = na
+bool longRiskOk = false
+
+float shortStopPrice = na
+float shortTargetPrice = na
+float shortRiskPerUnit = na
+float shortRiskAtr = na
+bool shortRiskOk = false
+
+// For breakout entries, the broken resistance/support itself is the natural
+// structural stop reference. Explicit side checks prevent an invalid stop.
+float longStopAnchor = lsrHighUsePivot
+float shortStopAnchor = lsrLowUsePivot
+
+if longSetupNow and not na(longStopAnchor)
+    float candidateStop =
+         longStopAnchor -
+         stopBufferAtrMultInput * atrCoach
+
+    if candidateStop < close
+        longStopPrice := candidateStop
+        longRiskPerUnit := close - longStopPrice
+        longRiskAtr := longRiskPerUnit / atrCoach
+        longRiskOk :=
+             longRiskPerUnit > 0 and
+             longRiskAtr <= maximumEntryRiskAtrInput
+        longTargetPrice :=
+             close + longRiskPerUnit * rMultipleInput
+
+if shortSetupNow and not na(shortStopAnchor)
+    float candidateStop =
+         shortStopAnchor +
+         stopBufferAtrMultInput * atrCoach
+
+    if candidateStop > close
+        shortStopPrice := candidateStop
+        shortRiskPerUnit := shortStopPrice - close
+        shortRiskAtr := shortRiskPerUnit / atrCoach
+        shortRiskOk :=
+             shortRiskPerUnit > 0 and
+             shortRiskAtr <= maximumEntryRiskAtrInput
+        shortTargetPrice :=
+             close - shortRiskPerUnit * rMultipleInput
+
+float riskDollars =
+     accountSizeInput * riskPercentInput / 100.0
+
+f_suggestedSize(float riskPerUnit) =>
+    float riskPerContract =
+         riskPerUnit * pointValueInput
+
+    riskPerContract > 0 ?
+         riskDollars / riskPerContract :
+         na
+
+float longSuggestedSize =
+     longSetupNow ?
+     f_suggestedSize(longRiskPerUnit) :
+     na
+
+float shortSuggestedSize =
+     shortSetupNow ?
+     f_suggestedSize(shortRiskPerUnit) :
+     na
+
+bool actualLongSignal =
+     longSetupNow and
+     longRiskOk
+
+bool actualShortSignal =
+     shortSetupNow and
+     shortRiskOk
+
+
+// ============================================================================
+// 07 - ACTUAL TRADE OUTCOME TRACKING
+// ============================================================================
+
+string G_OUTCOME = "07 - Outcome Tracking"
+
+showOutcomeTrackerInput =
+     input.bool(true, "Show Outcome Tracker Table", group = G_OUTCOME)
+
+outcomeHorizonBarsInput =
+     input.int(
+         20, "Outcome Tracking Horizon (Bars)",
+         minval = 1, maxval = 500, group = G_OUTCOME
+     )
+
+outcomeTablePositionInput =
+     input.string(
+         "Bottom Right",
+         "Outcome Table Position",
+         options = [
+             "Top Left", "Top Center", "Top Right",
+             "Middle Left", "Middle Center", "Middle Right",
+             "Bottom Left", "Bottom Center", "Bottom Right"
+         ],
+         group = G_OUTCOME
+     )
+
+outcomeTableSizeInput =
+     input.string(
+         "Small",
+         "Outcome Table Text Size",
+         options = ["Tiny", "Small", "Normal", "Large"],
+         group = G_OUTCOME
+     )
+
+var array<bool> pendingIsLong = array.new_bool()
+var array<int> pendingEntryBar = array.new_int()
+var array<float> pendingTargetPrice = array.new_float()
+var array<float> pendingStopPrice = array.new_float()
+var array<float> pendingEntryPrice = array.new_float()
+
+var int longWins = 0
+var int longLosses = 0
+var int longExpired = 0
+
+var int shortWins = 0
+var int shortLosses = 0
+var int shortExpired = 0
+
+var int totalSetupsRegistered = 0
+
+if actualLongSignal
+    array.push(pendingIsLong, true)
+    array.push(pendingEntryBar, bar_index)
+    array.push(pendingTargetPrice, longTargetPrice)
+    array.push(pendingStopPrice, longStopPrice)
+    array.push(pendingEntryPrice, close)
+    totalSetupsRegistered += 1
+
+if actualShortSignal
+    array.push(pendingIsLong, false)
+    array.push(pendingEntryBar, bar_index)
+    array.push(pendingTargetPrice, shortTargetPrice)
+    array.push(pendingStopPrice, shortStopPrice)
+    array.push(pendingEntryPrice, close)
+    totalSetupsRegistered += 1
+
+if array.size(pendingEntryBar) > 0
+    for i = array.size(pendingEntryBar) - 1 to 0
+        bool isLongPending = array.get(pendingIsLong, i)
+        float targetPending = array.get(pendingTargetPrice, i)
+        float stopPending = array.get(pendingStopPrice, i)
+        int entryBarPending = array.get(pendingEntryBar, i)
+
+        // A close-confirmed entry exists only AFTER its signal bar closes.
+        // Never let that same bar's earlier high/low resolve the trade.
+        bool eligibleForResolution =
+             bar_index > entryBarPending
+
+        bool hitTarget =
+             eligibleForResolution and
+             (
+                 isLongPending ?
+                 high >= targetPending :
+                 low <= targetPending
+             )
+
+        bool hitStop =
+             eligibleForResolution and
+             (
+                 isLongPending ?
+                 low <= stopPending :
+                 high >= stopPending
+             )
+
+        bool expiredNow =
+             bar_index - entryBarPending >= outcomeHorizonBarsInput
+
+        bool resolvedNow = false
+        bool wasWin = false
+
+        if hitTarget and hitStop
+            // OHLC cannot identify which happened first. Conservative loss.
+            resolvedNow := true
+            wasWin := false
+        else if hitTarget
+            resolvedNow := true
+            wasWin := true
+        else if hitStop
+            resolvedNow := true
+            wasWin := false
+
+        if resolvedNow
+            if isLongPending
+                if wasWin
+                    longWins += 1
+                else
+                    longLosses += 1
+            else
+                if wasWin
+                    shortWins += 1
+                else
+                    shortLosses += 1
+
+            array.remove(pendingIsLong, i)
+            array.remove(pendingEntryBar, i)
+            array.remove(pendingTargetPrice, i)
+            array.remove(pendingStopPrice, i)
+            array.remove(pendingEntryPrice, i)
+
+        else if expiredNow
+            if isLongPending
+                longExpired += 1
+            else
+                shortExpired += 1
+
+            array.remove(pendingIsLong, i)
+            array.remove(pendingEntryBar, i)
+            array.remove(pendingTargetPrice, i)
+            array.remove(pendingStopPrice, i)
+            array.remove(pendingEntryPrice, i)
+
+var table outcomeTable =
+     table.new(
+         f_tablePosition(outcomeTablePositionInput),
+         4, 4,
+         bgcolor = color.new(color.rgb(15, 20, 27), 10),
+         border_width = 1
+     )
+
+if barstate.islast and showOutcomeTrackerInput
+    outcomeTextSize = f_tableTextSize(outcomeTableSizeInput)
+
+    table.cell(outcomeTable, 0, 0, "OUTCOMES",
+         text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = outcomeTextSize)
+
+    table.cell(outcomeTable, 1, 0, "W",
+         text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = outcomeTextSize)
+
+    table.cell(outcomeTable, 2, 0, "L",
+         text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = outcomeTextSize)
+
+    table.cell(outcomeTable, 3, 0, "EXP",
+         text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 1, "LONG", text_color = color.aqua, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 1, 1, str.tostring(longWins), text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 2, 1, str.tostring(longLosses), text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 3, 1, str.tostring(longExpired), text_color = color.white, text_size = outcomeTextSize)
+
+    table.cell(outcomeTable, 0, 2, "SHORT", text_color = color.orange, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 1, 2, str.tostring(shortWins), text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 2, 2, str.tostring(shortLosses), text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 3, 2, str.tostring(shortExpired), text_color = color.white, text_size = outcomeTextSize)
+
+    int totalResolved =
+         longWins + longLosses +
+         shortWins + shortLosses
+
+    float totalWinRate =
+         totalResolved > 0 ?
+         (longWins + shortWins) * 100.0 / totalResolved :
+         na
+
+    table.cell(outcomeTable, 0, 3, "WIN RATE", text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 1, 3,
+         na(totalWinRate) ? "--" : str.tostring(totalWinRate, "#.0") + "%",
+         text_color = color.white, text_size = outcomeTextSize)
+
+    table.cell(outcomeTable, 2, 3, "N", text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 3, 3, str.tostring(totalSetupsRegistered),
+         text_color = color.white, text_size = outcomeTextSize)
+
+
+// ============================================================================
+// 08 - VISUALS
+// ============================================================================
+
+string G_VISUALS = "08 - Visuals"
+
+showEntryMarkersInput =
+     input.bool(true, "Show Entry Markers", group = G_VISUALS)
+
+longColorInput =
+     input.color(color.aqua, "Long Color", group = G_VISUALS)
+
+shortColorInput =
+     input.color(color.orange, "Short Color", group = G_VISUALS)
+
+plotshape(
+     showEntryMarkersInput and actualLongSignal,
+     title = "Long Setup",
+     style = shape.triangleup,
+     location = location.belowbar,
+     size = size.small,
+     color = longColorInput,
+     text = "LONG",
+     textcolor = color.white
+)
+
+plotshape(
+     showEntryMarkersInput and actualShortSignal,
+     title = "Short Setup",
+     style = shape.triangledown,
+     location = location.abovebar,
+     size = size.small,
+     color = shortColorInput,
+     text = "SHORT",
+     textcolor = color.white
+)
+
+alertcondition(
+     actualLongSignal,
+     title = "Trading Coach: Long Setup",
+     message = "Trading Coach LONG setup -- {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     actualShortSignal,
+     title = "Trading Coach: Short Setup",
+     message = "Trading Coach SHORT setup -- {{ticker}} {{interval}} @ {{close}}"
+)
+
+
+// ============================================================================
+// 09 - COACHING DASHBOARD
+// ============================================================================
+
+string G_DASH = "09 - Dashboard"
+
+showDashboardInput =
+     input.bool(true, "Show Coaching Dashboard", group = G_DASH)
+
+dashboardPositionInput =
+     input.string(
+         "Top Right",
+         "Dashboard Position",
+         options = [
+             "Top Left", "Top Center", "Top Right",
+             "Middle Left", "Middle Center", "Middle Right",
+             "Bottom Left", "Bottom Center", "Bottom Right"
+         ],
+         group = G_DASH
+     )
+
+dashboardSizeInput =
+     input.string(
+         "Small",
+         "Dashboard Text Size",
+         options = ["Tiny", "Small", "Normal", "Large"],
+         group = G_DASH
+     )
+
+string sessionProfileText =
+     activeSessionLabel + " -- " + dayProfile +
+     (dayShowsManipulation ? " (!)" : "")
+
+color sessionProfileColor =
+     dayShowsManipulation ?
+     color.orange :
+     sessionFavorable ?
+     color.aqua :
+     color.gray
+
+string coachResRefText =
+     na(selectedResistanceLevel) ?
+     "no valid resistance" :
+     str.tostring(selectedResistanceLevel, format.mintick) +
+     " " + selectedResistanceSource
+
+string coachSupRefText =
+     na(selectedSupportLevel) ?
+     "no valid support" :
+     str.tostring(selectedSupportLevel, format.mintick) +
+     " " + selectedSupportSource
+
+string coachMessage =
+     structureTrend == "RANGE" ?
+     "Structure ranging -- wait for clearer structure" :
+
+     structureTrend == "UP" and not longSignalNow ?
+     "Uptrend -- RES " + coachResRefText + " | " + resAction :
+
+     structureTrend == "UP" and longSignalNow and not momentumOkLong ?
+     "S/R break fired -- waiting for momentum confirmation" :
+
+     structureTrend == "UP" and longSignalNow and momentumOkLong and not pressureOkLong ?
+     "Momentum confirms -- waiting for volume pressure" :
+
+     structureTrend == "UP" and longSignalNow and momentumOkLong and pressureOkLong and not sessionOkForLong ?
+     "Setup ready -- outside favorable session" :
+
+     structureTrend == "UP" and longSignalNow and momentumOkLong and pressureOkLong and sessionOkForLong and not longCooldownOk ?
+     "Setup ready -- long cooldown active" :
+
+     actualLongSignal ?
+     "LONG SETUP ACTIVE [Grade " + longSetupGrade + "]" :
+
+     structureTrend == "DOWN" and not shortSignalNow ?
+     "Downtrend -- SUP " + coachSupRefText + " | " + supAction :
+
+     structureTrend == "DOWN" and shortSignalNow and not momentumOkShort ?
+     "S/R break fired -- waiting for momentum confirmation" :
+
+     structureTrend == "DOWN" and shortSignalNow and momentumOkShort and not pressureOkShort ?
+     "Momentum confirms -- waiting for volume pressure" :
+
+     structureTrend == "DOWN" and shortSignalNow and momentumOkShort and pressureOkShort and not sessionOkForShort ?
+     "Setup ready -- outside favorable session" :
+
+     structureTrend == "DOWN" and shortSignalNow and momentumOkShort and pressureOkShort and sessionOkForShort and not shortCooldownOk ?
+     "Setup ready -- short cooldown active" :
+
+     actualShortSignal ?
+     "SHORT SETUP ACTIVE [Grade " + shortSetupGrade + "]" :
+
+     "No clear setup forming"
+
+var table coachTable =
+     table.new(
+         f_tablePosition(dashboardPositionInput),
+         2, 12,
+         bgcolor = color.new(color.rgb(15, 20, 27), 10),
+         border_width = 1
+     )
+
+if barstate.islast and showDashboardInput
+    dashTextSize = f_tableTextSize(dashboardSizeInput)
+
+    table.cell(coachTable, 0, 0, "TRADING COACH",
+         text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = dashTextSize)
+
+    table.cell(coachTable, 1, 0, syminfo.ticker + " " + timeframe.period,
+         text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 1, "Coach Observation",
+         text_color = color.yellow, text_size = dashTextSize)
+
+    table.cell(coachTable, 1, 1, coachMessage,
+         text_color = actualLongSignal or actualShortSignal ? color.white : color.yellow,
+         text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 2, "Session Profile",
+         text_color = color.white, text_size = dashTextSize)
+
+    table.cell(coachTable, 1, 2, sessionProfileText,
+         text_color = sessionProfileColor, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 3, "Structure",
+         text_color = color.white, text_size = dashTextSize)
+
+    table.cell(coachTable, 1, 3, structureTrend,
+         text_color = structureTrend == "UP" ? longColorInput :
+              structureTrend == "DOWN" ? shortColorInput : color.gray,
+         text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 4, "Volume Pressure",
+         text_color = color.white, text_size = dashTextSize)
+
+    table.cell(coachTable, 1, 4, str.tostring(executionDeltaPressure, "#.0") + "%",
+         text_color = executionDeltaPressure >= 0 ? longColorInput : shortColorInput,
+         text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 5, "Momentum",
+         text_color = color.white, text_size = dashTextSize)
+
+    table.cell(coachTable, 1, 5,
+         tdiConfirmsLong ? "BULLISH" :
+         tdiConfirmsShort ? "BEARISH" :
+         "NEUTRAL",
+         text_color = tdiConfirmsLong ? longColorInput :
+              tdiConfirmsShort ? shortColorInput : color.gray,
+         text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 6, "Zone Broken",
+         text_color = color.white, text_size = dashTextSize)
+
+    table.cell(coachTable, 1, 6, str.tostring(zonesBrokenCount) + " / 6",
+         text_color = zonesBrokenCount > 0 ? color.orange : color.gray,
+         text_size = dashTextSize)
+
+    string dashRes =
+         na(selectedResistanceLevel) ?
+         "--" :
+         str.tostring(selectedResistanceLevel, format.mintick) +
+         " | " + selectedResistanceSource +
+         " | " + resAction
+
+    string dashSup =
+         na(selectedSupportLevel) ?
+         "--" :
+         str.tostring(selectedSupportLevel, format.mintick) +
+         " | " + selectedSupportSource +
+         " | " + supAction
+
+    table.cell(coachTable, 0, 7, "Resistance",
+         text_color = color.white, text_size = dashTextSize)
+
+    table.cell(coachTable, 1, 7, dashRes,
+         text_color = srResistanceColorInput, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 8, "Support",
+         text_color = color.white, text_size = dashTextSize)
+
+    table.cell(coachTable, 1, 8, dashSup,
+         text_color = srSupportColorInput, text_size = dashTextSize)
+
+    table.cell(coachTable, 0, 9, "Sweep First (Dist)",
+         text_color = color.white, text_size = dashTextSize)
+
+    table.cell(
+         coachTable, 1, 9,
+         sweepFirstText,
+         text_color = sweptPdhToday or sweptPdlToday ? color.orange : color.white,
+         text_size = dashTextSize
+    )
+
+    table.cell(coachTable, 0, 10, "Reaction Model",
+         text_color = color.white, text_size = dashTextSize)
+
+    table.cell(
+         coachTable, 1, 10,
+         "RES n=" + str.tostring(resGlobalTrials) +
+         " | SUP n=" + str.tostring(supGlobalTrials),
+         text_color = color.white,
+         text_size = dashTextSize
+    )
+
+    table.cell(coachTable, 0, 11, "Calibration",
+         text_color = color.white, text_size = dashTextSize)
+
+    table.cell(
+         coachTable, 1, 11,
+         "Brier R " + (na(resBrier) ? "--" : str.tostring(resBrier, "#.000")) +
+         " | S " + (na(supBrier) ? "--" : str.tostring(supBrier, "#.000")),
+         text_color = color.white,
+         text_size = dashTextSize
+    )
+
+
+// ============================================================================
+// 10 - ENTRY FUNNEL DIAGNOSTICS
+// ============================================================================
+
+string G_FUNNEL = "10 - Entry Funnel Diagnostics"
+
+showFunnelInput =
+     input.bool(
+         false, "Show Entry Funnel Diagnostics Table",
+         tooltip = "Debug table. Off by default.",
+         group = G_FUNNEL
+     )
+
+funnelTablePositionInput =
+     input.string(
+         "Bottom Left",
+         "Funnel Table Position",
+         options = [
+             "Top Left", "Top Center", "Top Right",
+             "Middle Left", "Middle Center", "Middle Right",
+             "Bottom Left", "Bottom Center", "Bottom Right"
+         ],
+         group = G_FUNNEL
+     )
+
+funnelTableSizeInput =
+     input.string(
+         "Tiny",
+         "Funnel Table Text Size",
+         options = ["Tiny", "Small", "Normal", "Large"],
+         group = G_FUNNEL
+     )
+
+var array<int> fLong = array.new_int(8, 0)
+var array<int> fShort = array.new_int(8, 0)
+
+f_incrFunnel(
+     array<int> counts,
+     bool structureOk,
+     bool signalOk,
+     bool momentumOk,
+     bool pressureOk,
+     bool sessionOk,
+     bool cooldownOk,
+     bool riskOk
+) =>
+    array.set(counts, 0, array.get(counts, 0) + 1)
+
+    if structureOk
+        array.set(counts, 1, array.get(counts, 1) + 1)
+
+        if signalOk
+            array.set(counts, 2, array.get(counts, 2) + 1)
+
+            if momentumOk
+                array.set(counts, 3, array.get(counts, 3) + 1)
+
+                if pressureOk
+                    array.set(counts, 4, array.get(counts, 4) + 1)
+
+                    if sessionOk
+                        array.set(counts, 5, array.get(counts, 5) + 1)
+
+                        if cooldownOk
+                            array.set(counts, 6, array.get(counts, 6) + 1)
+
+                            if riskOk
+                                array.set(counts, 7, array.get(counts, 7) + 1)
+
+    true
+
+if barstate.isconfirmed
+    f_incrFunnel(
+         fLong,
+         longStructureOk,
+         longSignalNow,
+         momentumOkLong,
+         pressureOkLong,
+         sessionOkForLong,
+         longCooldownOk,
+         longRiskOk
+    )
+
+    f_incrFunnel(
+         fShort,
+         shortStructureOk,
+         shortSignalNow,
+         momentumOkShort,
+         pressureOkShort,
+         sessionOkForShort,
+         shortCooldownOk,
+         shortRiskOk
+    )
+
+var table funnelTable =
+     table.new(
+         f_tablePosition(funnelTablePositionInput),
+         3, 9,
+         bgcolor = color.new(color.rgb(15, 20, 27), 10),
+         border_width = 1
+     )
+
+if barstate.islast and showFunnelInput
+    funnelTextSize = f_tableTextSize(funnelTableSizeInput)
+
+    array<string> funnelLabels =
+         array.from(
+             "ENTRY FUNNEL",
+             "Bars Evaluated",
+             "+ Structure",
+             "+ Signal",
+             "+ Momentum",
+             "+ Pressure",
+             "+ Session",
+             "+ Cooldown",
+             "+ Risk OK"
+         )
+
+    for row = 0 to 8
+        table.cell(
+             funnelTable,
+             0, row,
+             array.get(funnelLabels, row),
+             text_color = color.white,
+             bgcolor = row == 0 ? color.rgb(22, 52, 86) : na,
+             text_size = funnelTextSize
+        )
+
+    table.cell(funnelTable, 1, 0, "LONG",
+         text_color = longColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
+
+    table.cell(funnelTable, 2, 0, "SHORT",
+         text_color = shortColorInput, bgcolor = color.rgb(22, 52, 86), text_size = funnelTextSize)
+
+    for row = 1 to 8
+        table.cell(funnelTable, 1, row, str.tostring(array.get(fLong, row - 1)),
+             text_color = color.gray, text_size = funnelTextSize)
+
+        table.cell(funnelTable, 2, row, str.tostring(array.get(fShort, row - 1)),
+             text_color = color.gray, text_size = funnelTextSize)
+
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+
+plot(
+     structureTrend == "UP" ? 1 :
+     structureTrend == "DOWN" ? -1 : 0,
+     title = "Structure Trend",
+     display = display.data_window
+)
+
+plot(atrCoach, title = "ATR", display = display.data_window)
+plot(executionDeltaPressure, title = "Execution Pressure %", display = display.data_window)
+plot(zScore, title = "Z-Score", display = display.data_window)
+
+plot(actualLongSignal ? 1 : 0, title = "Actual Long Signal", display = display.data_window)
+plot(actualShortSignal ? 1 : 0, title = "Actual Short Signal", display = display.data_window)
+
+plot(lsrHighUsePivot, title = "Resistance Step-Line", display = display.data_window)
+plot(lsrLowUsePivot, title = "Support Step-Line", display = display.data_window)
+
+plot(selectedResistanceLevel, title = "Selected Probability Resistance", display = display.data_window)
+plot(selectedSupportLevel, title = "Selected Probability Support", display = display.data_window)
+
+plot(lsrOsc, title = "Volume Oscillator %", display = display.data_window)
+
+plot(resCtxBreakPct, title = "RES Context Break %", display = display.data_window)
+plot(resCtxFadePct, title = "RES Context Fade %", display = display.data_window)
+plot(resCtxFailPct, title = "RES Context Fail %", display = display.data_window)
+plot(resCtxExpirePct, title = "RES Context Expire %", display = display.data_window)
+
+plot(supCtxBreakPct, title = "SUP Context Break %", display = display.data_window)
+plot(supCtxFadePct, title = "SUP Context Fade %", display = display.data_window)
+plot(supCtxFailPct, title = "SUP Context Fail %", display = display.data_window)
+plot(supCtxExpirePct, title = "SUP Context Expire %", display = display.data_window)
+
+plot(resBreakLift, title = "RES Break Lift pp", display = display.data_window)
+plot(resFadeLift, title = "RES Fade Lift pp", display = display.data_window)
+plot(supBreakLift, title = "SUP Break Lift pp", display = display.data_window)
+plot(supFadeLift, title = "SUP Fade Lift pp", display = display.data_window)
+
+plot(resBreakZ, title = "RES Break Edge Z", display = display.data_window)
+plot(resFadeZ, title = "RES Fade Edge Z", display = display.data_window)
+plot(supBreakZ, title = "SUP Break Edge Z", display = display.data_window)
+plot(supFadeZ, title = "SUP Fade Edge Z", display = display.data_window)
+
+plot(resCtxTrials, title = "RES Context Sample", display = display.data_window)
+plot(supCtxTrials, title = "SUP Context Sample", display = display.data_window)
+plot(resGlobalTrials, title = "RES Rolling Global Sample", display = display.data_window)
+plot(supGlobalTrials, title = "SUP Rolling Global Sample", display = display.data_window)
+
+plot(resBrier, title = "RES Rolling Multiclass Brier", display = display.data_window)
+plot(supBrier, title = "SUP Rolling Multiclass Brier", display = display.data_window)
+
+plot(prevDayHigh, title = "Prior Day High", display = display.data_window)
+plot(prevDayLow, title = "Prior Day Low", display = display.data_window)
+
+plot(sweptPdhToday ? 1 : 0, title = "PDH Swept", display = display.data_window)
+plot(sweptPdlToday ? 1 : 0, title = "PDL Swept", display = display.data_window)
+
+plot(pdhSweepRate, title = "PDH Sweep Rate %", display = display.data_window)
+plot(pdlSweepRate, title = "PDL Sweep Rate %", display = display.data_window)

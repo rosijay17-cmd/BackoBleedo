@@ -1,0 +1,2091 @@
+//@version=6
+indicator(
+     "Session Profile + Trading Coach Merged",
+     shorttitle = "Session Coach",
+     overlay = true,
+     max_boxes_count = 200,
+     max_lines_count = 200,
+     max_labels_count = 300
+)
+import TradingView/ta/14 as tvta
+
+// ============================================================================
+// SESSION PROFILE + TRADING COACH -- MERGED
+// ----------------------------------------------------------------------------
+// Combines Advanced_Session_Profile_Predictor_SR_OR.pine (session tracking,
+// Profil 1-4 prediction, the 4-state SHORT/LONG labels, ChartPrime SR boxes,
+// TDI, per-profile outcome tracker) and Trading_Coach.pine (PDH/PDL sweep
+// tracking, Market Structure HTF trend, Lux-style S/R breakout entry setup,
+// the PDH/PDL Reaction Probability engine, risk management, long/short
+// outcome tracker, entry funnel diagnostics) into one script, per request.
+//
+// DROPPED as genuinely redundant/identical between the two source scripts
+// (not merely similar -- literally the same computation done twice):
+//   - Session in/out + per-session open/close/high/low tracking. Both
+//     scripts already used the same fixed pattern (3 independent `if`
+//     blocks, absolute time capture). Kept once, under Session Profile's
+//     names (asiaHigh/asiaLow/... etc) -- Trading Coach's downstream code
+//     used the exact same names already, so nothing needed rewiring.
+//   - Day-reset flag (newDayCoach vs newDay) -- kept once as newDay.
+//   - TDI + Momentum (RSI/band/fast-MA/momentum formula) -- identical in
+//     both. Kept once (Session Profile's version, which also has the
+//     tdiSlowMa signal line).
+//   - Trading Coach's own "Day Profile" classification (dayProfile:
+//     Trend Continuation / NY Manipulation / London+NY Manipulation /
+//     Consolidation+Continuation / No Clear Profile) is the SAME
+//     classification as Session Profile's own Profil 1-4 system, just
+//     under different names/language. Dropped entirely -- nextProfile is
+//     the one source of truth. (It was only ever consumed by Trading
+//     Coach's own Coaching Dashboard, which is excluded below anyway.)
+//
+// EXCLUDED per explicit request: Trading Coach's own "Coaching Dashboard"
+// table. In its place: a new "CP / Regime" status table (4H Bias, 1H
+// Trend, CP Trend, CUSUM sPos/sNeg, Bars In Regime, Retest, Pressure,
+// Buyers/Sellers, Chart TF) ported from the DBR Change-Point engine
+// (delta_break_retest/Stage9_ChangePointVolumePressure.pine, same engine
+// already proven in P0_Delta_DBR_ChangePoint_Merged_Strategy.pine) --
+// neither source script computed this, so the whole CUSUM change-point /
+// 4H Bias / 1H Trend / Retest state machine is newly ported in. This
+// stays a plain indicator (no strategy/broker here), so the Position /
+// Cooldown / Broker Trades rows from the original 13-row table are left
+// out -- there is no live position or cooldown state without a strategy.
+// Buyers/Sellers % is computed from the real LTF up/down volume already
+// pulled for Trading Coach's own Volume Pressure section (more accurate
+// than the original OHLC-candle-body delta estimate, and reuses the same
+// request instead of adding a second one). Pressure (the dashboard row)
+// reuses that same executionDeltaPressure for the same reason.
+//
+// NEW:
+//   - "Show All Chart Objects" master switch (section 00) -- ANDed into
+//     every draw call (plots, labels, lines, boxes, tables) so everything
+//     drawn on the chart can be hidden at once. Never affects Data Window
+//     plots, which don't draw on the chart itself.
+//   - Label-size inputs defaulted to Tiny throughout, for phone screens.
+//   - alertcondition()s across every distinct setup concept in the file,
+//     worded to this repo's BULL/BEAR | LONG ENTRY/SHORT ENTRY convention.
+// ============================================================================
+
+
+// ============================================================================
+// 00 - MASTER VISIBILITY
+// ============================================================================
+
+string G_MASTER = "00 - Master Visibility"
+
+bool showAllChartObjectsInput = input.bool(true, "Show All Chart Objects", tooltip = "Master switch for everything this script draws ON THE CHART PANE -- session boxes/lines/labels, PDH/PDL, SR boxes, SHORT/LONG labels, reaction-probability labels, entry markers, the CP/Regime status table, and both outcome trackers. Does NOT affect Data Window plots.", group = G_MASTER)
+
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+f_tablePosition(string label) =>
+    switch label
+        "Top Left" => position.top_left
+        "Top Center" => position.top_center
+        "Top Right" => position.top_right
+        "Middle Left" => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right" => position.middle_right
+        "Bottom Left" => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Bottom Right" => position.bottom_right
+        => position.bottom_right
+
+f_tableTextSize(string label) =>
+    switch label
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        => size.tiny
+
+f_labelTextSize(string label) =>
+    label == "Tiny" ? size.tiny :
+     label == "Small" ? size.small :
+     label == "Normal" ? size.normal : size.tiny
+
+f_pp(float x) =>
+    (x >= 0 ? "+" : "") + str.tostring(x, "#.0")
+
+
+// ============================================================================
+// 01 - SESSIONS & TIMEZONE
+// ============================================================================
+
+string G_SESSION = "01 - Sessions & Timezone"
+
+timezoneInput = input.string("UTC", "Timezone", options = ["UTC", "Europe/London", "America/New_York"], group = G_SESSION)
+asiaSessionInput = input.session("0000-0800", "Asia Session", group = G_SESSION)
+londonSessionInput = input.session("0800-1600", "London Session", group = G_SESSION)
+newYorkSessionInput = input.session("1300-2100", "New York Session", group = G_SESSION)
+trendThresholdInput = input.float(1.5, "Profile Trend Threshold", minval = 1.0, step = 0.1, group = G_SESSION)
+orWindowMinutesInput = input.int(15, "Opening Range Window (Minutes)", minval = 1, maxval = 120, group = G_SESSION)
+
+showSessionBgInput = input.bool(true, "Show Session Background Tint", group = G_SESSION)
+sessionBgTransparencyInput = input.int(90, "Session Background Tint Transparency", minval = 0, maxval = 100, group = G_SESSION)
+showOrBoxesInput = input.bool(true, "Show Opening Range Boxes", group = G_SESSION)
+orBoxTransparencyInput = input.int(90, "Opening Range Box Transparency", minval = 0, maxval = 100, group = G_SESSION)
+labelSizeSessionInput = input.string("Tiny", "Session Label Size", options = ["Tiny", "Small", "Normal"], group = G_SESSION)
+
+var int asiaSessionBarsTotal = 0
+var int londonSessionBarsTotal = 0
+var int nySessionBarsTotal = 0
+var int profileWindowBarsTotal = 0
+
+bool asiaInSession = nz(time(timeframe.period, asiaSessionInput, timezoneInput), 0) != 0
+bool londonInSession = nz(time(timeframe.period, londonSessionInput, timezoneInput), 0) != 0
+bool nyInSession = nz(time(timeframe.period, newYorkSessionInput, timezoneInput), 0) != 0
+
+if asiaInSession
+    asiaSessionBarsTotal += 1
+if londonInSession
+    londonSessionBarsTotal += 1
+if nyInSession
+    nySessionBarsTotal += 1
+
+var float asiaOpen = na
+var float asiaClose = na
+var float asiaHigh = na
+var float asiaLow = na
+var float londonOpen = na
+var float londonClose = na
+var float londonHigh = na
+var float londonLow = na
+var float nyOpen = na
+var float nyClose = na
+var float nyHigh = na
+var float nyLow = na
+
+if asiaInSession
+    asiaOpen := na(asiaOpen) ? open : asiaOpen
+    asiaClose := close
+    asiaHigh := math.max(high, nz(asiaHigh, low))
+    asiaLow := math.min(low, nz(asiaLow, high))
+
+if londonInSession
+    londonOpen := na(londonOpen) ? open : londonOpen
+    londonClose := close
+    londonHigh := math.max(high, nz(londonHigh, low))
+    londonLow := math.min(low, nz(londonLow, high))
+
+if nyInSession
+    nyOpen := na(nyOpen) ? open : nyOpen
+    nyClose := close
+    nyHigh := math.max(high, nz(nyHigh, low))
+    nyLow := math.min(low, nz(nyLow, high))
+
+var float asiaOrHigh = na
+var float asiaOrLow = na
+var float londonOrHigh = na
+var float londonOrLow = na
+var float nyOrHigh = na
+var float nyOrLow = na
+var int asiaSessionStartTime = na
+var int londonSessionStartTime = na
+var int nySessionStartTime = na
+var box asiaOrBox = na
+var box londonOrBox = na
+var box nyOrBox = na
+
+if asiaInSession and na(asiaSessionStartTime)
+    asiaSessionStartTime := time
+if londonInSession and na(londonSessionStartTime)
+    londonSessionStartTime := time
+if nyInSession and na(nySessionStartTime)
+    nySessionStartTime := time
+
+int orWindowMs = orWindowMinutesInput * 60000
+
+if asiaInSession and time >= asiaSessionStartTime and time <= asiaSessionStartTime + orWindowMs
+    asiaOrHigh := math.max(high, nz(asiaOrHigh, high))
+    asiaOrLow := math.min(low, nz(asiaOrLow, low))
+    if showAllChartObjectsInput and showOrBoxesInput
+        if na(asiaOrBox)
+            asiaOrBox := box.new(left = bar_index, top = high, right = bar_index + 1, bottom = low, bgcolor = color.new(color.yellow, orBoxTransparencyInput), border_color = color.yellow)
+        else
+            box.set_top(asiaOrBox, asiaOrHigh)
+            box.set_bottom(asiaOrBox, asiaOrLow)
+            box.set_right(asiaOrBox, bar_index + 1)
+else if time > asiaSessionStartTime + orWindowMs and not na(asiaOrBox)
+    box.set_right(asiaOrBox, bar_index)
+
+if londonInSession and time >= londonSessionStartTime and time <= londonSessionStartTime + orWindowMs
+    londonOrHigh := math.max(high, nz(londonOrHigh, high))
+    londonOrLow := math.min(low, nz(londonOrLow, low))
+    if showAllChartObjectsInput and showOrBoxesInput
+        if na(londonOrBox)
+            londonOrBox := box.new(left = bar_index, top = high, right = bar_index + 1, bottom = low, bgcolor = color.new(color.red, orBoxTransparencyInput), border_color = color.red)
+        else
+            box.set_top(londonOrBox, londonOrHigh)
+            box.set_bottom(londonOrBox, londonOrLow)
+            box.set_right(londonOrBox, bar_index + 1)
+else if time > londonSessionStartTime + orWindowMs and not na(londonOrBox)
+    box.set_right(londonOrBox, bar_index)
+
+if nyInSession and time >= nySessionStartTime and time <= nySessionStartTime + orWindowMs
+    nyOrHigh := math.max(high, nz(nyOrHigh, high))
+    nyOrLow := math.min(low, nz(nyOrLow, low))
+    if showAllChartObjectsInput and showOrBoxesInput
+        if na(nyOrBox)
+            nyOrBox := box.new(left = bar_index, top = high, right = bar_index + 1, bottom = low, bgcolor = color.new(color.blue, orBoxTransparencyInput), border_color = color.blue)
+        else
+            box.set_top(nyOrBox, nyOrHigh)
+            box.set_bottom(nyOrBox, nyOrLow)
+            box.set_right(nyOrBox, bar_index + 1)
+else if time > nySessionStartTime + orWindowMs and not na(nyOrBox)
+    box.set_right(nyOrBox, bar_index)
+
+bgcolor(showAllChartObjectsInput and showSessionBgInput and asiaInSession ? color.new(color.yellow, sessionBgTransparencyInput) : na, title = "Asia Session")
+bgcolor(showAllChartObjectsInput and showSessionBgInput and londonInSession ? color.new(color.red, sessionBgTransparencyInput) : na, title = "London Session")
+bgcolor(showAllChartObjectsInput and showSessionBgInput and nyInSession ? color.new(color.blue, sessionBgTransparencyInput) : na, title = "New York Session")
+
+asiaRange = asiaHigh - asiaLow
+londonRange = londonHigh - londonLow
+asiaDirection = nz(asiaClose, 0) > nz(asiaOpen, 0) ? 1 : (nz(asiaClose, 0) < nz(asiaOpen, 0) ? -1 : 0)
+londonDirection = nz(londonClose, 0) > nz(londonOpen, 0) ? 1 : (nz(londonClose, 0) < nz(londonOpen, 0) ? -1 : 0)
+asiaTrending = nz(asiaRange, 0) > nz(ta.sma(asiaRange, 5), 0) * trendThresholdInput
+londonTrending = nz(londonRange, 0) > nz(ta.sma(londonRange, 5), 0) * trendThresholdInput
+londonConsolidating = nz(londonRange, 0) < nz(ta.sma(londonRange, 5), 0)
+londonManipulatesAsiaHigh = nz(londonHigh, 0) > nz(asiaHigh, 0) and nz(londonLow, 0) < nz(asiaClose, 0)
+londonManipulatesAsiaLow = nz(londonLow, 0) < nz(asiaLow, 0) and nz(londonHigh, 0) > nz(asiaClose, 0)
+
+var string nextProfile = "Ukendt"
+if not nyInSession and londonInSession and not na(asiaHigh)
+    profileWindowBarsTotal += 1
+    if asiaTrending and londonTrending and asiaDirection == londonDirection
+        nextProfile := "Profil 1: Trend Continuation"
+    else if asiaTrending and londonConsolidating
+        nextProfile := "Profil 2: NY Manipulation"
+    else if not asiaTrending and (londonManipulatesAsiaHigh or londonManipulatesAsiaLow)
+        if londonManipulatesAsiaHigh
+            nextProfile := "Profil 3: London+NY Manipulation"
+        else
+            nextProfile := "Profil 4: Consolidation+Continuation"
+    else
+        nextProfile := "Ingen klar profil"
+
+bool newDay = ta.change(time("D", timezoneInput)) != 0
+
+
+// ============================================================================
+// 02 - PDH / PDL + ZONE TRACKING
+// ============================================================================
+
+string G_ZONES = "02 - PDH / PDL + Zone Tracking"
+
+showPdhPdlInput = input.bool(true, "Show PDH/PDL", group = G_ZONES)
+pdhColorInput = input.color(color.orange, "PDH Color", group = G_ZONES, inline = "pdhpdl")
+pdlColorInput = input.color(color.aqua, "PDL Color", group = G_ZONES, inline = "pdhpdl")
+zoneToleranceAtrInput = input.float(0.30, "Zone Confluence Tolerance (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = G_ZONES)
+
+var bool asiaHighBroken = false
+var bool asiaLowBroken = false
+var bool londonHighBroken = false
+var bool londonLowBroken = false
+var bool nyHighBroken = false
+var bool nyLowBroken = false
+
+var float dayHigh = na
+var float dayLow = na
+var float prevDayHigh = na
+var float prevDayLow = na
+
+var bool sweptPdhToday = false
+var bool sweptPdlToday = false
+var int pdhSweepDaysTotal = 0
+var int pdhSweepDaysHit = 0
+var int pdlSweepDaysTotal = 0
+var int pdlSweepDaysHit = 0
+
+if newDay
+    if not na(prevDayHigh)
+        pdhSweepDaysTotal += 1
+        if sweptPdhToday
+            pdhSweepDaysHit += 1
+    if not na(prevDayLow)
+        pdlSweepDaysTotal += 1
+        if sweptPdlToday
+            pdlSweepDaysHit += 1
+
+    prevDayHigh := dayHigh
+    prevDayLow := dayLow
+    dayHigh := na
+    dayLow := na
+    sweptPdhToday := false
+    sweptPdlToday := false
+
+    asiaHighBroken := false
+    asiaLowBroken := false
+    londonHighBroken := false
+    londonLowBroken := false
+    nyHighBroken := false
+    nyLowBroken := false
+
+dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+dayLow := na(dayLow) ? low : math.min(dayLow, low)
+
+if not na(prevDayHigh) and not sweptPdhToday and high >= prevDayHigh
+    sweptPdhToday := true
+if not na(prevDayLow) and not sweptPdlToday and low <= prevDayLow
+    sweptPdlToday := true
+
+if not na(asiaHigh) and close > asiaHigh
+    asiaHighBroken := true
+if not na(asiaLow) and close < asiaLow
+    asiaLowBroken := true
+if not na(londonHigh) and close > londonHigh
+    londonHighBroken := true
+if not na(londonLow) and close < londonLow
+    londonLowBroken := true
+if not na(nyHigh) and close > nyHigh
+    nyHighBroken := true
+if not na(nyLow) and close < nyLow
+    nyLowBroken := true
+
+float pdhSweepRate = pdhSweepDaysTotal > 0 ? pdhSweepDaysHit * 100.0 / pdhSweepDaysTotal : na
+float pdlSweepRate = pdlSweepDaysTotal > 0 ? pdlSweepDaysHit * 100.0 / pdlSweepDaysTotal : na
+
+var line pdhLine = na
+var line pdlLine = na
+var label pdhLabel = na
+var label pdlLabel = na
+
+if barstate.islast
+    if showAllChartObjectsInput and showPdhPdlInput and not na(prevDayHigh)
+        if na(pdhLine)
+            pdhLine := line.new(bar_index - 1, prevDayHigh, bar_index + 1, prevDayHigh, color = pdhColorInput, style = line.style_dashed)
+        else
+            line.set_xy1(pdhLine, math.max(bar_index - 100, 0), prevDayHigh)
+            line.set_xy2(pdhLine, bar_index + 1, prevDayHigh)
+
+        string txtH = "PDH " + str.tostring(prevDayHigh, format.mintick) + (sweptPdhToday ? " SWEPT" : " | " + (na(pdhSweepRate) ? "--" : str.tostring(pdhSweepRate, "#.0") + "%"))
+
+        if na(pdhLabel)
+            pdhLabel := label.new(bar_index + 2, prevDayHigh, txtH, style = label.style_label_left, color = color.new(pdhColorInput, 20), textcolor = color.white, size = f_labelTextSize(labelSizeSessionInput))
+        else
+            label.set_xy(pdhLabel, bar_index + 2, prevDayHigh)
+            label.set_text(pdhLabel, txtH)
+    else if not na(pdhLine)
+        line.delete(pdhLine)
+        pdhLine := na
+        if not na(pdhLabel)
+            label.delete(pdhLabel)
+            pdhLabel := na
+
+    if showAllChartObjectsInput and showPdhPdlInput and not na(prevDayLow)
+        if na(pdlLine)
+            pdlLine := line.new(bar_index - 1, prevDayLow, bar_index + 1, prevDayLow, color = pdlColorInput, style = line.style_dashed)
+        else
+            line.set_xy1(pdlLine, math.max(bar_index - 100, 0), prevDayLow)
+            line.set_xy2(pdlLine, bar_index + 1, prevDayLow)
+
+        string txtL = "PDL " + str.tostring(prevDayLow, format.mintick) + (sweptPdlToday ? " SWEPT" : " | " + (na(pdlSweepRate) ? "--" : str.tostring(pdlSweepRate, "#.0") + "%"))
+
+        if na(pdlLabel)
+            pdlLabel := label.new(bar_index + 2, prevDayLow, txtL, style = label.style_label_left, color = color.new(pdlColorInput, 20), textcolor = color.white, size = f_labelTextSize(labelSizeSessionInput))
+        else
+            label.set_xy(pdlLabel, bar_index + 2, prevDayLow)
+            label.set_text(pdlLabel, txtL)
+    else if not na(pdlLine)
+        line.delete(pdlLine)
+        pdlLine := na
+        if not na(pdlLabel)
+            label.delete(pdlLabel)
+            pdlLabel := na
+
+
+// ============================================================================
+// 03 - MARKET STRUCTURE (1H HTF TREND)
+// ============================================================================
+
+string G_STRUCTURE = "03 - Market Structure"
+
+structureTimeframeInput = input.timeframe("60", "Structure Timeframe", group = G_STRUCTURE)
+structurePivotLeftInput = input.int(3, "Structure Pivot Left", minval = 1, maxval = 20, group = G_STRUCTURE)
+structurePivotRightInput = input.int(3, "Structure Pivot Right", minval = 1, maxval = 20, group = G_STRUCTURE)
+
+f_getStructureContextRaw() =>
+    float ph = ta.pivothigh(high, structurePivotLeftInput, structurePivotRightInput)
+    float pl = ta.pivotlow(low, structurePivotLeftInput, structurePivotRightInput)
+    float latestHigh = ta.valuewhen(not na(ph), ph, 0)
+    float previousHigh = ta.valuewhen(not na(ph), ph, 1)
+    float latestLow = ta.valuewhen(not na(pl), pl, 0)
+    float previousLow = ta.valuewhen(not na(pl), pl, 1)
+    [latestHigh, previousHigh, latestLow, previousLow]
+
+f_getStructureContextConfirmed() =>
+    [lh, ph, ll, pl] = f_getStructureContextRaw()
+    [lh[1], ph[1], ll[1], pl[1]]
+
+[htfLastHigh, htfPrevHigh, htfLastLow, htfPrevLow] = request.security(syminfo.tickerid, structureTimeframeInput, f_getStructureContextConfirmed(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool structureHaveEnoughPivots = not na(htfLastHigh) and not na(htfPrevHigh) and not na(htfLastLow) and not na(htfPrevLow)
+bool structureHigherHigh = structureHaveEnoughPivots and htfLastHigh > htfPrevHigh
+bool structureHigherLow = structureHaveEnoughPivots and htfLastLow > htfPrevLow
+bool structureLowerHigh = structureHaveEnoughPivots and htfLastHigh < htfPrevHigh
+bool structureLowerLow = structureHaveEnoughPivots and htfLastLow < htfPrevLow
+
+string structureTrend = structureHigherHigh and structureHigherLow ? "UP" : structureLowerHigh and structureLowerLow ? "DOWN" : "RANGE"
+
+
+// ============================================================================
+// 04 - MOMENTUM (TDI)
+// ============================================================================
+
+string G_TDI = "04 - Momentum (TDI)"
+
+tdiSourceInput = input.source(close, "TDI Source", group = G_TDI)
+tdiRsiPeriodInput = input.int(21, "RSI Period", minval = 1, group = G_TDI)
+tdiBandLengthInput = input.int(34, "Band Length", minval = 1, group = G_TDI)
+tdiFastMaLengthInput = input.int(2, "Fast MA on RSI", minval = 1, group = G_TDI)
+tdiSlowMaLengthInput = input.int(7, "Slow MA on RSI", minval = 0, group = G_TDI)
+momentumLengthInput = input.int(12, "Momentum Length", minval = 1, group = G_TDI)
+
+float tdiRsi = ta.rsi(tdiSourceInput, tdiRsiPeriodInput)
+float tdiMa = ta.sma(tdiRsi, tdiBandLengthInput)
+float tdiOffset = 1.6185 * ta.stdev(tdiRsi, tdiBandLengthInput)
+float tdiUpperBand = tdiMa + tdiOffset
+float tdiLowerBand = tdiMa - tdiOffset
+float tdiFastMa = ta.sma(tdiRsi, tdiFastMaLengthInput)
+float tdiSlowMa = ta.sma(tdiRsi, tdiSlowMaLengthInput)
+float momentum = tdiSourceInput - tdiSourceInput[momentumLengthInput]
+bool momentumRising = momentum > momentum[1]
+bool momentumFalling = momentum < momentum[1]
+bool tdiBullishMove = tdiFastMa > tdiUpperBand and tdiFastMa > 68
+bool tdiBearishMove = tdiFastMa < tdiLowerBand and tdiFastMa < 32
+bool tdiConfirmsLong = tdiBullishMove and momentumRising
+bool tdiConfirmsShort = tdiBearishMove and momentumFalling
+
+plotshape(showAllChartObjectsInput and tdiBullishMove and momentumRising ? high : na, style = shape.arrowup, color = color.new(color.lime, 0), size = size.small, location = location.abovebar, title = "Bullish Arrow")
+plotshape(showAllChartObjectsInput and tdiBearishMove and momentumFalling ? low : na, style = shape.arrowdown, color = color.new(color.red, 0), size = size.small, location = location.belowbar, title = "Bearish Arrow")
+
+
+// ============================================================================
+// 05 - VOLUME PRESSURE
+// ============================================================================
+
+string G_VOLUME = "05 - Volume Pressure"
+
+executionDeltaWindowInput = input.int(3, "Execution Pressure Window", minval = 1, maxval = 8, group = G_VOLUME)
+executionLtfInput = input.timeframe("5", "Lower Timeframe For Volume", tooltip = "Falls back to the chart's own timeframe if this is set above it.", group = G_VOLUME)
+requireVolumePressureInput = input.bool(false, "Require Volume Pressure Agreement", group = G_VOLUME)
+minimumVolumePressureInput = input.float(5.0, "Minimum Volume Pressure %", minval = 0.0, maxval = 60.0, step = 1.0, group = G_VOLUME)
+
+string effectiveExecutionLtf = timeframe.in_seconds(executionLtfInput) > timeframe.in_seconds(timeframe.period) ? timeframe.period : executionLtfInput
+
+[executionUpVolume, executionDownVolume, executionDeltaVolume] = tvta.requestUpAndDownVolume(effectiveExecutionLtf)
+
+float executionDeltaSum = 0.0
+float executionVolumeSum = 0.0
+float rollingBuyVolume = 0.0
+float rollingSellVolume = 0.0
+
+for i = 0 to executionDeltaWindowInput - 1
+    executionDeltaSum += nz(executionDeltaVolume[i], 0.0)
+    executionVolumeSum += nz(executionUpVolume[i], 0.0) + nz(executionDownVolume[i], 0.0)
+    rollingBuyVolume += nz(executionUpVolume[i], 0.0)
+    rollingSellVolume += nz(executionDownVolume[i], 0.0)
+
+float executionDeltaPressure = executionVolumeSum > 0 ? executionDeltaSum / executionVolumeSum * 100.0 : 0.0
+float buyRatio = rollingBuyVolume + rollingSellVolume > 0 ? rollingBuyVolume / (rollingBuyVolume + rollingSellVolume) : 0.5
+float sellRatio = 1.0 - buyRatio
+
+bool pressureOkLong = not requireVolumePressureInput or executionDeltaPressure >= minimumVolumePressureInput
+bool pressureOkShort = not requireVolumePressureInput or executionDeltaPressure <= -minimumVolumePressureInput
+
+
+// ============================================================================
+// 06 - RANGE & Z-SCORE
+// ============================================================================
+
+string G_ZSCORE = "06 - Range & Z-Score"
+
+zscoreLengthInput = input.int(21, "Z-Score Length", minval = 5, group = G_ZSCORE)
+zscoreObThresholdInput = input.float(1.5, "Z-Score OB/OS", minval = 0.5, step = 0.1, group = G_ZSCORE)
+showZscoreSignalsInput = input.bool(true, "Show Z-Score Re-entry Signals", group = G_ZSCORE)
+
+float zMean = ta.sma(close, zscoreLengthInput)
+float zDev = ta.stdev(close, zscoreLengthInput)
+float zScore = zDev > 0 ? (close - zMean) / zDev : 0.0
+bool zscoreOversold = zScore <= -zscoreObThresholdInput
+bool zscoreOverbought = zScore >= zscoreObThresholdInput
+bool zscoreCrossoverLong = ta.crossover(zScore, -zscoreObThresholdInput)
+bool zscoreCrossunderShort = ta.crossunder(zScore, zscoreObThresholdInput)
+
+plotshape(showAllChartObjectsInput and showZscoreSignalsInput and zscoreCrossoverLong, title = "Z-Score Long Signal", style = shape.diamond, location = location.belowbar, color = color.blue, size = size.tiny)
+plotshape(showAllChartObjectsInput and showZscoreSignalsInput and zscoreCrossunderShort, title = "Z-Score Short Signal", style = shape.diamond, location = location.abovebar, color = color.fuchsia, size = size.tiny)
+
+
+// ============================================================================
+// 07 - LUX-STYLE S/R BREAKS (ENTRY SETUP)
+// ============================================================================
+
+string G_ENTRY = "07 - Entry Setup (Lux-Style S/R Breaks)"
+
+lsrToggleBreaksInput = input.bool(true, "Show Breaks", group = G_ENTRY)
+lsrLeftBarsInput = input.int(15, "Left Bars", minval = 1, group = G_ENTRY)
+lsrRightBarsInput = input.int(15, "Right Bars", minval = 1, group = G_ENTRY)
+lsrVolumeThreshInput = input.int(20, "Volume Threshold", group = G_ENTRY)
+cooldownBarsInput = input.int(12, "Cooldown Bars Between Setups (Per Direction)", minval = 0, group = G_ENTRY)
+requireMomentumInput = input.bool(true, "Require Momentum Confirmation", group = G_ENTRY)
+
+float atrCoach = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
+
+float lsrPivotHighRaw = ta.pivothigh(lsrLeftBarsInput, lsrRightBarsInput)
+float lsrPivotLowRaw = ta.pivotlow(lsrLeftBarsInput, lsrRightBarsInput)
+float lsrHighUsePivot = fixnan(lsrPivotHighRaw[1])
+float lsrLowUsePivot = fixnan(lsrPivotLowRaw[1])
+
+plot(showAllChartObjectsInput ? lsrHighUsePivot : na, title = "Resistance", color = ta.change(lsrHighUsePivot) != 0 ? na : color.red, linewidth = 2, offset = -(lsrRightBarsInput + 1))
+plot(showAllChartObjectsInput ? lsrLowUsePivot : na, title = "Support", color = ta.change(lsrLowUsePivot) != 0 ? na : color.blue, linewidth = 2, offset = -(lsrRightBarsInput + 1))
+
+float lsrShortEma = ta.ema(volume, 5)
+float lsrLongEma = ta.ema(volume, 10)
+float lsrOsc = lsrLongEma != 0 ? 100.0 * (lsrShortEma - lsrLongEma) / lsrLongEma : 0.0
+
+bool lsrCrossUnderSupport = ta.crossunder(close, lsrLowUsePivot)
+bool lsrCrossOverResistance = ta.crossover(close, lsrHighUsePivot)
+bool lsrBreakDown = lsrToggleBreaksInput and lsrCrossUnderSupport and not (open - close < high - open) and lsrOsc > lsrVolumeThreshInput
+bool lsrBreakUp = lsrToggleBreaksInput and lsrCrossOverResistance and not (open - low > close - open) and lsrOsc > lsrVolumeThreshInput
+
+plotshape(showAllChartObjectsInput and lsrBreakDown, title = "Break Down", text = "B", style = shape.labeldown, location = location.abovebar, color = color.red, textcolor = color.white, size = size.tiny)
+plotshape(showAllChartObjectsInput and lsrBreakUp, title = "Break Up", text = "B", style = shape.labelup, location = location.belowbar, color = color.green, textcolor = color.white, size = size.tiny)
+
+bool longSignalNow = lsrBreakUp
+bool shortSignalNow = lsrBreakDown
+
+
+// ============================================================================
+// 08 - S/R LEVEL SELECTION (PDH/PDL) + REACTION PROBABILITY
+// ============================================================================
+
+string G_SR_SELECT = "08a - S/R Level Selection"
+
+srMaxDistanceAtrInput = input.float(5.0, "Maximum S/R Distance (ATR)", minval = 0.25, maxval = 30.0, step = 0.25, group = G_SR_SELECT)
+srShowSelectedLevelsInput = input.bool(true, "Plot PDH/PDL", group = G_SR_SELECT)
+srResistanceColorInput = input.color(color.fuchsia, "PDH Probability Color", group = G_SR_SELECT)
+srSupportColorInput = input.color(color.aqua, "PDL Probability Color", group = G_SR_SELECT)
+
+float srMaxDistancePoints = srMaxDistanceAtrInput * atrCoach
+
+float selectedResistanceLevel = not na(prevDayHigh) and math.abs(prevDayHigh - close) <= srMaxDistancePoints ? prevDayHigh : na
+float selectedSupportLevel = not na(prevDayLow) and math.abs(close - prevDayLow) <= srMaxDistancePoints ? prevDayLow : na
+
+int selectedResistanceNominalRole = 1
+int selectedSupportNominalRole = -1
+int selectedResistanceClass = 2
+int selectedSupportClass = 2
+
+plot(showAllChartObjectsInput and srShowSelectedLevelsInput ? selectedResistanceLevel : na, title = "Selected Probability Resistance", color = srResistanceColorInput, linewidth = 2, style = plot.style_stepline)
+plot(showAllChartObjectsInput and srShowSelectedLevelsInput ? selectedSupportLevel : na, title = "Selected Probability Support", color = srSupportColorInput, linewidth = 2, style = plot.style_stepline)
+
+float sweepFirstDistRes = not na(prevDayHigh) ? math.abs(prevDayHigh - close) : na
+float sweepFirstDistSup = not na(prevDayLow) ? math.abs(close - prevDayLow) : na
+float sweepFirstPdhPct = not na(sweepFirstDistRes) and not na(sweepFirstDistSup) and (sweepFirstDistRes + sweepFirstDistSup) > 0 ? sweepFirstDistSup / (sweepFirstDistRes + sweepFirstDistSup) * 100.0 : na
+float sweepFirstPdlPct = na(sweepFirstPdhPct) ? na : 100.0 - sweepFirstPdhPct
+
+string sweepFirstText = sweptPdhToday and sweptPdlToday ? "both swept" : sweptPdhToday ? "PDH swept -- PDL next" : sweptPdlToday ? "PDL swept -- PDH next" : na(sweepFirstPdhPct) ? "--" : "PDH " + str.tostring(sweepFirstPdhPct, "#") + "% / PDL " + str.tostring(sweepFirstPdlPct, "#") + "%"
+
+string G_BREAK_PROB = "08b - S/R Reaction Probability"
+
+breakProbEnableInput = input.bool(true, "Enable Reaction Probability", group = G_BREAK_PROB)
+breakProbTestZoneAtrInput = input.float(0.35, "Test Zone Distance (ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = G_BREAK_PROB)
+breakProbHorizonBarsInput = input.int(12, "Pre-Break Test Horizon (Bars)", minval = 1, maxval = 100, group = G_BREAK_PROB)
+breakProbFollowAtrInput = input.float(0.75, "Follow Distance (ATR)", minval = 0.25, maxval = 5.0, step = 0.25, group = G_BREAK_PROB)
+breakProbFollowBarsInput = input.int(6, "Follow Bars After Close-Through", minval = 1, maxval = 50, group = G_BREAK_PROB)
+breakProbRollingTrialsInput = input.int(500, "Rolling Resolved Trials Per Side", minval = 50, maxval = 5000, step = 50, group = G_BREAK_PROB)
+breakProbPriorEachInput = input.float(1.0, "Dirichlet Prior Per Outcome", minval = 0.1, maxval = 20.0, step = 0.1, group = G_BREAK_PROB)
+breakProbShrinkStrengthInput = input.float(20.0, "Context Shrinkage To LOO Baseline", minval = 0.0, maxval = 200.0, step = 1.0, group = G_BREAK_PROB)
+breakProbMinSampleInput = input.int(25, "Minimum Context Sample", minval = 5, maxval = 500, group = G_BREAK_PROB)
+breakProbMinBaselineInput = input.int(30, "Minimum Leave-One-Out Baseline Sample", minval = 5, maxval = 1000, group = G_BREAK_PROB)
+breakProbMinLiftInput = input.float(8.0, "Minimum Lift For A Call (percentage points)", minval = 1.0, maxval = 40.0, step = 0.5, group = G_BREAK_PROB)
+breakProbMinEdgeZInput = input.float(1.64, "Minimum Approx Edge Z", minval = 0.0, maxval = 4.0, step = 0.05, group = G_BREAK_PROB)
+breakProbActionDistAtrInput = input.float(0.5, "Action Distance (ATR)", minval = 0.1, maxval = 5.0, step = 0.1, group = G_BREAK_PROB)
+breakProbRangeBlocksInput = input.bool(true, "RANGE Structure Forces Stand Aside", group = G_BREAK_PROB)
+breakProbDisplayInput = input.string("Context + Global", "Probability Display", options = ["Context Only", "Global Only", "Context + Global"], group = G_BREAK_PROB)
+breakProbShowLabelsInput = input.bool(true, "Show Probability Labels At Selected S/R", group = G_BREAK_PROB)
+breakProbLabelSizeInput = input.string("Tiny", "Probability Label Size", options = ["Tiny", "Small", "Normal"], group = G_BREAK_PROB)
+breakProbResLabelOffsetInput = input.int(3, "Resistance Label Offset (Bars)", minval = -100, maxval = 100, group = G_BREAK_PROB)
+breakProbSupLabelOffsetInput = input.int(3, "Support Label Offset (Bars)", minval = -100, maxval = 100, group = G_BREAK_PROB)
+
+int OUT_EXPIRE = 0
+int OUT_BREAK = 1
+int OUT_FADE = 2
+int OUT_FAIL = 3
+
+f_structureState(bool wantResistance, string trend) =>
+    bool aligned = wantResistance ? trend == "UP" : trend == "DOWN"
+    bool opposed = wantResistance ? trend == "DOWN" : trend == "UP"
+    aligned ? 1 : opposed ? 2 : 0
+
+f_srStatBucketV2(int sourceClass, int nominalRole, bool wantResistance, string trend) =>
+    bool flipped = wantResistance ? nominalRole == -1 : nominalRole == 1
+    int levelClass = flipped ? 3 : sourceClass
+    int structureState = f_structureState(wantResistance, trend)
+    math.max(0, math.min(11, levelClass + structureState * 4))
+
+f_quality(int trials) =>
+    trials >= breakProbMinSampleInput * 4 ? "DEEP" :
+     trials >= breakProbMinSampleInput * 2 ? "MATURE" :
+     trials >= breakProbMinSampleInput ? "USABLE" :
+     trials >= math.max(5, int(math.round(breakProbMinSampleInput * 0.5))) ? "DEVELOPING" :
+     "EARLY"
+
+f_dirichletPct(int count, int total, float priorEach) =>
+    float denom = total + 4.0 * priorEach
+    denom > 0 ? (count + priorEach) / denom * 100.0 : 25.0
+
+f_dirichletVar(int count, int total, float priorEach) =>
+    float alphaI = count + priorEach
+    float alphaTotal = total + 4.0 * priorEach
+    alphaTotal > 0 ? alphaI * (alphaTotal - alphaI) / (alphaTotal * alphaTotal * (alphaTotal + 1.0)) : na
+
+f_hierPct(int ctxCount, int ctxTrials, float basePct, float shrink, float priorEach) =>
+    float alpha = ctxCount + priorEach + shrink * basePct / 100.0
+    float alphaTotal = ctxTrials + 4.0 * priorEach + shrink
+    alphaTotal > 0 ? alpha / alphaTotal * 100.0 : 25.0
+
+f_hierVar(int ctxCount, int ctxTrials, float basePct, float shrink, float priorEach) =>
+    float alpha = ctxCount + priorEach + shrink * basePct / 100.0
+    float alphaTotal = ctxTrials + 4.0 * priorEach + shrink
+    alphaTotal > 0 ? alpha * (alphaTotal - alpha) / (alphaTotal * alphaTotal * (alphaTotal + 1.0)) : na
+
+f_edgeZ(float ctxPct, float basePct, float ctxVar, float baseVar) =>
+    float se = math.sqrt(math.max(nz(ctxVar, 0.0) + nz(baseVar, 0.0), 0.0))
+    se > 0 ? (ctxPct / 100.0 - basePct / 100.0) / se : 0.0
+
+f_probCall(bool enabled, bool hasLevel, int globalTrials, int ctxTrials, int baseTrials, float breakLift, float fadeLift, float breakZ, float fadeZ, float distAtr, bool isRange, string displayMode) =>
+    string action = "NO EDGE"
+    bool showCtx = false
+    float shownLift = 0.0
+    float shownZ = 0.0
+    bool contextAllowed = displayMode != "Global Only"
+    bool breakOk = hasLevel and contextAllowed and ctxTrials >= breakProbMinSampleInput and baseTrials >= breakProbMinBaselineInput and breakLift >= breakProbMinLiftInput and breakZ >= breakProbMinEdgeZInput
+    bool fadeOk = hasLevel and contextAllowed and ctxTrials >= breakProbMinSampleInput and baseTrials >= breakProbMinBaselineInput and fadeLift >= breakProbMinLiftInput and fadeZ >= breakProbMinEdgeZInput
+    bool near = hasLevel and not na(distAtr) and distAtr <= breakProbActionDistAtrInput
+
+    if not enabled
+        action := "OFF"
+    else if globalTrials < 10
+        action := "LEARNING"
+    else if breakProbRangeBlocksInput and isRange
+        action := "STAND ASIDE"
+    else if breakOk and (not fadeOk or breakZ >= fadeZ)
+        action := near ? "BREAK BIAS" : "WATCH BREAK"
+        showCtx := true
+        shownLift := breakLift
+        shownZ := breakZ
+    else if fadeOk
+        action := near ? "FADE BIAS" : "WATCH FADE"
+        showCtx := true
+        shownLift := fadeLift
+        shownZ := fadeZ
+    else
+        action := "NO EDGE"
+
+    if displayMode == "Context Only" and enabled and globalTrials >= 10
+        showCtx := true
+
+    [action, showCtx, shownLift, shownZ]
+
+var array<int> resTrials = array.new_int(12, 0)
+var array<int> resBreaks = array.new_int(12, 0)
+var array<int> resFades = array.new_int(12, 0)
+var array<int> resFails = array.new_int(12, 0)
+var array<int> supTrials = array.new_int(12, 0)
+var array<int> supBreaks = array.new_int(12, 0)
+var array<int> supFades = array.new_int(12, 0)
+var array<int> supFails = array.new_int(12, 0)
+var array<int> resHistBucket = array.new_int()
+var array<int> resHistOutcome = array.new_int()
+var array<int> supHistBucket = array.new_int()
+var array<int> supHistOutcome = array.new_int()
+var array<float> resBrierHist = array.new_float()
+var array<float> supBrierHist = array.new_float()
+
+f_addResolvedTrial(array<int> trials, array<int> breaks, array<int> fades, array<int> fails, array<int> histBucket, array<int> histOutcome, int bucket, int outcome, int maxTrials) =>
+    int b = math.max(0, math.min(11, bucket))
+    array.set(trials, b, array.get(trials, b) + 1)
+    if outcome == OUT_BREAK
+        array.set(breaks, b, array.get(breaks, b) + 1)
+    else if outcome == OUT_FADE
+        array.set(fades, b, array.get(fades, b) + 1)
+    else if outcome == OUT_FAIL
+        array.set(fails, b, array.get(fails, b) + 1)
+    array.push(histBucket, b)
+    array.push(histOutcome, outcome)
+    if array.size(histBucket) > maxTrials
+        int oldB = array.shift(histBucket)
+        int oldO = array.shift(histOutcome)
+        array.set(trials, oldB, math.max(0, array.get(trials, oldB) - 1))
+        if oldO == OUT_BREAK
+            array.set(breaks, oldB, math.max(0, array.get(breaks, oldB) - 1))
+        else if oldO == OUT_FADE
+            array.set(fades, oldB, math.max(0, array.get(fades, oldB) - 1))
+        else if oldO == OUT_FAIL
+            array.set(fails, oldB, math.max(0, array.get(fails, oldB) - 1))
+    true
+
+f_pushBrier(array<float> hist, float score, int maxTrials) =>
+    array.push(hist, score)
+    if array.size(hist) > maxTrials
+        array.shift(hist)
+    true
+
+f_multiclassBrier(float pBreak, float pFade, float pFail, float pExpire, int outcome) =>
+    float yBreak = outcome == OUT_BREAK ? 1.0 : 0.0
+    float yFade = outcome == OUT_FADE ? 1.0 : 0.0
+    float yFail = outcome == OUT_FAIL ? 1.0 : 0.0
+    float yExpire = outcome == OUT_EXPIRE ? 1.0 : 0.0
+    math.pow(pBreak / 100.0 - yBreak, 2) + math.pow(pFade / 100.0 - yFade, 2) + math.pow(pFail / 100.0 - yFail, 2) + math.pow(pExpire / 100.0 - yExpire, 2)
+
+bool resHasLevel = selectedResistanceClass >= 0 and not na(selectedResistanceLevel)
+bool supHasLevel = selectedSupportClass >= 0 and not na(selectedSupportLevel)
+int resCurrentBucket = resHasLevel ? f_srStatBucketV2(selectedResistanceClass, selectedResistanceNominalRole, true, structureTrend) : 0
+int supCurrentBucket = supHasLevel ? f_srStatBucketV2(selectedSupportClass, selectedSupportNominalRole, false, structureTrend) : 0
+
+int resGlobalTrials = array.sum(resTrials)
+int resGlobalBreaks = array.sum(resBreaks)
+int resGlobalFades = array.sum(resFades)
+int resGlobalFails = array.sum(resFails)
+int resGlobalExpires = math.max(0, resGlobalTrials - resGlobalBreaks - resGlobalFades - resGlobalFails)
+int resCtxTrials = array.get(resTrials, resCurrentBucket)
+int resCtxBreaks = array.get(resBreaks, resCurrentBucket)
+int resCtxFades = array.get(resFades, resCurrentBucket)
+int resCtxFails = array.get(resFails, resCurrentBucket)
+int resCtxExpires = math.max(0, resCtxTrials - resCtxBreaks - resCtxFades - resCtxFails)
+int resBaseTrials = math.max(0, resGlobalTrials - resCtxTrials)
+int resBaseBreaks = math.max(0, resGlobalBreaks - resCtxBreaks)
+int resBaseFades = math.max(0, resGlobalFades - resCtxFades)
+int resBaseFails = math.max(0, resGlobalFails - resCtxFails)
+int resBaseExpires = math.max(0, resGlobalExpires - resCtxExpires)
+float resGlobalBreakPct = f_dirichletPct(resGlobalBreaks, resGlobalTrials, breakProbPriorEachInput)
+float resGlobalFadePct = f_dirichletPct(resGlobalFades, resGlobalTrials, breakProbPriorEachInput)
+float resBaseBreakPct = f_dirichletPct(resBaseBreaks, resBaseTrials, breakProbPriorEachInput)
+float resBaseFadePct = f_dirichletPct(resBaseFades, resBaseTrials, breakProbPriorEachInput)
+float resCtxBreakPct = f_hierPct(resCtxBreaks, resCtxTrials, resBaseBreakPct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float resCtxFadePct = f_hierPct(resCtxFades, resCtxTrials, resBaseFadePct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float resCtxBreakVar = f_hierVar(resCtxBreaks, resCtxTrials, resBaseBreakPct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float resCtxFadeVar = f_hierVar(resCtxFades, resCtxTrials, resBaseFadePct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float resBaseBreakVar = f_dirichletVar(resBaseBreaks, resBaseTrials, breakProbPriorEachInput)
+float resBaseFadeVar = f_dirichletVar(resBaseFades, resBaseTrials, breakProbPriorEachInput)
+float resBreakLift = resCtxBreakPct - resBaseBreakPct
+float resFadeLift = resCtxFadePct - resBaseFadePct
+float resBreakZ = f_edgeZ(resCtxBreakPct, resBaseBreakPct, resCtxBreakVar, resBaseBreakVar)
+float resFadeZ = f_edgeZ(resCtxFadePct, resBaseFadePct, resCtxFadeVar, resBaseFadeVar)
+
+int supGlobalTrials = array.sum(supTrials)
+int supGlobalBreaks = array.sum(supBreaks)
+int supGlobalFades = array.sum(supFades)
+int supGlobalFails = array.sum(supFails)
+int supGlobalExpires = math.max(0, supGlobalTrials - supGlobalBreaks - supGlobalFades - supGlobalFails)
+int supCtxTrials = array.get(supTrials, supCurrentBucket)
+int supCtxBreaks = array.get(supBreaks, supCurrentBucket)
+int supCtxFades = array.get(supFades, supCurrentBucket)
+int supCtxFails = array.get(supFails, supCurrentBucket)
+int supCtxExpires = math.max(0, supCtxTrials - supCtxBreaks - supCtxFades - supCtxFails)
+int supBaseTrials = math.max(0, supGlobalTrials - supCtxTrials)
+int supBaseBreaks = math.max(0, supGlobalBreaks - supCtxBreaks)
+int supBaseFades = math.max(0, supGlobalFades - supCtxFades)
+int supBaseFails = math.max(0, supGlobalFails - supCtxFails)
+int supBaseExpires = math.max(0, supGlobalExpires - supCtxExpires)
+float supGlobalBreakPct = f_dirichletPct(supGlobalBreaks, supGlobalTrials, breakProbPriorEachInput)
+float supGlobalFadePct = f_dirichletPct(supGlobalFades, supGlobalTrials, breakProbPriorEachInput)
+float supBaseBreakPct = f_dirichletPct(supBaseBreaks, supBaseTrials, breakProbPriorEachInput)
+float supBaseFadePct = f_dirichletPct(supBaseFades, supBaseTrials, breakProbPriorEachInput)
+float supCtxBreakPct = f_hierPct(supCtxBreaks, supCtxTrials, supBaseBreakPct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float supCtxFadePct = f_hierPct(supCtxFades, supCtxTrials, supBaseFadePct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float supCtxBreakVar = f_hierVar(supCtxBreaks, supCtxTrials, supBaseBreakPct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float supCtxFadeVar = f_hierVar(supCtxFades, supCtxTrials, supBaseFadePct, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+float supBaseBreakVar = f_dirichletVar(supBaseBreaks, supBaseTrials, breakProbPriorEachInput)
+float supBaseFadeVar = f_dirichletVar(supBaseFades, supBaseTrials, breakProbPriorEachInput)
+float supBreakLift = supCtxBreakPct - supBaseBreakPct
+float supFadeLift = supCtxFadePct - supBaseFadePct
+float supBreakZ = f_edgeZ(supCtxBreakPct, supBaseBreakPct, supCtxBreakVar, supBaseBreakVar)
+float supFadeZ = f_edgeZ(supCtxFadePct, supBaseFadePct, supCtxFadeVar, supBaseFadeVar)
+
+var bool resActive = false
+var bool supActive = false
+var float resFrozenLevel = na
+var float supFrozenLevel = na
+var float resFrozenDist = na
+var float supFrozenDist = na
+var int resStartBar = na
+var int supStartBar = na
+var int resFrozenBucket = 0
+var int supFrozenBucket = 0
+var bool resBroken = false
+var bool supBroken = false
+var int resBreakBar = na
+var int supBreakBar = na
+var float resFrozenPBreak = 25.0
+var float resFrozenPFade = 25.0
+var float resFrozenPFail = 25.0
+var float resFrozenPExpire = 25.0
+var float supFrozenPBreak = 25.0
+var float supFrozenPFade = 25.0
+var float supFrozenPFail = 25.0
+var float supFrozenPExpire = 25.0
+
+float probAtrRef = math.max(nz(atrCoach[1], atrCoach), syminfo.mintick)
+float probZoneDist = breakProbTestZoneAtrInput * probAtrRef
+
+float resArmLevel = selectedResistanceLevel[1]
+float supArmLevel = selectedSupportLevel[1]
+int resArmClass = selectedResistanceClass[1]
+int supArmClass = selectedSupportClass[1]
+int resArmRole = selectedResistanceNominalRole[1]
+int supArmRole = selectedSupportNominalRole[1]
+
+bool resArmStable = breakProbEnableInput and resArmClass >= 0 and not na(resArmLevel) and not na(selectedResistanceLevel[2]) and math.abs(resArmLevel - selectedResistanceLevel[2]) <= syminfo.mintick
+bool supArmStable = breakProbEnableInput and supArmClass >= 0 and not na(supArmLevel) and not na(selectedSupportLevel[2]) and math.abs(supArmLevel - selectedSupportLevel[2]) <= syminfo.mintick
+bool resWasOutside = resArmStable and high[1] < resArmLevel - probZoneDist
+bool supWasOutside = supArmStable and low[1] > supArmLevel + probZoneDist
+bool resIntersectsNow = resArmStable and high >= resArmLevel - probZoneDist and low <= resArmLevel
+bool supIntersectsNow = supArmStable and low <= supArmLevel + probZoneDist and high >= supArmLevel
+bool resEnteredZone = resWasOutside and resIntersectsNow
+bool supEnteredZone = supWasOutside and supIntersectsNow
+
+if barstate.isconfirmed and resEnteredZone and not resActive
+    string frozenTrend = structureTrend[1]
+    resActive := true
+    resFrozenLevel := resArmLevel
+    resStartBar := bar_index
+    resFrozenBucket := f_srStatBucketV2(resArmClass, resArmRole, true, frozenTrend)
+    resFrozenDist := breakProbFollowAtrInput * probAtrRef
+    resBroken := false
+    resBreakBar := na
+
+    int b = resFrozenBucket
+    int cTrials = array.get(resTrials, b)
+    int cBreaks = array.get(resBreaks, b)
+    int cFades = array.get(resFades, b)
+    int cFails = array.get(resFails, b)
+    int cExpires = math.max(0, cTrials - cBreaks - cFades - cFails)
+    int gTrials = array.sum(resTrials)
+    int gBreaks = array.sum(resBreaks)
+    int gFades = array.sum(resFades)
+    int gFails = array.sum(resFails)
+    int gExpires = math.max(0, gTrials - gBreaks - gFades - gFails)
+    int bTrials = math.max(0, gTrials - cTrials)
+    int bBreaks = math.max(0, gBreaks - cBreaks)
+    int bFades = math.max(0, gFades - cFades)
+    int bFails = math.max(0, gFails - cFails)
+    int bExpires = math.max(0, gExpires - cExpires)
+    float bpBreak = f_dirichletPct(bBreaks, bTrials, breakProbPriorEachInput)
+    float bpFade = f_dirichletPct(bFades, bTrials, breakProbPriorEachInput)
+    float bpFail = f_dirichletPct(bFails, bTrials, breakProbPriorEachInput)
+    float bpExpire = f_dirichletPct(bExpires, bTrials, breakProbPriorEachInput)
+    resFrozenPBreak := f_hierPct(cBreaks, cTrials, bpBreak, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+    resFrozenPFade := f_hierPct(cFades, cTrials, bpFade, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+    resFrozenPFail := f_hierPct(cFails, cTrials, bpFail, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+    resFrozenPExpire := f_hierPct(cExpires, cTrials, bpExpire, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+
+if barstate.isconfirmed and supEnteredZone and not supActive
+    string frozenTrend = structureTrend[1]
+    supActive := true
+    supFrozenLevel := supArmLevel
+    supStartBar := bar_index
+    supFrozenBucket := f_srStatBucketV2(supArmClass, supArmRole, false, frozenTrend)
+    supFrozenDist := breakProbFollowAtrInput * probAtrRef
+    supBroken := false
+    supBreakBar := na
+
+    int b = supFrozenBucket
+    int cTrials = array.get(supTrials, b)
+    int cBreaks = array.get(supBreaks, b)
+    int cFades = array.get(supFades, b)
+    int cFails = array.get(supFails, b)
+    int cExpires = math.max(0, cTrials - cBreaks - cFades - cFails)
+    int gTrials = array.sum(supTrials)
+    int gBreaks = array.sum(supBreaks)
+    int gFades = array.sum(supFades)
+    int gFails = array.sum(supFails)
+    int gExpires = math.max(0, gTrials - gBreaks - gFades - gFails)
+    int bTrials = math.max(0, gTrials - cTrials)
+    int bBreaks = math.max(0, gBreaks - cBreaks)
+    int bFades = math.max(0, gFades - cFades)
+    int bFails = math.max(0, gFails - cFails)
+    int bExpires = math.max(0, gExpires - cExpires)
+    float bpBreak = f_dirichletPct(bBreaks, bTrials, breakProbPriorEachInput)
+    float bpFade = f_dirichletPct(bFades, bTrials, breakProbPriorEachInput)
+    float bpFail = f_dirichletPct(bFails, bTrials, breakProbPriorEachInput)
+    float bpExpire = f_dirichletPct(bExpires, bTrials, breakProbPriorEachInput)
+    supFrozenPBreak := f_hierPct(cBreaks, cTrials, bpBreak, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+    supFrozenPFade := f_hierPct(cFades, cTrials, bpFade, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+    supFrozenPFail := f_hierPct(cFails, cTrials, bpFail, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+    supFrozenPExpire := f_hierPct(cExpires, cTrials, bpExpire, breakProbShrinkStrengthInput, breakProbPriorEachInput)
+
+if barstate.isconfirmed and resActive
+    int age = bar_index - resStartBar
+    float lvl = resFrozenLevel
+    float dist = resFrozenDist
+    int outcome = -1
+
+    if not resBroken
+        if low <= lvl - dist
+            outcome := OUT_FADE
+        else if close > lvl
+            resBroken := true
+            resBreakBar := bar_index
+        else if age >= breakProbHorizonBarsInput
+            outcome := OUT_EXPIRE
+
+    if outcome == -1 and resBroken and bar_index > resBreakBar
+        int sinceBreak = bar_index - resBreakBar
+        if high >= lvl + dist
+            outcome := OUT_BREAK
+        else if close < lvl
+            outcome := OUT_FAIL
+        else if sinceBreak >= breakProbFollowBarsInput
+            outcome := OUT_FAIL
+
+    if outcome >= 0
+        f_addResolvedTrial(resTrials, resBreaks, resFades, resFails, resHistBucket, resHistOutcome, resFrozenBucket, outcome, breakProbRollingTrialsInput)
+        float score = f_multiclassBrier(resFrozenPBreak, resFrozenPFade, resFrozenPFail, resFrozenPExpire, outcome)
+        f_pushBrier(resBrierHist, score, breakProbRollingTrialsInput)
+        resActive := false
+        resFrozenLevel := na
+        resFrozenDist := na
+        resStartBar := na
+        resFrozenBucket := 0
+        resBroken := false
+        resBreakBar := na
+
+if barstate.isconfirmed and supActive
+    int age = bar_index - supStartBar
+    float lvl = supFrozenLevel
+    float dist = supFrozenDist
+    int outcome = -1
+
+    if not supBroken
+        if high >= lvl + dist
+            outcome := OUT_FADE
+        else if close < lvl
+            supBroken := true
+            supBreakBar := bar_index
+        else if age >= breakProbHorizonBarsInput
+            outcome := OUT_EXPIRE
+
+    if outcome == -1 and supBroken and bar_index > supBreakBar
+        int sinceBreak = bar_index - supBreakBar
+        if low <= lvl - dist
+            outcome := OUT_BREAK
+        else if close > lvl
+            outcome := OUT_FAIL
+        else if sinceBreak >= breakProbFollowBarsInput
+            outcome := OUT_FAIL
+
+    if outcome >= 0
+        f_addResolvedTrial(supTrials, supBreaks, supFades, supFails, supHistBucket, supHistOutcome, supFrozenBucket, outcome, breakProbRollingTrialsInput)
+        float score = f_multiclassBrier(supFrozenPBreak, supFrozenPFade, supFrozenPFail, supFrozenPExpire, outcome)
+        f_pushBrier(supBrierHist, score, breakProbRollingTrialsInput)
+        supActive := false
+        supFrozenLevel := na
+        supFrozenDist := na
+        supStartBar := na
+        supFrozenBucket := 0
+        supBroken := false
+        supBreakBar := na
+
+float resDistAtr = resHasLevel and atrCoach > 0 ? math.abs(selectedResistanceLevel - close) / atrCoach : na
+float supDistAtr = supHasLevel and atrCoach > 0 ? math.abs(selectedSupportLevel - close) / atrCoach : na
+
+[resAction, resShowContext, resShownLift, resShownZ] = f_probCall(breakProbEnableInput, resHasLevel, resGlobalTrials, resCtxTrials, resBaseTrials, resBreakLift, resFadeLift, resBreakZ, resFadeZ, resDistAtr, structureTrend == "RANGE", breakProbDisplayInput)
+[supAction, supShowContext, supShownLift, supShownZ] = f_probCall(breakProbEnableInput, supHasLevel, supGlobalTrials, supCtxTrials, supBaseTrials, supBreakLift, supFadeLift, supBreakZ, supFadeZ, supDistAtr, structureTrend == "RANGE", breakProbDisplayInput)
+
+bool resFocusFade = resAction == "FADE BIAS" or resAction == "WATCH FADE"
+bool supFocusFade = supAction == "FADE BIAS" or supAction == "WATCH FADE"
+float resFocusPct = resFocusFade ? resCtxFadePct : resCtxBreakPct
+float supFocusPct = supFocusFade ? supCtxFadePct : supCtxBreakPct
+
+string resCallWord = resFocusFade ? "FADE" : "BREAK"
+string supCallWord = supFocusFade ? "FADE" : "BREAK"
+string resDisplayText = "PDH " + str.tostring(selectedResistanceLevel, format.mintick) + " - " + (resShowContext ? resCallWord + " " + str.tostring(resFocusPct, "#") + "%" : resAction)
+string supDisplayText = "PDL " + str.tostring(selectedSupportLevel, format.mintick) + " - " + (supShowContext ? supCallWord + " " + str.tostring(supFocusPct, "#") + "%" : supAction)
+
+color resLabelColor = resAction == "BREAK BIAS" or resAction == "WATCH BREAK" ? color.new(srResistanceColorInput, 0) : resAction == "FADE BIAS" or resAction == "WATCH FADE" ? color.new(color.orange, 0) : color.new(color.gray, 25)
+color supLabelColor = supAction == "FADE BIAS" or supAction == "WATCH FADE" ? color.new(srSupportColorInput, 0) : supAction == "BREAK BIAS" or supAction == "WATCH BREAK" ? color.new(color.orange, 0) : color.new(color.gray, 25)
+
+var label resProbLabel = na
+var label supProbLabel = na
+
+if barstate.islast
+    if showAllChartObjectsInput and breakProbEnableInput and breakProbShowLabelsInput and resHasLevel
+        if na(resProbLabel)
+            resProbLabel := label.new(bar_index + breakProbResLabelOffsetInput, selectedResistanceLevel, resDisplayText, style = label.style_label_left, color = resLabelColor, textcolor = color.white, size = f_labelTextSize(breakProbLabelSizeInput))
+        else
+            label.set_xy(resProbLabel, bar_index + breakProbResLabelOffsetInput, selectedResistanceLevel)
+            label.set_text(resProbLabel, resDisplayText)
+            label.set_color(resProbLabel, resLabelColor)
+            label.set_size(resProbLabel, f_labelTextSize(breakProbLabelSizeInput))
+    else if not na(resProbLabel)
+        label.delete(resProbLabel)
+        resProbLabel := na
+
+    if showAllChartObjectsInput and breakProbEnableInput and breakProbShowLabelsInput and supHasLevel
+        if na(supProbLabel)
+            supProbLabel := label.new(bar_index + breakProbSupLabelOffsetInput, selectedSupportLevel, supDisplayText, style = label.style_label_left, color = supLabelColor, textcolor = color.white, size = f_labelTextSize(breakProbLabelSizeInput))
+        else
+            label.set_xy(supProbLabel, bar_index + breakProbSupLabelOffsetInput, selectedSupportLevel)
+            label.set_text(supProbLabel, supDisplayText)
+            label.set_color(supProbLabel, supLabelColor)
+            label.set_size(supProbLabel, f_labelTextSize(breakProbLabelSizeInput))
+    else if not na(supProbLabel)
+        label.delete(supProbLabel)
+        supProbLabel := na
+
+
+// ============================================================================
+// 09 - SR BOXES (CHARTPRIME PIVOT/VOLUME)
+// ============================================================================
+
+string G_SR_BOX = "09 - SR Boxes"
+
+srBoxLookbackInput = input.int(20, "Lookback Period", minval = 1, group = G_SR_BOX)
+volumeFilterLengthInput = input.int(2, "Delta Volume Filter Length", group = G_SR_BOX)
+boxWidthMultInput = input.float(1, "Adjust Box Width", maxval = 1000, minval = 0, step = 0.1, group = G_SR_BOX)
+volumePivotDivisorInput = input.float(2.5, "Volume Pivot Divisor", minval = 0.1, step = 0.1, group = G_SR_BOX)
+srBoxTransparencyInput = input.int(70, "SR Box Transparency", minval = 0, maxval = 100, group = G_SR_BOX)
+
+f_upAndDownVolume() =>
+    posVol = 0.0
+    negVol = 0.0
+    var isBuyVolume = true
+    if close > open
+        isBuyVolume := true
+    else if close < open
+        isBuyVolume := false
+    if isBuyVolume
+        posVol := posVol + volume
+    else
+        negVol := negVol - volume
+    posVol + negVol
+
+f_calcSupportResistance(srSource, srLookback) =>
+    deltaVolume = f_upAndDownVolume()
+    deltaVolumeHigh = ta.highest(deltaVolume / volumePivotDivisorInput, volumeFilterLengthInput)
+    deltaVolumeLow = ta.lowest(deltaVolume / volumePivotDivisorInput, volumeFilterLengthInput)
+
+    var float supportLevel = na
+    var float supportBreakLevel = na
+    var float resistanceLevel = na
+    var float resistanceBreakLevel = na
+    var box supportBox = na
+    var box resistanceBox = na
+    var color resistanceColor = color.new(color.red, srBoxTransparencyInput)
+    var color supportColor = color.new(color.green, srBoxTransparencyInput)
+    var bool resistanceBreakout = false
+    var bool supportBreakout = false
+    var bool resistanceHolds = false
+    var bool supportHolds = false
+
+    pivotHigh = ta.pivothigh(srSource, srLookback, srLookback)
+    pivotLow = ta.pivotlow(srSource, srLookback, srLookback)
+    atrValue = ta.atr(200)
+    boxWidth = atrValue * boxWidthMultInput
+
+    if (not na(pivotLow)) and deltaVolume > deltaVolumeHigh
+        supportLevel := pivotLow
+        supportBreakLevel := supportLevel - boxWidth
+        topLeft = chart.point.from_index(bar_index - srLookback, supportLevel)
+        bottomRight = chart.point.from_index(bar_index, supportBreakLevel)
+        if showAllChartObjectsInput
+            supportBox := box.new(top_left = topLeft, bottom_right = bottomRight, border_color = color.green, border_width = 1, bgcolor = supportColor, text = "Vol: " + str.tostring(math.round(deltaVolume, 2)), text_color = chart.fg_color, text_size = size.small)
+
+    if (not na(pivotHigh)) and deltaVolume < deltaVolumeLow
+        resistanceLevel := pivotHigh
+        resistanceBreakLevel := resistanceLevel + boxWidth
+        topLeft = chart.point.from_index(bar_index - srLookback, resistanceLevel)
+        bottomRight = chart.point.from_index(bar_index, resistanceBreakLevel)
+        if showAllChartObjectsInput
+            resistanceBox := box.new(top_left = topLeft, bottom_right = bottomRight, border_color = color.red, border_width = 1, bgcolor = resistanceColor, text = "Vol: " + str.tostring(math.round(deltaVolume, 2)), text_color = chart.fg_color, text_size = size.small)
+
+    if not na(supportBox)
+        supportBox.set_right(bar_index + 1)
+    if not na(resistanceBox)
+        resistanceBox.set_right(bar_index + 1)
+
+    resistanceBreakout := ta.crossover(low, resistanceBreakLevel)
+    resistanceHolds := ta.crossunder(high, resistanceLevel)
+    supportHolds := ta.crossover(low, supportLevel)
+    supportBreakout := ta.crossunder(high, supportBreakLevel)
+
+    if supportBreakout and not na(supportBox)
+        supportBox.set_border_style(line.style_dashed)
+    if supportHolds and not na(supportBox)
+        supportBox.set_border_style(line.style_solid)
+    if resistanceBreakout and not na(resistanceBox)
+        resistanceBox.set_border_style(line.style_dashed)
+    if resistanceHolds and not na(resistanceBox)
+        resistanceBox.set_border_style(line.style_solid)
+
+    [supportLevel, resistanceLevel, resistanceBreakout, resistanceHolds, supportHolds, supportBreakout]
+
+[srBoxSupportLevel, srBoxResistanceLevel, srBoxResistanceBreakout, srBoxResistanceHolds, srBoxSupportHolds, srBoxSupportBreakout] = f_calcSupportResistance(close, srBoxLookbackInput)
+
+var bool srBoxResistanceBecameSupport = false
+var bool srBoxSupportBecameResistance = false
+if srBoxResistanceBreakout
+    srBoxResistanceBecameSupport := true
+if srBoxResistanceHolds
+    srBoxResistanceBecameSupport := false
+if srBoxSupportBreakout
+    srBoxSupportBecameResistance := true
+if srBoxSupportHolds
+    srBoxSupportBecameResistance := false
+
+plotchar(showAllChartObjectsInput and srBoxResistanceHolds, "Resistance Holds", "◆", color = color.red, size = size.tiny, location = location.abovebar, offset = -1)
+plotchar(showAllChartObjectsInput and srBoxSupportHolds, "Support Holds", "◆", color = color.green, size = size.tiny, location = location.belowbar, offset = -1)
+plotchar(showAllChartObjectsInput and srBoxResistanceBreakout and srBoxResistanceBecameSupport[1], "Resistance as Support Holds", "◆", color = color.green, size = size.tiny, location = location.belowbar, offset = -1)
+plotchar(showAllChartObjectsInput and srBoxSupportBreakout and srBoxSupportBecameResistance[1], "Support as Resistance Holds", "◆", color = color.red, size = size.tiny, location = location.abovebar, offset = -1)
+
+if showAllChartObjectsInput and srBoxSupportBreakout and not srBoxSupportBecameResistance[1]
+    label.new(bar_index[1], srBoxSupportLevel[1], text = "Break Sup", style = label.style_label_down, color = color.new(color.red, 20), textcolor = chart.fg_color, size = f_labelTextSize(labelSizeSessionInput))
+if showAllChartObjectsInput and srBoxResistanceBreakout and not srBoxResistanceBecameSupport[1]
+    label.new(bar_index[1], srBoxResistanceLevel[1], text = "Break Res", style = label.style_label_up, color = color.new(color.green, 20), textcolor = chart.fg_color, size = f_labelTextSize(labelSizeSessionInput))
+
+
+// ============================================================================
+// 10 - SHORT / LONG PROFILE LABELS (4-STATE: WAITING/TESTING/TRIGGERED/RETEST)
+// ============================================================================
+
+string G_PROFILE_LABEL = "10 - Session Profile Labels"
+
+triggerBufferAtrInput = input.float(0.10, "Trigger Zone Buffer (x ATR)", minval = 0.0, maxval = 1.0, step = 0.01, group = G_PROFILE_LABEL)
+labelSizeProfileInput = input.string("Tiny", "Profile Label Size", options = ["Tiny", "Small", "Normal"], group = G_PROFILE_LABEL)
+
+var string shortCondition = "No Short"
+var string longCondition = "No Long"
+var float shortTriggerPrice = na
+var float longTriggerPrice = na
+var float shortLevelSticky = na
+var float longLevelSticky = na
+var string shortLevelTag = ""
+var string longLevelTag = ""
+
+if barstate.islast
+    if nextProfile == "Profil 1: Trend Continuation"
+        if asiaDirection == 1 and londonDirection == 1
+            if close < asiaHigh
+                longCondition := "IF price hits " + str.tostring(asiaHigh) + " LONG (A/L/NY)"
+                longTriggerPrice := asiaHigh
+            else
+                longCondition := "No Long (over " + str.tostring(asiaHigh) + ")"
+                longTriggerPrice := na
+            longLevelSticky := asiaHigh
+            longLevelTag := "(A/L/NY)"
+            shortCondition := "No Short"
+            shortTriggerPrice := na
+            shortLevelSticky := na
+            shortLevelTag := ""
+        else if asiaDirection == -1 and londonDirection == -1
+            if close > asiaLow
+                shortCondition := "IF price hits " + str.tostring(asiaLow) + " SHORT (A/L/NY)"
+                shortTriggerPrice := asiaLow
+            else
+                shortCondition := "No Short (under " + str.tostring(asiaLow) + ")"
+                shortTriggerPrice := na
+            shortLevelSticky := asiaLow
+            shortLevelTag := "(A/L/NY)"
+            longCondition := "No Long"
+            longTriggerPrice := na
+            longLevelSticky := na
+            longLevelTag := ""
+        else
+            shortCondition := "No Short"
+            longCondition := "No Long"
+            shortTriggerPrice := na
+            longTriggerPrice := na
+            shortLevelSticky := na
+            longLevelSticky := na
+            shortLevelTag := ""
+            longLevelTag := ""
+    else if nextProfile == "Profil 2: NY Manipulation"
+        if asiaDirection == 1
+            if close < asiaHigh
+                longCondition := "IF price hits " + str.tostring(asiaHigh) + " LONG (A/L/NY)"
+                longTriggerPrice := asiaHigh
+                longLevelSticky := asiaHigh
+                longLevelTag := "(A/L/NY)"
+            else if nyInSession and close < londonHigh
+                longCondition := "IF price hits " + str.tostring(londonHigh) + " LONG (NY)"
+                longTriggerPrice := londonHigh
+                longLevelSticky := londonHigh
+                longLevelTag := "(NY)"
+            else
+                longCondition := "No Long (over " + str.tostring(londonHigh) + ")"
+                longTriggerPrice := na
+                longLevelSticky := londonHigh
+                longLevelTag := "(NY)"
+            if close > londonLow
+                shortCondition := "IF price hits " + str.tostring(londonLow) + " SHORT (L/NY)"
+                shortTriggerPrice := londonLow
+            else
+                shortCondition := "No Short (under " + str.tostring(londonLow) + ")"
+                shortTriggerPrice := na
+            shortLevelSticky := londonLow
+            shortLevelTag := "(L/NY)"
+        else if asiaDirection == -1
+            if close > asiaLow
+                shortCondition := "IF price hits " + str.tostring(asiaLow) + " SHORT (A/L/NY)"
+                shortTriggerPrice := asiaLow
+                shortLevelSticky := asiaLow
+                shortLevelTag := "(A/L/NY)"
+            else if nyInSession and close > londonLow
+                shortCondition := "IF price hits " + str.tostring(londonLow) + " SHORT (NY)"
+                shortTriggerPrice := londonLow
+                shortLevelSticky := londonLow
+                shortLevelTag := "(NY)"
+            else
+                shortCondition := "No Short (under " + str.tostring(londonLow) + ")"
+                shortTriggerPrice := na
+                shortLevelSticky := londonLow
+                shortLevelTag := "(NY)"
+            if close < londonHigh
+                longCondition := "IF price hits " + str.tostring(londonHigh) + " LONG (L/NY)"
+                longTriggerPrice := londonHigh
+            else
+                longCondition := "No Long (over " + str.tostring(londonHigh) + ")"
+                longTriggerPrice := na
+            longLevelSticky := londonHigh
+            longLevelTag := "(L/NY)"
+        else
+            shortCondition := "No Short"
+            longCondition := "No Long"
+            shortTriggerPrice := na
+            longTriggerPrice := na
+            shortLevelSticky := na
+            longLevelSticky := na
+            shortLevelTag := ""
+            longLevelTag := ""
+    else if nextProfile == "Profil 3: London+NY Manipulation"
+        if close > asiaClose
+            shortCondition := "IF price hits " + str.tostring(asiaClose) + " SHORT (L/NY)"
+            shortTriggerPrice := asiaClose
+        else
+            shortCondition := "No Short (under " + str.tostring(asiaClose) + ")"
+            shortTriggerPrice := na
+        shortLevelSticky := asiaClose
+        shortLevelTag := "(L/NY)"
+        if close < asiaHigh
+            longCondition := "IF price hits " + str.tostring(asiaHigh) + " LONG (L/NY)"
+            longTriggerPrice := asiaHigh
+        else
+            longCondition := "No Long (over " + str.tostring(asiaHigh) + ")"
+            longTriggerPrice := na
+        longLevelSticky := asiaHigh
+        longLevelTag := "(L/NY)"
+    else if nextProfile == "Profil 4: Consolidation+Continuation"
+        if close > asiaLow
+            shortCondition := "IF price hits " + str.tostring(asiaLow) + " SHORT (L/NY)"
+            shortTriggerPrice := asiaLow
+        else
+            shortCondition := "No Short (under " + str.tostring(asiaLow) + ")"
+            shortTriggerPrice := na
+        shortLevelSticky := asiaLow
+        shortLevelTag := "(L/NY)"
+        if close < asiaClose
+            longCondition := "IF price hits " + str.tostring(asiaClose) + " LONG (L/NY)"
+            longTriggerPrice := asiaClose
+        else
+            longCondition := "No Long (over " + str.tostring(asiaClose) + ")"
+            longTriggerPrice := na
+        longLevelSticky := asiaClose
+        longLevelTag := "(L/NY)"
+    else
+        shortCondition := "No Short"
+        longCondition := "No Long"
+        shortTriggerPrice := na
+        longTriggerPrice := na
+        shortLevelSticky := na
+        longLevelSticky := na
+        shortLevelTag := ""
+        longLevelTag := ""
+
+    // Prefer a closer PDH/PDL level over the session-extreme target above, but
+    // only when the Reaction Probability engine actually found edge there
+    // (resShowContext/supShowContext) -- a nearby level with "NO EDGE" is left
+    // alone and the session extreme stays the trigger.
+    bool longOverrideEligible = resShowContext and resHasLevel and not na(selectedResistanceLevel) and not na(longLevelSticky) and selectedResistanceLevel > close and selectedResistanceLevel < longLevelSticky
+    bool shortOverrideEligible = supShowContext and supHasLevel and not na(selectedSupportLevel) and not na(shortLevelSticky) and selectedSupportLevel < close and selectedSupportLevel > shortLevelSticky
+
+    if longOverrideEligible
+        float sessionLongLevel = longLevelSticky
+        longLevelSticky := selectedResistanceLevel
+        longLevelTag := "(PDH " + resAction + ")"
+        longTriggerPrice := close < selectedResistanceLevel ? selectedResistanceLevel : na
+        longCondition := close < selectedResistanceLevel ? "IF price hits " + str.tostring(selectedResistanceLevel) + " LONG (PDH, closer than " + str.tostring(sessionLongLevel) + ")" : "No Long (over " + str.tostring(selectedResistanceLevel) + ")"
+
+    if shortOverrideEligible
+        float sessionShortLevel = shortLevelSticky
+        shortLevelSticky := selectedSupportLevel
+        shortLevelTag := "(PDL " + supAction + ")"
+        shortTriggerPrice := close > selectedSupportLevel ? selectedSupportLevel : na
+        shortCondition := close > selectedSupportLevel ? "IF price hits " + str.tostring(selectedSupportLevel) + " SHORT (PDL, closer than " + str.tostring(sessionShortLevel) + ")" : "No Short (under " + str.tostring(selectedSupportLevel) + ")"
+
+var bool shortEverTriggered = false
+var bool longEverTriggered = false
+var float shortStickyPrevLevel = na
+var float longStickyPrevLevel = na
+var int shortLabelState = na
+var int longLabelState = na
+var string shortStateText = "No Short"
+var string longStateText = "No Long"
+
+float labelBuffer = atrCoach * triggerBufferAtrInput
+
+if barstate.islast
+    if not na(shortLevelSticky) and (na(shortStickyPrevLevel) or math.abs(shortLevelSticky - shortStickyPrevLevel) > syminfo.mintick)
+        shortEverTriggered := false
+    if not na(longLevelSticky) and (na(longStickyPrevLevel) or math.abs(longLevelSticky - longStickyPrevLevel) > syminfo.mintick)
+        longEverTriggered := false
+
+    shortStickyPrevLevel := shortLevelSticky
+    longStickyPrevLevel := longLevelSticky
+    shortLabelState := na
+    longLabelState := na
+    shortStateText := "No Short"
+    longStateText := "No Long"
+
+    if not na(shortLevelSticky)
+        float distToGo = close - shortLevelSticky
+        if distToGo > labelBuffer
+            shortLabelState := 0
+        else if distToGo < -labelBuffer
+            shortEverTriggered := true
+            shortLabelState := 2
+        else
+            shortLabelState := shortEverTriggered ? 3 : 1
+
+        string shortLevelStr = str.tostring(shortLevelSticky)
+        shortStateText :=
+             shortLabelState == 0 ? "IF price hits " + shortLevelStr + " SHORT " + shortLevelTag :
+             shortLabelState == 1 ? "TESTING " + shortLevelStr + " " + shortLevelTag + " -- SHORT pending" :
+             shortLabelState == 2 ? "SHORT TRIGGERED @ " + shortLevelStr + " " + shortLevelTag :
+             "RETEST " + shortLevelStr + " " + shortLevelTag + " -- watch for reclaim"
+
+    if not na(longLevelSticky)
+        float distToGo = longLevelSticky - close
+        if distToGo > labelBuffer
+            longLabelState := 0
+        else if distToGo < -labelBuffer
+            longEverTriggered := true
+            longLabelState := 2
+        else
+            longLabelState := longEverTriggered ? 3 : 1
+
+        string longLevelStr = str.tostring(longLevelSticky)
+        longStateText :=
+             longLabelState == 0 ? "IF price hits " + longLevelStr + " LONG " + longLevelTag :
+             longLabelState == 1 ? "TESTING " + longLevelStr + " " + longLevelTag + " -- LONG pending" :
+             longLabelState == 2 ? "LONG TRIGGERED @ " + longLevelStr + " " + longLevelTag :
+             "RETEST " + longLevelStr + " " + longLevelTag + " -- watch for reclaim"
+
+float shortTriggerPricePrev = shortTriggerPrice[1]
+float longTriggerPricePrev = longTriggerPrice[1]
+bool shortTouchNow = not na(shortTriggerPricePrev) and close < shortTriggerPricePrev and close[1] >= shortTriggerPricePrev
+bool longTouchNow = not na(longTriggerPricePrev) and close > longTriggerPricePrev and close[1] <= longTriggerPricePrev
+bool shortTouchConfirmedNow = shortTouchNow and tdiConfirmsShort
+bool longTouchConfirmedNow = longTouchNow and tdiConfirmsLong
+
+var label profileLabel = na
+var label shortLabel = na
+var label longLabel = na
+
+if barstate.islast
+    if showAllChartObjectsInput
+        if na(profileLabel)
+            profileLabel := label.new(x = bar_index, y = high * 1.005, text = "[r11] Session Profil: " + nextProfile, color = color.black, textcolor = color.white, style = label.style_label_down, size = f_labelTextSize(labelSizeProfileInput))
+        label.set_text(profileLabel, "[r11] Session Profil: " + nextProfile)
+        label.set_x(profileLabel, bar_index)
+        label.set_y(profileLabel, high * 1.005)
+
+        string profileBias = "NEUTRAL"
+        if nextProfile == "Profil 2: NY Manipulation"
+            profileBias := asiaDirection == 1 ? "SHORT" : asiaDirection == -1 ? "LONG" : "NEUTRAL"
+        else if nextProfile == "Profil 3: London+NY Manipulation"
+            profileBias := "SHORT"
+        else if nextProfile == "Profil 4: Consolidation+Continuation"
+            profileBias := "LONG"
+
+        bool shortActive = not na(shortLabelState)
+        bool longActive = not na(longLabelState)
+        bool bothActive = shortActive and longActive
+
+        string shortDisplayText = shortStateText + (bothActive and profileBias == "SHORT" ? " [PRIMARY]" : bothActive and profileBias == "LONG" ? " [ALT]" : "")
+        string longDisplayText = longStateText + (bothActive and profileBias == "LONG" ? " [PRIMARY]" : bothActive and profileBias == "SHORT" ? " [ALT]" : "")
+
+        shortLblColor = shortActive ? (bothActive and profileBias == "LONG" ? color.new(color.red, 55) : color.red) : color.new(color.gray, 20)
+        longLblColor = longActive ? (bothActive and profileBias == "SHORT" ? color.new(color.green, 55) : color.green) : color.new(color.gray, 20)
+
+        if na(shortLabel)
+            shortLabel := label.new(x = bar_index, y = high * 1.003, text = shortDisplayText, color = shortLblColor, textcolor = color.white, style = label.style_label_down, size = f_labelTextSize(labelSizeProfileInput))
+        label.set_text(shortLabel, shortDisplayText)
+        label.set_x(shortLabel, bar_index)
+        label.set_y(shortLabel, high * 1.003)
+        label.set_color(shortLabel, shortLblColor)
+
+        if na(longLabel)
+            longLabel := label.new(x = bar_index, y = high * 1.001, text = longDisplayText, color = longLblColor, textcolor = color.white, style = label.style_label_down, size = f_labelTextSize(labelSizeProfileInput))
+        label.set_text(longLabel, longDisplayText)
+        label.set_x(longLabel, bar_index)
+        label.set_y(longLabel, high * 1.001)
+        label.set_color(longLabel, longLblColor)
+    else
+        if not na(profileLabel)
+            label.delete(profileLabel)
+            profileLabel := na
+        if not na(shortLabel)
+            label.delete(shortLabel)
+            shortLabel := na
+        if not na(longLabel)
+            label.delete(longLabel)
+            longLabel := na
+
+
+// ============================================================================
+// 11 - CP / REGIME ENGINE (CUSUM + 4H BIAS + 1H TREND + RETEST)
+//-----------------------------------------------------------------------------
+// Ported from the DBR Change-Point engine (already proven in
+// P0_Delta_DBR_ChangePoint_Merged_Strategy.pine / Stage9). Purely
+// informational here -- no strategy/broker in this file, so it never places
+// an order. Feeds the CP/Regime status table in section 12 in place of
+// Trading Coach's own Coaching Dashboard.
+// ============================================================================
+
+string G_CUSUM = "11a - CP Change Point (CUSUM)"
+
+cusumLengthInput = input.int(50, "CUSUM Lookback Period", minval = 10, group = G_CUSUM)
+cusumThresholdInput = input.float(4.0, "CUSUM Threshold (h)", minval = 0.1, step = 0.1, group = G_CUSUM)
+cusumSlackInput = input.float(0.5, "CUSUM Slack (k)", minval = 0.0, step = 0.1, group = G_CUSUM)
+showChangePointVisualInput = input.bool(true, "Show CUSUM Regime Line + Pressure Fill", group = G_CUSUM)
+cpLongColorInput = input.color(color.aqua, "CP Bull Color", group = G_CUSUM)
+cpShortColorInput = input.color(color.orange, "CP Bear Color", group = G_CUSUM)
+
+float atrExec = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
+float cusumSrc = close
+float cusumLogReturns = math.log(cusumSrc / nz(cusumSrc[1], cusumSrc))
+float cusumRollingMean = ta.sma(cusumLogReturns, cusumLengthInput)
+float cusumRollingStd = ta.stdev(cusumLogReturns, cusumLengthInput)
+float cusumZScore = (cusumLogReturns - cusumRollingMean) / (cusumRollingStd == 0 ? 1.0 : cusumRollingStd)
+
+var float sPos = 0.0
+var float sNeg = 0.0
+var int trend = 0
+bool changeUp = false
+bool changeDn = false
+
+if barstate.isconfirmed
+    if not na(cusumZScore)
+        sPos := math.max(0, sPos + cusumZScore - cusumSlackInput)
+        sNeg := math.min(0, sNeg + cusumZScore + cusumSlackInput)
+    changeUp := sPos > cusumThresholdInput
+    changeDn := sNeg < -cusumThresholdInput
+
+bool isChangePoint = changeUp or changeDn
+
+var float regimePrice = na
+var int regimeStartBar = bar_index
+
+if barstate.isconfirmed and (isChangePoint or bar_index == cusumLengthInput)
+    trend := changeUp ? 1 : (changeDn ? -1 : trend)
+    regimePrice := cusumSrc
+    regimeStartBar := bar_index
+    sPos := 0.0
+    sNeg := 0.0
+
+int barsInRegime = bar_index - regimeStartBar
+string cpTrendLabel = trend == 1 ? "BULL" : trend == -1 ? "BEAR" : "NONE"
+
+color cpTrendColor = trend == 1 ? cpLongColorInput : (trend == -1 ? cpShortColorInput : color.gray)
+bool cpIsLevelChange = regimePrice != regimePrice[1]
+
+cpRegimeLine = plot(regimePrice, "CP Regime Price", color = showAllChartObjectsInput and showChangePointVisualInput and not cpIsLevelChange ? cpTrendColor : na, style = plot.style_linebr, linewidth = 2)
+
+float cpPriceVol = ta.stdev(cusumSrc, cusumLengthInput)
+float cpCusumLevelPos = regimePrice + sPos * cpPriceVol
+float cpCusumLevelNeg = regimePrice + sNeg * cpPriceVol
+
+cpPressurePosLine = plot(cpCusumLevelPos, "CP Bullish Pressure", color = showAllChartObjectsInput and showChangePointVisualInput and not cpIsLevelChange ? color.new(cpLongColorInput, 80) : na, style = plot.style_linebr)
+cpPressureNegLine = plot(cpCusumLevelNeg, "CP Bearish Pressure", color = showAllChartObjectsInput and showChangePointVisualInput and not cpIsLevelChange ? color.new(cpShortColorInput, 80) : na, style = plot.style_linebr)
+
+fill(cpRegimeLine, cpPressurePosLine, color = showAllChartObjectsInput and showChangePointVisualInput ? color.new(cpLongColorInput, 90) : na, title = "CP Bullish Fill")
+fill(cpRegimeLine, cpPressureNegLine, color = showAllChartObjectsInput and showChangePointVisualInput ? color.new(cpShortColorInput, 90) : na, title = "CP Bearish Fill")
+
+plotshape(showAllChartObjectsInput and showChangePointVisualInput and changeUp, title = "CP Change Up", style = shape.triangleup, location = location.belowbar, color = cpLongColorInput, size = size.tiny)
+plotshape(showAllChartObjectsInput and showChangePointVisualInput and changeDn, title = "CP Change Down", style = shape.triangledown, location = location.abovebar, color = cpShortColorInput, size = size.tiny)
+
+string G_MTF = "11b - CP 4H Bias / 1H Trend"
+
+biasTimeframeInput = input.timeframe("240", "4H Bias Timeframe", group = G_MTF)
+biasPivotLeftInput = input.int(3, "4H Pivot Left", minval = 1, maxval = 20, group = G_MTF)
+biasPivotRightInput = input.int(3, "4H Pivot Right", minval = 1, maxval = 20, group = G_MTF)
+biasEmaLengthInput = input.int(50, "4H EMA Length", minval = 2, group = G_MTF)
+biasSlopeLookbackInput = input.int(5, "4H EMA Slope Lookback", minval = 1, maxval = 50, group = G_MTF)
+trendTimeframeInput = input.timeframe("60", "1H Trend Timeframe", group = G_MTF)
+trend1hAdxLengthInput = input.int(14, "1H ADX / DI Length", minval = 1, group = G_MTF)
+trend1hAdxMinimumInput = input.float(20.0, "1H Minimum ADX", minval = 0.0, step = 0.5, group = G_MTF)
+trend1hFastEmaInput = input.int(21, "1H Fast EMA", minval = 1, group = G_MTF)
+trend1hSlowEmaInput = input.int(50, "1H Slow EMA", minval = 2, group = G_MTF)
+trend1hErLengthInput = input.int(10, "1H Efficiency Ratio Length", minval = 2, group = G_MTF)
+trend1hErMinimumInput = input.float(0.30, "1H Minimum Efficiency Ratio", minval = 0.0, maxval = 1.0, step = 0.05, group = G_MTF)
+
+f_get4hContext() =>
+    float ph = ta.pivothigh(high, biasPivotLeftInput, biasPivotRightInput)
+    float pl = ta.pivotlow(low, biasPivotLeftInput, biasPivotRightInput)
+    float latestHigh = ta.valuewhen(not na(ph), ph, 0)
+    float previousHigh = ta.valuewhen(not na(ph), ph, 1)
+    float latestLow = ta.valuewhen(not na(pl), pl, 0)
+    float previousLow = ta.valuewhen(not na(pl), pl, 1)
+    float ema = ta.ema(close, biasEmaLengthInput)
+    bool aboveEma = close > ema
+    bool slopeUp = ema > ema[biasSlopeLookbackInput]
+    bool slopeDown = ema < ema[biasSlopeLookbackInput]
+    [latestHigh[1], previousHigh[1], latestLow[1], previousLow[1], aboveEma[1], slopeUp[1], slopeDown[1]]
+
+[lastPivotHigh, prevPivotHigh, lastPivotLow, prevPivotLow, closeAboveEma4h, emaSlopeUp4h, emaSlopeDown4h] = request.security(syminfo.tickerid, biasTimeframeInput, f_get4hContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool haveEnoughPivots4h = not na(lastPivotHigh) and not na(prevPivotHigh) and not na(lastPivotLow) and not na(prevPivotLow)
+bool structureUp4h = haveEnoughPivots4h and lastPivotHigh > prevPivotHigh and lastPivotLow > prevPivotLow
+bool structureDown4h = haveEnoughPivots4h and lastPivotHigh < prevPivotHigh and lastPivotLow < prevPivotLow
+bool slowFilterUp = closeAboveEma4h and emaSlopeUp4h
+bool slowFilterDown = not closeAboveEma4h and emaSlopeDown4h
+
+string bias = structureUp4h and slowFilterUp ? "LONG_ONLY" : structureDown4h and slowFilterDown ? "SHORT_ONLY" : "NO_TRADE"
+
+f_efficiencyRatio(int length) =>
+    float netMove = math.abs(close - close[length])
+    float sumMoves = 0.0
+    for i = 0 to length - 1
+        sumMoves += math.abs(close[i] - close[i + 1])
+    sumMoves > 0 ? netMove / sumMoves : 0.0
+
+f_get1hContext() =>
+    [plusDi, minusDi, adx] = ta.dmi(trend1hAdxLengthInput, trend1hAdxLengthInput)
+    float emaFast = ta.ema(close, trend1hFastEmaInput)
+    float emaSlow = ta.ema(close, trend1hSlowEmaInput)
+    float er = f_efficiencyRatio(trend1hErLengthInput)
+    [adx[1], emaFast[1], emaSlow[1], er[1]]
+
+[adx1h, emaFast1h, emaSlow1h, er1h] = request.security(syminfo.tickerid, trendTimeframeInput, f_get1hContext(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+
+bool adxOk1h = adx1h >= trend1hAdxMinimumInput
+bool erOk1h = er1h >= trend1hErMinimumInput
+bool emaStackBullish1h = emaFast1h > emaSlow1h
+bool emaStackBearish1h = emaFast1h < emaSlow1h
+bool long1hTrendOk = emaStackBullish1h and adxOk1h and erOk1h
+bool short1hTrendOk = emaStackBearish1h and adxOk1h and erOk1h
+
+string G_RETEST = "11c - CP Retest / Trigger"
+
+regimeZoneAtrMultInput = input.float(0.25, "Regime Zone Half-Width (x ATR)", minval = 0.05, maxval = 2.0, step = 0.05, group = G_RETEST)
+retestWindowHoursInput = input.float(6.0, "Maximum Change-Point-To-Retest Window (Hours)", minval = 0.5, maxval = 48.0, step = 0.5, group = G_RETEST)
+minBarsAfterRetestInput = input.int(0, "Minimum Bars After Retest Before Trigger", minval = 0, maxval = 5, group = G_RETEST)
+maxBarsAfterRetestInput = input.int(4, "Maximum Bars After Retest To Trigger", minval = 1, maxval = 12, group = G_RETEST)
+maxRetestOvershootAtrInput = input.float(0.10, "Maximum Retest Overshoot Beyond Far Edge (ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = G_RETEST)
+reclaimBufferAtrInput = input.float(0.05, "Minimum Reclaim Beyond Zone Edge (ATR)", minval = 0.0, maxval = 0.50, step = 0.01, group = G_RETEST)
+maxEntryExtensionAtrInput = input.float(0.50, "Maximum Entry Extension From Zone (ATR)", minval = 0.10, maxval = 1.50, step = 0.05, group = G_RETEST)
+minimumTriggerBodyFractionInput = input.float(0.30, "Minimum Trigger Candle Body / Range", minval = 0.0, maxval = 1.0, step = 0.05, group = G_RETEST)
+minimumTriggerCloseLocationInput = input.float(0.58, "Minimum Trigger Close Location", minval = 0.50, maxval = 0.95, step = 0.05, group = G_RETEST)
+requireRetestPressureInput = input.bool(true, "Require Volume Pressure Confirmation On Trigger", group = G_RETEST)
+showRetestZoneInput = input.bool(true, "Show Active Retest Zone", group = G_RETEST)
+showRetestTouchMarkerInput = input.bool(true, "Show Retest Touch Marker", group = G_RETEST)
+showRetestTriggerInput = input.bool(true, "Show Qualified Retest Trigger", group = G_RETEST)
+
+float cpHalfWidth = atrExec * regimeZoneAtrMultInput
+float cpZoneLow = cusumSrc - cpHalfWidth
+float cpZoneHigh = cusumSrc + cpHalfWidth
+int cpDirection = changeUp ? 1 : (changeDn ? -1 : 0)
+
+float triggerRange = math.max(high - low, syminfo.mintick)
+float triggerBodyFraction = math.abs(close - open) / triggerRange
+float triggerCloseLocation = (close - low) / triggerRange
+
+var float activeZoneLow = na
+var float activeZoneHigh = na
+var int activeDirection = 0
+var int activeEventTime = na
+var string retestState = "NONE"
+var int retestTouchBar = na
+
+bool newChangePointEvent = barstate.isconfirmed and cpDirection != 0
+
+if newChangePointEvent
+    activeZoneLow := cpZoneLow
+    activeZoneHigh := cpZoneHigh
+    activeDirection := cpDirection
+    activeEventTime := int(time)
+    retestState := "WATCHING"
+    retestTouchBar := na
+
+int hoursSinceEvent = na(activeEventTime) ? na : int((time - activeEventTime) / (60 * 60 * 1000))
+bool windowExpired = not na(activeEventTime) and hoursSinceEvent > retestWindowHoursInput
+
+bool retestLongTouchNow = false
+bool retestShortTouchNow = false
+
+if retestState == "WATCHING"
+    if windowExpired
+        retestState := "EXPIRED"
+    else
+        bool failedBeforeRetestLong = activeDirection == 1 and close < activeZoneLow
+        bool failedBeforeRetestShort = activeDirection == -1 and close > activeZoneHigh
+
+        if failedBeforeRetestLong or failedBeforeRetestShort
+            retestState := "INVALIDATED"
+        else
+            bool validLongTouch = activeDirection == 1 and close[1] > activeZoneHigh and low <= activeZoneHigh and high >= activeZoneLow and low >= activeZoneLow - atrExec * maxRetestOvershootAtrInput
+            bool validShortTouch = activeDirection == -1 and close[1] < activeZoneLow and high >= activeZoneLow and low <= activeZoneHigh and high <= activeZoneHigh + atrExec * maxRetestOvershootAtrInput
+
+            if validLongTouch or validShortTouch
+                retestState := "RETESTED"
+                retestTouchBar := bar_index
+                retestLongTouchNow := validLongTouch
+                retestShortTouchNow := validShortTouch
+
+bool triggerUpNow = false
+bool triggerDownNow = false
+
+if retestState == "RETESTED"
+    int barsAfterRetest = na(retestTouchBar) ? 100000 : bar_index - retestTouchBar
+    bool retestTooOld = barsAfterRetest > maxBarsAfterRetestInput
+    bool invalidateLong = activeDirection == 1 and close < activeZoneLow - atrExec * maxRetestOvershootAtrInput
+    bool invalidateShort = activeDirection == -1 and close > activeZoneHigh + atrExec * maxRetestOvershootAtrInput
+
+    if windowExpired or retestTooOld
+        retestState := "EXPIRED"
+    else if invalidateLong or invalidateShort
+        retestState := "INVALIDATED"
+    else if barsAfterRetest >= minBarsAfterRetestInput
+        float reclaimBuffer = atrExec * reclaimBufferAtrInput
+        float maxExtension = atrExec * maxEntryExtensionAtrInput
+        bool priceReclaimLong = activeDirection == 1 and close > activeZoneHigh + reclaimBuffer
+        bool priceReclaimShort = activeDirection == -1 and close < activeZoneLow - reclaimBuffer
+        bool extensionLongOk = close - activeZoneHigh <= maxExtension
+        bool extensionShortOk = activeZoneLow - close <= maxExtension
+        bool candleBodyOk = triggerBodyFraction >= minimumTriggerBodyFractionInput
+        bool candleLocationLongOk = triggerCloseLocation >= minimumTriggerCloseLocationInput
+        bool candleLocationShortOk = triggerCloseLocation <= 1.0 - minimumTriggerCloseLocationInput
+        bool pressureLongOk = not requireRetestPressureInput or executionDeltaPressure >= minimumVolumePressureInput
+        bool pressureShortOk = not requireRetestPressureInput or executionDeltaPressure <= -minimumVolumePressureInput
+
+        triggerUpNow := priceReclaimLong and extensionLongOk and candleBodyOk and candleLocationLongOk and pressureLongOk
+        triggerDownNow := priceReclaimShort and extensionShortOk and candleBodyOk and candleLocationShortOk and pressureShortOk
+
+        if triggerUpNow or triggerDownNow
+            retestState := "TRIGGERED"
+
+var box activeZoneBox = na
+
+if barstate.islast
+    if not na(activeZoneBox)
+        box.delete(activeZoneBox)
+    if showAllChartObjectsInput and showRetestZoneInput and (retestState == "WATCHING" or retestState == "RETESTED")
+        color zoneColor = activeDirection == 1 ? cpLongColorInput : cpShortColorInput
+        activeZoneBox := box.new(left = bar_index - 40, top = activeZoneHigh, right = bar_index + 5, bottom = activeZoneLow, xloc = xloc.bar_index, bgcolor = color.new(zoneColor, 87), border_color = zoneColor)
+
+plotshape(showAllChartObjectsInput and showRetestTouchMarkerInput and retestLongTouchNow, title = "Long Retest Touch", style = shape.circle, location = location.belowbar, size = size.tiny, color = color.new(cpLongColorInput, 20))
+plotshape(showAllChartObjectsInput and showRetestTouchMarkerInput and retestShortTouchNow, title = "Short Retest Touch", style = shape.circle, location = location.abovebar, size = size.tiny, color = color.new(cpShortColorInput, 20))
+plotshape(showAllChartObjectsInput and showRetestTriggerInput and triggerUpNow, title = "Qualified Long Retest Trigger", style = shape.diamond, location = location.belowbar, size = size.small, color = cpLongColorInput, text = "T", textcolor = color.white)
+plotshape(showAllChartObjectsInput and showRetestTriggerInput and triggerDownNow, title = "Qualified Short Retest Trigger", style = shape.diamond, location = location.abovebar, size = size.small, color = cpShortColorInput, text = "T", textcolor = color.white)
+
+
+// ============================================================================
+// 12 - CP / REGIME STATUS TABLE
+// ============================================================================
+
+string G_CP_DASH = "12 - CP / Regime Dashboard"
+
+showCpDashboardInput = input.bool(true, "Show CP / Regime Dashboard", group = G_CP_DASH)
+cpDashboardPositionInput = input.string("Top Right", "Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_CP_DASH)
+cpDashboardSizeInput = input.string("Tiny", "Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_CP_DASH)
+
+var table cpTable = table.new(f_tablePosition(cpDashboardPositionInput), 2, 9, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast and showAllChartObjectsInput and showCpDashboardInput
+    cpTextSize = f_tableTextSize(cpDashboardSizeInput)
+
+    table.cell(cpTable, 0, 0, "CP / REGIME", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = cpTextSize)
+    table.cell(cpTable, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = cpTextSize)
+
+    table.cell(cpTable, 0, 1, "4H Bias", text_color = color.white, text_size = cpTextSize)
+    table.cell(cpTable, 1, 1, bias, text_color = bias == "LONG_ONLY" ? color.aqua : bias == "SHORT_ONLY" ? color.orange : color.gray, text_size = cpTextSize)
+
+    table.cell(cpTable, 0, 2, "1H Trend", text_color = color.white, text_size = cpTextSize)
+    table.cell(cpTable, 1, 2, long1hTrendOk ? "BULL" : short1hTrendOk ? "BEAR" : "MIXED", text_color = long1hTrendOk ? color.aqua : short1hTrendOk ? color.orange : color.gray, text_size = cpTextSize)
+
+    table.cell(cpTable, 0, 3, "CP Trend", text_color = color.white, text_size = cpTextSize)
+    table.cell(cpTable, 1, 3, cpTrendLabel, text_color = trend == 1 ? color.aqua : trend == -1 ? color.orange : color.gray, text_size = cpTextSize)
+
+    table.cell(cpTable, 0, 4, "CUSUM sPos/sNeg", text_color = color.white, text_size = cpTextSize)
+    table.cell(cpTable, 1, 4, str.tostring(sPos, "#.00") + " / " + str.tostring(sNeg, "#.00"), text_color = color.gray, text_size = cpTextSize)
+
+    table.cell(cpTable, 0, 5, "Bars In Regime", text_color = color.white, text_size = cpTextSize)
+    table.cell(cpTable, 1, 5, str.tostring(barsInRegime), text_color = color.gray, text_size = cpTextSize)
+
+    table.cell(cpTable, 0, 6, "Retest", text_color = color.white, text_size = cpTextSize)
+    table.cell(cpTable, 1, 6, retestState, text_color = retestState == "TRIGGERED" ? color.white : color.gray, text_size = cpTextSize)
+
+    table.cell(cpTable, 0, 7, "Pressure", text_color = color.white, text_size = cpTextSize)
+    table.cell(cpTable, 1, 7, str.tostring(executionDeltaPressure, "#.0") + "%", text_color = executionDeltaPressure >= 0 ? color.aqua : color.orange, text_size = cpTextSize)
+
+    table.cell(cpTable, 0, 8, "Buyers / Sellers", text_color = color.white, text_size = cpTextSize)
+    table.cell(cpTable, 1, 8, str.tostring(int(math.round(buyRatio * 100.0))) + "% / " + str.tostring(int(math.round(sellRatio * 100.0))) + "%", text_color = color.gray, text_size = cpTextSize)
+
+
+// ============================================================================
+// 13 - RISK / SETUP GATES (LUX S/R BREAKOUT ENTRY)
+// ============================================================================
+
+string G_RISK = "13 - Risk / Setup Gates"
+
+accountSizeInput = input.float(10000.0, "Account Size ($)", minval = 0.0, group = G_RISK)
+riskPercentInput = input.float(1.0, "Risk Per Trade (%)", minval = 0.0, maxval = 100.0, step = 0.1, group = G_RISK)
+pointValueInput = input.float(2.0, "Dollar Value Per Point", minval = 0.0, group = G_RISK)
+stopBufferAtrMultInput = input.float(0.15, "Stop Buffer Beyond Broken Level (x ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = G_RISK)
+rMultipleInput = input.float(2.0, "Target R-Multiple", minval = 0.5, maxval = 10.0, step = 0.5, group = G_RISK)
+maximumEntryRiskAtrInput = input.float(1.5, "Maximum Entry Risk (x ATR)", minval = 0.25, maxval = 5.0, step = 0.05, group = G_RISK)
+requireFavorableSessionInput = input.bool(true, "Require Favorable Session", group = G_RISK)
+favorForLondonInput = input.bool(true, "Favorable Session: London", group = G_RISK, inline = "fav")
+favorForNyInput = input.bool(true, "Favorable Session: New York", group = G_RISK, inline = "fav")
+favorForAsiaInput = input.bool(false, "Favorable Session: Asia", group = G_RISK, inline = "fav")
+
+bool sessionFavorable = (asiaInSession and favorForAsiaInput) or (londonInSession and favorForLondonInput) or (nyInSession and favorForNyInput)
+
+bool longStructureOk = structureTrend == "UP"
+bool shortStructureOk = structureTrend == "DOWN"
+bool momentumOkLong = not requireMomentumInput or tdiConfirmsLong
+bool momentumOkShort = not requireMomentumInput or tdiConfirmsShort
+bool sessionOkForLong = not requireFavorableSessionInput or sessionFavorable
+bool sessionOkForShort = not requireFavorableSessionInput or sessionFavorable
+
+var int lastLongSetupBar = na
+var int lastShortSetupBar = na
+
+bool longCooldownOk = na(lastLongSetupBar) or bar_index - lastLongSetupBar > cooldownBarsInput
+bool shortCooldownOk = na(lastShortSetupBar) or bar_index - lastShortSetupBar > cooldownBarsInput
+
+bool longSetupNow = barstate.isconfirmed and longSignalNow and longStructureOk and momentumOkLong and pressureOkLong and sessionOkForLong and longCooldownOk
+bool shortSetupNow = barstate.isconfirmed and shortSignalNow and shortStructureOk and momentumOkShort and pressureOkShort and sessionOkForShort and shortCooldownOk
+
+if longSetupNow
+    lastLongSetupBar := bar_index
+if shortSetupNow
+    lastShortSetupBar := bar_index
+
+f_nearZone(float price, float level, bool broken) =>
+    not broken and not na(level) and math.abs(price - level) <= zoneToleranceAtrInput * atrCoach
+
+f_nearBrokenZone(float price, float level, bool broken) =>
+    broken and not na(level) and math.abs(price - level) <= zoneToleranceAtrInput * atrCoach
+
+bool longZoneConfluence = f_nearZone(close, asiaLow, asiaLowBroken) or f_nearZone(close, londonLow, londonLowBroken) or f_nearZone(close, nyLow, nyLowBroken) or f_nearBrokenZone(close, asiaHigh, asiaHighBroken) or f_nearBrokenZone(close, londonHigh, londonHighBroken) or f_nearBrokenZone(close, nyHigh, nyHighBroken)
+bool shortZoneConfluence = f_nearZone(close, asiaHigh, asiaHighBroken) or f_nearZone(close, londonHigh, londonHighBroken) or f_nearZone(close, nyHigh, nyHighBroken) or f_nearBrokenZone(close, asiaLow, asiaLowBroken) or f_nearBrokenZone(close, londonLow, londonLowBroken) or f_nearBrokenZone(close, nyLow, nyLowBroken)
+
+bool longPressureBonus = executionDeltaPressure >= minimumVolumePressureInput
+bool shortPressureBonus = executionDeltaPressure <= -minimumVolumePressureInput
+bool longZscoreBonus = zscoreOversold
+bool shortZscoreBonus = zscoreOverbought
+
+int longBonusPoints = (longZoneConfluence ? 1 : 0) + (longPressureBonus ? 1 : 0) + (longZscoreBonus ? 1 : 0)
+int shortBonusPoints = (shortZoneConfluence ? 1 : 0) + (shortPressureBonus ? 1 : 0) + (shortZscoreBonus ? 1 : 0)
+string longSetupGrade = longBonusPoints >= 3 ? "A" : longBonusPoints >= 1 ? "B" : "C"
+string shortSetupGrade = shortBonusPoints >= 3 ? "A" : shortBonusPoints >= 1 ? "B" : "C"
+
+float longStopAnchor = lsrHighUsePivot
+float shortStopAnchor = lsrLowUsePivot
+float longStopPrice = na
+float longTargetPrice = na
+float longRiskPerUnit = na
+float longRiskAtr = na
+bool longRiskOk = false
+float shortStopPrice = na
+float shortTargetPrice = na
+float shortRiskPerUnit = na
+float shortRiskAtr = na
+bool shortRiskOk = false
+
+if longSetupNow and not na(longStopAnchor)
+    float candidateStop = longStopAnchor - stopBufferAtrMultInput * atrCoach
+    if candidateStop < close
+        longStopPrice := candidateStop
+        longRiskPerUnit := close - longStopPrice
+        longRiskAtr := longRiskPerUnit / atrCoach
+        longRiskOk := longRiskPerUnit > 0 and longRiskAtr <= maximumEntryRiskAtrInput
+        longTargetPrice := close + longRiskPerUnit * rMultipleInput
+
+if shortSetupNow and not na(shortStopAnchor)
+    float candidateStop = shortStopAnchor + stopBufferAtrMultInput * atrCoach
+    if candidateStop > close
+        shortStopPrice := candidateStop
+        shortRiskPerUnit := shortStopPrice - close
+        shortRiskAtr := shortRiskPerUnit / atrCoach
+        shortRiskOk := shortRiskPerUnit > 0 and shortRiskAtr <= maximumEntryRiskAtrInput
+        shortTargetPrice := close - shortRiskPerUnit * rMultipleInput
+
+bool actualLongSignal = longSetupNow and longRiskOk
+bool actualShortSignal = shortSetupNow and shortRiskOk
+
+
+// ============================================================================
+// 14 - VISUALS + OUTCOME TRACKERS
+// ============================================================================
+
+string G_VISUALS = "14a - Entry Visuals"
+
+showEntryMarkersInput = input.bool(true, "Show Entry Markers", group = G_VISUALS)
+longColorInput = input.color(color.aqua, "Long Color", group = G_VISUALS)
+shortColorInput = input.color(color.orange, "Short Color", group = G_VISUALS)
+
+plotshape(showAllChartObjectsInput and showEntryMarkersInput and actualLongSignal, title = "Long Setup", style = shape.triangleup, location = location.belowbar, size = size.small, color = longColorInput, text = "LONG", textcolor = color.white)
+plotshape(showAllChartObjectsInput and showEntryMarkersInput and actualShortSignal, title = "Short Setup", style = shape.triangledown, location = location.abovebar, size = size.small, color = shortColorInput, text = "SHORT", textcolor = color.white)
+
+string G_COACH_OUTCOME = "14b - Coach Outcome Tracker"
+
+showOutcomeTrackerInput = input.bool(true, "Show Outcome Tracker Table", group = G_COACH_OUTCOME)
+outcomeHorizonBarsInput = input.int(20, "Outcome Tracking Horizon (Bars)", minval = 1, maxval = 500, group = G_COACH_OUTCOME)
+outcomeTablePositionInput = input.string("Bottom Right", "Outcome Table Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_COACH_OUTCOME)
+outcomeTableSizeInput = input.string("Tiny", "Outcome Table Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_COACH_OUTCOME)
+
+var array<bool> pendingIsLong = array.new_bool()
+var array<int> pendingEntryBar = array.new_int()
+var array<float> pendingTargetPrice = array.new_float()
+var array<float> pendingStopPrice = array.new_float()
+
+var int longWins = 0
+var int longLosses = 0
+var int longExpired = 0
+var int shortWins = 0
+var int shortLosses = 0
+var int shortExpired = 0
+var int totalSetupsRegistered = 0
+
+if actualLongSignal
+    array.push(pendingIsLong, true)
+    array.push(pendingEntryBar, bar_index)
+    array.push(pendingTargetPrice, longTargetPrice)
+    array.push(pendingStopPrice, longStopPrice)
+    totalSetupsRegistered += 1
+
+if actualShortSignal
+    array.push(pendingIsLong, false)
+    array.push(pendingEntryBar, bar_index)
+    array.push(pendingTargetPrice, shortTargetPrice)
+    array.push(pendingStopPrice, shortStopPrice)
+    totalSetupsRegistered += 1
+
+if array.size(pendingEntryBar) > 0
+    for i = array.size(pendingEntryBar) - 1 to 0
+        bool isLongPending = array.get(pendingIsLong, i)
+        float targetPending = array.get(pendingTargetPrice, i)
+        float stopPending = array.get(pendingStopPrice, i)
+        int entryBarPending = array.get(pendingEntryBar, i)
+        bool eligibleForResolution = bar_index > entryBarPending
+        bool hitTarget = eligibleForResolution and (isLongPending ? high >= targetPending : low <= targetPending)
+        bool hitStop = eligibleForResolution and (isLongPending ? low <= stopPending : high >= stopPending)
+        bool expiredNow = bar_index - entryBarPending >= outcomeHorizonBarsInput
+        bool resolvedNow = false
+        bool wasWin = false
+
+        if hitTarget and hitStop
+            resolvedNow := true
+            wasWin := false
+        else if hitTarget
+            resolvedNow := true
+            wasWin := true
+        else if hitStop
+            resolvedNow := true
+            wasWin := false
+
+        if resolvedNow
+            if isLongPending
+                if wasWin
+                    longWins += 1
+                else
+                    longLosses += 1
+            else
+                if wasWin
+                    shortWins += 1
+                else
+                    shortLosses += 1
+            array.remove(pendingIsLong, i)
+            array.remove(pendingEntryBar, i)
+            array.remove(pendingTargetPrice, i)
+            array.remove(pendingStopPrice, i)
+        else if expiredNow
+            if isLongPending
+                longExpired += 1
+            else
+                shortExpired += 1
+            array.remove(pendingIsLong, i)
+            array.remove(pendingEntryBar, i)
+            array.remove(pendingTargetPrice, i)
+            array.remove(pendingStopPrice, i)
+
+var table outcomeTable = table.new(f_tablePosition(outcomeTablePositionInput), 4, 4, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast and showAllChartObjectsInput and showOutcomeTrackerInput
+    outcomeTextSize = f_tableTextSize(outcomeTableSizeInput)
+    table.cell(outcomeTable, 0, 0, "OUTCOMES", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = outcomeTextSize)
+    table.cell(outcomeTable, 1, 0, "W", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = outcomeTextSize)
+    table.cell(outcomeTable, 2, 0, "L", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = outcomeTextSize)
+    table.cell(outcomeTable, 3, 0, "EXP", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = outcomeTextSize)
+    table.cell(outcomeTable, 0, 1, "LONG", text_color = color.aqua, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 1, 1, str.tostring(longWins), text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 2, 1, str.tostring(longLosses), text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 3, 1, str.tostring(longExpired), text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 0, 2, "SHORT", text_color = color.orange, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 1, 2, str.tostring(shortWins), text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 2, 2, str.tostring(shortLosses), text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 3, 2, str.tostring(shortExpired), text_color = color.white, text_size = outcomeTextSize)
+
+    int totalResolved = longWins + longLosses + shortWins + shortLosses
+    float totalWinRate = totalResolved > 0 ? (longWins + shortWins) * 100.0 / totalResolved : na
+
+    table.cell(outcomeTable, 0, 3, "WIN RATE", text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 1, 3, na(totalWinRate) ? "--" : str.tostring(totalWinRate, "#.0") + "%", text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 2, 3, "N", text_color = color.white, text_size = outcomeTextSize)
+    table.cell(outcomeTable, 3, 3, str.tostring(totalSetupsRegistered), text_color = color.white, text_size = outcomeTextSize)
+
+string G_PROFILE_OUTCOME = "14c - Profile Outcome Tracker"
+
+showProfileOutcomeInput = input.bool(true, "Show Per-Profile Outcome Table", group = G_PROFILE_OUTCOME)
+profileOutcomeTargetAtrInput = input.float(1.0, "Outcome Target / Stop (x ATR)", minval = 0.1, step = 0.1, group = G_PROFILE_OUTCOME)
+profileOutcomeHorizonBarsInput = input.int(20, "Profile Outcome Tracking Horizon (Bars)", minval = 1, maxval = 500, group = G_PROFILE_OUTCOME)
+profileOutcomeTablePositionInput = input.string("Bottom Left", "Table Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_PROFILE_OUTCOME)
+profileOutcomeTableSizeInput = input.string("Tiny", "Table Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_PROFILE_OUTCOME)
+
+f_profileCode(string profile) =>
+    switch profile
+        "Profil 1: Trend Continuation" => 0
+        "Profil 2: NY Manipulation" => 1
+        "Profil 3: London+NY Manipulation" => 2
+        "Profil 4: Consolidation+Continuation" => 3
+        => -1
+
+float profileOutcomeAtr = ta.atr(14)
+int currentProfileCode = f_profileCode(nextProfile)
+
+var array<int> profileOccurrences = array.new_int(4, 0)
+var bool profileCountedToday = false
+
+if barstate.islast and not profileCountedToday and currentProfileCode >= 0
+    array.set(profileOccurrences, currentProfileCode, array.get(profileOccurrences, currentProfileCode) + 1)
+    profileCountedToday := true
+
+if newDay
+    profileCountedToday := false
+
+var array<int> pendingProfileCode = array.new_int()
+var array<bool> pendingProfileIsShort = array.new_bool()
+var array<int> pendingProfileEntryBar = array.new_int()
+var array<float> pendingProfileTargetPrice = array.new_float()
+var array<float> pendingProfileStopPrice = array.new_float()
+
+var array<int> statWins = array.new_int(8, 0)
+var array<int> statLosses = array.new_int(8, 0)
+
+if barstate.isconfirmed and not na(profileOutcomeAtr)
+    if shortTouchNow and currentProfileCode >= 0
+        array.push(pendingProfileCode, currentProfileCode)
+        array.push(pendingProfileIsShort, true)
+        array.push(pendingProfileEntryBar, bar_index)
+        array.push(pendingProfileTargetPrice, close - profileOutcomeTargetAtrInput * profileOutcomeAtr)
+        array.push(pendingProfileStopPrice, close + profileOutcomeTargetAtrInput * profileOutcomeAtr)
+
+    if longTouchNow and currentProfileCode >= 0
+        array.push(pendingProfileCode, currentProfileCode)
+        array.push(pendingProfileIsShort, false)
+        array.push(pendingProfileEntryBar, bar_index)
+        array.push(pendingProfileTargetPrice, close + profileOutcomeTargetAtrInput * profileOutcomeAtr)
+        array.push(pendingProfileStopPrice, close - profileOutcomeTargetAtrInput * profileOutcomeAtr)
+
+if array.size(pendingProfileEntryBar) > 0
+    for i = array.size(pendingProfileEntryBar) - 1 to 0
+        bool isShortPending = array.get(pendingProfileIsShort, i)
+        float targetPending = array.get(pendingProfileTargetPrice, i)
+        float stopPending = array.get(pendingProfileStopPrice, i)
+        int entryBarPending = array.get(pendingProfileEntryBar, i)
+        int profileCodePending = array.get(pendingProfileCode, i)
+        bool eligibleForResolution = bar_index > entryBarPending
+        bool hitTarget = eligibleForResolution and (isShortPending ? low <= targetPending : high >= targetPending)
+        bool hitStop = eligibleForResolution and (isShortPending ? high >= stopPending : low <= stopPending)
+        bool expiredNow = bar_index - entryBarPending >= profileOutcomeHorizonBarsInput
+        int statIdx = profileCodePending * 2 + (isShortPending ? 0 : 1)
+        bool resolved = false
+        bool wasWin = false
+
+        if hitTarget and hitStop
+            resolved := true
+            wasWin := false
+        else if hitTarget
+            resolved := true
+            wasWin := true
+        else if hitStop
+            resolved := true
+            wasWin := false
+
+        if resolved
+            if wasWin
+                array.set(statWins, statIdx, array.get(statWins, statIdx) + 1)
+            else
+                array.set(statLosses, statIdx, array.get(statLosses, statIdx) + 1)
+            array.remove(pendingProfileCode, i)
+            array.remove(pendingProfileIsShort, i)
+            array.remove(pendingProfileEntryBar, i)
+            array.remove(pendingProfileTargetPrice, i)
+            array.remove(pendingProfileStopPrice, i)
+        else if expiredNow
+            array.remove(pendingProfileCode, i)
+            array.remove(pendingProfileIsShort, i)
+            array.remove(pendingProfileEntryBar, i)
+            array.remove(pendingProfileTargetPrice, i)
+            array.remove(pendingProfileStopPrice, i)
+
+f_winRateCell(int wins, int losses) =>
+    int total = wins + losses
+    total > 0 ? str.tostring(wins) + "-" + str.tostring(losses) + " (" + str.tostring(math.round(wins / total * 100)) + "%)" : "0-0 (--)"
+
+f_profileStatCell(int profileCode) =>
+    "S " + f_winRateCell(array.get(statWins, profileCode * 2 + 0), array.get(statLosses, profileCode * 2 + 0)) + " / L " + f_winRateCell(array.get(statWins, profileCode * 2 + 1), array.get(statLosses, profileCode * 2 + 1))
+
+var table profileOutcomeTable = table.new(f_tablePosition(profileOutcomeTablePositionInput), 2, 5, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast and showAllChartObjectsInput and showProfileOutcomeInput
+    profileOutcomeTextSize = f_tableTextSize(profileOutcomeTableSizeInput)
+    table.cell(profileOutcomeTable, 0, 0, "PROFILE OUTCOMES", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = profileOutcomeTextSize)
+    table.cell(profileOutcomeTable, 1, 0, "S / L", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = profileOutcomeTextSize)
+    table.cell(profileOutcomeTable, 0, 1, "Profile 1", text_color = color.white, text_size = profileOutcomeTextSize)
+    table.cell(profileOutcomeTable, 1, 1, f_profileStatCell(0), text_color = color.gray, text_size = profileOutcomeTextSize)
+    table.cell(profileOutcomeTable, 0, 2, "Profile 2", text_color = color.white, text_size = profileOutcomeTextSize)
+    table.cell(profileOutcomeTable, 1, 2, f_profileStatCell(1), text_color = color.gray, text_size = profileOutcomeTextSize)
+    table.cell(profileOutcomeTable, 0, 3, "Profile 3", text_color = color.white, text_size = profileOutcomeTextSize)
+    table.cell(profileOutcomeTable, 1, 3, f_profileStatCell(2), text_color = color.gray, text_size = profileOutcomeTextSize)
+    table.cell(profileOutcomeTable, 0, 4, "Profile 4", text_color = color.white, text_size = profileOutcomeTextSize)
+    table.cell(profileOutcomeTable, 1, 4, f_profileStatCell(3), text_color = color.gray, text_size = profileOutcomeTextSize)
+
+
+// ============================================================================
+// 15 - ALERTS
+// ============================================================================
+
+alertcondition(shortTouchNow, title = "Session Profile Short Trigger Touched", message = "BEAR | SHORT ENTRY | SESSION PROFILE TRIGGER | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(longTouchNow, title = "Session Profile Long Trigger Touched", message = "BULL | LONG ENTRY | SESSION PROFILE TRIGGER | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(shortTouchConfirmedNow, title = "Session Profile Short Trigger + TDI Confirmed", message = "BEAR | SHORT ENTRY | SESSION PROFILE TRIGGER (TDI CONFIRMED) | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(longTouchConfirmedNow, title = "Session Profile Long Trigger + TDI Confirmed", message = "BULL | LONG ENTRY | SESSION PROFILE TRIGGER (TDI CONFIRMED) | {{ticker}} {{interval}} @ {{close}}")
+
+alertcondition(actualLongSignal, title = "Coach Long Setup (Lux S/R Breakout)", message = "BULL | LONG ENTRY | COACH LUX S/R BREAKOUT | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(actualShortSignal, title = "Coach Short Setup (Lux S/R Breakout)", message = "BEAR | SHORT ENTRY | COACH LUX S/R BREAKOUT | {{ticker}} {{interval}} @ {{close}}")
+
+alertcondition(triggerUpNow, title = "CP Retest Trigger Up", message = "BULL | LONG ENTRY | CP RETEST TRIGGER | {{ticker}} {{interval}} @ {{close}}")
+alertcondition(triggerDownNow, title = "CP Retest Trigger Down", message = "BEAR | SHORT ENTRY | CP RETEST TRIGGER | {{ticker}} {{interval}} @ {{close}}")
+
+
+// ============================================================================
+// DATA WINDOW
+// ============================================================================
+// Diagnostic-only plots removed to keep the plot-family count well under
+// Pine's 64 limit -- none of these drew on the chart (display.data_window
+// only), and the CP/Regime table already surfaces the live state.

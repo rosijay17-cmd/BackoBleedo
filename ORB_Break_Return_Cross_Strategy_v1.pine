@@ -1,0 +1,581 @@
+//@version=6
+//@strategy_alert_message {{strategy.order.alert_message}} | {{ticker}} | {{interval}} | Fill: {{strategy.order.price}}
+
+strategy(
+     title="ORB Break-Return-Cross Strategy v1",
+     shorttitle="ORB_BRC_STRAT",
+     overlay=true,
+     pyramiding=0,
+     initial_capital=50000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=2.50,
+     slippage=1,
+     process_orders_on_close=true,
+     calc_on_order_fills=true,
+     calc_on_every_tick=true,
+     use_bar_magnifier=false,
+     max_labels_count=500,
+     max_lines_count=500,
+     max_boxes_count=500
+)
+
+//=============================================================================
+// ORB BREAK-RETURN-CROSS STRATEGY
+//=============================================================================
+// Logic:
+//   Long:
+//      1. Price breaks above OR high.
+//      2. Price returns/touches OR high.
+//      3. Price crosses back above OR high.
+//      4. Strategy enters long.
+//
+//   Short:
+//      1. Price breaks below OR low.
+//      2. Price returns/touches OR low.
+//      3. Price crosses back below OR low.
+//      4. Strategy enters short.
+//
+// v1.1 ALERT FIX:
+//   The only alert delivery path in the original script was
+//   strategy.entry(alert_message=...)/strategy.exit(alert_message=...),
+//   which only ever fires if the TradingView alert is created with the
+//   "Order fills" condition against this strategy. If a user instead
+//   creates an alert with "Any alert() function call" (the default most
+//   people reach for), nothing was ever going to fire -- there was no
+//   alert() call anywhere in the script for that condition to match.
+//   Explicit alert() calls (bull/bear labeled) and named alertcondition()s
+//   are added below so alerts work regardless of which condition the user
+//   picks in the Create Alert dialog.
+//=============================================================================
+
+
+//=============================================================================
+// 01. INPUTS
+//=============================================================================
+
+const string G_SESSION = "01 - Session"
+const string G_ORB = "02 - ORB Settings"
+const string G_ENTRY = "03 - Entry Logic"
+const string G_RISK = "04 - Risk Management"
+const string G_DISPLAY = "05 - Display"
+
+string sessionTimezone = input.string("America/New_York", "Session Timezone", group=G_SESSION)
+string tradingSession = input.session("0930-1600", "Trading Session", group=G_SESSION)
+
+string tf = input.timeframe("15", "ORB Timeframe / Duration", group=G_ORB)
+float bfrRange = input.float(0.00, "ORB Buffer %", step=0.01, group=G_ORB) / 100.0
+
+string lastentryTime = input.string("12:15", "Last Entry Time HH:mm", group=G_ENTRY)
+int maxTrades = input.int(2, "Max Retest Trades Per Session", minval=1, group=G_ENTRY)
+bool allowLongs = input.bool(true, "Allow Longs", group=G_ENTRY)
+bool allowShorts = input.bool(true, "Allow Shorts", group=G_ENTRY)
+
+string crossTriggerMode = input.string(
+     "Touch",
+     "Cross Trigger Mode",
+     options=["Touch", "Close"],
+     tooltip="Touch uses high/low crossing the ORB level. Close requires candle close beyond the ORB level.",
+     group=G_ENTRY
+)
+
+float rrInput = input.float(2.0, "Risk-Reward Ratio", minval=0.1, step=0.1, group=G_RISK)
+float orderQuantity = input.float(1.0, "Contracts", minval=1.0, step=1.0, group=G_RISK)
+bool closeAtSessionEnd = input.bool(true, "Close Position At Session End", group=G_RISK)
+
+bool showORBBox = input.bool(true, "Show ORB Box", group=G_DISPLAY)
+bool showORBLevels = input.bool(true, "Show ORB Levels", group=G_DISPLAY)
+bool showEntryArrows = input.bool(true, "Show Entry Arrows", group=G_DISPLAY)
+bool showRiskLevels = input.bool(true, "Show Active SL / TP", group=G_DISPLAY)
+bool showDashboard = input.bool(true, "Show Dashboard", group=G_DISPLAY)
+bool enableInformationalAlerts = input.bool(true, "Enable alert() Messages", tooltip="Fires an explicit alert() call on every entry, labeled BULLISH/BEARISH. Works with any TradingView alert condition (Any alert() function call, or the named alertcondition()s below). Turn off if you only use an 'Order fills' alert and don't want duplicate notifications.", group=G_DISPLAY)
+
+
+//=============================================================================
+// 02. COLORS
+//=============================================================================
+
+color C_LONG = color.rgb(0, 145, 255)
+color C_SHORT = color.rgb(165, 90, 235)
+color C_RANGE = color.rgb(245, 155, 25)
+color C_READY = color.rgb(20, 185, 105)
+color C_STOP = color.rgb(240, 65, 80)
+color C_TP = color.rgb(20, 185, 105)
+color C_NEUTRAL = color.rgb(95, 110, 130)
+color C_WARNING = color.rgb(255, 190, 60)
+
+
+//=============================================================================
+// 03. HELPERS
+//=============================================================================
+
+f_toMinutes(string timeStr) =>
+    parts = str.split(timeStr, ":")
+
+    int result = 0
+
+    if array.size(parts) == 2
+        result := int(str.tonumber(array.get(parts, 0))) * 60 + int(str.tonumber(array.get(parts, 1)))
+
+    result
+
+f_sessionStartMOD(string sessionValue) =>
+    int(str.tonumber(str.substring(sessionValue, 0, 2))) * 60 + int(str.tonumber(str.substring(sessionValue, 2, 4)))
+
+f_sessionEndMOD(string sessionValue) =>
+    int(str.tonumber(str.substring(sessionValue, 5, 7))) * 60 + int(str.tonumber(str.substring(sessionValue, 7, 9)))
+
+f_price(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+
+//=============================================================================
+// 04. SESSION STATE
+//=============================================================================
+
+int tradingStartMOD = f_sessionStartMOD(tradingSession)
+int tradingEndMOD = f_sessionEndMOD(tradingSession)
+
+int barOpenMOD = hour(time, sessionTimezone) * 60 + minute(time, sessionTimezone)
+int barCloseMOD = hour(time_close, sessionTimezone) * 60 + minute(time_close, sessionTimezone)
+
+bool inTradingSession = not na(time(timeframe.period, tradingSession, sessionTimezone))
+bool newSession = inTradingSession and (barstate.isfirst or not inTradingSession[1])
+
+int elapsedSessionMinutes =
+     barOpenMOD >= tradingStartMOD ?
+     barOpenMOD - tradingStartMOD :
+     1440 - tradingStartMOD + barOpenMOD
+
+int orbMinutes = math.max(1, int(math.round(timeframe.in_seconds(tf) / 60.0)))
+
+bool inOpeningRange = inTradingSession and elapsedSessionMinutes < orbMinutes
+bool finalSessionBar = inTradingSession and barOpenMOD < tradingEndMOD and barCloseMOD >= tradingEndMOD
+
+int currentMinutes = hour(time, sessionTimezone) * 60 + minute(time, sessionTimezone)
+int lastEntryMinutes = f_toMinutes(lastentryTime)
+bool isWithinEntryTime = inTradingSession and currentMinutes <= lastEntryMinutes
+
+bool timeframeWarning = not timeframe.isminutes
+
+
+//=============================================================================
+// 05. ORB BUILDING
+//=============================================================================
+
+var float developingHigh = na
+var float developingLow = na
+
+var float hv = na
+var float lv = na
+
+var bool activeRange = false
+var bool rangeReady = false
+
+var box orbBox = na
+
+if newSession
+    strategy.cancel_all()
+
+    developingHigh := na
+    developingLow := na
+
+    hv := na
+    lv := na
+
+    activeRange := true
+    rangeReady := false
+
+    if showORBBox
+        orbBox := box.new(
+             left=bar_index,
+             top=high,
+             right=bar_index,
+             bottom=low,
+             border_width=1,
+             bgcolor=color.new(C_RANGE, 88),
+             border_color=color.new(C_RANGE, 50)
+        )
+
+if activeRange and inOpeningRange
+    developingHigh := na(developingHigh) ? high : math.max(developingHigh, high)
+    developingLow := na(developingLow) ? low : math.min(developingLow, low)
+
+    if showORBBox and not na(orbBox)
+        box.set_top(orbBox, developingHigh)
+        box.set_bottom(orbBox, developingLow)
+        box.set_right(orbBox, bar_index)
+
+bool openingRangeJustEnded =
+     activeRange and
+     inTradingSession and
+     not inOpeningRange and
+     not na(developingHigh) and
+     not na(developingLow)
+
+if openingRangeJustEnded
+    hv := developingHigh * (1.0 + bfrRange)
+    lv := developingLow * (1.0 - bfrRange)
+
+    activeRange := false
+    rangeReady := not na(hv) and not na(lv) and hv > lv
+
+    if showORBBox and not na(orbBox)
+        box.set_top(orbBox, hv)
+        box.set_bottom(orbBox, lv)
+        box.set_right(orbBox, bar_index)
+
+if showORBBox and not na(orbBox) and inTradingSession
+    box.set_right(orbBox, bar_index)
+
+
+//=============================================================================
+// 06. BREAK-RETURN-CROSS STATE MACHINE
+//=============================================================================
+
+varip int tradeCount = 0
+
+varip bool hasBrokenOutUpper = false
+varip bool hasReturnedToUpper = false
+
+varip bool hasBrokenOutLower = false
+varip bool hasReturnedToLower = false
+
+if newSession
+    tradeCount := 0
+
+    hasBrokenOutUpper := false
+    hasReturnedToUpper := false
+
+    hasBrokenOutLower := false
+    hasReturnedToLower := false
+
+bool flat = strategy.position_size == 0
+
+bool canTrackBRC =
+     rangeReady and
+     inTradingSession and
+     not inOpeningRange and
+     not activeRange
+
+bool canEnter =
+     canTrackBRC and
+     isWithinEntryTime and
+     flat and
+     tradeCount < maxTrades
+
+if canTrackBRC
+    if not hasBrokenOutUpper and high > hv
+        hasBrokenOutUpper := true
+
+    if hasBrokenOutUpper and not hasReturnedToUpper and low <= hv
+        hasReturnedToUpper := true
+
+    if not hasBrokenOutLower and low < lv
+        hasBrokenOutLower := true
+
+    if hasBrokenOutLower and not hasReturnedToLower and high >= lv
+        hasReturnedToLower := true
+
+bool upperCross =
+     crossTriggerMode == "Touch" ?
+     high > hv :
+     close > hv
+
+bool lowerCross =
+     crossTriggerMode == "Touch" ?
+     low < lv :
+     close < lv
+
+bool rawLongSignal =
+     canEnter and
+     allowLongs and
+     hasReturnedToUpper and
+     upperCross
+
+bool rawShortSignal =
+     canEnter and
+     allowShorts and
+     hasReturnedToLower and
+     lowerCross
+
+// If both sides trigger on the same candle, choose by candle direction.
+bool longEntrySignal =
+     rawLongSignal and
+     (not rawShortSignal or close >= open)
+
+bool shortEntrySignal =
+     rawShortSignal and
+     not longEntrySignal
+
+
+//=============================================================================
+// 07. STRATEGY ENTRY AND RISK LEVELS
+//=============================================================================
+
+float rangeHalf = rangeReady ? (hv - lv) / 2.0 : na
+
+varip float activeSL = na
+varip float activeTP = na
+varip float activeEntryReference = na
+
+if longEntrySignal
+    activeEntryReference := hv
+    activeSL := hv - rangeHalf
+    activeTP := hv + rangeHalf * rrInput
+
+    strategy.entry(
+         id="Long",
+         direction=strategy.long,
+         qty=orderQuantity,
+         comment="LONG ENTRY",
+         alert_message="LONG ENTRY"
+    )
+
+    strategy.exit(
+         id="Long Exit",
+         from_entry="Long",
+         stop=activeSL,
+         limit=activeTP,
+         comment="LONG EXIT",
+         alert_message="LONG EXIT",
+         disable_alert=true
+    )
+
+    tradeCount += 1
+
+    hasBrokenOutUpper := false
+    hasReturnedToUpper := false
+    hasBrokenOutLower := false
+    hasReturnedToLower := false
+
+    if enableInformationalAlerts
+        alert("ORB_BRC_STRAT BULLISH ENTRY | LONG | " + syminfo.ticker + " @ " + f_price(close) + " | SL " + f_price(activeSL) + " | TP " + f_price(activeTP), alert.freq_once_per_bar_close)
+
+if shortEntrySignal
+    activeEntryReference := lv
+    activeSL := lv + rangeHalf
+    activeTP := lv - rangeHalf * rrInput
+
+    strategy.entry(
+         id="Short",
+         direction=strategy.short,
+         qty=orderQuantity,
+         comment="SHORT ENTRY",
+         alert_message="SHORT ENTRY"
+    )
+
+    strategy.exit(
+         id="Short Exit",
+         from_entry="Short",
+         stop=activeSL,
+         limit=activeTP,
+         comment="SHORT EXIT",
+         alert_message="SHORT EXIT",
+         disable_alert=true
+    )
+
+    tradeCount += 1
+
+    hasBrokenOutUpper := false
+    hasReturnedToUpper := false
+    hasBrokenOutLower := false
+    hasReturnedToLower := false
+
+    if enableInformationalAlerts
+        alert("ORB_BRC_STRAT BEARISH ENTRY | SHORT | " + syminfo.ticker + " @ " + f_price(close) + " | SL " + f_price(activeSL) + " | TP " + f_price(activeTP), alert.freq_once_per_bar_close)
+
+if strategy.position_size > 0 and not na(activeSL) and not na(activeTP)
+    strategy.exit(
+         id="Long Exit",
+         from_entry="Long",
+         stop=activeSL,
+         limit=activeTP,
+         comment="LONG EXIT",
+         alert_message="LONG EXIT",
+         disable_alert=true
+    )
+
+if strategy.position_size < 0 and not na(activeSL) and not na(activeTP)
+    strategy.exit(
+         id="Short Exit",
+         from_entry="Short",
+         stop=activeSL,
+         limit=activeTP,
+         comment="SHORT EXIT",
+         alert_message="SHORT EXIT",
+         disable_alert=true
+    )
+
+if closeAtSessionEnd and finalSessionBar
+    strategy.cancel_all()
+
+    if strategy.position_size != 0
+        strategy.close_all(
+             immediately=true,
+             comment="SESSION CLOSE",
+             alert_message="SESSION CLOSE",
+             disable_alert=true
+        )
+
+bool positionJustClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if positionJustClosed
+    activeSL := na
+    activeTP := na
+    activeEntryReference := na
+
+
+//=============================================================================
+// 08. VISUALS
+//=============================================================================
+
+plot(
+     showORBLevels and rangeReady ? hv : na,
+     "ORB High",
+     color=C_LONG,
+     linewidth=2,
+     style=plot.style_stepline
+)
+
+plot(
+     showORBLevels and rangeReady ? lv : na,
+     "ORB Low",
+     color=C_SHORT,
+     linewidth=2,
+     style=plot.style_stepline
+)
+
+plot(
+     showRiskLevels and strategy.position_size != 0 ? activeSL : na,
+     "Active Stop Loss",
+     color=C_STOP,
+     linewidth=2,
+     style=plot.style_linebr
+)
+
+plot(
+     showRiskLevels and strategy.position_size != 0 ? activeTP : na,
+     "Active Take Profit",
+     color=C_TP,
+     linewidth=2,
+     style=plot.style_linebr
+)
+
+plotshape(
+     showEntryArrows and longEntrySignal,
+     title="LONG ENTRY",
+     style=shape.triangleup,
+     location=location.belowbar,
+     color=C_LONG,
+     text="LONG",
+     textcolor=color.white,
+     size=size.normal
+)
+
+plotshape(
+     showEntryArrows and shortEntrySignal,
+     title="SHORT ENTRY",
+     style=shape.triangledown,
+     location=location.abovebar,
+     color=C_SHORT,
+     text="SHORT",
+     textcolor=color.white,
+     size=size.normal
+)
+
+
+//=============================================================================
+// 09. DASHBOARD
+//=============================================================================
+
+string brcState =
+     not inTradingSession ? "OFF SESSION" :
+     activeRange or inOpeningRange ? "BUILDING ORB" :
+     not rangeReady ? "WAIT ORB" :
+     strategy.position_size > 0 ? "LONG" :
+     strategy.position_size < 0 ? "SHORT" :
+     tradeCount >= maxTrades ? "MAX TRADES" :
+     not isWithinEntryTime ? "ENTRY TIME CLOSED" :
+     hasReturnedToUpper ? "LONG CROSS READY" :
+     hasReturnedToLower ? "SHORT CROSS READY" :
+     hasBrokenOutUpper ? "WAIT LONG RETURN" :
+     hasBrokenOutLower ? "WAIT SHORT RETURN" :
+     "WAIT BREAK"
+
+color stateColor =
+     strategy.position_size > 0 ? C_LONG :
+     strategy.position_size < 0 ? C_SHORT :
+     brcState == "LONG CROSS READY" ? C_LONG :
+     brcState == "SHORT CROSS READY" ? C_SHORT :
+     brcState == "MAX TRADES" ? C_WARNING :
+     brcState == "ENTRY TIME CLOSED" ? C_WARNING :
+     C_NEUTRAL
+
+var table dashboard = table.new(position.top_right, 2, 13, border_width=1)
+
+f_dashboardCell(int row, string leftText, string rightText, color rightColor) =>
+    table.cell(
+         dashboard,
+         0,
+         row,
+         leftText,
+         text_color=color.white,
+         bgcolor=color.new(C_NEUTRAL, 25),
+         text_size=size.small,
+         text_halign=text.align_left
+    )
+
+    table.cell(
+         dashboard,
+         1,
+         row,
+         rightText,
+         text_color=color.white,
+         bgcolor=color.new(rightColor, 25),
+         text_size=size.small,
+         text_halign=text.align_right
+    )
+
+if barstate.islast
+    table.clear(dashboard, 0, 0, 1, 12)
+
+    if showDashboard
+        f_dashboardCell(0, "ORB BRC", brcState, stateColor)
+        f_dashboardCell(1, "SESSION", tradingSession, C_NEUTRAL)
+        f_dashboardCell(2, "ORB TF", tf + " / " + str.tostring(orbMinutes) + "m", C_NEUTRAL)
+        f_dashboardCell(3, "ORB HIGH", f_price(hv), C_LONG)
+        f_dashboardCell(4, "ORB LOW", f_price(lv), C_SHORT)
+        f_dashboardCell(5, "RANGE HALF", f_price(rangeHalf), C_RANGE)
+        f_dashboardCell(6, "LAST ENTRY", lastentryTime, isWithinEntryTime ? C_READY : C_WARNING)
+        f_dashboardCell(7, "TRADES", str.tostring(tradeCount) + " / " + str.tostring(maxTrades), tradeCount < maxTrades ? C_READY : C_WARNING)
+        f_dashboardCell(8, "UPPER SEQ", str.tostring(hasBrokenOutUpper) + " / " + str.tostring(hasReturnedToUpper), hasReturnedToUpper ? C_LONG : C_NEUTRAL)
+        f_dashboardCell(9, "LOWER SEQ", str.tostring(hasBrokenOutLower) + " / " + str.tostring(hasReturnedToLower), hasReturnedToLower ? C_SHORT : C_NEUTRAL)
+        f_dashboardCell(10, "SL / TP", f_price(activeSL) + " / " + f_price(activeTP), strategy.position_size != 0 ? C_READY : C_NEUTRAL)
+        f_dashboardCell(11, "TRIGGER", crossTriggerMode, C_NEUTRAL)
+        f_dashboardCell(12, "ALERTS", enableInformationalAlerts ? "ON" : "OFF", enableInformationalAlerts ? C_READY : C_NEUTRAL)
+
+
+//=============================================================================
+// 10. DATA WINDOW
+//=============================================================================
+
+plot(float(tradeCount), "Trades This Session", display=display.data_window)
+plot(hv, "ORB High Data", display=display.data_window)
+plot(lv, "ORB Low Data", display=display.data_window)
+plot(hasBrokenOutUpper ? 1.0 : 0.0, "Has Broken Upper", display=display.data_window)
+plot(hasReturnedToUpper ? 1.0 : 0.0, "Has Returned Upper", display=display.data_window)
+plot(hasBrokenOutLower ? 1.0 : 0.0, "Has Broken Lower", display=display.data_window)
+plot(hasReturnedToLower ? 1.0 : 0.0, "Has Returned Lower", display=display.data_window)
+
+
+//=============================================================================
+// 11. ALERT CONDITIONS
+//=============================================================================
+// Named, selectable conditions for the Create Alert dialog -- an alternative
+// to "Any alert() function call" or "Order fills" that lets a user pick the
+// exact bullish/bearish condition directly from the Condition dropdown.
+
+alertcondition(longEntrySignal, title="ORB BRC Bullish Entry", message="ORB_BRC_STRAT BULLISH ENTRY (LONG)")
+alertcondition(shortEntrySignal, title="ORB BRC Bearish Entry", message="ORB_BRC_STRAT BEARISH ENTRY (SHORT)")

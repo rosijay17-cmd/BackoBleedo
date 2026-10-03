@@ -1,0 +1,1591 @@
+//@version=6
+strategy(
+     title = "AMD Po3 Reversal Strategy v1.0.3 Trend Veto",
+     shorttitle = "AMD Po3 Reversal v1.0.3",
+     overlay = true,
+     initial_capital = 100000,
+     pyramiding = 0,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.50,
+     slippage = 1,
+     process_orders_on_close = true,
+     calc_on_order_fills = true,
+     calc_on_every_tick = false,
+     use_bar_magnifier = false,
+     max_bars_back = 1000,
+     max_labels_count = 200
+)
+
+//=============================================================================
+// AMD / PO3 REVERSAL STRATEGY v1.0.3
+//-----------------------------------------------------------------------------
+// Core reversal engine:
+// 1) Detect compressed accumulation.
+// 2) Let the range mature.
+// 3) Sweep one boundary.
+// 4) Require a CLOSE back inside the range within N bars.
+// 5) LOW sweep  -> LONG.
+// 6) HIGH sweep -> SHORT.
+// 7) Optional trend filtering.
+// 8) Entry = manipulation-confirmation close.
+// 9) Stop = beyond sweep extreme + anchored ATR buffer.
+// 10) Target = Fib extension of manipulation leg.
+//
+// Trend-filter design:
+// - The sweep/reclaim detector is NOT changed.
+// - A reversal does NOT need to already agree with a trend indicator.
+// - Instead, the recommended filter blocks a trade only when BOTH:
+//      A) confirmed HTF structure is strongly trending against the trade, AND
+//      B) execution-timeframe EMA slope/location confirms that opposing trend.
+// - Neutral / rotational conditions remain eligible for reversals.
+// - Confirmed HTF data uses offset values with lookahead_on.
+//=============================================================================
+
+
+//=============================================================================
+// 01 - ACCUMULATION RANGE
+//=============================================================================
+
+string G_RANGE = "01 - Accumulation Range"
+
+int rangeWindowInput = input.int(
+     20,
+     "Donchian Window",
+     minval = 10,
+     maxval = 100,
+     group = G_RANGE)
+
+int minRangeBarsInput = input.int(
+     12,
+     "Minimum Range Maturity",
+     minval = 8,
+     maxval = 40,
+     group = G_RANGE)
+
+int maxRangeBarsInput = input.int(
+     96,
+     "Maximum Range Age",
+     minval = 24,
+     maxval = 250,
+     group = G_RANGE)
+
+int compressionPctInput = input.int(
+     25,
+     "Compression Threshold Percentile",
+     minval = 5,
+     maxval = 60,
+     group = G_RANGE)
+
+int statWindowInput = input.int(
+     200,
+     "Compression Distribution Window",
+     minval = 100,
+     maxval = 500,
+     group = G_RANGE)
+
+float rangeToleranceInput = input.float(
+     0.10,
+     "Sweep Tolerance (Fraction Of Range)",
+     minval = 0.0,
+     maxval = 0.30,
+     step = 0.01,
+     group = G_RANGE)
+
+float minRangeWidthPctInput = input.float(
+     0.15,
+     "Minimum Range Width (% Of Price)",
+     minval = 0.05,
+     maxval = 2.0,
+     step = 0.05,
+     group = G_RANGE)
+
+string boundaryModeInput = input.string(
+     "Pivot",
+     "Boundary Method",
+     options = ["Pivot", "Absolute"],
+     group = G_RANGE)
+
+int pivotStrengthInput = input.int(
+     3,
+     "Pivot Strength",
+     minval = 1,
+     maxval = 10,
+     group = G_RANGE)
+
+int cooldownBarsInput = input.int(
+     10,
+     "Cycle Cooldown Bars",
+     minval = 0,
+     maxval = 100,
+     group = G_RANGE)
+
+
+//=============================================================================
+// 02 - MANIPULATION / SWEEP
+//=============================================================================
+
+string G_SWEEP = "02 - Manipulation / Sweep"
+
+int sweepReturnBarsInput = input.int(
+     8,
+     "Maximum Bars To Return Inside",
+     minval = 1,
+     maxval = 20,
+     group = G_SWEEP)
+
+bool requireLiquidityInput = input.bool(
+     false,
+     "Require EQH / EQL Liquidity",
+     group = G_SWEEP)
+
+int eqLookbackInput = input.int(
+     96,
+     "EQH / EQL Lookback",
+     minval = 20,
+     maxval = 300,
+     group = G_SWEEP)
+
+float eqToleranceInput = input.float(
+     0.10,
+     "EQH / EQL Tolerance (Fraction Of Range)",
+     minval = 0.02,
+     maxval = 0.30,
+     step = 0.01,
+     group = G_SWEEP)
+
+int sweepDepthPctInput = input.int(
+     100,
+     "Soft Sweep Depth Cap Percentile (100 = Off)",
+     minval = 80,
+     maxval = 100,
+     group = G_SWEEP)
+
+bool allowRearmInput = input.bool(
+     true,
+     "Allow Opposite-Side Re-Arm If Entry Is Filtered",
+     group = G_SWEEP)
+
+
+//=============================================================================
+// 03 - SWEEP SESSION FILTER
+//=============================================================================
+
+string G_SESSION = "03 - Sweep Session Filter"
+
+bool useKillzonesInput = input.bool(
+     false,
+     "Restrict Sweeps To Killzones",
+     group = G_SESSION)
+
+string kzTimezoneInput = input.string(
+     "UTC",
+     "Killzone Timezone",
+     group = G_SESSION)
+
+string londonSessionInput = input.session(
+     "0700-1000",
+     "London Killzone",
+     group = G_SESSION)
+
+string newYorkSessionInput = input.session(
+     "1330-1600",
+     "New York Killzone",
+     group = G_SESSION)
+
+
+//=============================================================================
+// 04 - TREND FILTER
+//=============================================================================
+
+string G_HTF = "04 - Trend Filter"
+
+// Legacy strict filter.
+// Leave OFF if you want the recommended asymmetric strong-trend veto.
+bool useHtfBiasInput = input.bool(
+     false,
+     "Strict: Require Confirmed HTF EMA50 Direction",
+     group = G_HTF,
+     tooltip = "Legacy-style filter. Longs require confirmed HTF close above the fast EMA; shorts require below it. This is intentionally stricter than the strong-trend veto.")
+
+// Recommended filter.
+bool useTrendVetoInput = input.bool(
+     true,
+     "Block Only Strong Counter-Trend Reversals",
+     group = G_HTF,
+     tooltip = "Recommended. Neutral/ranging regimes stay eligible. Longs are blocked only in strong bearish conditions; shorts are blocked only in strong bullish conditions.")
+
+string htfTimeframeInput = input.timeframe(
+     "60",
+     "Trend Timeframe",
+     group = G_HTF,
+     tooltip = "Starting point for a 5-minute execution chart: 60 minutes. For 1-minute execution, test 15-60 minutes.")
+
+int htfFastEmaLengthInput = input.int(
+     50,
+     "HTF Fast EMA",
+     minval = 5,
+     maxval = 300,
+     group = G_HTF)
+
+int htfSlowEmaLengthInput = input.int(
+     200,
+     "HTF Slow EMA",
+     minval = 20,
+     maxval = 500,
+     group = G_HTF)
+
+int htfSlopeBarsInput = input.int(
+     3,
+     "HTF Fast EMA Slope Lookback",
+     minval = 1,
+     maxval = 20,
+     group = G_HTF)
+
+float htfSlopeMinAtrInput = input.float(
+     0.08,
+     "Minimum HTF Slope (ATR Units)",
+     minval = 0.0,
+     maxval = 2.0,
+     step = 0.01,
+     group = G_HTF,
+     tooltip = "Fast EMA change across the slope lookback divided by confirmed HTF ATR. Higher values make the veto more selective.")
+
+int localTrendEmaLengthInput = input.int(
+     50,
+     "Execution TF EMA",
+     minval = 5,
+     maxval = 300,
+     group = G_HTF)
+
+int localSlopeBarsInput = input.int(
+     8,
+     "Execution TF EMA Slope Lookback",
+     minval = 1,
+     maxval = 50,
+     group = G_HTF)
+
+float localSlopeMinAtrInput = input.float(
+     0.10,
+     "Minimum Execution TF Slope (ATR Units)",
+     minval = 0.0,
+     maxval = 2.0,
+     step = 0.01,
+     group = G_HTF,
+     tooltip = "Execution-timeframe EMA change divided by current ATR.")
+
+bool showBlockedSignalsInput = input.bool(
+     true,
+     "Show Filtered Counter-Trend Setups",
+     group = G_HTF,
+     tooltip = "Plots an X where the original reversal engine produced a setup but the trend filter vetoed the entry.")
+
+//=============================================================================
+// 05 - RISK / TARGET
+//=============================================================================
+
+string G_RISK = "05 - Risk / Target"
+
+float contractsInput = input.float(
+     1.0,
+     "Contracts",
+     minval = 1.0,
+     step = 1.0,
+     group = G_RISK)
+
+int atrLengthInput = input.int(
+     14,
+     "ATR Length",
+     minval = 1,
+     group = G_RISK)
+
+float stopBufferAtrInput = input.float(
+     0.40,
+     "Stop Buffer Past Sweep (ATR Anchor)",
+     minval = 0.0,
+     maxval = 2.0,
+     step = 0.05,
+     group = G_RISK)
+
+float fibExtensionInput = input.float(
+     1.50,
+     "Fib Extension Target",
+     minval = 1.0,
+     maxval = 3.0,
+     step = 0.001,
+     group = G_RISK)
+
+int distributionTimeoutBarsInput = input.int(
+     64,
+     "Distribution Timeout Bars",
+     minval = 8,
+     maxval = 200,
+     group = G_RISK)
+
+bool useBreakEvenInput = input.bool(
+     false,
+     "Move Stop To Break-Even",
+     group = G_RISK)
+
+float breakEvenAtRInput = input.float(
+     1.0,
+     "Break-Even Trigger (R)",
+     minval = 0.25,
+     maxval = 5.0,
+     step = 0.25,
+     group = G_RISK)
+
+
+//=============================================================================
+// 06 - VISUALS
+//=============================================================================
+
+string G_VIS = "06 - Visuals"
+
+bool showRangeInput = input.bool(
+     true,
+     "Show Active Accumulation Range",
+     group = G_VIS)
+
+bool showSweepMarkersInput = input.bool(
+     true,
+     "Show Sweep Markers",
+     group = G_VIS)
+
+bool showEntryMarkersInput = input.bool(
+     true,
+     "Show Custom Entry Markers",
+     group = G_VIS)
+
+bool showTradeLevelsInput = input.bool(
+     true,
+     "Show Active Stop / Target",
+     group = G_VIS)
+
+bool showTrendEmaInput = input.bool(
+     false,
+     "Show Execution TF Trend EMA",
+     group = G_VIS)
+
+color rangeColorInput = input.color(
+     color.rgb(91, 127, 166),
+     "Range Color",
+     group = G_VIS)
+
+color longColorInput = input.color(
+     color.aqua,
+     "Long Color",
+     group = G_VIS)
+
+color shortColorInput = input.color(
+     color.orange,
+     "Short Color",
+     group = G_VIS)
+
+bool showTrendDebugTableInput = input.bool(
+     true,
+     "Show Trend Veto Debug Table",
+     group = G_VIS,
+     tooltip = "On-chart readout of the strong-trend veto's six inputs, for accounts without Data Window access. Screenshot this at the moment a counter-trend entry fires.")
+
+string debugTablePositionInput = input.string(
+     "Top Right",
+     "Debug Table Position",
+     options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"],
+     group = G_VIS)
+
+
+//=============================================================================
+// 07 - ALERTS
+//=============================================================================
+
+string G_ALERT = "07 - Alerts"
+
+bool enableDynamicAlertsInput = input.bool(
+     true,
+     "Enable Dynamic alert() Calls",
+     group = G_ALERT)
+
+bool alertSweepsInput = input.bool(
+     false,
+     "Alert On Sweep Detection",
+     group = G_ALERT)
+
+bool alertEntriesInput = input.bool(
+     true,
+     "Alert On Entries",
+     group = G_ALERT)
+
+bool alertExitsInput = input.bool(
+     true,
+     "Alert On Exits",
+     group = G_ALERT)
+
+bool alertBlockedInput = input.bool(
+     false,
+     "Alert On Trend-Vetoed Setups",
+     group = G_ALERT)
+
+string alertFormatInput = input.string(
+     "Detailed",
+     "Alert Format",
+     options = ["Compact", "Detailed"],
+     group = G_ALERT)
+
+
+//=============================================================================
+// VALIDATION
+//=============================================================================
+
+if (useHtfBiasInput or useTrendVetoInput) and timeframe.in_seconds(htfTimeframeInput) < timeframe.in_seconds(timeframe.period)
+    runtime.error("Trend timeframe must be >= chart timeframe.")
+
+if htfSlowEmaLengthInput <= htfFastEmaLengthInput
+    runtime.error("HTF Slow EMA must be greater than HTF Fast EMA.")
+
+
+//=============================================================================
+// FUNCTIONS
+//=============================================================================
+
+f_price(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+
+f_debugTablePosition(string choice) =>
+    choice == "Top Left" ? position.top_left :
+     choice == "Bottom Left" ? position.bottom_left :
+     choice == "Bottom Right" ? position.bottom_right :
+     position.top_right
+
+
+f_flagText(bool flag) =>
+    flag ? "1" : "0"
+
+
+f_flagColor(bool flag) =>
+    flag ? color.new(color.lime, 0) : color.new(color.gray, 40)
+
+
+f_entryAlert(
+     bool bullish,
+     float entry,
+     float stop,
+     float target,
+     float sweepExtremeValue,
+     float rangeLowValue,
+     float rangeHighValue,
+     float rrValue,
+     bool rearmed) =>
+
+    string headline = bullish ?
+         "BULL | LONG ENTRY | LOW SWEEP REVERSAL" :
+         "BEAR | SHORT ENTRY | HIGH SWEEP REVERSAL"
+
+    headline := headline +
+         " | " +
+         syminfo.ticker +
+         " " +
+         timeframe.period +
+         " @ " +
+         f_price(entry)
+
+    string detailed = headline +
+         "\nRange: " + f_price(rangeLowValue) + " - " + f_price(rangeHighValue) +
+         "\nSweep Extreme: " + f_price(sweepExtremeValue) +
+         "\nStop: " + f_price(stop) +
+         "\nTarget: " + f_price(target) +
+         "\nR:R: " + str.tostring(rrValue, "#.##") + "R" +
+         "\nStrict HTF Bias: " + (useHtfBiasInput ? "ON" : "OFF") +
+         "\nStrong Trend Veto: " + (useTrendVetoInput ? "ON" : "OFF") +
+         "\nRe-Armed: " + (rearmed ? "YES" : "NO")
+
+    alertFormatInput == "Compact" ? headline : detailed
+
+
+f_sweepAlert(bool highSweep, float sweepPrice) =>
+    string prefix = highSweep ?
+         "BEAR CONTEXT | HIGH SWEEP DETECTED" :
+         "BULL CONTEXT | LOW SWEEP DETECTED"
+
+    prefix +
+         " | " +
+         syminfo.ticker +
+         " " +
+         timeframe.period +
+         " | Extreme " +
+         f_price(sweepPrice)
+
+
+f_exitAlert(bool wasLong, string reason) =>
+    string prefix = wasLong ? "LONG EXIT" : "SHORT EXIT"
+
+    prefix +
+         " | AMD PO3 REVERSAL | " +
+         syminfo.ticker +
+         " " +
+         timeframe.period +
+         " @ " +
+         f_price(close) +
+         "\nReason: " +
+         reason
+
+
+//=============================================================================
+// BASE CALCULATIONS
+//=============================================================================
+
+float atrValue = math.max(
+     nz(
+         ta.atr(atrLengthInput),
+         ta.tr(true)),
+     syminfo.mintick)
+
+float rawHigh = ta.highest(
+     high,
+     rangeWindowInput)
+
+float rawLow = ta.lowest(
+     low,
+     rangeWindowInput)
+
+float rawWidth = rawHigh - rawLow
+
+float compressionRank = ta.percentrank(
+     rawWidth,
+     statWindowInput)
+
+float sweepDepthThreshold = ta.percentile_nearest_rank(
+     ta.tr,
+     statWindowInput,
+     sweepDepthPctInput)
+
+float pivotHigh = ta.pivothigh(
+     high,
+     pivotStrengthInput,
+     pivotStrengthInput)
+
+float pivotLow = ta.pivotlow(
+     low,
+     pivotStrengthInput,
+     pivotStrengthInput)
+
+bool warmedUp = bar_index > statWindowInput
+
+bool inLondon = not na(
+     time(
+         timeframe.period,
+         londonSessionInput + ":1234567",
+         kzTimezoneInput))
+
+bool inNewYork = not na(
+     time(
+         timeframe.period,
+         newYorkSessionInput + ":1234567",
+         kzTimezoneInput))
+
+bool inKillzone = inLondon or inNewYork
+
+
+//=============================================================================
+// CONFIRMED HTF TREND DATA
+//-----------------------------------------------------------------------------
+// Every HTF expression is offset.
+// Using historical offsets together with lookahead_on returns confirmed HTF
+// information rather than the developing HTF bar.
+//=============================================================================
+
+[htfClose, htfEmaFast, htfEmaFastPast, htfEmaSlow, htfAtr] = request.security(
+     syminfo.tickerid,
+     htfTimeframeInput,
+     [
+         close[1],
+         ta.ema(close, htfFastEmaLengthInput)[1],
+         ta.ema(close, htfFastEmaLengthInput)[htfSlopeBarsInput + 1],
+         ta.ema(close, htfSlowEmaLengthInput)[1],
+         ta.atr(atrLengthInput)[1]
+     ],
+     lookahead = barmerge.lookahead_on
+)
+
+float htfSlopeAtr = (
+     not na(htfAtr) and
+     htfAtr > 0 and
+     not na(htfEmaFast) and
+     not na(htfEmaFastPast)
+) ? (
+     htfEmaFast -
+     htfEmaFastPast
+) / htfAtr : 0.0
+
+float localTrendEma = ta.ema(
+     close,
+     localTrendEmaLengthInput)
+
+float localSlopeAtr = (
+     not na(localTrendEma[localSlopeBarsInput]) and
+     atrValue > 0
+) ? (
+     localTrendEma -
+     localTrendEma[localSlopeBarsInput]
+) / atrValue : 0.0
+
+bool htfStrongBull = (
+     not na(htfClose) and
+     not na(htfEmaFast) and
+     not na(htfEmaSlow) and
+     htfClose > htfEmaFast and
+     htfEmaFast > htfEmaSlow and
+     htfSlopeAtr >= htfSlopeMinAtrInput
+)
+
+bool htfStrongBear = (
+     not na(htfClose) and
+     not na(htfEmaFast) and
+     not na(htfEmaSlow) and
+     htfClose < htfEmaFast and
+     htfEmaFast < htfEmaSlow and
+     htfSlopeAtr <= -htfSlopeMinAtrInput
+)
+
+bool localStrongBull = (
+     close > localTrendEma and
+     localSlopeAtr >= localSlopeMinAtrInput
+)
+
+bool localStrongBear = (
+     close < localTrendEma and
+     localSlopeAtr <= -localSlopeMinAtrInput
+)
+
+// Both timeframes must agree before a reversal is vetoed.
+bool strongBullTrend = htfStrongBull and localStrongBull
+bool strongBearTrend = htfStrongBear and localStrongBear
+
+int trendState = strongBullTrend ? 1 : strongBearTrend ? -1 : 0
+
+
+//=============================================================================
+// CONFIRMED PIVOT REGISTRY
+//=============================================================================
+
+var array<float> pivotHighValues = array.new_float()
+var array<int> pivotHighBars = array.new_int()
+var array<float> pivotLowValues = array.new_float()
+var array<int> pivotLowBars = array.new_int()
+
+if not na(pivotHigh)
+    array.push(
+         pivotHighValues,
+         pivotHigh)
+
+    array.push(
+         pivotHighBars,
+         bar_index - pivotStrengthInput)
+
+    if array.size(pivotHighValues) > 80
+        array.shift(pivotHighValues)
+        array.shift(pivotHighBars)
+
+if not na(pivotLow)
+    array.push(
+         pivotLowValues,
+         pivotLow)
+
+    array.push(
+         pivotLowBars,
+         bar_index - pivotStrengthInput)
+
+    if array.size(pivotLowValues) > 80
+        array.shift(pivotLowValues)
+        array.shift(pivotLowBars)
+
+
+//=============================================================================
+// FSM STATE
+//
+// 0 = IDLE
+// 1 = ACCUMULATION
+// 2 = SWEEP PENDING
+// 3 = DISTRIBUTION / TRADE ACTIVE
+//=============================================================================
+
+var int state = 0
+var int lastCycleEndBar = -10000
+
+var float rangeHigh = na
+var float rangeLow = na
+var float rangeWidth = na
+var int rangeStartBar = na
+var int expiryAnchorBar = na
+var float atrAnchor = na
+
+var int sweepSide = 0
+var int firstSweepSide = 0
+var float sweepExtreme = na
+var int sweepBar = na
+var bool rearmUsed = false
+
+var float activeEntry = na
+var float activeStop = na
+var float activeTarget = na
+var float initialRisk = na
+var int distributionStartBar = na
+var bool breakEvenActive = false
+
+bool manipulationConfirmed = false
+bool newHighSweep = false
+bool newLowSweep = false
+
+bool longEntrySignal = false
+bool shortEntrySignal = false
+
+bool blockedLongSignal = false
+bool blockedShortSignal = false
+
+float toleranceBand = not na(rangeWidth) ?
+     rangeToleranceInput * rangeWidth :
+     0.0
+
+bool insideRange = (
+     not na(rangeHigh) and
+     not na(rangeLow) and
+     close <= rangeHigh and
+     close >= rangeLow)
+
+bool breachHigh = (
+     not na(rangeHigh) and
+     high > rangeHigh + toleranceBand)
+
+bool breachLow = (
+     not na(rangeLow) and
+     low < rangeLow - toleranceBand)
+
+
+//=============================================================================
+// FSM
+//=============================================================================
+
+if barstate.isconfirmed
+
+    //=========================================================================
+    // IDLE -> ACCUMULATION
+    //=========================================================================
+
+    if state == 0
+        bool cooldownOK = bar_index - lastCycleEndBar >= cooldownBarsInput
+        bool compressed = warmedUp and compressionRank <= compressionPctInput
+        bool widthOK = rawWidth >= minRangeWidthPctInput / 100.0 * close
+
+        if cooldownOK and compressed and widthOK
+            int candidateStartBar = bar_index - rangeWindowInput + 1
+            float candidateHigh = rawHigh
+            float candidateLow = rawLow
+
+            if boundaryModeInput == "Pivot"
+                float bestPivotHigh = na
+                float bestPivotLow = na
+
+                if array.size(pivotHighValues) > 0
+                    for j = 0 to array.size(pivotHighValues) - 1
+                        if array.get(pivotHighBars, j) >= candidateStartBar
+                            float value = array.get(pivotHighValues, j)
+                            bestPivotHigh := na(bestPivotHigh) ?
+                                 value :
+                                 math.max(
+                                     bestPivotHigh,
+                                     value)
+
+                if array.size(pivotLowValues) > 0
+                    for j = 0 to array.size(pivotLowValues) - 1
+                        if array.get(pivotLowBars, j) >= candidateStartBar
+                            float value = array.get(pivotLowValues, j)
+                            bestPivotLow := na(bestPivotLow) ?
+                                 value :
+                                 math.min(
+                                     bestPivotLow,
+                                     value)
+
+                candidateHigh := na(bestPivotHigh) ?
+                     candidateHigh :
+                     bestPivotHigh
+
+                candidateLow := na(bestPivotLow) ?
+                     candidateLow :
+                     bestPivotLow
+
+            float candidateWidth = candidateHigh - candidateLow
+
+            if candidateWidth >= minRangeWidthPctInput / 100.0 * close
+                rangeStartBar := candidateStartBar
+                expiryAnchorBar := candidateStartBar
+
+                rangeHigh := candidateHigh
+                rangeLow := candidateLow
+                rangeWidth := candidateWidth
+
+                atrAnchor := nz(
+                     atrValue[rangeWindowInput],
+                     atrValue)
+
+                sweepSide := 0
+                firstSweepSide := 0
+                rearmUsed := false
+
+                state := 1
+
+
+    //=========================================================================
+    // ACCUMULATION -> SWEEP
+    //=========================================================================
+
+    else if state == 1
+        int rangeAge = bar_index - rangeStartBar
+
+        if bar_index - expiryAnchorBar > maxRangeBarsInput
+            state := 0
+            lastCycleEndBar := bar_index
+
+        else if breachHigh and breachLow
+            state := 0
+            lastCycleEndBar := bar_index
+
+        else if breachHigh or breachLow
+            int candidateSide = breachHigh ? 1 : -1
+
+            if rangeAge < minRangeBarsInput
+                state := 0
+                lastCycleEndBar := bar_index
+
+            else
+                bool sameSideBlocked = rearmUsed and candidateSide == firstSweepSide
+                bool killzoneOK = not useKillzonesInput or inKillzone
+
+                float excursion = candidateSide == 1 ?
+                     high - rangeHigh :
+                     rangeLow - low
+
+                bool depthOK = sweepDepthPctInput >= 100 or excursion <= sweepDepthThreshold
+
+                int liquidityCount = 0
+                float eqTolerance = eqToleranceInput * rangeWidth
+
+                if requireLiquidityInput
+
+                    if candidateSide == 1 and array.size(pivotHighValues) > 0
+                        for j = 0 to array.size(pivotHighValues) - 1
+                            bool recent = array.get(pivotHighBars, j) >= bar_index - eqLookbackInput
+                            bool nearBoundary = math.abs(array.get(pivotHighValues, j) - rangeHigh) <= eqTolerance
+
+                            if recent and nearBoundary
+                                liquidityCount += 1
+
+                    if candidateSide == -1 and array.size(pivotLowValues) > 0
+                        for j = 0 to array.size(pivotLowValues) - 1
+                            bool recent = array.get(pivotLowBars, j) >= bar_index - eqLookbackInput
+                            bool nearBoundary = math.abs(array.get(pivotLowValues, j) - rangeLow) <= eqTolerance
+
+                            if recent and nearBoundary
+                                liquidityCount += 1
+
+                bool liquidityOK = not requireLiquidityInput or liquidityCount >= 2
+
+                if killzoneOK and depthOK and liquidityOK and not sameSideBlocked
+                    sweepSide := candidateSide
+                    sweepBar := bar_index
+                    sweepExtreme := candidateSide == 1 ? high : low
+
+                    if firstSweepSide == 0
+                        firstSweepSide := candidateSide
+
+                    newHighSweep := candidateSide == 1
+                    newLowSweep := candidateSide == -1
+
+                    if enableDynamicAlertsInput and alertSweepsInput
+                        alert(
+                             f_sweepAlert(
+                                 candidateSide == 1,
+                                 sweepExtreme),
+                             alert.freq_once_per_bar_close)
+
+                    state := 2
+
+                    // Same-bar wick sweep and return.
+                    if insideRange
+                        manipulationConfirmed := true
+
+                else if not insideRange
+                    state := 0
+                    lastCycleEndBar := bar_index
+
+
+        // Absolute ranges may breathe inside tolerance.
+        else if boundaryModeInput == "Absolute"
+            float newHigh = math.min(
+                 math.max(
+                     rangeHigh,
+                     high),
+                 rangeHigh + toleranceBand)
+
+            float newLow = math.max(
+                 math.min(
+                     rangeLow,
+                     low),
+                 rangeLow - toleranceBand)
+
+            if newHigh != rangeHigh or newLow != rangeLow
+                rangeHigh := newHigh
+                rangeLow := newLow
+                rangeWidth := rangeHigh - rangeLow
+
+
+    //=========================================================================
+    // SWEEP PENDING -> RETURN OR BREAKOUT FAILURE
+    //=========================================================================
+
+    else if state == 2
+        sweepExtreme := sweepSide == 1 ?
+             math.max(
+                 sweepExtreme,
+                 high) :
+             math.min(
+                 sweepExtreme,
+                 low)
+
+        if bar_index - sweepBar > sweepReturnBarsInput
+            state := 0
+            lastCycleEndBar := bar_index
+
+        else if insideRange
+            manipulationConfirmed := true
+
+
+//=============================================================================
+// MANIPULATION CONFIRMATION -> ACTUAL ENTRY
+//=============================================================================
+
+if barstate.isconfirmed and manipulationConfirmed
+
+    int projectedDirection = sweepSide == -1 ? 1 : -1
+
+    //-------------------------------------------------------------------------
+    // Legacy strict HTF direction filter.
+    //
+    // Previously this only checked confirmed HTF close against the HTF fast
+    // EMA -- a single MA on a single timeframe, with no requirement that the
+    // HTF EMA stack (fast vs slow) or the execution-timeframe trend agree.
+    // That let a reversal pass "strict" bias purely because the last
+    // confirmed HTF close happened to sit on the right side of one EMA, even
+    // while the broader HTF stack and the 5m trend both disagreed -- exactly
+    // the gap that let counter-trend entries through with this filter ON.
+    // Strict mode now requires full structural agreement: HTF close beyond
+    // the HTF EMA stack (fast vs slow, both ordered correctly) AND the
+    // execution-timeframe close on the matching side of its own trend EMA.
+    //-------------------------------------------------------------------------
+
+    bool strictHtfBiasOK = (
+         not useHtfBiasInput or
+         (
+             not na(htfClose) and
+             not na(htfEmaFast) and
+             not na(htfEmaSlow) and
+             (
+                 projectedDirection == 1 ?
+                 (
+                     htfClose > htfEmaFast and
+                     htfEmaFast > htfEmaSlow and
+                     close > localTrendEma
+                 ) :
+                 (
+                     htfClose < htfEmaFast and
+                     htfEmaFast < htfEmaSlow and
+                     close < localTrendEma
+                 )
+             )
+         )
+    )
+
+    //-------------------------------------------------------------------------
+    // Recommended asymmetric strong-trend veto.
+    //
+    // LONG:
+    //     Block only when HTF + execution TF are strongly bearish.
+    //
+    // SHORT:
+    //     Block only when HTF + execution TF are strongly bullish.
+    //
+    // Neutral:
+    //     Do not interfere with the original reversal engine.
+    //-------------------------------------------------------------------------
+
+    bool vetoedByStrongTrend = (
+         useTrendVetoInput and
+         (
+             (
+                 projectedDirection == 1 and
+                 strongBearTrend
+             ) or
+             (
+                 projectedDirection == -1 and
+                 strongBullTrend
+             )
+         )
+    )
+
+    bool entryTrendOK = strictHtfBiasOK and not vetoedByStrongTrend
+
+    if not entryTrendOK
+        blockedLongSignal := projectedDirection == 1
+        blockedShortSignal := projectedDirection == -1
+
+        if showTrendDebugTableInput
+            string blockedDebugText = "BLOCKED" +
+                 "\nStrict Bias " + (useHtfBiasInput ? f_flagText(strictHtfBiasOK) : "OFF") +
+                 "\nHTF Bull " + f_flagText(htfStrongBull) + " Bear " + f_flagText(htfStrongBear) +
+                 "\nLocal Bull " + f_flagText(localStrongBull) + " Bear " + f_flagText(localStrongBear) +
+                 "\nHTF Slope " + str.tostring(htfSlopeAtr, "#.###") +
+                 "\nLocal Slope " + str.tostring(localSlopeAtr, "#.###")
+
+            label.new(
+                 bar_index,
+                 projectedDirection == 1 ? low : high,
+                 blockedDebugText,
+                 style = projectedDirection == 1 ? label.style_label_up : label.style_label_down,
+                 color = color.new(color.red, 20),
+                 textcolor = color.white,
+                 size = size.tiny)
+
+        if enableDynamicAlertsInput and alertBlockedInput
+            string blockedSide = projectedDirection == 1 ? "LONG" : "SHORT"
+
+            string opposingTrend = strongBearTrend ?
+                 "STRONG BEAR" :
+                 strongBullTrend ?
+                 "STRONG BULL" :
+                 "STRICT HTF BIAS"
+
+            alert(
+                 "AMD PO3 | " +
+                 blockedSide +
+                 " REVERSAL FILTERED" +
+                 " | Opposing regime: " +
+                 opposingTrend +
+                 " | " +
+                 syminfo.ticker +
+                 " " +
+                 timeframe.period +
+                 " | HTF slope/ATR: " +
+                 str.tostring(
+                     htfSlopeAtr,
+                     "#.###") +
+                 " | Local slope/ATR: " +
+                 str.tostring(
+                     localSlopeAtr,
+                     "#.###"),
+                 alert.freq_once_per_bar_close)
+
+    if entryTrendOK and strategy.position_size == 0
+
+        float fibLeg = projectedDirection == 1 ?
+             rangeHigh - sweepExtreme :
+             sweepExtreme - rangeLow
+
+        activeEntry := close
+
+        activeStop := projectedDirection == 1 ?
+             sweepExtreme - stopBufferAtrInput * atrAnchor :
+             sweepExtreme + stopBufferAtrInput * atrAnchor
+
+        activeTarget := projectedDirection == 1 ?
+             rangeHigh + (fibExtensionInput - 1.0) * fibLeg :
+             rangeLow - (fibExtensionInput - 1.0) * fibLeg
+
+        initialRisk := math.max(
+             math.abs(
+                 activeEntry -
+                 activeStop),
+             syminfo.mintick)
+
+        float rrValue = math.abs(
+             activeTarget -
+             activeEntry) /
+             initialRisk
+
+        distributionStartBar := bar_index
+        breakEvenActive := false
+
+        string entryMessage = f_entryAlert(
+             projectedDirection == 1,
+             activeEntry,
+             activeStop,
+             activeTarget,
+             sweepExtreme,
+             rangeLow,
+             rangeHigh,
+             rrValue,
+             rearmUsed)
+
+        if projectedDirection == 1
+            longEntrySignal := true
+
+            strategy.entry(
+                 id = "AMD Long",
+                 direction = strategy.long,
+                 qty = contractsInput,
+                 comment = "LOW SWEEP REVERSAL",
+                 alert_message = entryMessage)
+
+        else
+            shortEntrySignal := true
+
+            strategy.entry(
+                 id = "AMD Short",
+                 direction = strategy.short,
+                 qty = contractsInput,
+                 comment = "HIGH SWEEP REVERSAL",
+                 alert_message = entryMessage)
+
+        if enableDynamicAlertsInput and alertEntriesInput
+            alert(
+                 entryMessage,
+                 alert.freq_once_per_bar_close)
+
+        if showTrendDebugTableInput
+            string entryDebugText = "ENTERED" +
+                 "\nStrict Bias " + (useHtfBiasInput ? f_flagText(strictHtfBiasOK) : "OFF") +
+                 "\nHTF Bull " + f_flagText(htfStrongBull) +
+                 " Bear " + f_flagText(htfStrongBear) +
+                 "\nLocal Bull " + f_flagText(localStrongBull) +
+                 " Bear " + f_flagText(localStrongBear) +
+                 "\nHTF Slope " + str.tostring(htfSlopeAtr, "#.###") +
+                 "\nLocal Slope " + str.tostring(localSlopeAtr, "#.###")
+
+            label.new(
+                 bar_index,
+                 projectedDirection == 1 ? low : high,
+                 entryDebugText,
+                 style = projectedDirection == 1 ? label.style_label_up : label.style_label_down,
+                 color = color.new(color.purple, 20),
+                 textcolor = color.white,
+                 size = size.tiny)
+
+        state := 3
+
+
+    else if strategy.position_size == 0 and not entryTrendOK
+
+        // If the reversal was rejected by the trend filter,
+        // preserve the range and allow the opposite-side setup.
+        if allowRearmInput and not rearmUsed
+            rearmUsed := true
+            expiryAnchorBar := bar_index
+            state := 1
+
+        else
+            state := 0
+            lastCycleEndBar := bar_index
+
+
+    else if strategy.position_size != 0
+        state := 0
+        lastCycleEndBar := bar_index
+
+
+//=============================================================================
+// ACTIVE POSITION MANAGEMENT
+//=============================================================================
+
+if strategy.position_size > 0
+
+    if useBreakEvenInput and
+       not breakEvenActive and
+       high >= activeEntry + initialRisk * breakEvenAtRInput
+
+        activeStop := math.max(
+             activeStop,
+             activeEntry)
+
+        breakEvenActive := true
+
+    strategy.exit(
+         id = "AMD Long Exit",
+         from_entry = "AMD Long",
+         stop = activeStop,
+         limit = activeTarget,
+         comment_profit = "TARGET",
+         comment_loss = "STOP")
+
+
+if strategy.position_size < 0
+
+    if useBreakEvenInput and
+       not breakEvenActive and
+       low <= activeEntry - initialRisk * breakEvenAtRInput
+
+        activeStop := math.min(
+             activeStop,
+             activeEntry)
+
+        breakEvenActive := true
+
+    strategy.exit(
+         id = "AMD Short Exit",
+         from_entry = "AMD Short",
+         stop = activeStop,
+         limit = activeTarget,
+         comment_profit = "TARGET",
+         comment_loss = "STOP")
+
+
+//=============================================================================
+// DISTRIBUTION TIMEOUT
+//=============================================================================
+
+if state == 3 and
+   strategy.position_size != 0 and
+   not na(distributionStartBar)
+
+    bool timedOut = (
+         bar_index -
+         distributionStartBar >
+         distributionTimeoutBarsInput)
+
+    if timedOut
+        string timeoutMessage = strategy.position_size > 0 ?
+             "LONG EXIT | AMD PO3 REVERSAL | TIMEOUT | " + syminfo.ticker :
+             "SHORT EXIT | AMD PO3 REVERSAL | TIMEOUT | " + syminfo.ticker
+
+        if strategy.position_size > 0
+            strategy.close(
+                 id = "AMD Long",
+                 comment = "TIMEOUT",
+                 alert_message = timeoutMessage,
+                 immediately = true)
+
+        else
+            strategy.close(
+                 id = "AMD Short",
+                 comment = "TIMEOUT",
+                 alert_message = timeoutMessage,
+                 immediately = true)
+
+
+//=============================================================================
+// POSITION CLOSE DETECTION + DYNAMIC EXIT ALERT
+//=============================================================================
+
+bool longClosed = (
+     strategy.position_size == 0 and
+     strategy.position_size[1] > 0)
+
+bool shortClosed = (
+     strategy.position_size == 0 and
+     strategy.position_size[1] < 0)
+
+if longClosed or shortClosed
+
+    string exitReason = strategy.closedtrades > 0 ?
+         strategy.closedtrades.exit_comment(
+             strategy.closedtrades - 1) :
+         "EXIT"
+
+    if enableDynamicAlertsInput and alertExitsInput
+        alert(
+             f_exitAlert(
+                 longClosed,
+                 exitReason),
+             alert.freq_once_per_bar_close)
+
+    state := 0
+    lastCycleEndBar := bar_index
+
+    activeEntry := na
+    activeStop := na
+    activeTarget := na
+    initialRisk := na
+    distributionStartBar := na
+    breakEvenActive := false
+
+
+//=============================================================================
+// VISUALS
+//=============================================================================
+
+float visibleRangeHigh = (
+     showRangeInput and
+     (
+         state == 1 or
+         state == 2
+     )
+) ? rangeHigh : na
+
+float visibleRangeLow = (
+     showRangeInput and
+     (
+         state == 1 or
+         state == 2
+     )
+) ? rangeLow : na
+
+rangeHighPlot = plot(
+     visibleRangeHigh,
+     title = "Accumulation High",
+     color = color.new(
+         rangeColorInput,
+         5),
+     linewidth = 1,
+     style = plot.style_linebr)
+
+rangeLowPlot = plot(
+     visibleRangeLow,
+     title = "Accumulation Low",
+     color = color.new(
+         rangeColorInput,
+         5),
+     linewidth = 1,
+     style = plot.style_linebr)
+
+fill(
+     rangeHighPlot,
+     rangeLowPlot,
+     color = color.new(
+         rangeColorInput,
+         91),
+     title = "Accumulation Fill")
+
+plot(
+     showTrendEmaInput ?
+         localTrendEma :
+         na,
+     title = "Execution TF Trend EMA",
+     color = trendState == 1 ?
+         color.lime :
+         trendState == -1 ?
+         color.red :
+         color.gray,
+     linewidth = 2)
+
+plotshape(
+     showSweepMarkersInput and newLowSweep,
+     title = "Low Sweep",
+     style = shape.circle,
+     location = location.belowbar,
+     size = size.tiny,
+     color = longColorInput,
+     text = "M")
+
+plotshape(
+     showSweepMarkersInput and newHighSweep,
+     title = "High Sweep",
+     style = shape.circle,
+     location = location.abovebar,
+     size = size.tiny,
+     color = shortColorInput,
+     text = "M")
+
+plotshape(
+     showEntryMarkersInput and longEntrySignal,
+     title = "AMD Long Entry",
+     style = shape.triangleup,
+     location = location.belowbar,
+     size = size.small,
+     color = longColorInput)
+
+plotshape(
+     showEntryMarkersInput and shortEntrySignal,
+     title = "AMD Short Entry",
+     style = shape.triangledown,
+     location = location.abovebar,
+     size = size.small,
+     color = shortColorInput)
+
+plotshape(
+     showBlockedSignalsInput and blockedLongSignal,
+     title = "Filtered Long",
+     style = shape.xcross,
+     location = location.belowbar,
+     size = size.tiny,
+     color = color.red,
+     text = "X")
+
+plotshape(
+     showBlockedSignalsInput and blockedShortSignal,
+     title = "Filtered Short",
+     style = shape.xcross,
+     location = location.abovebar,
+     size = size.tiny,
+     color = color.red,
+     text = "X")
+
+plot(
+     showTradeLevelsInput and strategy.position_size != 0 ?
+         activeStop :
+         na,
+     title = "Active Stop",
+     color = color.red,
+     linewidth = 1,
+     style = plot.style_linebr)
+
+plot(
+     showTradeLevelsInput and strategy.position_size != 0 ?
+         activeTarget :
+         na,
+     title = "Active Target",
+     color = color.lime,
+     linewidth = 1,
+     style = plot.style_linebr)
+
+
+//=============================================================================
+// TREND VETO DEBUG TABLE
+//-----------------------------------------------------------------------------
+// Free-tier substitute for the Data Window -- screenshot this at the moment a
+// counter-trend entry fires to see exactly which of the six veto inputs was
+// 0 when it should have been 1.
+//=============================================================================
+
+var table trendDebugTable = table.new(
+     f_debugTablePosition(debugTablePositionInput),
+     2,
+     7,
+     bgcolor = color.new(color.rgb(15, 20, 27), 10),
+     border_width = 1)
+
+if barstate.islast and showTrendDebugTableInput
+    table.cell(trendDebugTable, 0, 0, "TREND VETO", text_color = color.white, text_size = size.tiny, bgcolor = color.new(color.rgb(40, 40, 40), 0))
+    table.cell(trendDebugTable, 1, 0, "", text_color = color.white, text_size = size.tiny, bgcolor = color.new(color.rgb(40, 40, 40), 0))
+
+    table.cell(trendDebugTable, 0, 1, "HTF Strong Bull", text_color = color.white, text_size = size.tiny)
+    table.cell(trendDebugTable, 1, 1, f_flagText(htfStrongBull), text_color = f_flagColor(htfStrongBull), text_size = size.tiny)
+
+    table.cell(trendDebugTable, 0, 2, "HTF Strong Bear", text_color = color.white, text_size = size.tiny)
+    table.cell(trendDebugTable, 1, 2, f_flagText(htfStrongBear), text_color = f_flagColor(htfStrongBear), text_size = size.tiny)
+
+    table.cell(trendDebugTable, 0, 3, "Local Strong Bull", text_color = color.white, text_size = size.tiny)
+    table.cell(trendDebugTable, 1, 3, f_flagText(localStrongBull), text_color = f_flagColor(localStrongBull), text_size = size.tiny)
+
+    table.cell(trendDebugTable, 0, 4, "Local Strong Bear", text_color = color.white, text_size = size.tiny)
+    table.cell(trendDebugTable, 1, 4, f_flagText(localStrongBear), text_color = f_flagColor(localStrongBear), text_size = size.tiny)
+
+    table.cell(trendDebugTable, 0, 5, "HTF Slope/ATR", text_color = color.white, text_size = size.tiny)
+    table.cell(trendDebugTable, 1, 5, str.tostring(htfSlopeAtr, "#.###"), text_color = color.white, text_size = size.tiny)
+
+    table.cell(trendDebugTable, 0, 6, "Local Slope/ATR", text_color = color.white, text_size = size.tiny)
+    table.cell(trendDebugTable, 1, 6, str.tostring(localSlopeAtr, "#.###"), text_color = color.white, text_size = size.tiny)
+
+
+//=============================================================================
+// DATA WINDOW
+//=============================================================================
+
+plot(
+     compressionRank,
+     title = "Compression Percentile",
+     display = display.data_window)
+
+plot(
+     state,
+     title = "FSM State 0 Idle / 1 Range / 2 Sweep / 3 Trade",
+     display = display.data_window)
+
+plot(
+     sweepSide,
+     title = "Sweep Side +1 High / -1 Low",
+     display = display.data_window)
+
+plot(
+     trendState,
+     title = "Trend State +1 Bull / 0 Neutral / -1 Bear",
+     display = display.data_window)
+
+plot(
+     htfSlopeAtr,
+     title = "HTF Fast EMA Slope / HTF ATR",
+     display = display.data_window)
+
+plot(
+     localSlopeAtr,
+     title = "Execution EMA Slope / ATR",
+     display = display.data_window)
+
+plot(
+     htfEmaFast,
+     title = "Confirmed HTF Fast EMA",
+     display = display.data_window)
+
+plot(
+     htfEmaSlow,
+     title = "Confirmed HTF Slow EMA",
+     display = display.data_window)
+
+plot(
+     htfStrongBull ? 1 : 0,
+     title = "HTF Strong Bull",
+     display = display.data_window)
+
+plot(
+     htfStrongBear ? 1 : 0,
+     title = "HTF Strong Bear",
+     display = display.data_window)
+
+plot(
+     localStrongBull ? 1 : 0,
+     title = "Local Strong Bull",
+     display = display.data_window)
+
+plot(
+     localStrongBear ? 1 : 0,
+     title = "Local Strong Bear",
+     display = display.data_window)
+
+
+//=============================================================================
+// ALERT CONDITIONS
+//-----------------------------------------------------------------------------
+// Dynamic alert:
+// Create Alert -> this strategy -> Any alert() function call
+//
+// Order-fill alert:
+// {{strategy.order.alert_message}}
+//=============================================================================
+
+alertcondition(
+     newLowSweep,
+     title = "AMD Low Sweep",
+     message = "BULL CONTEXT | LOW SWEEP DETECTED | {{ticker}} {{interval}}")
+
+alertcondition(
+     newHighSweep,
+     title = "AMD High Sweep",
+     message = "BEAR CONTEXT | HIGH SWEEP DETECTED | {{ticker}} {{interval}}")
+
+alertcondition(
+     longEntrySignal,
+     title = "AMD Long Reversal Entry",
+     message = "BULL | LONG ENTRY | LOW SWEEP REVERSAL | {{ticker}} {{interval}} @ {{close}}")
+
+alertcondition(
+     shortEntrySignal,
+     title = "AMD Short Reversal Entry",
+     message = "BEAR | SHORT ENTRY | HIGH SWEEP REVERSAL | {{ticker}} {{interval}} @ {{close}}")
+
+alertcondition(
+     blockedLongSignal,
+     title = "AMD Long Filtered By Trend",
+     message = "LONG REVERSAL FILTERED BY STRONG TREND | {{ticker}} {{interval}}")
+
+alertcondition(
+     blockedShortSignal,
+     title = "AMD Short Filtered By Trend",
+     message = "SHORT REVERSAL FILTERED BY STRONG TREND | {{ticker}} {{interval}}")
+
+alertcondition(
+     longClosed,
+     title = "AMD Long Exit",
+     message = "LONG EXIT | AMD PO3 REVERSAL | {{ticker}} {{interval}} @ {{close}}")
+
+alertcondition(
+     shortClosed,
+     title = "AMD Short Exit",
+     message = "SHORT EXIT | AMD PO3 REVERSAL | {{ticker}} {{interval}} @ {{close}}")

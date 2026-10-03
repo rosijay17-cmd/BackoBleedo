@@ -1,0 +1,248 @@
+//@version=6
+// NOTE: strategy() declaration parameters (initial_capital, default_qty_value,
+// commission_value) require a compile-time "const float" — an input.*() call
+// resolves to "input float", which the compiler rejects here (CE10123). These
+// three are therefore fixed constants below; TradingView's own Properties tab
+// already exposes Initial Capital and Commission for the user to change
+// without touching the script. Position size stays genuinely input-driven —
+// see positionSizePctInput below — by computing an explicit qty at entry
+// time instead of relying on the declaration's default_qty_value.
+strategy(title = "DeltaFlow Volume Profile Strategy", shorttitle = "DeltaFlow VP Strategy", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, initial_capital = 50000.0, currency = currency.USD, default_qty_type = strategy.cash, default_qty_value = 50000.0, commission_type = strategy.commission.percent, commission_value = 0.02, process_orders_on_close = true, calc_on_every_tick = false)
+
+// ============================================================================
+// VOLUME PROFILE INPUTS — preserved verbatim from the DeltaFlow reference
+// (same names, same defaults, same missing group/title where the original
+// left them ungrouped) for exact render parity.
+// ============================================================================
+lookBack     = input.int(200, "LookBack")
+binsAmount   = input.int(30, "Bins", maxval = 100, minval = 10)
+offset       = input.int(5)
+
+deltaHeatMap = input.bool(true, "Delta Heat Map", group = "Features")
+deltaDisplay = input.bool(true, "Delta", group = "Features")
+volumeBars   = input.bool(true, "Volume Bars", group = "Features")
+pocDisplay   = input.bool(true, "", inline = "poc", group = "Features")
+pocColor     = input.color(color.rgb(0, 183, 255), "PoC Color", inline = "poc", group = "Features")
+
+bullcolor    = input.color(color.teal, "Volume +/-", inline = "vol")
+bearcolor    = input.color(color.rgb(230, 150, 30), "", inline = "vol")
+
+// ============================================================================
+// STRATEGY INPUTS (Phase 2)
+// ============================================================================
+const string G_STRAT = "Strategy"
+positionSizePctInput = input.float(10.0, "Position Size (% of Equity)", minval = 1.0, maxval = 100.0, group = G_STRAT)
+enableLongInput      = input.bool(true, "Enable Long Trades", group = G_STRAT)
+enableShortInput     = input.bool(true, "Enable Short Trades", group = G_STRAT)
+toleranceTicksInput  = input.int(2, "Level Touch Tolerance (ticks)", minval = 0, group = G_STRAT)
+valueAreaPctInput    = input.float(70.0, "Value Area %", minval = 50.0, maxval = 95.0, group = G_STRAT)
+rMultipleInput       = input.float(2.0, "Target R-Multiple", minval = 0.5, group = G_STRAT)
+showLevelsInput      = input.bool(true, "Plot POC / VAH / VAL Signal Levels", group = G_STRAT)
+showEntryMarkersInput = input.bool(true, "Plot Entry Markers", group = G_STRAT)
+
+type vp_
+    array<float> volumeArry
+    array<float> bearVolume
+    array<float> bullVolume
+
+vp = vp_.new(array.new<float>(binsAmount, 0.), array.new<float>(binsAmount, 0.), array.new<float>(binsAmount, 0.))
+
+MaxMin     = array.new<float>()
+var boxes  = array.new<box>()
+
+// ============================================================================
+// PHASE 2 — SIGNAL-PATH VOLUME PROFILE (non-repainting)
+// Computed every confirmed bar from the window [1, lookBack] — i.e. shifted
+// one full bar back from the display profile below — so the level a signal
+// reacts to on bar N was already fixed before bar N started forming. This
+// is deliberately a *different* calculation from the display block below;
+// see the deviations note in the accompanying change log.
+// ============================================================================
+f_signalProfile(int bars, int bins) =>
+    float sigTop = high[1]
+    float sigBot = low[1]
+    for i = 1 to bars
+        sigTop := math.max(sigTop, high[i])
+        sigBot := math.min(sigBot, low[i])
+    float sigStep = (sigTop - sigBot) / bins
+    array<float> sigVol = array.new<float>(bins, 0.0)
+    for i = 1 to bars
+        float price = close[i]
+        for k = 0 to bins - 1
+            float lower = sigBot + sigStep * k
+            float mid   = lower + sigStep / 2
+            if math.abs(mid - price) <= sigStep
+                array.set(sigVol, k, array.get(sigVol, k) + volume[i])
+    int   pocIdx = 0
+    float pocVol = 0.0
+    for k = 0 to bins - 1
+        float v = array.get(sigVol, k)
+        if v > pocVol
+            pocVol := v
+            pocIdx := k
+    float sigPoc = sigBot + sigStep * pocIdx + sigStep / 2
+    float totalVol = array.sum(sigVol)
+    float target = totalVol * (valueAreaPctInput / 100.0)
+    float cum = array.get(sigVol, pocIdx)
+    int lo = pocIdx
+    int hi = pocIdx
+    while cum < target and (lo > 0 or hi < bins - 1)
+        float volBelow = lo > 0 ? array.get(sigVol, lo - 1) : -1.0
+        float volAbove = hi < bins - 1 ? array.get(sigVol, hi + 1) : -1.0
+        if volAbove >= volBelow
+            hi += 1
+            cum += array.get(sigVol, hi)
+        else
+            lo -= 1
+            cum += array.get(sigVol, lo)
+    float sigVah = sigBot + sigStep * (hi + 1)
+    float sigVal = sigBot + sigStep * lo
+    [sigTop, sigBot, sigPoc, sigVah, sigVal]
+
+bool enoughHistory = bar_index >= lookBack + 1
+
+var float sigTop = na
+var float sigBot = na
+var float sigPocPrice = na
+var float sigVahPrice = na
+var float sigValPrice = na
+
+if enoughHistory
+    [profTop, profBot, profPoc, profVah, profVal] = f_signalProfile(lookBack, binsAmount)
+    sigTop := profTop
+    sigBot := profBot
+    sigPocPrice := profPoc
+    sigVahPrice := profVah
+    sigValPrice := profVal
+
+float tick = syminfo.mintick
+float tol  = toleranceTicksInput * tick
+
+bool longVpocReclaim     = enoughHistory and ta.crossover(close, sigPocPrice)
+bool longSupportBounce   = enoughHistory and low <= sigValPrice + tol and close > sigValPrice
+bool longCondition       = enableLongInput and (longVpocReclaim or longSupportBounce)
+
+bool shortVpocReject     = enoughHistory and ta.crossunder(close, sigPocPrice)
+bool shortResistanceFail = enoughHistory and high >= sigVahPrice - tol and close < sigVahPrice
+bool shortCondition      = enableShortInput and (shortVpocReject or shortResistanceFail)
+
+var float longStopPrice  = na
+var float longTargetPrice = na
+var float shortStopPrice = na
+var float shortTargetPrice = na
+
+float orderQty = close > 0 ? strategy.equity * (positionSizePctInput / 100.0) / close : na
+
+if longCondition and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long, qty = orderQty)
+    longStopPrice := sigBot
+    float longRisk = close - sigBot
+    longTargetPrice := close + longRisk * rMultipleInput
+
+if shortCondition and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short, qty = orderQty)
+    shortStopPrice := sigTop
+    float shortRisk = sigTop - close
+    shortTargetPrice := close - shortRisk * rMultipleInput
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", from_entry = "Long", stop = longStopPrice, limit = longTargetPrice)
+if strategy.position_size < 0
+    strategy.exit("Short Exit", from_entry = "Short", stop = shortStopPrice, limit = shortTargetPrice)
+
+plot(showLevelsInput and enoughHistory ? sigPocPrice : na, "Signal POC", color = color.new(pocColor, 0), linewidth = 1, style = plot.style_linebr)
+plot(showLevelsInput and enoughHistory ? sigVahPrice : na, "Signal VAH", color = color.new(color.red, 0), linewidth = 1, style = plot.style_linebr)
+plot(showLevelsInput and enoughHistory ? sigValPrice : na, "Signal VAL", color = color.new(color.green, 0), linewidth = 1, style = plot.style_linebr)
+
+plotshape(showEntryMarkersInput and longCondition and strategy.position_size[1] <= 0 and strategy.position_size > 0 ? low : na, "Long Entry", style = shape.triangleup, location = location.belowbar, color = color.new(color.lime, 0), size = size.small)
+plotshape(showEntryMarkersInput and shortCondition and strategy.position_size[1] >= 0 and strategy.position_size < 0 ? high : na, "Short Entry", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0), size = size.small)
+
+// ============================================================================
+// PHASE 1 — DISPLAY VOLUME PROFILE (verbatim from the DeltaFlow reference)
+// Recomputed only on the last bar, using the window [0, lookBack] (current
+// forming bar included), exactly matching the original indicator's math and
+// drawing order for visual parity. This is intentionally NOT the same window
+// as the signal profile above.
+// ============================================================================
+if barstate.islast
+
+    if boxes.size() > 0
+        for b in boxes
+            b.delete()
+        boxes.clear()
+
+    for i = 0 to lookBack
+        MaxMin.push(high[i])
+        MaxMin.push(low[i])
+
+    top = MaxMin.max()
+    bot = MaxMin.min()
+    step = (top-bot)/binsAmount
+
+    for i = 0 to lookBack
+
+        price = close[i]
+        isBear = close[i] < open[i]
+        voll = volume[i]
+
+        for k = 0 to binsAmount - 1
+            lower = bot + step * k
+            mid   = lower + step/2
+
+            if math.abs(mid - price) <= step
+                vp.volumeArry.set(k, vp.volumeArry.get(k) + voll)
+
+                if isBear
+                    vp.bearVolume.set(k, vp.bearVolume.get(k) + voll)
+                else
+                    vp.bullVolume.set(k, vp.bullVolume.get(k) + voll)
+
+    for i = 0 to binsAmount - 1
+
+        start = bar_index + 100+offset
+
+        volumeArryvalue = vp.volumeArry.get(i)
+
+        lower = bot + step * i
+        upper = lower + step
+        mid   = lower + step /2
+        vol   = int(vp.volumeArry.get(i) / vp.volumeArry.max() * 100)
+
+        bullV = math.floor(vp.bullVolume.get(i) / vp.volumeArry.max() * 100)
+        bearV = math.floor(vp.bearVolume.get(i) / vp.volumeArry.max() * 100)
+
+        size  = (start - start-vol)
+
+        bullsPercent = math.abs(bullV/size*100)
+        bearsPercent = math.abs(bearV/size*100)
+
+        bullsPercent := bullsPercent > 100 ? 100 : bullsPercent
+
+        delta       = bullsPercent - bearsPercent
+        deltaColor  = color.from_gradient(delta, -30, 30, bearcolor, bullcolor)
+
+        box poc      = na
+        box labelBox = na
+        box MapBody  = na
+        box bulls    = na
+        box bears    = na
+
+        if deltaHeatMap
+            MapBody  := box.new(start-lookBack-50-vol, upper, start, lower, border_color = chart.bg_color, border_width = 0, bgcolor = color.from_gradient(vol, 0, 100, color.new(deltaColor, 100), color.new(deltaColor, 70)))
+        if vol == 100 and pocDisplay
+            poc := box.new(start-lookBack-50-vol, upper, start, lower, border_color = pocColor, border_width = 1, bgcolor = na, text = str.tostring(volumeArryvalue, format.volume), text_color = chart.fg_color)
+        if deltaDisplay
+            labelBox := box.new(start+15, upper, start, lower, border_color = chart.bg_color, border_width = 1, bgcolor = color.new(deltaColor, 80), text = "Δ " + str.tostring(delta, format.percent), text_color = deltaColor)
+
+        body        = box.new(start-vol, upper, start, lower, border_color = chart.bg_color, border_width = 1, bgcolor = color.new(deltaColor, 50))
+
+        if volumeBars
+            bulls  := box.new(start-bullV, mid, start, lower, bgcolor = bullcolor, border_color = chart.bg_color, border_width = 1, text = str.tostring(bullsPercent, format = format.percent), text_halign = text.align_right)
+            bears  := box.new(start-bearV, upper, start, mid, bgcolor = bearcolor, border_color = chart.bg_color, border_width = 1, text = str.tostring(bearsPercent, format = format.percent), text_halign = text.align_right)
+
+        boxes.push(poc)
+        boxes.push(labelBox)
+        boxes.push(MapBody)
+        boxes.push(body)
+        boxes.push(bulls)
+        boxes.push(bears)

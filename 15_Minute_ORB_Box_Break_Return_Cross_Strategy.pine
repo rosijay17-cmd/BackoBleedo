@@ -1,0 +1,1115 @@
+//@version=6
+//@strategy_alert_message {{strategy.order.alert_message}} | {{ticker}} | {{interval}} | Fill: {{strategy.order.price}}
+
+strategy(
+     title = "15-Minute ORB Box — Break-Return-Cross Strategy",
+     shorttitle = "15M ORB BRC",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 50000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.50,
+     slippage = 1,
+     process_orders_on_close = true,
+     calc_on_order_fills = true,
+     calc_on_every_tick = true,
+     use_bar_magnifier = false,
+     max_labels_count = 500,
+     max_lines_count = 500,
+     max_boxes_count = 500
+)
+
+//=============================================================================
+// COMPOSITION NOTE
+//=============================================================================
+// This script pairs two existing repo scripts rather than being written from
+// scratch:
+//
+//   PART A — Sections 1-12 (heavy ═ banners): "15-Minute ORB Box — Master"
+//   (indicator). Its session detection, box drawing, and high/mid/low line
+//   finalization are reused UNCHANGED -- same variable names, same defaults,
+//   same input groups ("1. ORB Settings" through "4. Price Label Controls").
+//   Nothing in Part A was rewritten.
+//
+//   PART B — Sections 01-10 (plain = banners): "ORB Break-Return-Cross
+//   Strategy v1" (ORB_BRC_STRAT). Its break -> return -> cross entry state
+//   machine, RR-based risk model, dashboard, and dual alert()/alertcondition()
+//   pattern are reused, rewired to trade off Part A's orbHigh / orbMid /
+//   orbLow instead of ORB_BRC_STRAT's own duplicate range-builder (which is
+//   dropped entirely -- one ORB engine, not two).
+//
+//   Risk model note: ORB_BRC_STRAT already computed activeSL = hv - rangeHalf
+//   for longs, which is numerically identical to the range midpoint. Now that
+//   Part A draws a real midpoint line, the long stop is simply orbMid -- same
+//   math as the original, now expressed with the level that's actually on
+//   the chart.
+//
+//   Buffer note: ORB_BRC_STRAT's "ORB Buffer %" inflated its own hv/lv before
+//   use. Here it is applied only at the break/return/cross COMPARISON point
+//   (bufferedOrbHigh / bufferedOrbLow below) -- Part A's drawn box and lines
+//   always show the true, unbuffered range.
+//
+//   Timezone note: ORB_BRC_STRAT's trading-session and last-entry-time
+//   defaults were expressed in America/New_York. Part A's orbTimezone
+//   defaults to America/Chicago (1 hour behind New York, constant offset).
+//   Both new inputs below (tradingSession, lastEntryTime) are read in
+//   orbTimezone, so their defaults are shifted to the Chicago-equivalent of
+//   the original 09:30-16:00 / 12:15 New York values -- same real-world wall
+//   clock, single timezone concept for the whole script instead of two.
+//=============================================================================
+
+
+//══════════════════════════════════════════════════════════════════════
+// 1. ORB SETTINGS
+//══════════════════════════════════════════════════════════════════════
+
+groupORB = "1. ORB Settings"
+
+orbSession = input.session(
+     defval = "0830-0845",
+     title = "ORB Session",
+     group = groupORB
+)
+
+orbTimezone = input.string(
+     defval = "America/Chicago",
+     title = "ORB Time Zone",
+     options = [
+         "America/Chicago",
+         "America/New_York",
+         "America/Denver",
+         "America/Los_Angeles",
+         "Etc/UTC"
+     ],
+     group = groupORB
+)
+
+weekdaysOnly = input.bool(
+     defval = true,
+     title = "Weekdays Only",
+     group = groupORB
+)
+
+showHistoricalObjects = input.bool(
+     defval = true,
+     title = "Show Historical ORBs",
+     group = groupORB
+)
+
+//══════════════════════════════════════════════════════════════════════
+// 2. BOX APPEARANCE
+//══════════════════════════════════════════════════════════════════════
+
+groupBox = "2. Box Appearance"
+
+showORBBox = input.bool(
+     defval = true,
+     title = "Show ORB Box",
+     group = groupBox
+)
+
+boxBorderColor = input.color(
+     defval = color.orange,
+     title = "Box Border Color",
+     group = groupBox
+)
+
+boxFillColor = input.color(
+     defval = color.orange,
+     title = "Box Fill Color",
+     group = groupBox
+)
+
+boxTransparency = input.int(
+     defval = 88,
+     title = "Box Fill Transparency",
+     minval = 0,
+     maxval = 100,
+     group = groupBox
+)
+
+boxBorderWidth = input.int(
+     defval = 2,
+     title = "Box Border Width",
+     minval = 1,
+     maxval = 5,
+     group = groupBox
+)
+
+boxBorderStyleInput = input.string(
+     defval = "Solid",
+     title = "Box Border Style",
+     options = ["Solid", "Dashed", "Dotted"],
+     group = groupBox
+)
+
+//══════════════════════════════════════════════════════════════════════
+// 3. PRICE-LEVEL LINE SETTINGS
+//══════════════════════════════════════════════════════════════════════
+
+groupLevels = "3. Price Level Lines"
+
+showHighLine = input.bool(
+     defval = true,
+     title = "Show ORB High Line",
+     group = groupLevels
+)
+
+showMidLine = input.bool(
+     defval = true,
+     title = "Show ORB Midpoint Line",
+     group = groupLevels
+)
+
+showLowLine = input.bool(
+     defval = true,
+     title = "Show ORB Low Line",
+     group = groupLevels
+)
+
+lineStartOffset = input.int(
+     defval = 0,
+     title = "Line Start Offset",
+     tooltip = "Moves the beginning of the lines from the 8:45 AM completion bar. Zero begins at the right edge of the ORB.",
+     minval = -50,
+     maxval = 100,
+     group = groupLevels
+)
+
+highColor = input.color(
+     defval = color.red,
+     title = "ORB High Color",
+     group = groupLevels
+)
+
+midColor = input.color(
+     defval = color.yellow,
+     title = "ORB Midpoint Color",
+     group = groupLevels
+)
+
+lowColor = input.color(
+     defval = color.lime,
+     title = "ORB Low Color",
+     group = groupLevels
+)
+
+levelWidth = input.int(
+     defval = 2,
+     title = "High and Low Width",
+     minval = 1,
+     maxval = 5,
+     group = groupLevels
+)
+
+midpointWidth = input.int(
+     defval = 1,
+     title = "Midpoint Width",
+     minval = 1,
+     maxval = 5,
+     group = groupLevels
+)
+
+levelStyleInput = input.string(
+     defval = "Solid",
+     title = "High and Low Style",
+     options = ["Solid", "Dashed", "Dotted"],
+     group = groupLevels
+)
+
+midpointStyleInput = input.string(
+     defval = "Dashed",
+     title = "Midpoint Style",
+     options = ["Solid", "Dashed", "Dotted"],
+     group = groupLevels
+)
+
+//══════════════════════════════════════════════════════════════════════
+// 4. PRICE-LABEL CONTROLS
+//══════════════════════════════════════════════════════════════════════
+
+groupLabels = "4. Price Label Controls"
+
+showLabels = input.bool(
+     defval = true,
+     title = "Show Price Labels",
+     group = groupLabels
+)
+
+showHighLabel = input.bool(
+     defval = true,
+     title = "Show High Label",
+     group = groupLabels
+)
+
+showMidLabel = input.bool(
+     defval = true,
+     title = "Show Midpoint Label",
+     group = groupLabels
+)
+
+showLowLabel = input.bool(
+     defval = true,
+     title = "Show Low Label",
+     group = groupLabels
+)
+
+showPriceInLabel = input.bool(
+     defval = true,
+     title = "Include Price in Labels",
+     group = groupLabels
+)
+
+labelHorizontalOffset = input.int(
+     defval = 10,
+     title = "Label and Line Endpoint Offset",
+     tooltip = "Moves the labels left or right. The price lines automatically terminate at this position.",
+     minval = -100,
+     maxval = 500,
+     group = groupLabels
+)
+
+labelSizeInput = input.string(
+     defval = "Small",
+     title = "Label Size",
+     options = ["Tiny", "Small", "Normal", "Large", "Huge"],
+     group = groupLabels
+)
+
+labelStyleInput = input.string(
+     defval = "Left",
+     title = "Label Direction",
+     options = ["Left", "Right", "Up", "Down"],
+     group = groupLabels
+)
+
+highLabelBackground = input.color(
+     defval = color.red,
+     title = "High Label Background",
+     group = groupLabels
+)
+
+highLabelTextColor = input.color(
+     defval = color.white,
+     title = "High Label Text",
+     group = groupLabels
+)
+
+midLabelBackground = input.color(
+     defval = color.yellow,
+     title = "Midpoint Label Background",
+     group = groupLabels
+)
+
+midLabelTextColor = input.color(
+     defval = color.black,
+     title = "Midpoint Label Text",
+     group = groupLabels
+)
+
+lowLabelBackground = input.color(
+     defval = color.lime,
+     title = "Low Label Background",
+     group = groupLabels
+)
+
+lowLabelTextColor = input.color(
+     defval = color.black,
+     title = "Low Label Text",
+     group = groupLabels
+)
+
+//══════════════════════════════════════════════════════════════════════
+// 5. STYLE CONVERSIONS
+//══════════════════════════════════════════════════════════════════════
+
+boxBorderStyle = switch boxBorderStyleInput
+    "Solid"  => line.style_solid
+    "Dashed" => line.style_dashed
+    "Dotted" => line.style_dotted
+    => line.style_solid
+
+levelLineStyle = switch levelStyleInput
+    "Solid"  => line.style_solid
+    "Dashed" => line.style_dashed
+    "Dotted" => line.style_dotted
+    => line.style_solid
+
+midpointLineStyle = switch midpointStyleInput
+    "Solid"  => line.style_solid
+    "Dashed" => line.style_dashed
+    "Dotted" => line.style_dotted
+    => line.style_dashed
+
+selectedLabelSize = switch labelSizeInput
+    "Tiny"   => size.tiny
+    "Small"  => size.small
+    "Normal" => size.normal
+    "Large"  => size.large
+    "Huge"   => size.huge
+    => size.small
+
+selectedLabelStyle = switch labelStyleInput
+    "Left"  => label.style_label_left
+    "Right" => label.style_label_right
+    "Up"    => label.style_label_up
+    "Down"  => label.style_label_down
+    => label.style_label_left
+
+//══════════════════════════════════════════════════════════════════════
+// 6. SESSION DETECTION
+//══════════════════════════════════════════════════════════════════════
+
+sessionDays = weekdaysOnly ? ":23456" : ":1234567"
+completeSession = orbSession + sessionDays
+
+inORB = not na(
+     time(
+         timeframe.period,
+         completeSession,
+         orbTimezone
+     )
+)
+
+orbBegins = inORB and not inORB[1]
+orbEnds = not inORB and inORB[1]
+
+//══════════════════════════════════════════════════════════════════════
+// 7. PERSISTENT VARIABLES
+//══════════════════════════════════════════════════════════════════════
+
+var float orbHigh = na
+var float orbLow = na
+var float orbMid = na
+
+var int orbStartTime = na
+var int orbEndTime = na
+
+var box currentORBBox = na
+
+var line currentHighLine = na
+var line currentMidLine = na
+var line currentLowLine = na
+
+var label currentHighLabel = na
+var label currentMidLabel = na
+var label currentLowLabel = na
+
+//══════════════════════════════════════════════════════════════════════
+// 8. DELETE PREVIOUS ORB OBJECTS
+//══════════════════════════════════════════════════════════════════════
+
+if orbBegins and not showHistoricalObjects
+    if not na(currentORBBox)
+        box.delete(currentORBBox)
+
+    if not na(currentHighLine)
+        line.delete(currentHighLine)
+
+    if not na(currentMidLine)
+        line.delete(currentMidLine)
+
+    if not na(currentLowLine)
+        line.delete(currentLowLine)
+
+    if not na(currentHighLabel)
+        label.delete(currentHighLabel)
+
+    if not na(currentMidLabel)
+        label.delete(currentMidLabel)
+
+    if not na(currentLowLabel)
+        label.delete(currentLowLabel)
+
+//══════════════════════════════════════════════════════════════════════
+// 9. START NEW ORB
+//══════════════════════════════════════════════════════════════════════
+
+if orbBegins
+    orbHigh := high
+    orbLow := low
+    orbMid := (orbHigh + orbLow) / 2.0
+
+    orbStartTime := time
+    orbEndTime := time_close
+
+    if showORBBox
+        currentORBBox := box.new(
+             left = orbStartTime,
+             top = orbHigh,
+             right = orbEndTime,
+             bottom = orbLow,
+             xloc = xloc.bar_time,
+             border_color = boxBorderColor,
+             border_width = boxBorderWidth,
+             border_style = boxBorderStyle,
+             bgcolor = color.new(boxFillColor, boxTransparency)
+         )
+
+//══════════════════════════════════════════════════════════════════════
+// 10. UPDATE ORB WHILE FORMING
+//══════════════════════════════════════════════════════════════════════
+
+if inORB
+    orbHigh := math.max(nz(orbHigh, high), high)
+    orbLow := math.min(nz(orbLow, low), low)
+    orbMid := (orbHigh + orbLow) / 2.0
+    orbEndTime := time_close
+
+    if showORBBox and not na(currentORBBox)
+        box.set_top(currentORBBox, orbHigh)
+        box.set_bottom(currentORBBox, orbLow)
+        box.set_right(currentORBBox, orbEndTime)
+        box.set_border_color(currentORBBox, boxBorderColor)
+        box.set_border_width(currentORBBox, boxBorderWidth)
+        box.set_border_style(currentORBBox, boxBorderStyle)
+        box.set_bgcolor(
+             currentORBBox,
+             color.new(boxFillColor, boxTransparency)
+         )
+
+//══════════════════════════════════════════════════════════════════════
+// 11. FINALIZE ORB
+// Lines terminate at the same X-coordinate as the labels.
+// Moving the labels automatically changes each line's length.
+//══════════════════════════════════════════════════════════════════════
+
+if orbEnds and not na(orbHigh) and not na(orbLow)
+    orbMid := (orbHigh + orbLow) / 2.0
+
+    int lineStartBar = bar_index + lineStartOffset
+    int labelXPosition = bar_index + labelHorizontalOffset
+
+    // Prevent line endpoints from being placed before line starts.
+    int lineEndBar = math.max(
+         lineStartBar + 1,
+         labelXPosition
+     )
+
+    if showORBBox and not na(currentORBBox)
+        box.set_top(currentORBBox, orbHigh)
+        box.set_bottom(currentORBBox, orbLow)
+        box.set_right(currentORBBox, orbEndTime)
+
+    if showHighLine
+        currentHighLine := line.new(
+             x1 = lineStartBar,
+             y1 = orbHigh,
+             x2 = lineEndBar,
+             y2 = orbHigh,
+             xloc = xloc.bar_index,
+             extend = extend.none,
+             color = highColor,
+             style = levelLineStyle,
+             width = levelWidth
+         )
+
+    if showMidLine
+        currentMidLine := line.new(
+             x1 = lineStartBar,
+             y1 = orbMid,
+             x2 = lineEndBar,
+             y2 = orbMid,
+             xloc = xloc.bar_index,
+             extend = extend.none,
+             color = midColor,
+             style = midpointLineStyle,
+             width = midpointWidth
+         )
+
+    if showLowLine
+        currentLowLine := line.new(
+             x1 = lineStartBar,
+             y1 = orbLow,
+             x2 = lineEndBar,
+             y2 = orbLow,
+             xloc = xloc.bar_index,
+             extend = extend.none,
+             color = lowColor,
+             style = levelLineStyle,
+             width = levelWidth
+         )
+
+    string highText = showPriceInLabel
+         ? "ORB High  " + str.tostring(orbHigh, format.mintick)
+         : "ORB High"
+
+    string midText = showPriceInLabel
+         ? "ORB Mid  " + str.tostring(orbMid, format.mintick)
+         : "ORB Mid"
+
+    string lowText = showPriceInLabel
+         ? "ORB Low  " + str.tostring(orbLow, format.mintick)
+         : "ORB Low"
+
+    if showLabels and showHighLabel
+        currentHighLabel := label.new(
+             x = labelXPosition,
+             y = orbHigh,
+             text = highText,
+             xloc = xloc.bar_index,
+             yloc = yloc.price,
+             style = selectedLabelStyle,
+             color = highLabelBackground,
+             textcolor = highLabelTextColor,
+             size = selectedLabelSize
+         )
+
+    if showLabels and showMidLabel
+        currentMidLabel := label.new(
+             x = labelXPosition,
+             y = orbMid,
+             text = midText,
+             xloc = xloc.bar_index,
+             yloc = yloc.price,
+             style = selectedLabelStyle,
+             color = midLabelBackground,
+             textcolor = midLabelTextColor,
+             size = selectedLabelSize
+         )
+
+    if showLabels and showLowLabel
+        currentLowLabel := label.new(
+             x = labelXPosition,
+             y = orbLow,
+             text = lowText,
+             xloc = xloc.bar_index,
+             yloc = yloc.price,
+             style = selectedLabelStyle,
+             color = lowLabelBackground,
+             textcolor = lowLabelTextColor,
+             size = selectedLabelSize
+         )
+
+//══════════════════════════════════════════════════════════════════════
+// 12. ORB ALERTS
+// Purely informational -- these fire off the raw box/level state and are
+// independent of the strategy's own entries (Part B, section 10 below).
+//══════════════════════════════════════════════════════════════════════
+
+alertcondition(
+     condition = orbEnds,
+     title = "15-Minute ORB Complete",
+     message = "The opening range is complete."
+)
+
+alertcondition(
+     condition = not inORB and not na(orbHigh) and ta.crossover(close, orbHigh),
+     title = "ORB High Break",
+     message = "Price crossed above the 15-minute ORB high."
+)
+
+alertcondition(
+     condition = not inORB and not na(orbLow) and ta.crossunder(close, orbLow),
+     title = "ORB Low Break",
+     message = "Price crossed below the 15-minute ORB low."
+)
+
+alertcondition(
+     condition = not inORB and not na(orbMid) and ta.crossover(close, orbMid),
+     title = "ORB Midpoint Cross Up",
+     message = "Price crossed above the 15-minute ORB midpoint."
+)
+
+alertcondition(
+     condition = not inORB and not na(orbMid) and ta.crossunder(close, orbMid),
+     title = "ORB Midpoint Cross Down",
+     message = "Price crossed below the 15-minute ORB midpoint."
+)
+
+
+//=============================================================================
+// 01. TRADING SESSION AND ENTRY-LOGIC INPUTS
+//=============================================================================
+// Part B begins here: ORB_BRC_STRAT's break-return-cross layer, rewired to
+// trade off orbHigh / orbMid / orbLow from Part A above.
+
+const string G_SESSION = "05 - Trading Session"
+const string G_ENTRY = "06 - Entry Logic"
+const string G_RISK = "07 - Risk Management"
+const string G_DISPLAY2 = "08 - Strategy Display"
+
+// Expressed in orbTimezone (see the Composition Note timezone remark) --
+// defaults are the Chicago-equivalent of ORB_BRC_STRAT's original
+// 09:30-16:00 / 12:15 New York values, same wall clock.
+string tradingSession = input.session("0830-1500", "Trading Session", group = G_SESSION)
+string lastentryTime = input.string("11:15", "Last Entry Time HH:mm", group = G_SESSION)
+
+int maxTrades = input.int(2, "Max Retest Trades Per Session", minval = 1, group = G_ENTRY)
+int cooldownBars = input.int(10, "Cooldown Bars After Trade Closes", minval = 0, tooltip = "Minimum number of bars required after a position closes before a new break-return-cross entry is allowed. Independent of Max Retest Trades Per Session -- this throttles how soon after an exit re-entry can happen, that caps how many entries total.", group = G_ENTRY)
+bool allowLongs = input.bool(true, "Allow Longs", group = G_ENTRY)
+bool allowShorts = input.bool(true, "Allow Shorts", group = G_ENTRY)
+
+string crossTriggerMode = input.string(
+     "Touch",
+     "Cross Trigger Mode",
+     options = ["Touch", "Close"],
+     tooltip = "Touch uses high/low crossing the ORB level. Close requires candle close beyond the ORB level.",
+     group = G_ENTRY
+)
+
+float bfrRange = input.float(
+     0.00,
+     "ORB Buffer %",
+     step = 0.01,
+     tooltip = "Applied only to the break/return/cross comparison -- the drawn ORB box and lines above always show the true, unbuffered range.",
+     group = G_ENTRY
+) / 100.0
+
+float rrInput = input.float(2.0, "Risk-Reward Ratio", minval = 0.1, step = 0.1, group = G_RISK)
+float orderQuantity = input.float(1.0, "Contracts", minval = 1.0, step = 1.0, group = G_RISK)
+bool closeAtSessionEnd = input.bool(true, "Close Position At Session End", group = G_RISK)
+
+bool showEntryArrows = input.bool(true, "Show Entry Arrows", group = G_DISPLAY2)
+bool showRiskLevels = input.bool(true, "Show Active SL / TP", group = G_DISPLAY2)
+bool showDashboard = input.bool(true, "Show Dashboard", group = G_DISPLAY2)
+bool enableInformationalAlerts = input.bool(true, "Enable alert() Messages", tooltip = "Fires an explicit alert() call on every entry, labeled BULLISH/BEARISH. Works with any TradingView alert condition (Any alert() function call, or the named alertcondition()s below). Turn off if you only use an 'Order fills' alert and don't want duplicate notifications.", group = G_DISPLAY2)
+
+
+//=============================================================================
+// 02. STRATEGY COLORS
+//=============================================================================
+// C_RANGE from the original ORB_BRC_STRAT is dropped -- the box's own color
+// now comes entirely from Part A's Box Appearance inputs.
+
+color C_LONG = color.rgb(0, 145, 255)
+color C_SHORT = color.rgb(165, 90, 235)
+color C_READY = color.rgb(20, 185, 105)
+color C_STOP = color.rgb(240, 65, 80)
+color C_TP = color.rgb(20, 185, 105)
+color C_NEUTRAL = color.rgb(95, 110, 130)
+color C_WARNING = color.rgb(255, 190, 60)
+
+
+//=============================================================================
+// 03. STRATEGY HELPERS
+//=============================================================================
+
+f_toMinutes(string timeStr) =>
+    parts = str.split(timeStr, ":")
+
+    int result = 0
+
+    if array.size(parts) == 2
+        result := int(str.tonumber(array.get(parts, 0))) * 60 + int(str.tonumber(array.get(parts, 1)))
+
+    result
+
+f_sessionStartMOD(string sessionValue) =>
+    int(str.tonumber(str.substring(sessionValue, 0, 2))) * 60 + int(str.tonumber(str.substring(sessionValue, 2, 4)))
+
+f_sessionEndMOD(string sessionValue) =>
+    int(str.tonumber(str.substring(sessionValue, 5, 7))) * 60 + int(str.tonumber(str.substring(sessionValue, 7, 9)))
+
+f_price(float value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+
+//=============================================================================
+// 04. TRADING SESSION STATE
+//=============================================================================
+
+int tradingStartMOD = f_sessionStartMOD(tradingSession)
+int tradingEndMOD = f_sessionEndMOD(tradingSession)
+
+int barOpenMOD = hour(time, orbTimezone) * 60 + minute(time, orbTimezone)
+int barCloseMOD = hour(time_close, orbTimezone) * 60 + minute(time_close, orbTimezone)
+
+bool inTradingSession = not na(time(timeframe.period, tradingSession, orbTimezone))
+bool finalSessionBar = inTradingSession and barOpenMOD < tradingEndMOD and barCloseMOD >= tradingEndMOD
+
+int currentMinutes = hour(time, orbTimezone) * 60 + minute(time, orbTimezone)
+int lastEntryMinutes = f_toMinutes(lastentryTime)
+bool isWithinEntryTime = inTradingSession and currentMinutes <= lastEntryMinutes
+
+// Range-readiness flag Part A doesn't need for itself (it just draws
+// whatever it has), but the entry logic below needs an explicit "has
+// today's range actually finalized yet" signal -- mirrors how
+// ORB_BRC_STRAT tracked its own rangeReady, now hung off orbBegins/orbEnds
+// instead of a duplicate range-builder.
+var bool orbRangeReady = false
+
+if orbBegins
+    orbRangeReady := false
+
+if orbEnds
+    orbRangeReady := not na(orbHigh) and not na(orbLow) and orbHigh > orbLow
+
+// Cooldown: minimum bars since the last CLOSED trade before a new entry is
+// allowed. lastExitBar is set in section 06 when positionJustClosed fires.
+var int lastExitBar = na
+
+bool cooldownPass = na(lastExitBar) or (bar_index - lastExitBar > cooldownBars)
+int cooldownRemaining = na(lastExitBar) ? 0 : math.max(cooldownBars - (bar_index - lastExitBar), 0)
+
+float bufferedOrbHigh = not na(orbHigh) ? orbHigh * (1.0 + bfrRange) : na
+float bufferedOrbLow = not na(orbLow) ? orbLow * (1.0 - bfrRange) : na
+
+
+//=============================================================================
+// 05. BREAK-RETURN-CROSS STATE MACHINE
+//=============================================================================
+
+varip int tradeCount = 0
+
+varip bool hasBrokenOutUpper = false
+varip bool hasReturnedToUpper = false
+
+varip bool hasBrokenOutLower = false
+varip bool hasReturnedToLower = false
+
+if orbBegins
+    strategy.cancel_all()
+
+    tradeCount := 0
+
+    hasBrokenOutUpper := false
+    hasReturnedToUpper := false
+
+    hasBrokenOutLower := false
+    hasReturnedToLower := false
+
+bool flat = strategy.position_size == 0
+
+bool canTrackBRC =
+     orbRangeReady and
+     inTradingSession and
+     not inORB
+
+bool canEnter =
+     canTrackBRC and
+     isWithinEntryTime and
+     flat and
+     tradeCount < maxTrades and
+     cooldownPass
+
+if canTrackBRC
+    if not hasBrokenOutUpper and high > bufferedOrbHigh
+        hasBrokenOutUpper := true
+
+    if hasBrokenOutUpper and not hasReturnedToUpper and low <= bufferedOrbHigh
+        hasReturnedToUpper := true
+
+    if not hasBrokenOutLower and low < bufferedOrbLow
+        hasBrokenOutLower := true
+
+    if hasBrokenOutLower and not hasReturnedToLower and high >= bufferedOrbLow
+        hasReturnedToLower := true
+
+bool upperCross =
+     crossTriggerMode == "Touch" ?
+     high > bufferedOrbHigh :
+     close > bufferedOrbHigh
+
+bool lowerCross =
+     crossTriggerMode == "Touch" ?
+     low < bufferedOrbLow :
+     close < bufferedOrbLow
+
+bool rawLongSignal =
+     canEnter and
+     allowLongs and
+     hasReturnedToUpper and
+     upperCross
+
+bool rawShortSignal =
+     canEnter and
+     allowShorts and
+     hasReturnedToLower and
+     lowerCross
+
+// If both sides trigger on the same candle, choose by candle direction.
+bool longEntrySignal =
+     rawLongSignal and
+     (not rawShortSignal or close >= open)
+
+bool shortEntrySignal =
+     rawShortSignal and
+     not longEntrySignal
+
+
+//=============================================================================
+// 06. STRATEGY ENTRY AND RISK LEVELS
+//=============================================================================
+// SL sits at orbMid -- numerically identical to ORB_BRC_STRAT's original
+// "hv - rangeHalf", now expressed with the line Part A already draws. TP
+// scales off that same distance by the Risk-Reward Ratio input.
+
+varip float activeSL = na
+varip float activeTP = na
+varip float activeEntryReference = na
+
+// FIX: longEntrySignal / shortEntrySignal go true only transiently. The
+// entry block below resets hasBrokenOutUpper/hasReturnedToUpper (etc.) the
+// instant it fires -- and since this script runs calc_on_every_tick=true,
+// those varip flags flip back to false on the very next recalculation of
+// the SAME bar, well before that bar's final render. strategy.entry() still
+// fires correctly (it already executed procedurally), but plotshape() only
+// draws a bar's FINAL calculated value, so the entry arrow silently never
+// appears -- most visible during Bar Replay, which plays out each bar's
+// intrabar path tick by tick, making the flip-back easy to actually catch.
+// These bar_index-keyed markers persist "an entry fired on this bar" for
+// the rest of that bar's recalculations, independent of the state-machine
+// reset, so section 07's arrows plot correctly.
+var int longEntryFiredBar = na
+var int shortEntryFiredBar = na
+
+if longEntrySignal
+    float longRisk = orbHigh - orbMid
+
+    activeEntryReference := orbHigh
+    activeSL := orbMid
+    activeTP := orbHigh + longRisk * rrInput
+
+    strategy.entry(
+         id = "Long",
+         direction = strategy.long,
+         qty = orderQuantity,
+         comment = "LONG ENTRY",
+         alert_message = "LONG ENTRY"
+    )
+
+    strategy.exit(
+         id = "Long Exit",
+         from_entry = "Long",
+         stop = activeSL,
+         limit = activeTP,
+         comment = "LONG EXIT",
+         alert_message = "LONG EXIT",
+         disable_alert = true
+    )
+
+    tradeCount += 1
+    longEntryFiredBar := bar_index
+
+    hasBrokenOutUpper := false
+    hasReturnedToUpper := false
+    hasBrokenOutLower := false
+    hasReturnedToLower := false
+
+    if enableInformationalAlerts
+        alert("15M ORB BRC BULLISH ENTRY | LONG | " + syminfo.ticker + " @ " + f_price(close) + " | SL " + f_price(activeSL) + " | TP " + f_price(activeTP), alert.freq_once_per_bar_close)
+
+if shortEntrySignal
+    float shortRisk = orbMid - orbLow
+
+    activeEntryReference := orbLow
+    activeSL := orbMid
+    activeTP := orbLow - shortRisk * rrInput
+
+    strategy.entry(
+         id = "Short",
+         direction = strategy.short,
+         qty = orderQuantity,
+         comment = "SHORT ENTRY",
+         alert_message = "SHORT ENTRY"
+    )
+
+    strategy.exit(
+         id = "Short Exit",
+         from_entry = "Short",
+         stop = activeSL,
+         limit = activeTP,
+         comment = "SHORT EXIT",
+         alert_message = "SHORT EXIT",
+         disable_alert = true
+    )
+
+    tradeCount += 1
+    shortEntryFiredBar := bar_index
+
+    hasBrokenOutUpper := false
+    hasReturnedToUpper := false
+    hasBrokenOutLower := false
+    hasReturnedToLower := false
+
+    if enableInformationalAlerts
+        alert("15M ORB BRC BEARISH ENTRY | SHORT | " + syminfo.ticker + " @ " + f_price(close) + " | SL " + f_price(activeSL) + " | TP " + f_price(activeTP), alert.freq_once_per_bar_close)
+
+if strategy.position_size > 0 and not na(activeSL) and not na(activeTP)
+    strategy.exit(
+         id = "Long Exit",
+         from_entry = "Long",
+         stop = activeSL,
+         limit = activeTP,
+         comment = "LONG EXIT",
+         alert_message = "LONG EXIT",
+         disable_alert = true
+    )
+
+if strategy.position_size < 0 and not na(activeSL) and not na(activeTP)
+    strategy.exit(
+         id = "Short Exit",
+         from_entry = "Short",
+         stop = activeSL,
+         limit = activeTP,
+         comment = "SHORT EXIT",
+         alert_message = "SHORT EXIT",
+         disable_alert = true
+    )
+
+if closeAtSessionEnd and finalSessionBar
+    strategy.cancel_all()
+
+    if strategy.position_size != 0
+        strategy.close_all(
+             immediately = true,
+             comment = "SESSION CLOSE",
+             alert_message = "SESSION CLOSE",
+             disable_alert = true
+        )
+
+bool positionJustClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if positionJustClosed
+    lastExitBar := bar_index
+
+    activeSL := na
+    activeTP := na
+    activeEntryReference := na
+
+
+//=============================================================================
+// 07. STRATEGY VISUALS
+//=============================================================================
+// ORB high/low/mid are already drawn as lines by Part A (section 11) --
+// no duplicate step-line plots here, only the strategy-specific overlays.
+
+plot(
+     showRiskLevels and strategy.position_size != 0 ? activeSL : na,
+     "Active Stop Loss",
+     color = C_STOP,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     showRiskLevels and strategy.position_size != 0 ? activeTP : na,
+     "Active Take Profit",
+     color = C_TP,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plotshape(
+     showEntryArrows and longEntryFiredBar == bar_index,
+     title = "LONG ENTRY",
+     style = shape.triangleup,
+     location = location.belowbar,
+     color = C_LONG,
+     text = "LONG",
+     textcolor = color.white,
+     size = size.normal
+)
+
+plotshape(
+     showEntryArrows and shortEntryFiredBar == bar_index,
+     title = "SHORT ENTRY",
+     style = shape.triangledown,
+     location = location.abovebar,
+     color = C_SHORT,
+     text = "SHORT",
+     textcolor = color.white,
+     size = size.normal
+)
+
+
+//=============================================================================
+// 08. DASHBOARD
+//=============================================================================
+
+string brcState =
+     not inTradingSession ? "OFF SESSION" :
+     inORB ? "BUILDING ORB" :
+     not orbRangeReady ? "WAIT ORB" :
+     strategy.position_size > 0 ? "LONG" :
+     strategy.position_size < 0 ? "SHORT" :
+     tradeCount >= maxTrades ? "MAX TRADES" :
+     not cooldownPass ? "COOLDOWN" :
+     not isWithinEntryTime ? "ENTRY TIME CLOSED" :
+     hasReturnedToUpper ? "LONG CROSS READY" :
+     hasReturnedToLower ? "SHORT CROSS READY" :
+     hasBrokenOutUpper ? "WAIT LONG RETURN" :
+     hasBrokenOutLower ? "WAIT SHORT RETURN" :
+     "WAIT BREAK"
+
+color stateColor =
+     strategy.position_size > 0 ? C_LONG :
+     strategy.position_size < 0 ? C_SHORT :
+     brcState == "LONG CROSS READY" ? C_LONG :
+     brcState == "SHORT CROSS READY" ? C_SHORT :
+     brcState == "MAX TRADES" ? C_WARNING :
+     brcState == "COOLDOWN" ? C_WARNING :
+     brcState == "ENTRY TIME CLOSED" ? C_WARNING :
+     C_NEUTRAL
+
+var table dashboard = table.new(position.top_right, 2, 14, border_width = 1)
+
+f_dashboardCell(int row, string leftText, string rightText, color rightColor) =>
+    table.cell(
+         dashboard,
+         0,
+         row,
+         leftText,
+         text_color = color.white,
+         bgcolor = color.new(C_NEUTRAL, 25),
+         text_size = size.small,
+         text_halign = text.align_left
+    )
+
+    table.cell(
+         dashboard,
+         1,
+         row,
+         rightText,
+         text_color = color.white,
+         bgcolor = color.new(rightColor, 25),
+         text_size = size.small,
+         text_halign = text.align_right
+    )
+
+if barstate.islast
+    table.clear(dashboard, 0, 0, 1, 13)
+
+    if showDashboard
+        f_dashboardCell(0, "ORB BRC", brcState, stateColor)
+        f_dashboardCell(1, "SESSION", tradingSession + " " + orbTimezone, C_NEUTRAL)
+        f_dashboardCell(2, "ORB WINDOW", orbSession, C_NEUTRAL)
+        f_dashboardCell(3, "ORB HIGH", f_price(orbHigh), C_LONG)
+        f_dashboardCell(4, "ORB MID", f_price(orbMid), C_WARNING)
+        f_dashboardCell(5, "ORB LOW", f_price(orbLow), C_SHORT)
+        f_dashboardCell(6, "LAST ENTRY", lastentryTime, isWithinEntryTime ? C_READY : C_WARNING)
+        f_dashboardCell(7, "TRADES", str.tostring(tradeCount) + " / " + str.tostring(maxTrades), tradeCount < maxTrades ? C_READY : C_WARNING)
+        f_dashboardCell(8, "COOLDOWN", cooldownPass ? "READY" : str.tostring(cooldownRemaining) + " BARS", cooldownPass ? C_READY : C_WARNING)
+        f_dashboardCell(9, "UPPER SEQ", str.tostring(hasBrokenOutUpper) + " / " + str.tostring(hasReturnedToUpper), hasReturnedToUpper ? C_LONG : C_NEUTRAL)
+        f_dashboardCell(10, "LOWER SEQ", str.tostring(hasBrokenOutLower) + " / " + str.tostring(hasReturnedToLower), hasReturnedToLower ? C_SHORT : C_NEUTRAL)
+        f_dashboardCell(11, "SL / TP", f_price(activeSL) + " / " + f_price(activeTP), strategy.position_size != 0 ? C_READY : C_NEUTRAL)
+        f_dashboardCell(12, "TRIGGER", crossTriggerMode, C_NEUTRAL)
+        f_dashboardCell(13, "ALERTS", enableInformationalAlerts ? "ON" : "OFF", enableInformationalAlerts ? C_READY : C_NEUTRAL)
+
+
+//=============================================================================
+// 09. DATA WINDOW
+//=============================================================================
+
+plot(float(tradeCount), "Trades This Session", display = display.data_window)
+plot(orbHigh, "ORB High Data", display = display.data_window)
+plot(orbMid, "ORB Mid Data", display = display.data_window)
+plot(orbLow, "ORB Low Data", display = display.data_window)
+plot(hasBrokenOutUpper ? 1.0 : 0.0, "Has Broken Upper", display = display.data_window)
+plot(hasReturnedToUpper ? 1.0 : 0.0, "Has Returned Upper", display = display.data_window)
+plot(hasBrokenOutLower ? 1.0 : 0.0, "Has Broken Lower", display = display.data_window)
+plot(hasReturnedToLower ? 1.0 : 0.0, "Has Returned Lower", display = display.data_window)
+
+
+//=============================================================================
+// 10. STRATEGY ALERT CONDITIONS
+//=============================================================================
+// Named, selectable conditions for the Create Alert dialog -- an alternative
+// to "Any alert() function call" or "Order fills" that lets a user pick the
+// exact bullish/bearish condition directly from the Condition dropdown.
+
+alertcondition(longEntrySignal, title = "ORB BRC Bullish Entry", message = "15M ORB BRC BULLISH ENTRY (LONG)")
+alertcondition(shortEntrySignal, title = "ORB BRC Bearish Entry", message = "15M ORB BRC BEARISH ENTRY (SHORT)")

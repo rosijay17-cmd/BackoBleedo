@@ -1,0 +1,406 @@
+//@version=6
+// =====================================================
+// INTRADAY REVERSAL FEASIBILITY CHECK (Herberger, Horn & Oehler 2020)
+// Built from Herberger, Horn & Oehler (2020), "Are intraday reversal and
+// momentum trading strategies feasible? An analysis for German blue chip
+// stocks" (Financial Markets and Portfolio Management), logged in this
+// repo's quant-research-notes skill as
+// references/intraday-reversal-momentum-feasibility-herberger.md.
+//
+// WHAT THIS PORTS, AND WHAT HAD TO CHANGE:
+// The paper's own method is CROSS-SECTIONAL: at the end of a ranking
+// window, rank all 30 DAX stocks by return and buy the single worst
+// performer. A single-instrument MNQ/NQ script has no basket to rank
+// against, so this is adapted to TIME-SERIES: instead of "worst of 30
+// stocks right now," this asks "is THIS instrument's own ranking-period
+// return among the most negative it has produced recently" (a rolling
+// percentile rank of its own history). This is the same TSM-vs-CSM
+// adaptation already discussed in this skill's paper #12 -- a different,
+// not identical, effect to the one the paper actually tested. Everything
+// else is a faithful, literal port:
+//   - The ranking/skip/holding structure, including the one-bar skip
+//     between ranking and holding to avoid bid-ask-bounce contamination
+//     (Jegadeesh 1990, Lehmann 1990).
+//   - LONG-ONLY, on purpose -- the paper deliberately restricts to long
+//     positions because it assumes retail investors face prohibitive
+//     costs to short. Futures don't have that same asymmetry, but this
+//     port keeps long-only to stay faithful to what was actually tested.
+//   - The paper's own headline finding is not "here is a signal" -- it's
+//     "this signal is statistically real and still doesn't clear real
+//     transaction costs." Section 5 below is that check, implemented
+//     live: it tracks this strategy's own realized gross (pre-cost)
+//     average return per trade and compares it directly against an
+//     estimated round-trip cost, exactly the comparison the paper makes
+//     with its 0.19bp-effect-vs-0.48bp-fee result. Expect this dashboard
+//     to say NOT VIABLE most of the time -- that would be the paper's own
+//     finding replicating, not a bug.
+//
+// Momentum is not implemented here at all: the paper found no significant
+// momentum effect at these horizons, so there is nothing validated to
+// port on that side.
+// =====================================================
+strategy(
+     title="Intraday Reversal Feasibility Check (Herberger)",
+     shorttitle="Herberger IntraRev",
+     overlay=true,
+     initial_capital=25000,
+     currency=currency.USD,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     pyramiding=0,
+     calc_on_every_tick=false,
+     process_orders_on_close=false,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=2.0,
+     slippage=2,
+     max_bars_back=2000
+)
+
+// =====================================================
+// 1. RANKING, SKIP & HOLDING
+// Mirrors the paper's own linear time-rescaling: it tested ranking/
+// holding periods of 60/120/180/300 minutes with a 1-candle skip. Inputs
+// are in MINUTES and converted to bar counts using the chart's own
+// timeframe, so this works correctly on any intraday timeframe, not just
+// the 5-min bars the paper itself used.
+// =====================================================
+string groupPeriods = "1. Ranking, Skip & Holding"
+
+int rankingMinutesInput = input.int(
+     defval=60,
+     title="Ranking Period (Minutes)",
+     minval=5,
+     maxval=600,
+     group=groupPeriods,
+     tooltip="How far back this instrument's own return is measured to decide if it just had an extreme down move. The paper tested 60/120/180/300 minutes for its reversal strategies."
+)
+
+int skipBarsInput = input.int(
+     defval=1,
+     title="Skip Bars Between Ranking And Holding",
+     minval=0,
+     maxval=5,
+     group=groupPeriods,
+     tooltip="Bars deliberately skipped between the end of the ranking window and the start of the holding window, to avoid bid-ask-bounce/price-pressure contamination (Jegadeesh 1990, Lehmann 1990). The paper's default and robustness-tested range was 1-3 bars."
+)
+
+int holdingMinutesInput = input.int(
+     defval=60,
+     title="Holding Period (Minutes)",
+     minval=5,
+     maxval=600,
+     group=groupPeriods,
+     tooltip="How long a position is held once entered, regardless of price action in between -- a fixed holding period, not a signal-driven exit, matching the paper's own methodology. The paper tested 60/120/180/300 minutes."
+)
+
+// =====================================================
+// 2. REVERSAL THRESHOLD
+// The paper's cross-sectional "worst of 30 stocks" selection is adapted
+// here to a rolling percentile rank of this instrument's OWN ranking-
+// period return history -- is today's ranking-period return among the
+// most negative this instrument has produced recently, not literally the
+// worst in a basket. See the file header for why this had to change.
+// =====================================================
+string groupThreshold = "2. Reversal Threshold"
+
+int lookbackWindowsInput = input.int(
+     defval=100,
+     title="Percentile Lookback (Bars)",
+     minval=20,
+     maxval=500,
+     group=groupThreshold,
+     tooltip="Number of past bars' worth of ranking-period returns used to build the percentile distribution that today's reading is compared against."
+)
+
+float extremePercentileInput = input.float(
+     defval=10.0,
+     title="Extreme Percentile Threshold",
+     minval=1.0,
+     maxval=50.0,
+     step=1.0,
+     group=groupThreshold,
+     tooltip="Entry fires when the current ranking-period return sits at or below this percentile of its own recent history -- e.g. 10 means \"among the worst 10% of ranking-period returns seen in the lookback window.\" Lower = rarer, more extreme signals."
+)
+
+// =====================================================
+// 3. POSITION SIZING
+// Same ATR-scaled, risk-proportional sizing formula used in
+// Kaufman_Trend_System_Swing.pine this session (Kaufman Ch. 8, Donchian
+// section): investment / (ATR x Big Point Value), sized to a per-trade
+// risk budget rather than a fixed contract count.
+// =====================================================
+string groupSizing = "3. Position Sizing"
+
+float riskPctInput = input.float(
+     defval=1.0,
+     title="Risk % of Equity per Trade",
+     minval=0.1,
+     maxval=10.0,
+     step=0.1,
+     group=groupSizing
+)
+
+int sizingAtrLenInput = input.int(
+     defval=20,
+     title="ATR Length (Sizing)",
+     minval=2,
+     maxval=100,
+     group=groupSizing
+)
+
+// =====================================================
+// 4. RISK MANAGEMENT (OPTIONAL)
+// The paper measures raw holding-period returns with no stop-loss at
+// all -- it is not a managed trade, just "buy, wait H bars, sell." A
+// protective stop is offered here, off by default, purely as a
+// real-world risk backstop, not because the paper's own methodology
+// includes one.
+// =====================================================
+string groupRisk = "4. Risk Management (Optional)"
+
+bool useProtectiveStopInput = input.bool(
+     defval=false,
+     title="Use Protective Stop",
+     group=groupRisk,
+     tooltip="OFF by default -- the paper's own methodology is a pure fixed-holding-period trade with no stop-loss. Enable this only for real-world risk management; it changes the return profile away from what was actually tested."
+)
+
+float stopAtrMultInput = input.float(
+     defval=3.0,
+     title="Protective Stop (x ATR)",
+     minval=1.0,
+     maxval=15.0,
+     step=0.5,
+     group=groupRisk
+)
+
+// =====================================================
+// 5. TRANSACTION COST FEASIBILITY
+// This is the paper's actual headline finding, implemented as a live
+// check rather than a one-time observation: its best measured reversal
+// effect (0.19bp) was smaller than the exchange's own minimum
+// transaction fee (0.48bp) -- statistically real, economically
+// worthless. This section tracks THIS strategy's own realized gross
+// (pre-cost) average return per trade and compares it directly against
+// an estimated round-trip cost in the same units, live, on the
+// dashboard.
+// =====================================================
+string groupCost = "5. Transaction Cost Feasibility"
+
+float commissionPerContractInput = input.float(
+     defval=2.0,
+     title="Commission (Per Contract, Per Side)",
+     minval=0.0,
+     step=0.5,
+     group=groupCost,
+     tooltip="Should match the commission_value set in this script's own strategy() declaration above, so the live feasibility check reflects the same costs the backtest itself is using."
+)
+
+float estimatedSlippageTicksInput = input.float(
+     defval=2.0,
+     title="Estimated Slippage (Ticks, Per Side)",
+     minval=0.0,
+     step=0.5,
+     group=groupCost
+)
+
+int minTradesForVerdictInput = input.int(
+     defval=20,
+     title="Minimum Trades Before Verdict",
+     minval=5,
+     maxval=200,
+     group=groupCost,
+     tooltip="The dashboard shows \"COLLECTING DATA\" instead of a VIABLE/NOT VIABLE verdict until at least this many trades have closed -- avoids drawing a conclusion from a tiny, noisy sample."
+)
+
+// =====================================================
+// 6. DISPLAY
+// =====================================================
+string groupDisplay = "6. Display"
+
+bool showDashboardInput = input.bool(defval=true, title="Show Dashboard", group=groupDisplay)
+
+// =====================================================
+// RANKING RETURN (with skip) AND EXTREME DETECTION
+// =====================================================
+int barsPerRankingPeriod = math.max(1, int(math.round(rankingMinutesInput * 60 / timeframe.in_seconds())))
+int barsPerHoldingPeriod = math.max(1, int(math.round(holdingMinutesInput * 60 / timeframe.in_seconds())))
+
+float rankingBaseClose = close[skipBarsInput + barsPerRankingPeriod]
+float rankingReturn = (not na(rankingBaseClose) and rankingBaseClose != 0) ? (close[skipBarsInput] / rankingBaseClose - 1) * 100 : na
+
+float rankingReturnPercentile = ta.percentrank(rankingReturn, lookbackWindowsInput)
+
+bool extremeUnderperformance = not na(rankingReturnPercentile) and rankingReturnPercentile <= extremePercentileInput
+
+// =====================================================
+// POSITION SIZING
+// =====================================================
+float atrForSizing = ta.atr(sizingAtrLenInput)
+float bigPointValue = syminfo.pointvalue
+float riskDollars = strategy.equity * (riskPctInput / 100.0)
+float rawQty = (atrForSizing > 0 and bigPointValue > 0) ? riskDollars / (atrForSizing * bigPointValue) : 0.0
+int posQty = int(math.floor(rawQty))
+bool qtyTooSmall = posQty < 1
+
+// =====================================================
+// ENTRY / FIXED-HOLDING-PERIOD EXIT
+// =====================================================
+var int entryBar = na
+
+bool flatPosition = strategy.position_size == 0
+bool freshEntry = flatPosition and extremeUnderperformance and not qtyTooSmall
+
+if freshEntry
+    strategy.entry("Reversal Long", strategy.long, qty=posQty)
+    entryBar := bar_index
+
+bool holdingPeriodOver = strategy.position_size > 0 and not na(entryBar) and (bar_index - entryBar) >= barsPerHoldingPeriod
+
+if holdingPeriodOver
+    strategy.close("Reversal Long", comment="Holding Period End")
+
+if useProtectiveStopInput and strategy.position_size > 0
+    float stopPrice = strategy.position_avg_price - stopAtrMultInput * atrForSizing
+    strategy.exit("Protective Stop", from_entry="Reversal Long", stop=stopPrice)
+
+int barsIntoHolding = (strategy.position_size > 0 and not na(entryBar)) ? bar_index - entryBar : na
+
+// =====================================================
+// GROSS (PRE-COST) TRADE RETURN TRACKING
+// Uses Pine's own closed-trade records (entry_price/exit_price), which
+// reflect raw fill prices -- not the commission-adjusted profit figure
+// -- so this is genuinely the gross, pre-cost return the paper's own
+// effect-size numbers are measuring, not a net-of-cost figure.
+// =====================================================
+var float sumGrossReturnPct = 0.0
+var int recordedTradeCount = 0
+
+if strategy.closedtrades > recordedTradeCount
+    int idx = strategy.closedtrades - 1
+    float entryPx = strategy.closedtrades.entry_price(idx)
+    float exitPx = strategy.closedtrades.exit_price(idx)
+    if not na(entryPx) and not na(exitPx) and entryPx != 0
+        sumGrossReturnPct := sumGrossReturnPct + (exitPx - entryPx) / entryPx * 100
+    recordedTradeCount := strategy.closedtrades
+
+float avgGrossReturnPct = recordedTradeCount > 0 ? sumGrossReturnPct / recordedTradeCount : na
+
+// =====================================================
+// ROUND-TRIP COST ESTIMATE (same units: % of price)
+// =====================================================
+float slippagePoints = estimatedSlippageTicksInput * syminfo.mintick
+float commissionPoints = bigPointValue > 0 ? commissionPerContractInput / bigPointValue : na
+float roundTripCostPoints = 2 * (nz(commissionPoints) + slippagePoints)
+float roundTripCostPct = close > 0 ? roundTripCostPoints / close * 100 : na
+
+bool haveEnoughTrades = recordedTradeCount >= minTradesForVerdictInput
+bool edgeClearsCost = haveEnoughTrades and not na(avgGrossReturnPct) and not na(roundTripCostPct) and avgGrossReturnPct > roundTripCostPct
+
+// =====================================================
+// DASHBOARD
+// =====================================================
+var table dash = table.new(
+     position.top_right,
+     2,
+     12,
+     bgcolor=color.rgb(8, 20, 38),
+     frame_color=color.rgb(35, 125, 255),
+     frame_width=2,
+     border_color=color.rgb(55, 75, 100),
+     border_width=1
+)
+
+f_row(tableId, row, labelText, valueText, valueBg) =>
+    table.cell(
+         table_id=tableId,
+         column=0,
+         row=row,
+         text=labelText,
+         text_color=color.white,
+         bgcolor=color.rgb(8, 20, 38),
+         text_size=size.small,
+         text_halign=text.align_left
+    )
+    table.cell(
+         table_id=tableId,
+         column=1,
+         row=row,
+         text=valueText,
+         text_color=color.white,
+         bgcolor=valueBg,
+         text_size=size.small,
+         text_halign=text.align_right
+    )
+
+if barstate.islast and showDashboardInput
+    table.cell(
+         table_id=dash,
+         column=0,
+         row=0,
+         text="INTRADAY REVERSAL (HERBERGER)",
+         text_color=color.white,
+         bgcolor=color.rgb(7, 24, 47),
+         text_size=size.small,
+         text_halign=text.align_left
+    )
+
+    string headerText = timeframe.isintraday ? "READY" : "NOT INTRADAY"
+    color headerColor = timeframe.isintraday ? color.rgb(25, 195, 100) : color.rgb(245, 55, 80)
+
+    table.cell(
+         table_id=dash,
+         column=1,
+         row=0,
+         text=headerText,
+         text_color=color.white,
+         bgcolor=headerColor,
+         text_size=size.small,
+         text_halign=text.align_right
+    )
+
+    string posText = strategy.position_size > 0 ? "LONG " + str.tostring(strategy.position_size) : "FLAT"
+    color posColor = strategy.position_size > 0 ? color.rgb(25, 195, 100) : color.rgb(88, 105, 132)
+    f_row(dash, 1, "POSITION", posText, posColor)
+
+    string rankText = na(rankingReturn) ? "N/A" : str.tostring(rankingReturn, "#.00") + "%"
+    f_row(dash, 2, "RANKING RETURN", rankText, color.rgb(88, 105, 132))
+
+    string pctText = na(rankingReturnPercentile) ? "N/A" : str.tostring(rankingReturnPercentile, "#.0") + " pct"
+    color pctColor = extremeUnderperformance ? color.rgb(25, 195, 100) : color.rgb(88, 105, 132)
+    f_row(dash, 3, "PERCENTILE RANK", pctText, pctColor)
+
+    string signalText = extremeUnderperformance ? "EXTREME LOW -- REVERSAL SETUP" : "NO SIGNAL"
+    color signalColor = extremeUnderperformance ? color.rgb(25, 195, 100) : color.rgb(88, 105, 132)
+    f_row(dash, 4, "SIGNAL", signalText, signalColor)
+
+    string holdText = strategy.position_size > 0 and not na(barsIntoHolding) ? str.tostring(barsIntoHolding) + " / " + str.tostring(barsPerHoldingPeriod) + " bars" : "N/A"
+    f_row(dash, 5, "HOLDING PROGRESS", holdText, color.rgb(88, 105, 132))
+
+    string qtyText = qtyTooSmall ? "TOO SMALL" : str.tostring(posQty)
+    color qtyColor = qtyTooSmall ? color.rgb(245, 55, 80) : color.rgb(88, 105, 132)
+    f_row(dash, 6, "QTY (RISK " + str.tostring(riskPctInput) + "%)", qtyText, qtyColor)
+
+    string avgGrossText = na(avgGrossReturnPct) ? "N/A" : str.tostring(avgGrossReturnPct, "#.000") + "%"
+    f_row(dash, 7, "AVG GROSS RETURN/TRADE", avgGrossText, color.rgb(88, 105, 132))
+
+    string costText = na(roundTripCostPct) ? "N/A" : str.tostring(roundTripCostPct, "#.000") + "%"
+    f_row(dash, 8, "ROUND-TRIP COST EST.", costText, color.rgb(245, 160, 20))
+
+    string verdictText = not haveEnoughTrades ? "COLLECTING DATA (n=" + str.tostring(recordedTradeCount) + ")" : edgeClearsCost ? "VIABLE" : "NOT VIABLE (per Herberger et al.)"
+    color verdictColor = not haveEnoughTrades ? color.rgb(88, 105, 132) : edgeClearsCost ? color.rgb(25, 195, 100) : color.rgb(245, 55, 80)
+    f_row(dash, 9, "EDGE vs COST VERDICT", verdictText, verdictColor)
+
+    f_row(dash, 10, "EQUITY", str.tostring(strategy.equity, "#,###"), color.rgb(88, 105, 132))
+
+    f_row(dash, 11, "CLOSED TRADES", str.tostring(strategy.closedtrades), color.rgb(88, 105, 132))
+
+// =====================================================
+// PLOTS
+// =====================================================
+plotshape(freshEntry, title="Reversal Entry", style=shape.triangleup, location=location.belowbar, color=color.rgb(25, 195, 100), size=size.small)
+plotshape(holdingPeriodOver, title="Holding Period Exit", style=shape.xcross, location=location.abovebar, color=color.rgb(88, 105, 132), size=size.tiny)
+
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 92) : na, title="In Position")
+
+alertcondition(freshEntry, title="Reversal Entry", message="Herberger intraday reversal entry -- {{ticker}} {{interval}}")

@@ -1,0 +1,943 @@
+//@version=6
+//@strategy_alert_message {{strategy.order.alert_message}} | Fill={{strategy.order.price}}
+
+strategy(
+    "ORB Break and Retest v3",
+    overlay = true,
+    pyramiding = 0,
+    process_orders_on_close = true,
+    calc_on_order_fills = true,
+    calc_on_every_tick = false,
+    max_labels_count = 500
+)
+
+//=============================================================================
+// INPUT GROUPS
+//=============================================================================
+
+const string GROUP_SESSION = "01 — Sessions"
+const string GROUP_ENTRY   = "02 — Entry"
+const string GROUP_RETEST  = "03 — Retest"
+const string GROUP_RISK    = "04 — Risk / Target"
+const string GROUP_ALERTS  = "05 — Alerts"
+const string GROUP_VISUALS = "06 — Visuals"
+
+//=============================================================================
+// SESSION INPUTS
+//=============================================================================
+
+string orSessionInput = input.session(
+    "0930-0945",
+    "Opening Range",
+    group = GROUP_SESSION
+)
+
+string tradeSessionInput = input.session(
+    "0945-1555",
+    "Entry Window",
+    group = GROUP_SESSION
+)
+
+string flatSessionInput = input.session(
+    "1555-1600",
+    "Force Flat Window",
+    group = GROUP_SESSION
+)
+
+string daysInput = input.string(
+    "23456",
+    "Trading Days",
+    tooltip = "1 = Sunday, 2 = Monday ... 7 = Saturday. 23456 = Monday-Friday.",
+    group = GROUP_SESSION
+)
+
+string timezoneInput = input.string(
+    "America/New_York",
+    "Time Zone",
+    group = GROUP_SESSION
+)
+
+bool forceFlatInput = input.bool(
+    true,
+    "Close Positions In Force Flat Window",
+    group = GROUP_SESSION
+)
+
+//=============================================================================
+// ENTRY INPUTS
+//=============================================================================
+
+string entryModeInput = input.string(
+    "Breakout",
+    "Entry Mode",
+    options = ["Breakout", "Retest"],
+    group = GROUP_ENTRY
+)
+
+bool allowLongInput = input.bool(
+    true,
+    "Enable Longs",
+    group = GROUP_ENTRY
+)
+
+bool allowShortInput = input.bool(
+    true,
+    "Enable Shorts",
+    group = GROUP_ENTRY
+)
+
+int breakoutBufferTicksInput = input.int(
+    0,
+    "Breakout Buffer — Ticks",
+    minval = 0,
+    group = GROUP_ENTRY
+)
+
+// NEW: a fixed tick buffer stays negligible on an instrument like NQ
+// regardless of volatility -- "cleared the OR" doesn't mean the same
+// thing on a calm day vs. a violent one. ATR mode scales the required
+// clearance to current volatility instead.
+string breakoutBufferModeInput = input.string(
+    "ATR",
+    "Breakout Buffer Mode",
+    options = ["Ticks", "ATR"],
+    tooltip = "Ticks uses Breakout Buffer -- Ticks above. ATR requires the break to clear the OR boundary by this multiple of ATR, which stays proportional to volatility instead of a fixed distance.",
+    group = GROUP_ENTRY
+)
+
+int breakoutAtrLengthInput = input.int(
+    14,
+    "Breakout Buffer ATR Length",
+    minval = 1,
+    group = GROUP_ENTRY
+)
+
+float breakoutBufferAtrMultInput = input.float(
+    0.10,
+    "Breakout Buffer — ATR Multiple",
+    minval = 0.0,
+    step = 0.01,
+    tooltip = "0.10 = price must clear the OR boundary by 10% of ATR before triggering.",
+    group = GROUP_ENTRY
+)
+
+int maxTradesInput = input.int(
+    1,
+    "Maximum Trades Per OR",
+    minval = 1,
+    maxval = 10,
+    group = GROUP_ENTRY
+)
+
+//=============================================================================
+// RETEST INPUTS
+//=============================================================================
+
+bool retestCloseBreakInput = input.bool(
+    true,
+    "Require Close Outside OR Before Retest",
+    tooltip = "ON = candle must close outside the OR before a retest is armed.",
+    group = GROUP_RETEST
+)
+
+string retestTypeInput = input.string(
+    "Limit at OR boundary",
+    "Retest Entry Type",
+    options = [
+        "Limit at OR boundary",
+        "Touch + confirmation close"
+    ],
+    group = GROUP_RETEST
+)
+
+int retestOffsetTicksInput = input.int(
+    0,
+    "Retest Limit Offset — Ticks",
+    minval = -100,
+    maxval = 100,
+    tooltip = "Positive = enter before complete retest. 0 = exact OR boundary. Negative = deeper retest.",
+    group = GROUP_RETEST
+)
+
+int retestToleranceTicksInput = input.int(
+    2,
+    "Retest Touch Tolerance — Ticks",
+    minval = 0,
+    group = GROUP_RETEST
+)
+
+int maxRetestBarsInput = input.int(
+    12,
+    "Maximum Bars To Wait For Retest",
+    minval = 1,
+    group = GROUP_RETEST
+)
+
+bool invalidateRetestInput = input.bool(
+    true,
+    "Invalidate Retest At Opposite OR Side",
+    group = GROUP_RETEST
+)
+
+//=============================================================================
+// RISK INPUTS
+//=============================================================================
+
+string stopMethodInput = input.string(
+    "Opposite OR",
+    "Stop Loss Method",
+    options = [
+        "Opposite OR",
+        "OR Midpoint",
+        "OR Width"
+    ],
+    group = GROUP_RISK
+)
+
+float stopWidthMultiplierInput = input.float(
+    1.0,
+    "OR Width Stop Multiplier",
+    minval = 0.1,
+    step = 0.1,
+    group = GROUP_RISK
+)
+
+float rewardRiskInput = input.float(
+    2.0,
+    "Reward / Risk Target",
+    minval = 0.1,
+    step = 0.1,
+    tooltip = "2.0 = 2R target.",
+    group = GROUP_RISK
+)
+
+//=============================================================================
+// ALERT INPUTS
+//=============================================================================
+
+bool alertExitsInput = input.bool(
+    false,
+    "Alert On Exits",
+    tooltip = "OFF = entry alerts only. ON = also alert on stop, target and end-of-day exits.",
+    group = GROUP_ALERTS
+)
+
+//=============================================================================
+// VISUAL INPUTS
+//=============================================================================
+
+bool showORInput = input.bool(
+    true,
+    "Show Opening Range",
+    group = GROUP_VISUALS
+)
+
+bool shadeORInput = input.bool(
+    true,
+    "Shade Opening Range Session",
+    group = GROUP_VISUALS
+)
+
+bool showEntryTrianglesInput = input.bool(
+    true,
+    "Show BUY / SELL Entry Triangles",
+    group = GROUP_VISUALS
+)
+
+color longTriangleColorInput = input.color(
+    color.blue,
+    "Long Triangle Color",
+    group = GROUP_VISUALS
+)
+
+color shortTriangleColorInput = input.color(
+    color.purple,
+    "Short Triangle Color",
+    group = GROUP_VISUALS
+)
+
+bool showTradeLevelsInput = input.bool(
+    true,
+    "Show Entry / Stop / Target",
+    group = GROUP_VISUALS
+)
+
+//=============================================================================
+// VALIDATION
+//=============================================================================
+
+if not timeframe.isintraday
+    runtime.error("ORB Strategy must be used on an intraday chart.")
+
+//=============================================================================
+// ALERT MESSAGE FUNCTIONS
+//=============================================================================
+// FIX (syntax error CE10156, "end of line without line continuation"):
+// a multi-line expression that isn't wrapped in brackets -- like a
+// function body after "=>" -- needs its continuation lines indented by
+// an amount that is NOT a multiple of 4 spaces. Pine reserves 4-space
+// multiples for if/for/function block nesting, so an 8-space (or any
+// other 4-multiple) continuation indent is still read as a new nested
+// block rather than a continuation of the "+" chain above it -- indent
+// alone being "deeper" isn't sufficient, it specifically can't land on
+// 4, 8, 12, etc. Both f_entryMessage and f_exitMessage now use a 6-space
+// continuation indent (first line of the body stays at the function's
+// normal 4-space indent). Only indentation changed, no logic/content.
+
+f_entryMessage(
+    string direction,
+    string mode,
+    string orderType,
+    float orderLevel,
+    float rangeHigh,
+    float rangeLow
+) =>
+    "ORB ENTRY " +
+      direction +
+      " | Symbol=" +
+      syminfo.tickerid +
+      " | TF=" +
+      timeframe.period +
+      " | Mode=" +
+      mode +
+      " | Type=" +
+      orderType +
+      " | Level=" +
+      str.tostring(orderLevel, format.mintick) +
+      " | ORH=" +
+      str.tostring(rangeHigh, format.mintick) +
+      " | ORL=" +
+      str.tostring(rangeLow, format.mintick)
+
+
+f_exitMessage(
+    string direction,
+    float stopPrice,
+    float targetPrice
+) =>
+    "ORB EXIT " +
+      direction +
+      " | Symbol=" +
+      syminfo.tickerid +
+      " | TF=" +
+      timeframe.period +
+      " | Stop=" +
+      str.tostring(stopPrice, format.mintick) +
+      " | Target=" +
+      str.tostring(targetPrice, format.mintick)
+
+//=============================================================================
+// SESSION DETECTION
+//=============================================================================
+
+string orSession = orSessionInput + ":" + daysInput
+string tradeSession = tradeSessionInput + ":" + daysInput
+string flatSession = flatSessionInput + ":" + daysInput
+
+bool inOR = not na(
+    time(
+        timeframe.period,
+        orSession,
+        timezoneInput
+    )
+)
+
+bool inTradeWindow = not na(
+    time(
+        timeframe.period,
+        tradeSession,
+        timezoneInput
+    )
+)
+
+bool inFlatWindow = not na(
+    time(
+        timeframe.period,
+        flatSession,
+        timezoneInput
+    )
+)
+
+bool openingRangeStarted = inOR and not inOR[1]
+bool openingRangeEnded = not inOR and inOR[1]
+
+//=============================================================================
+// STATE
+//=============================================================================
+
+var float orHigh = na
+var float orLow = na
+var bool rangeReady = false
+
+var int tradesTaken = 0
+
+//  1 = waiting for long retest
+// -1 = waiting for short retest
+//  0 = none
+
+var int retestDirection = 0
+var int breakoutBar = na
+
+var float activeStop = na
+var float activeTarget = na
+
+// Used to make sure an actual fill is processed only once.
+varip int handledTradeCount = 0
+
+//=============================================================================
+// BUILD OPENING RANGE
+//=============================================================================
+
+if openingRangeStarted
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+
+    orHigh := high
+    orLow := low
+
+    rangeReady := false
+    tradesTaken := 0
+
+    retestDirection := 0
+    breakoutBar := na
+
+else if inOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow := na(orLow) ? low : math.min(orLow, low)
+
+if openingRangeEnded
+    rangeReady := not na(orHigh) and not na(orLow)
+
+//=============================================================================
+// RANGE CALCULATIONS
+//=============================================================================
+
+float orWidth = not na(orHigh) and not na(orLow) ? orHigh - orLow : na
+
+float orMid = not na(orHigh) and not na(orLow) ? (orHigh + orLow) / 2.0 : na
+
+// NEW: ATR-scaled breakout buffer option.
+float breakoutAtr = ta.atr(breakoutAtrLengthInput)
+
+float breakoutBuffer = breakoutBufferModeInput == "ATR" ? breakoutAtr * breakoutBufferAtrMultInput : breakoutBufferTicksInput * syminfo.mintick
+
+float longBreakPrice = not na(orHigh) ? orHigh + breakoutBuffer : na
+
+float shortBreakPrice = not na(orLow) ? orLow - breakoutBuffer : na
+
+bool canEnter = rangeReady and inTradeWindow and not inOR and strategy.position_size == 0 and tradesTaken < maxTradesInput and not na(orWidth) and orWidth > syminfo.mintick
+
+//=============================================================================
+// BREAKOUT MODE
+//=============================================================================
+
+if entryModeInput == "Breakout"
+
+    retestDirection := 0
+    breakoutBar := na
+
+    if canEnter
+
+        if allowLongInput
+
+            strategy.entry(
+                id = "Long",
+                direction = strategy.long,
+                stop = longBreakPrice,
+                comment = "BUY BREAKOUT",
+                oca_name = "ORB Entry",
+                oca_type = strategy.oca.cancel,
+                alert_message = f_entryMessage(
+                    "LONG",
+                    "BREAKOUT",
+                    "STOP",
+                    longBreakPrice,
+                    orHigh,
+                    orLow
+                )
+            )
+
+        else
+            strategy.cancel("Long")
+
+        if allowShortInput
+
+            strategy.entry(
+                id = "Short",
+                direction = strategy.short,
+                stop = shortBreakPrice,
+                comment = "SELL BREAKOUT",
+                oca_name = "ORB Entry",
+                oca_type = strategy.oca.cancel,
+                alert_message = f_entryMessage(
+                    "SHORT",
+                    "BREAKOUT",
+                    "STOP",
+                    shortBreakPrice,
+                    orHigh,
+                    orLow
+                )
+            )
+
+        else
+            strategy.cancel("Short")
+
+//=============================================================================
+// RETEST BREAKOUT DETECTION
+//=============================================================================
+
+bool longCloseBreak = ta.crossover(
+    close,
+    longBreakPrice
+)
+
+bool shortCloseBreak = ta.crossunder(
+    close,
+    shortBreakPrice
+)
+
+bool longWickBreak = not na(longBreakPrice) and high > longBreakPrice and high[1] <= longBreakPrice
+
+bool shortWickBreak = not na(shortBreakPrice) and low < shortBreakPrice and low[1] >= shortBreakPrice
+
+bool longBreakEvent = retestCloseBreakInput ? longCloseBreak : longWickBreak
+
+bool shortBreakEvent = retestCloseBreakInput ? shortCloseBreak : shortWickBreak
+
+//=============================================================================
+// RETEST MODE
+//=============================================================================
+
+if entryModeInput == "Retest" and canEnter
+
+    //---------------------------------------------------------------------
+    // Detect original breakout
+    //---------------------------------------------------------------------
+
+    if retestDirection == 0
+
+        if longBreakEvent and not shortBreakEvent and allowLongInput
+            retestDirection := 1
+            breakoutBar := bar_index
+
+        else if shortBreakEvent and not longBreakEvent and allowShortInput
+            retestDirection := -1
+            breakoutBar := bar_index
+
+    //---------------------------------------------------------------------
+    // LONG RETEST
+    //---------------------------------------------------------------------
+
+    if retestDirection == 1 and not na(breakoutBar)
+
+        int barsSinceBreak = bar_index - breakoutBar
+
+        bool breakoutBarPassed = bar_index > breakoutBar
+
+        bool retestExpired = barsSinceBreak > maxRetestBarsInput
+
+        bool retestInvalid = breakoutBarPassed and invalidateRetestInput and low <= orLow
+
+        if retestExpired or retestInvalid
+
+            strategy.cancel("Long")
+
+            retestDirection := 0
+            breakoutBar := na
+
+        else
+
+            //-------------------------------------------------------------
+            // LONG LIMIT RETEST
+            //-------------------------------------------------------------
+
+            if retestTypeInput == "Limit at OR boundary"
+
+                float longRetestPrice = orHigh + retestOffsetTicksInput * syminfo.mintick
+
+                strategy.entry(
+                    id = "Long",
+                    direction = strategy.long,
+                    limit = longRetestPrice,
+                    comment = "BUY RETEST",
+                    alert_message = f_entryMessage(
+                        "LONG",
+                        "RETEST",
+                        "LIMIT",
+                        longRetestPrice,
+                        orHigh,
+                        orLow
+                    )
+                )
+
+            //-------------------------------------------------------------
+            // LONG CONFIRMATION RETEST
+            //-------------------------------------------------------------
+
+            else if breakoutBarPassed
+
+                float tolerance = retestToleranceTicksInput * syminfo.mintick
+
+                bool touchedLongLevel = low <= orHigh + tolerance and high >= orHigh - tolerance
+
+                bool longConfirmed = touchedLongLevel and close > orHigh
+
+                if longConfirmed
+
+                    strategy.entry(
+                        id = "Long",
+                        direction = strategy.long,
+                        comment = "BUY RETEST CONF",
+                        alert_message = f_entryMessage(
+                            "LONG",
+                            "RETEST",
+                            "CONFIRMATION",
+                            close,
+                            orHigh,
+                            orLow
+                        )
+                    )
+
+                    retestDirection := 0
+                    breakoutBar := na
+
+    //---------------------------------------------------------------------
+    // SHORT RETEST
+    //---------------------------------------------------------------------
+
+    if retestDirection == -1 and not na(breakoutBar)
+
+        int barsSinceBreak = bar_index - breakoutBar
+
+        bool breakoutBarPassed = bar_index > breakoutBar
+
+        bool retestExpired = barsSinceBreak > maxRetestBarsInput
+
+        bool retestInvalid = breakoutBarPassed and invalidateRetestInput and high >= orHigh
+
+        if retestExpired or retestInvalid
+
+            strategy.cancel("Short")
+
+            retestDirection := 0
+            breakoutBar := na
+
+        else
+
+            //-------------------------------------------------------------
+            // SHORT LIMIT RETEST
+            //-------------------------------------------------------------
+
+            if retestTypeInput == "Limit at OR boundary"
+
+                float shortRetestPrice = orLow - retestOffsetTicksInput * syminfo.mintick
+
+                strategy.entry(
+                    id = "Short",
+                    direction = strategy.short,
+                    limit = shortRetestPrice,
+                    comment = "SELL RETEST",
+                    alert_message = f_entryMessage(
+                        "SHORT",
+                        "RETEST",
+                        "LIMIT",
+                        shortRetestPrice,
+                        orHigh,
+                        orLow
+                    )
+                )
+
+            //-------------------------------------------------------------
+            // SHORT CONFIRMATION RETEST
+            //-------------------------------------------------------------
+
+            else if breakoutBarPassed
+
+                float tolerance = retestToleranceTicksInput * syminfo.mintick
+
+                bool touchedShortLevel = high >= orLow - tolerance and low <= orLow + tolerance
+
+                bool shortConfirmed = touchedShortLevel and close < orLow
+
+                if shortConfirmed
+
+                    strategy.entry(
+                        id = "Short",
+                        direction = strategy.short,
+                        comment = "SELL RETEST CONF",
+                        alert_message = f_entryMessage(
+                            "SHORT",
+                            "RETEST",
+                            "CONFIRMATION",
+                            close,
+                            orHigh,
+                            orLow
+                        )
+                    )
+
+                    retestDirection := 0
+                    breakoutBar := na
+
+//=============================================================================
+// DETECT ACTUAL FILLED ENTRY
+//=============================================================================
+
+int totalTradesStarted = strategy.closedtrades + strategy.opentrades
+
+bool newTradeFill = totalTradesStarted > handledTradeCount
+
+bool newLong = newTradeFill and strategy.position_size > 0
+
+bool newShort = newTradeFill and strategy.position_size < 0
+
+//=============================================================================
+// ACTUAL LONG FILL
+//=============================================================================
+
+if newLong
+
+    handledTradeCount := totalTradesStarted
+
+    tradesTaken += 1
+
+    strategy.cancel("Short")
+
+    retestDirection := 0
+    breakoutBar := na
+
+    float entryPrice = strategy.position_avg_price
+
+    float rawStop = stopMethodInput == "Opposite OR" ? orLow : stopMethodInput == "OR Midpoint" ? orMid : entryPrice - orWidth * stopWidthMultiplierInput
+
+    activeStop := math.min(
+        rawStop,
+        entryPrice - syminfo.mintick
+    )
+
+    float risk = entryPrice - activeStop
+
+    activeTarget := entryPrice + risk * rewardRiskInput
+
+//=============================================================================
+// ACTUAL SHORT FILL
+//=============================================================================
+
+if newShort
+
+    handledTradeCount := totalTradesStarted
+
+    tradesTaken += 1
+
+    strategy.cancel("Long")
+
+    retestDirection := 0
+    breakoutBar := na
+
+    float entryPrice = strategy.position_avg_price
+
+    float rawStop = stopMethodInput == "Opposite OR" ? orHigh : stopMethodInput == "OR Midpoint" ? orMid : entryPrice + orWidth * stopWidthMultiplierInput
+
+    activeStop := math.max(
+        rawStop,
+        entryPrice + syminfo.mintick
+    )
+
+    float risk = activeStop - entryPrice
+
+    activeTarget := entryPrice - risk * rewardRiskInput
+
+//=============================================================================
+// LONG EXIT
+//=============================================================================
+
+if strategy.position_size > 0 and not na(activeStop) and not na(activeTarget)
+
+    strategy.exit(
+        id = "Long Exit",
+        from_entry = "Long",
+        stop = activeStop,
+        limit = activeTarget,
+        alert_message = f_exitMessage(
+            "LONG",
+            activeStop,
+            activeTarget
+        ),
+        disable_alert = not alertExitsInput
+    )
+
+//=============================================================================
+// SHORT EXIT
+//=============================================================================
+
+if strategy.position_size < 0 and not na(activeStop) and not na(activeTarget)
+
+    strategy.exit(
+        id = "Short Exit",
+        from_entry = "Short",
+        stop = activeStop,
+        limit = activeTarget,
+        alert_message = f_exitMessage(
+            "SHORT",
+            activeStop,
+            activeTarget
+        ),
+        disable_alert = not alertExitsInput
+    )
+
+//=============================================================================
+// RESET ACTIVE LEVELS WHEN FLAT
+//=============================================================================
+
+if strategy.position_size == 0
+    activeStop := na
+    activeTarget := na
+
+//=============================================================================
+// CANCEL PENDING ENTRIES
+//=============================================================================
+
+if not inTradeWindow or inOR or tradesTaken >= maxTradesInput
+
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+
+    if not inTradeWindow
+        retestDirection := 0
+        breakoutBar := na
+
+//=============================================================================
+// FORCE FLAT
+//=============================================================================
+
+if forceFlatInput and inFlatWindow
+
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+
+    retestDirection := 0
+    breakoutBar := na
+
+    if strategy.position_size != 0
+
+        string eodDirection = strategy.position_size > 0 ? "LONG" : "SHORT"
+
+        strategy.close_all(
+            comment = "END OF SESSION",
+            alert_message = "ORB EOD EXIT " +
+            eodDirection +
+            " | Symbol=" +
+            syminfo.tickerid +
+            " | TF=" +
+            timeframe.period,
+            disable_alert = not alertExitsInput
+        )
+
+//=============================================================================
+// VISUALS
+//=============================================================================
+
+// NEW: entry triangles at the actual fill price, replacing the old BUY/
+// SELL text labels. plotshape() has to be called unconditionally at the
+// top level (unlike label.new(), it can't live inside the "if newLong"
+// block above), so the toggle and the fill condition both live in the
+// series argument instead.
+plotshape(
+    showEntryTrianglesInput and newLong,
+    title = "Long Entry Triangle",
+    style = shape.triangleup,
+    location = location.belowbar,
+    color = longTriangleColorInput,
+    size = size.small
+)
+
+plotshape(
+    showEntryTrianglesInput and newShort,
+    title = "Short Entry Triangle",
+    style = shape.triangledown,
+    location = location.abovebar,
+    color = shortTriangleColorInput,
+    size = size.small
+)
+
+bool displayOR = showORInput and (inOR or inTradeWindow or strategy.position_size != 0)
+
+orHighPlot = plot(
+    displayOR ? orHigh : na,
+    "OR High",
+    color = color.green,
+    linewidth = 2,
+    style = plot.style_linebr
+)
+
+orLowPlot = plot(
+    displayOR ? orLow : na,
+    "OR Low",
+    color = color.red,
+    linewidth = 2,
+    style = plot.style_linebr
+)
+
+plot(
+    displayOR ? orMid : na,
+    "OR Midpoint",
+    color = color.new(
+        color.gray,
+        40
+    ),
+    linewidth = 1,
+    style = plot.style_linebr
+)
+
+fill(
+    orHighPlot,
+    orLowPlot,
+    color = color.new(
+        color.blue,
+        92
+    ),
+    title = "Opening Range"
+)
+
+bgcolor(
+    shadeORInput and inOR
+    ? color.new(
+        color.yellow,
+        88
+    )
+    : na,
+    title = "Opening Range Session"
+)
+
+//=============================================================================
+// ENTRY / STOP / TARGET LINES
+//=============================================================================
+
+plot(
+    showTradeLevelsInput and strategy.position_size != 0
+    ? strategy.position_avg_price
+    : na,
+    "Entry Price",
+    color = color.blue,
+    linewidth = 2,
+    style = plot.style_linebr
+)
+
+plot(
+    showTradeLevelsInput and strategy.position_size != 0
+    ? activeStop
+    : na,
+    "Active Stop",
+    color = color.red,
+    linewidth = 2,
+    style = plot.style_linebr
+)
+
+plot(
+    showTradeLevelsInput and strategy.position_size != 0
+    ? activeTarget
+    : na,
+    "Active Target",
+    color = color.green,
+    linewidth = 2,
+    style = plot.style_linebr
+)
