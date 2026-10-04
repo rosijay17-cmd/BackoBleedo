@@ -264,6 +264,139 @@ bool alertExitsInput = input.bool(true, "Alert On Exits", group = G_ALERT)
 
 
 //=============================================================================
+// 06 - SELECTIVITY FILTERS
+//-----------------------------------------------------------------------------
+// Optional tightening knobs for each mode above. Every filter here defaults
+// to off (0 or false) so existing behavior is unchanged until you turn one
+// on. Mix and match per mode while optimizing.
+//=============================================================================
+
+string G_FILTER = "06 - Selectivity Filters"
+
+bool requireCloseBreakoutInput = input.bool(
+     false,
+     "Require Close Beyond Range (Not Just Wick)",
+     group = G_FILTER,
+     tooltip = "Applies to all three Range Source modes. OFF: a high/low wick beyond the range counts as a breakout. ON: the execution-TF candle must CLOSE beyond the range.")
+
+float minBreakoutAtrInput = input.float(
+     0.0,
+     "Minimum Breakout Distance (ATR, 0 = Off)",
+     minval = 0.0,
+     maxval = 3.0,
+     step = 0.05,
+     group = G_FILTER,
+     tooltip = "Require the breakout to clear the range boundary by at least this many ATR -- filters marginal/noise breaks.")
+
+float minRangeWidthAtrInput = input.float(
+     0.0,
+     "Minimum Range Width (ATR, 0 = Off)",
+     minval = 0.0,
+     maxval = 10.0,
+     step = 0.1,
+     group = G_FILTER,
+     tooltip = "Applies to all three Range Source modes (in addition to Maturing Consolidation's own % width filter). Skips ranges too small to trade.")
+
+float maxRangeWidthAtrInput = input.float(
+     0.0,
+     "Maximum Range Width (ATR, 0 = Off)",
+     minval = 0.0,
+     maxval = 20.0,
+     step = 0.1,
+     group = G_FILTER,
+     tooltip = "Skips ranges too wide/choppy to trade cleanly.")
+
+int consolMaxAgeBarsInput = input.int(
+     0,
+     "Consolidation Max Age Before Expiry (Range-TF Bars, 0 = Off)",
+     minval = 0,
+     maxval = 500,
+     group = G_FILTER,
+     tooltip = "Only used in Maturing Consolidation mode. Expires a matured range that's gone this many range-timeframe bars without being broken, instead of leaving it valid indefinitely.")
+
+float minTriggerBodyPctInput = input.float(
+     0.0,
+     "Min Trigger Candle Body (% Of Its Range, 0 = Off)",
+     minval = 0.0,
+     maxval = 100.0,
+     step = 5.0,
+     group = G_FILTER,
+     tooltip = "Only used in Close Back In Direction trigger mode. Requires the triggering candle's body to be a decisive fraction of its own high-low range, filtering doji-like closes.")
+
+float reclaimBufferAtrInput = input.float(
+     0.0,
+     "Reclaim Buffer Beyond Swing (ATR, 0 = Off)",
+     minval = 0.0,
+     maxval = 1.0,
+     step = 0.05,
+     group = G_FILTER,
+     tooltip = "Only used in Swing Reclaim trigger mode. Requires the close to clear the swing level by this many ATR, not just barely tag it.")
+
+float minRrInput = input.float(
+     0.0,
+     "Minimum R:R To Accept Entry (0 = Off)",
+     minval = 0.0,
+     maxval = 10.0,
+     step = 0.25,
+     group = G_FILTER,
+     tooltip = "Applies to both Stop / Target modes. If the computed reward:risk at entry falls below this, the setup is abandoned instead of taken.")
+
+
+//=============================================================================
+// 07 - SESSION FILTER
+//=============================================================================
+
+string G_SESSION = "07 - Session Filter"
+
+bool useKillzonesInput = input.bool(
+     false,
+     "Restrict New Setups To Killzones",
+     group = G_SESSION,
+     tooltip = "Only gates the start of a new breakout-watch cycle (state 0). A setup already in progress is allowed to finish outside the killzone.")
+
+string killzoneTimezoneInput = input.string(
+     "America/New_York",
+     "Killzone Timezone",
+     group = G_SESSION)
+
+string londonKillzoneInput = input.session(
+     "0300-0600",
+     "London Killzone",
+     group = G_SESSION)
+
+string newYorkKillzoneInput = input.session(
+     "0930-1100",
+     "New York Killzone",
+     group = G_SESSION)
+
+
+//=============================================================================
+// 08 - COOLDOWN
+//-----------------------------------------------------------------------------
+// Bar-index-arithmetic cooldown: stores only the bar index of the last
+// accepted entry and computes "still in cooldown" via subtraction, read
+// fresh every bar -- no decrementing countdown variable. Resets on ENTRY,
+// not on exit, so it doesn't depend on strategy.closedtrades ever
+// incrementing.
+//=============================================================================
+
+string G_COOLDOWN = "08 - Cooldown"
+
+bool useCooldownInput = input.bool(
+     true,
+     "Enable Entry Cooldown",
+     group = G_COOLDOWN)
+
+int cooldownBarsInput = input.int(
+     12,
+     "Cooldown Bars (Execution TF)",
+     minval = 0,
+     maxval = 500,
+     group = G_COOLDOWN,
+     tooltip = "Minimum execution-timeframe bars required after an entry before a new breakout-watch cycle (state 0) can start.")
+
+
+//=============================================================================
 // VALIDATION
 //=============================================================================
 
@@ -313,6 +446,7 @@ f_rangeContext(
      int consolStatWindow,
      int consolCompressionPct,
      float consolMinWidthPct,
+     int consolMaxAgeBars,
      string sessionOpen,
      string sessionTz) =>
 
@@ -364,6 +498,8 @@ f_rangeContext(
     else if cState == 2
         if high > cHigh or low < cLow
             cState := 0
+        else if consolMaxAgeBars > 0 and bar_index - cStartBar > consolMaxAgeBars
+            cState := 0
 
     bool consolValid = cState == 2
 
@@ -394,6 +530,7 @@ float swingPivotHigh = ta.pivothigh(high, swingPivotLengthInput, swingPivotLengt
          consolStatWindowInput,
          consolCompressionPctInput,
          consolMinWidthPctInput,
+         consolMaxAgeBarsInput,
          sessionOpenInput,
          sessionTzInput),
      lookahead = barmerge.lookahead_on
@@ -405,6 +542,17 @@ bool activeRangeValid = rangeSourceInput == "Each Closed 30m Candle" ? rangeEach
 float activeRangeHeight = activeRangeValid ? activeRangeHigh - activeRangeLow : na
 
 bool rangeChanged = activeRangeValid and (na(activeRangeHigh[1]) or activeRangeHigh != activeRangeHigh[1] or activeRangeLow != activeRangeLow[1])
+
+bool rangeWidthOK = activeRangeValid and
+     (minRangeWidthAtrInput <= 0 or activeRangeHeight >= minRangeWidthAtrInput * atrValue) and
+     (maxRangeWidthAtrInput <= 0 or activeRangeHeight <= maxRangeWidthAtrInput * atrValue)
+
+bool inLondonKillzone = not na(time(timeframe.period, londonKillzoneInput + ":1234567", killzoneTimezoneInput))
+bool inNewYorkKillzone = not na(time(timeframe.period, newYorkKillzoneInput + ":1234567", killzoneTimezoneInput))
+bool sessionOK = not useKillzonesInput or inLondonKillzone or inNewYorkKillzone
+
+bool breakoutUpNow = (requireCloseBreakoutInput ? close : high) > activeRangeHigh + minBreakoutAtrInput * atrValue
+bool breakoutDownNow = (requireCloseBreakoutInput ? close : low) < activeRangeLow - minBreakoutAtrInput * atrValue
 
 
 //=============================================================================
@@ -431,9 +579,16 @@ var float activeStop = na
 var float activeTarget = na
 var float initialRisk = na
 
+var int lastEntryBar = na
+
 bool longEntrySignal = false
 bool shortEntrySignal = false
 bool entryReady = false
+
+int barsSinceLastEntry = na(lastEntryBar) ? 1000000 : bar_index - lastEntryBar
+bool cooldownActive = useCooldownInput and cooldownBarsInput > 0 and not na(lastEntryBar) and barsSinceLastEntry < cooldownBarsInput
+bool cooldownOK = not cooldownActive
+int cooldownBarsLeft = not useCooldownInput or cooldownBarsInput == 0 or na(lastEntryBar) ? 0 : math.max(cooldownBarsInput - barsSinceLastEntry, 0)
 
 
 //=============================================================================
@@ -452,13 +607,13 @@ if rangeChanged and state != 3
 
 if barstate.isconfirmed and activeRangeValid
 
-    if state == 0
-        if high > activeRangeHigh
+    if state == 0 and cooldownOK and rangeWidthOK and sessionOK
+        if breakoutUpNow
             breakoutDir := 1
             breakoutExtreme := high
             breakoutBar := bar_index
             state := 1
-        else if low < activeRangeLow
+        else if breakoutDownNow
             breakoutDir := -1
             breakoutExtreme := low
             breakoutBar := bar_index
@@ -507,8 +662,10 @@ if barstate.isconfirmed and activeRangeValid
 
             else if entryTriggerInput == "Close Back In Direction"
                 bool closedBack = breakoutDir == 1 ? close > zoneHigh : close < zoneLow
+                float candleRange = high - low
+                bool bodyOK = minTriggerBodyPctInput <= 0 or (candleRange > 0 and math.abs(close - open) / candleRange * 100.0 >= minTriggerBodyPctInput)
 
-                if closedBack
+                if closedBack and bodyOK
                     entryReady := true
 
             else if entryTriggerInput == "Swing Reclaim"
@@ -519,7 +676,7 @@ if barstate.isconfirmed and activeRangeValid
                     swingFormed := true
 
                 if swingFormed
-                    bool reclaimed = breakoutDir == 1 ? close > swingLevel : close < swingLevel
+                    bool reclaimed = breakoutDir == 1 ? close > swingLevel + reclaimBufferAtrInput * atrValue : close < swingLevel - reclaimBufferAtrInput * atrValue
 
                     if reclaimed
                         entryReady := true
@@ -544,33 +701,49 @@ if barstate.isconfirmed and entryReady and strategy.position_size == 0
     initialRisk := math.max(math.abs(activeEntry - activeStop), syminfo.mintick)
 
     float rrValue = math.abs(activeTarget - activeEntry) / initialRisk
+    bool rrOK = minRrInput <= 0 or rrValue >= minRrInput
 
-    string entryMessage = f_entryAlert(breakoutDir == 1, activeEntry, activeStop, activeTarget, activeRangeHigh, activeRangeLow, rrValue)
+    if rrOK
+        string entryMessage = f_entryAlert(breakoutDir == 1, activeEntry, activeStop, activeTarget, activeRangeHigh, activeRangeLow, rrValue)
 
-    if breakoutDir == 1
-        longEntrySignal := true
+        if breakoutDir == 1
+            longEntrySignal := true
 
-        strategy.entry(
-             id = "30m Range Long",
-             direction = strategy.long,
-             qty = contractsInput,
-             comment = "RANGE RETRACEMENT",
-             alert_message = entryMessage)
+            strategy.entry(
+                 id = "30m Range Long",
+                 direction = strategy.long,
+                 qty = contractsInput,
+                 comment = "RANGE RETRACEMENT",
+                 alert_message = entryMessage)
+
+        else
+            shortEntrySignal := true
+
+            strategy.entry(
+                 id = "30m Range Short",
+                 direction = strategy.short,
+                 qty = contractsInput,
+                 comment = "RANGE RETRACEMENT",
+                 alert_message = entryMessage)
+
+        if enableDynamicAlertsInput and alertEntriesInput
+            alert(entryMessage, alert.freq_once_per_bar_close)
+
+        lastEntryBar := bar_index
+        state := 3
 
     else
-        shortEntrySignal := true
-
-        strategy.entry(
-             id = "30m Range Short",
-             direction = strategy.short,
-             qty = contractsInput,
-             comment = "RANGE RETRACEMENT",
-             alert_message = entryMessage)
-
-    if enableDynamicAlertsInput and alertEntriesInput
-        alert(entryMessage, alert.freq_once_per_bar_close)
-
-    state := 3
+        // R:R fell below the minimum once stop/target were computed -- abandon
+        // this setup rather than take a trade that doesn't meet the bar.
+        state := 0
+        breakoutDir := 0
+        breakoutExtreme := na
+        zoneHigh := na
+        zoneLow := na
+        activeEntry := na
+        activeStop := na
+        activeTarget := na
+        initialRisk := na
 
 
 //=============================================================================
@@ -705,7 +878,7 @@ plot(showTradeLevelsInput and strategy.position_size != 0 ? activeTarget : na, t
 // DEBUG TABLE (free-tier Data Window substitute)
 //=============================================================================
 
-var table debugTable = table.new(position.top_right, 2, 7, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+var table debugTable = table.new(position.top_right, 2, 8, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
 
 if barstate.islast and showDebugTableInput
     string stateText = state == 0 ? "WAITING BREAKOUT" : state == 1 ? "WAITING RETRACE" : state == 2 ? "WAITING TRIGGER" : "IN TRADE"
@@ -731,6 +904,9 @@ if barstate.islast and showDebugTableInput
 
     table.cell(debugTable, 0, 6, "Trigger Mode", text_color = color.white, text_size = size.tiny)
     table.cell(debugTable, 1, 6, entryTriggerInput, text_color = color.white, text_size = size.tiny)
+
+    table.cell(debugTable, 0, 7, "Cooldown Left", text_color = color.white, text_size = size.tiny)
+    table.cell(debugTable, 1, 7, str.tostring(cooldownBarsLeft), text_color = cooldownBarsLeft > 0 ? color.orange : color.white, text_size = size.tiny)
 
 
 //=============================================================================
