@@ -1,0 +1,456 @@
+//@version=6
+indicator("Upthrust After Distribution + Entry Alerts", shorttitle="UTAD + Alerts", overlay=true, format=format.price, max_boxes_count=250, max_lines_count=500, max_labels_count=500)
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+int STAGE_IDLE = 0
+int STAGE_AWAIT_LOW = 1
+int STAGE_RANGE = 2
+
+int RESOLVE_NONE = 0
+int RESOLVE_UP = 1
+int RESOLVE_DOWN = -1
+
+float TOUCH_ZONE_FRAC = 0.15
+float SOW_CLOSE_FRAC = 0.5
+
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+color NEUTRAL_COLOR = #787b86
+color TRANSP_COLOR = #00000000
+
+string GROUP_TREND = "Prior Advance"
+string GROUP_RANGE = "Range Detection"
+string GROUP_UTAD = "UTAD Detection"
+string GROUP_TEST = "Secondary Test & Confirmation"
+string GROUP_STYLE = "Style"
+string GROUP_ALERT = "Dynamic Entry Alerts"
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+trendLookbackInput = input.int(50, "Advance Lookback (Bars)", minval=10, group=GROUP_TREND)
+trendMultInput = input.float(2.0, "Minimum Advance (xATR)", minval=0.25, step=0.25, group=GROUP_TREND)
+atrLengthInput = input.int(14, "ATR Length", minval=1, group=GROUP_TREND)
+
+pivotLengthInput = input.int(5, "Swing Length", minval=2, group=GROUP_RANGE)
+minRangeBarsInput = input.int(15, "Minimum Range Duration (Bars)", minval=5, group=GROUP_RANGE)
+matureBarsInput = input.int(40, "Terminal Maturity (Bars)", minval=5, group=GROUP_RANGE)
+minTestsInput = input.int(1, "Minimum Boundary Tests", minval=0, group=GROUP_RANGE)
+graceBarsInput = input.int(3, "Support Grace (Bars)", minval=1, group=GROUP_RANGE)
+
+failWindowInput = input.int(5, "Failure Window (Bars)", minval=1, group=GROUP_UTAD)
+volFilterInput = input.bool(true, "Breakout Volume Multiple", inline="vol", group=GROUP_UTAD)
+volMultInput = input.float(1.2, "", inline="vol", minval=0.5, step=0.1, group=GROUP_UTAD)
+volLengthInput = input.int(20, "Volume Average Length", minval=1, group=GROUP_UTAD)
+
+testZoneInput = input.float(25, "Test Proximity (% of Range Height)", minval=5, maxval=100, step=5, group=GROUP_TEST)
+testPivotInput = input.int(2, "Test Swing Length", minval=1, group=GROUP_TEST)
+testQualityInput = input.bool(true, "Shrinking Volume & Narrower Spread", group=GROUP_TEST)
+sowSpreadInput = input.float(1.5, "Wide Down-Bar (xATR)", minval=0.5, step=0.25, group=GROUP_TEST)
+
+showBoxInput = input.bool(true, "Show Range Box", group=GROUP_STYLE)
+showStopInput = input.bool(true, "Show UTAD High Level", group=GROUP_STYLE)
+showTargetInput = input.bool(true, "Show Downside Projection", group=GROUP_STYLE)
+fillTransparencyInput = input.int(90, "Range Fill Transparency", minval=50, maxval=100, group=GROUP_STYLE)
+bullColorInput = input.color(BULL_COLOR, "Bullish", inline="colors", group=GROUP_STYLE)
+bearColorInput = input.color(BEAR_COLOR, "Bearish", inline="colors", group=GROUP_STYLE)
+neutralColorInput = input.color(NEUTRAL_COLOR, "Range", inline="colors", group=GROUP_STYLE)
+
+// Dynamic alert() controls.
+enableDynamicAlertsInput = input.bool(true, "Enable Dynamic alert() Calls", group=GROUP_ALERT)
+alertRangeInput = input.bool(false, "Alert - Range Established", group=GROUP_ALERT)
+alertAttemptInput = input.bool(false, "Alert - Terminal Breakout Attempt", group=GROUP_ALERT)
+alertUtadInput = input.bool(true, "Alert - UTAD Aggressive Short Setup", group=GROUP_ALERT)
+alertTestInput = input.bool(true, "Alert - Secondary Test Primary Short Entry", group=GROUP_ALERT)
+alertSowInput = input.bool(true, "Alert - Sign of Weakness Confirmed Short", group=GROUP_ALERT)
+alertInvalidInput = input.bool(true, "Alert - Breakout Accepted / Short Invalidated", group=GROUP_ALERT)
+includeAlertLevelsInput = input.bool(true, "Include Range / Stop / Target Levels", group=GROUP_ALERT)
+
+// ============================================================================
+// PRIOR ADVANCE & SWINGS
+// ============================================================================
+
+float atrValue = ta.atr(atrLengthInput)
+float volumeSma = ta.sma(nz(volume), volLengthInput)
+float pivotHighPrice = ta.pivothigh(high, pivotLengthInput, pivotLengthInput)
+float pivotLowPrice = ta.pivotlow(low, pivotLengthInput, pivotLengthInput)
+float testPivotPrice = ta.pivothigh(high, testPivotInput, testPivotInput)
+
+bool hasVolume = not na(volume) and nz(volumeSma) > 0
+
+float highAtPivot = high[pivotLengthInput]
+float atrAtPivot = atrValue[pivotLengthInput]
+float priorCloseAtPivot = close[pivotLengthInput + trendLookbackInput]
+
+float gainAtPivot = not na(priorCloseAtPivot) and not na(atrAtPivot) and atrAtPivot > 0 ? (highAtPivot - priorCloseAtPivot) / atrAtPivot : na
+bool advanceOk = not na(pivotHighPrice) and not na(gainAtPivot) and gainAtPivot >= trendMultInput
+
+// ============================================================================
+// RANGE STATE
+// ============================================================================
+
+var int stage = STAGE_IDLE
+var float rangeTop = na
+var float rangeBottom = na
+var float rangeHeight = na
+var int topBar = na
+var bool established = false
+var box rangeBox = na
+
+var int resistanceTests = 0
+var int supportTests = 0
+var bool wasInResZone = false
+var bool wasInSupZone = false
+
+var bool episodeActive = false
+var bool episodeFromUtad = false
+var bool episodeMature = false
+var bool episodeTested = false
+var float episodeHigh = na
+var int episodeHighBar = na
+var float episodeVolume = na
+var float episodeSpread = na
+var float episodeBaseSma = na
+var int aboveCloses = 0
+
+var int belowSupportBar = na
+
+var bool utadConfirmed = false
+var float utadHigh = na
+var int utadHighBar = na
+var int utadFailBar = na
+var float utadVolume = na
+var float utadSpread = na
+var bool testDone = false
+var int postAboveCloses = 0
+
+var line stopLine = na
+var int stopTopBar = na
+var line targetLine = na
+var int targetTopBar = na
+var bool targetActive = false
+
+bool rangeEvent = false
+bool attemptEvent = false
+bool utadEvent = false
+bool testEvent = false
+bool sowEvent = false
+bool invalidEvent = false
+bool doReset = false
+bool doCancel = false
+int resolveDir = RESOLVE_NONE
+
+if stage == STAGE_IDLE and advanceOk
+    stage := STAGE_AWAIT_LOW
+    rangeTop := pivotHighPrice
+    topBar := bar_index - pivotLengthInput
+
+if stage == STAGE_AWAIT_LOW
+    if not na(pivotHighPrice) and pivotHighPrice >= rangeTop
+        rangeTop := pivotHighPrice
+        topBar := bar_index - pivotLengthInput
+
+    if not na(pivotLowPrice) and bar_index - pivotLengthInput > topBar and pivotLowPrice < rangeTop
+        stage := STAGE_RANGE
+        rangeBottom := pivotLowPrice
+        rangeHeight := rangeTop - rangeBottom
+        established := false
+        resistanceTests := 0
+        supportTests := 0
+        wasInResZone := high >= rangeTop - TOUCH_ZONE_FRAC * rangeHeight
+        wasInSupZone := low <= rangeBottom + TOUCH_ZONE_FRAC * rangeHeight
+        episodeActive := false
+        utadConfirmed := false
+        testDone := false
+        belowSupportBar := na
+        postAboveCloses := 0
+
+if stage == STAGE_RANGE
+    if not established and bar_index - topBar >= minRangeBarsInput
+        established := true
+        rangeEvent := true
+        if showBoxInput
+            rangeBox := box.new(topBar, rangeTop, bar_index, rangeBottom, border_color=neutralColorInput, border_width=1, border_style=line.style_dashed, bgcolor=color.new(neutralColorInput, fillTransparencyInput))
+
+    if established and not na(rangeBox)
+        box.set_right(rangeBox, bar_index)
+
+    bool inResZone = high >= rangeTop - TOUCH_ZONE_FRAC * rangeHeight
+    bool inSupZone = low <= rangeBottom + TOUCH_ZONE_FRAC * rangeHeight
+
+    if inResZone and not wasInResZone
+        resistanceTests += 1
+
+    if inSupZone and not wasInSupZone
+        supportTests += 1
+
+    wasInResZone := inResZone
+    wasInSupZone := inSupZone
+
+    if close < rangeBottom
+        if utadConfirmed
+            sowEvent := true
+            doReset := true
+            resolveDir := RESOLVE_DOWN
+            label.new(bar_index, low, "SOW", style=label.style_label_up, color=TRANSP_COLOR, textcolor=bearColorInput, size=size.small)
+        else if na(belowSupportBar)
+            belowSupportBar := bar_index
+        else if bar_index - belowSupportBar >= graceBarsInput
+            if established
+                doReset := true
+                resolveDir := RESOLVE_DOWN
+            else
+                doCancel := true
+    else
+        belowSupportBar := na
+
+    if not doReset and not doCancel
+        bool pokeArm = not episodeActive and not utadConfirmed and high > rangeTop
+        bool retestArm = not episodeActive and utadConfirmed and high > utadHigh
+
+        if pokeArm or retestArm
+            episodeActive := true
+            episodeFromUtad := retestArm
+            episodeHigh := high
+            episodeHighBar := bar_index
+            episodeVolume := nz(volume)
+            episodeSpread := high - low
+            episodeBaseSma := volumeSma[1]
+            aboveCloses := 0
+            episodeMature := retestArm or bar_index - topBar >= matureBarsInput
+            episodeTested := retestArm or (established and (minTestsInput == 0 or (resistanceTests - 1 >= minTestsInput and supportTests >= minTestsInput)))
+
+            if episodeMature and episodeTested
+                attemptEvent := true
+
+        else if episodeActive
+            if high > episodeHigh
+                episodeHigh := high
+                episodeHighBar := bar_index
+
+            episodeVolume := math.max(episodeVolume, nz(volume))
+            episodeSpread := math.max(episodeSpread, high - low)
+
+        if episodeActive
+            if close <= rangeTop
+                bool volumeOk = not volFilterInput or not hasVolume or na(episodeBaseSma) or episodeBaseSma <= 0 or episodeVolume >= volMultInput * episodeBaseSma
+
+                if episodeMature and episodeTested and volumeOk
+                    utadConfirmed := true
+                    utadHigh := episodeHigh
+                    utadHighBar := episodeHighBar
+                    utadFailBar := bar_index
+                    utadVolume := episodeVolume
+                    utadSpread := episodeSpread
+                    testDone := false
+                    postAboveCloses := 0
+                    utadEvent := true
+
+                    label.new(episodeHighBar, episodeHigh, "UTAD", style=label.style_label_down, color=TRANSP_COLOR, textcolor=bearColorInput, size=size.small)
+
+                    if showStopInput
+                        if not na(stopLine) and stopTopBar == topBar
+                            line.set_xy1(stopLine, utadHighBar, utadHigh)
+                            line.set_xy2(stopLine, bar_index, utadHigh)
+                        else
+                            stopLine := line.new(utadHighBar, utadHigh, bar_index, utadHigh, color=bearColorInput, style=line.style_dotted)
+                            stopTopBar := topBar
+
+                    if showTargetInput and (na(targetLine) or targetTopBar != topBar)
+                        targetLine := line.new(bar_index, rangeBottom - rangeHeight, bar_index, rangeBottom - rangeHeight, color=bearColorInput, style=line.style_dotted)
+                        targetTopBar := topBar
+                        targetActive := true
+
+                else if episodeFromUtad
+                    utadHigh := episodeHigh
+                    utadHighBar := episodeHighBar
+                    utadFailBar := bar_index
+                    postAboveCloses := 0
+
+                episodeActive := false
+
+            else
+                aboveCloses += 1
+
+                if aboveCloses >= failWindowInput
+                    if established and (utadConfirmed or (episodeMature and episodeTested))
+                        invalidEvent := true
+                        label.new(bar_index, high, "Held", style=label.style_label_down, color=TRANSP_COLOR, textcolor=bullColorInput, size=size.small)
+
+                        if targetActive and not na(targetLine) and targetTopBar == topBar
+                            line.delete(targetLine)
+                            targetLine := na
+                            targetActive := false
+
+                    if established
+                        doReset := true
+                        resolveDir := RESOLVE_UP
+                    else
+                        doCancel := true
+
+        if utadConfirmed and not episodeActive and not doReset
+            postAboveCloses := close > rangeTop ? postAboveCloses + 1 : 0
+
+            if postAboveCloses >= failWindowInput
+                invalidEvent := true
+                doReset := true
+                resolveDir := RESOLVE_UP
+
+                label.new(bar_index, high, "Held", style=label.style_label_down, color=TRANSP_COLOR, textcolor=bullColorInput, size=size.small)
+
+                if targetActive and not na(targetLine) and targetTopBar == topBar
+                    line.delete(targetLine)
+                    targetLine := na
+                    targetActive := false
+
+            if not doReset and not testDone and not na(testPivotPrice)
+                int testBar = bar_index - testPivotInput
+                float testVolume = nz(volume[testPivotInput])
+                float testSpread = high[testPivotInput] - low[testPivotInput]
+                bool zoneOk = testPivotPrice <= utadHigh and testPivotPrice >= utadHigh - rangeHeight * testZoneInput / 100
+                bool qualityOk = not testQualityInput or ((not hasVolume or testVolume < utadVolume) and testSpread < utadSpread)
+
+                if testBar > utadFailBar and zoneOk and qualityOk
+                    testDone := true
+                    testEvent := true
+                    label.new(testBar, testPivotPrice, "Test", style=label.style_label_down, color=TRANSP_COLOR, textcolor=bearColorInput, size=size.small)
+
+            if not doReset and close < open and not na(atrValue) and high - low >= sowSpreadInput * atrValue and (not hasVolume or nz(volume) >= volMultInput * volumeSma) and close <= rangeBottom + SOW_CLOSE_FRAC * rangeHeight
+                sowEvent := true
+                doReset := true
+                resolveDir := RESOLVE_DOWN
+                label.new(bar_index, low, "SOW", style=label.style_label_up, color=TRANSP_COLOR, textcolor=bearColorInput, size=size.small)
+
+    if utadConfirmed and not doReset and showStopInput and not na(stopLine) and stopTopBar == topBar
+        line.set_xy1(stopLine, utadHighBar, utadHigh)
+        line.set_xy2(stopLine, bar_index, utadHigh)
+
+// ============================================================================
+// FUNNEL DIAGNOSTICS (Data Window only)
+// ----------------------------------------------------------------------------
+// Watch these in the Data Window to see exactly how far each bar gets through
+// the pipeline if signals still look too rare -- stage stuck at 0 means
+// advanceOk never fires; stage stuck at 1 means no qualifying pivot low comes
+// after the pivot high; established staying 0 means price never holds in a
+// range for minRangeBarsInput; resistance/support test counts below
+// minTestsInput mean the boundary-test requirement is the current gate.
+// ============================================================================
+
+plot(stage, "Stage (0 Idle / 1 Await Low / 2 Range)", display = display.data_window)
+plot(advanceOk ? 1 : 0, "Advance OK", display = display.data_window)
+plot(established ? 1 : 0, "Range Established", display = display.data_window)
+plot(episodeActive ? 1 : 0, "Episode Active", display = display.data_window)
+plot(utadConfirmed ? 1 : 0, "UTAD Confirmed", display = display.data_window)
+plot(resistanceTests, "Resistance Tests", display = display.data_window)
+plot(supportTests, "Support Tests", display = display.data_window)
+
+// ============================================================================
+// DYNAMIC alert() MESSAGES
+// ----------------------------------------------------------------------------
+// Create the TradingView alert with:
+// Condition -> this indicator -> Any alert() function call
+//
+// Entry classification:
+// RANGE       = informational / no entry
+// ATTEMPT     = watch only / no entry yet
+// UTAD        = aggressive short setup
+// TEST        = primary short entry
+// SOW         = confirmed short / breakdown entry
+// HELD        = short invalidated
+//
+// These calls occur before the reset block so range levels still exist.
+// ============================================================================
+
+if barstate.isconfirmed and enableDynamicAlertsInput
+    string baseInfo = " | SYMBOL: " + syminfo.ticker + " | TF: " + timeframe.period + " | PRICE: " + str.tostring(close, format.mintick)
+    string rangeInfo = includeAlertLevelsInput and not na(rangeTop) ? " | RANGE R: " + str.tostring(rangeTop, format.mintick) : ""
+    rangeInfo += includeAlertLevelsInput and not na(rangeBottom) ? " | RANGE S: " + str.tostring(rangeBottom, format.mintick) : ""
+
+    float projectedTarget = not na(rangeBottom) and not na(rangeHeight) ? rangeBottom - rangeHeight : na
+    string utadInfo = includeAlertLevelsInput and not na(utadHigh) ? " | UTAD HIGH: " + str.tostring(utadHigh, format.mintick) : ""
+    string targetInfo = includeAlertLevelsInput and not na(projectedTarget) ? " | TARGET: " + str.tostring(projectedTarget, format.mintick) : ""
+
+    if rangeEvent and alertRangeInput
+        string msgRange = "ENTRY CATEGORY: INFORMATIONAL | ENTRY TYPE: NO ENTRY | TRIGGER: DISTRIBUTION RANGE ESTABLISHED" + baseInfo + rangeInfo
+        alert(msgRange, alert.freq_once_per_bar_close)
+
+    if attemptEvent and alertAttemptInput
+        string msgAttempt = "ENTRY CATEGORY: WATCH | ENTRY TYPE: NO ENTRY YET | TRIGGER: TERMINAL BREAKOUT ATTEMPT | WAIT FOR ACCEPTANCE OR FAILURE" + baseInfo + rangeInfo
+        alert(msgAttempt, alert.freq_once_per_bar_close)
+
+    if utadEvent and alertUtadInput
+        string msgUtad = "ENTRY CATEGORY: BEARISH | ENTRY TYPE: AGGRESSIVE SHORT SETUP | TRIGGER: UTAD FAILED BREAKOUT" + baseInfo + rangeInfo + utadInfo + targetInfo
+        alert(msgUtad, alert.freq_once_per_bar_close)
+
+    if testEvent and alertTestInput
+        string testInfo = includeAlertLevelsInput and not na(testPivotPrice) ? " | TEST HIGH: " + str.tostring(testPivotPrice, format.mintick) : ""
+        string msgTest = "ENTRY CATEGORY: BEARISH | ENTRY TYPE: PRIMARY SHORT ENTRY | TRIGGER: UTAD SECONDARY TEST" + baseInfo + rangeInfo + testInfo + utadInfo + targetInfo
+        alert(msgTest, alert.freq_once_per_bar_close)
+
+    if sowEvent and alertSowInput
+        string msgSow = "ENTRY CATEGORY: BEARISH | ENTRY TYPE: CONFIRMED SHORT / BREAKDOWN ENTRY | TRIGGER: SIGN OF WEAKNESS" + baseInfo + rangeInfo + utadInfo + targetInfo
+        alert(msgSow, alert.freq_once_per_bar_close)
+
+    if invalidEvent and alertInvalidInput
+        string msgInvalid = "ENTRY CATEGORY: NONE | ENTRY TYPE: SHORT INVALIDATED | TRIGGER: BREAKOUT ACCEPTED ABOVE DISTRIBUTION RANGE" + baseInfo + rangeInfo + utadInfo
+        alert(msgInvalid, alert.freq_once_per_bar_close)
+
+// ============================================================================
+// APPLY RESOLUTION / RESET
+// ============================================================================
+
+if doReset and not na(rangeBox)
+    color resolveColor = resolveDir == RESOLVE_UP ? bullColorInput : bearColorInput
+    box.set_right(rangeBox, bar_index)
+    box.set_border_style(rangeBox, line.style_solid)
+    box.set_border_color(rangeBox, resolveColor)
+    box.set_bgcolor(rangeBox, color.new(resolveColor, fillTransparencyInput))
+
+if doCancel or doReset
+    stage := STAGE_IDLE
+    rangeTop := na
+    rangeBottom := na
+    rangeHeight := na
+    topBar := na
+    established := false
+    rangeBox := na
+    resistanceTests := 0
+    supportTests := 0
+    episodeActive := false
+    belowSupportBar := na
+    utadConfirmed := false
+    testDone := false
+    postAboveCloses := 0
+
+// ============================================================================
+// DOWNSIDE PROJECTION
+// ============================================================================
+
+if targetActive and not na(targetLine)
+    line.set_x2(targetLine, bar_index)
+
+    if low <= line.get_y1(targetLine)
+        targetActive := false
+
+// ============================================================================
+// NAMED ALERT CONDITIONS
+// ----------------------------------------------------------------------------
+// These are kept for compatibility.
+// For the detailed entry-type message, select "Any alert() function call".
+// ============================================================================
+
+alertcondition(rangeEvent, "Trading Range Established", "Extended trading range established after a significant advance on {{ticker}} ({{interval}}) - candidate distribution context; a late failed break above resistance would be the UTAD")
+
+alertcondition(attemptEvent, "Terminal Breakout Attempt", "Break above the resistance of a mature trading range on {{ticker}} ({{interval}}) - watch only until the breakout is accepted or rejected")
+
+alertcondition(utadEvent, "UTAD Detected", "Upthrust after distribution on {{ticker}} ({{interval}}) - aggressive bearish setup; the late break above range resistance failed back inside")
+
+alertcondition(testEvent, "UTAD Secondary Test", "Weak secondary test of the UTAD high rolled over on {{ticker}} ({{interval}}) - primary short-entry evidence")
+
+alertcondition(sowEvent, "Sign of Weakness", "Sign of weakness after the UTAD on {{ticker}} ({{interval}}) - confirmed bearish / breakdown entry")
+
+alertcondition(invalidEvent, "Breakout Accepted", "Price accepted above the broken level on {{ticker}} ({{interval}}) - bearish UTAD setup invalidated")

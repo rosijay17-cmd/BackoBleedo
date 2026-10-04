@@ -1,0 +1,107 @@
+//@version=6
+
+// ============================================================================
+// P0 REBUILD -- STAGE 0: SANITY CHECK
+// ----------------------------------------------------------------------------
+// Deliberately the simplest possible strategy: no P0, no acceptance/rejection
+// scoring, no structural profile, no cooldown logic, no entry-type tracking.
+// Every N bars, while flat, enter long with a plain ATR stop and target.
+//
+// PURPOSE: isolate whether the actual broker/order mechanism works at all on
+// this account/symbol/plan, completely independent of the complex logic that
+// has been the subject of every prior diagnostic. If trades don't open and
+// close cleanly here, the problem was never in the scoring/entry-engine
+// logic -- it's something about the environment itself, and rebuilding the
+// rest would not have fixed it either. If this DOES work, the foundation is
+// sound and each subsequent module gets added back one at a time, each
+// validated to actually place real trades before the next is layered on.
+// ============================================================================
+
+strategy(
+     title = "P0 Rebuild - Stage 0 Sanity Check",
+     shorttitle = "P0 Stage0",
+     overlay = true,
+     initial_capital = 100000,
+     pyramiding = 0,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.50,
+     slippage = 1,
+     process_orders_on_close = true,
+     calc_on_order_fills = true,
+     calc_on_every_tick = false,
+     max_labels_count = 200
+)
+
+int barsBetweenEntries = input.int(30, "Bars Between Forced Entries", minval = 5, maxval = 200)
+float stopATRInput = input.float(1.0, "Stop (ATR)", minval = 0.1)
+float targetATRInput = input.float(1.5, "Target (ATR)", minval = 0.1)
+
+float atr = ta.atr(14)
+bool flat = strategy.position_size == 0
+
+var int lastEntryBar = -100000
+bool cooldownElapsed = bar_index - lastEntryBar >= barsBetweenEntries
+bool forceEntry = flat and cooldownElapsed and barstate.isconfirmed
+
+if forceEntry
+    lastEntryBar := bar_index
+    strategy.entry(id = "Stage0 Long", direction = strategy.long, qty = 1)
+
+if strategy.position_size > 0
+    strategy.exit(
+         id = "Stage0 Long Exit",
+         from_entry = "Stage0 Long",
+         stop = strategy.position_avg_price - atr * stopATRInput,
+         limit = strategy.position_avg_price + atr * targetATRInput
+    )
+
+plotshape(forceEntry, title = "Forced Entry", style = shape.triangleup, location = location.belowbar, size = size.small, color = color.aqua)
+
+var array<string> closeLog = array.new_string()
+var int processedClosedTrades = 0
+
+if strategy.closedtrades > processedClosedTrades
+    int tradeNum = strategy.closedtrades - 1
+    string entryId = strategy.closedtrades.entry_id(tradeNum)
+    int entryBar = strategy.closedtrades.entry_bar_index(tradeNum)
+    int exitBar = strategy.closedtrades.exit_bar_index(tradeNum)
+    float pnl = strategy.closedtrades.profit(tradeNum)
+
+    string logEntry = entryId + " entry@" + str.tostring(entryBar) + " exit@" + str.tostring(exitBar) + " pnl=" + str.tostring(pnl, "#.##")
+    array.unshift(closeLog, logEntry)
+    if array.size(closeLog) > 6
+        array.pop(closeLog)
+
+    processedClosedTrades := strategy.closedtrades
+
+    label.new(bar_index, high, "CLOSED #" + str.tostring(tradeNum) + "\npnl=" + str.tostring(pnl, "#.##"), style = label.style_label_down, color = color.new(color.orange, 20), textcolor = color.black, size = size.small)
+
+var table statusTable = table.new(position.top_right, 2, 8, bgcolor = color.new(color.rgb(15, 20, 27), 10), border_width = 1)
+
+if barstate.islast
+    table.cell(statusTable, 0, 0, "STAGE 0 STATUS", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+    table.cell(statusTable, 1, 0, "", text_color = color.white, bgcolor = color.rgb(22, 52, 86))
+
+    table.cell(statusTable, 0, 1, "Bar Index", text_color = color.white)
+    table.cell(statusTable, 1, 1, str.tostring(bar_index), text_color = color.white)
+
+    table.cell(statusTable, 0, 2, "Position Size", text_color = color.white)
+    table.cell(statusTable, 1, 2, str.tostring(strategy.position_size), text_color = strategy.position_size != 0 ? color.aqua : color.gray)
+
+    table.cell(statusTable, 0, 3, "Open Trades", text_color = color.white)
+    table.cell(statusTable, 1, 3, str.tostring(strategy.opentrades), text_color = strategy.opentrades > 0 ? color.aqua : color.gray)
+
+    table.cell(statusTable, 0, 4, "Closed Trades", text_color = color.white)
+    table.cell(statusTable, 1, 4, str.tostring(strategy.closedtrades), text_color = strategy.closedtrades > 0 ? color.lime : color.gray)
+
+    table.cell(statusTable, 0, 5, "Net Profit", text_color = color.white)
+    table.cell(statusTable, 1, 5, str.tostring(strategy.netprofit, "#.##"), text_color = strategy.netprofit >= 0 ? color.lime : color.red)
+
+    table.cell(statusTable, 0, 6, "Bars Since Last Entry", text_color = color.white)
+    table.cell(statusTable, 1, 6, str.tostring(bar_index - lastEntryBar), text_color = color.white)
+
+    string closeLogText = array.size(closeLog) > 0 ? array.join(closeLog, " | ") : "no closes yet"
+    table.cell(statusTable, 0, 7, "Close Log", text_color = color.white)
+    table.cell(statusTable, 1, 7, closeLogText, text_color = color.white)

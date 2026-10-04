@@ -1,0 +1,1888 @@
+//@version=6
+// STRATEGY CONVERSION NOTE: the entire zone-detection, strength-scoring, and
+// break-detection engine below is UNCHANGED from the Supply & Demand Zones XL
+// indicator -- none of that logic was touched. The only additions are the
+// strategy() declaration itself and a new "STRATEGY ENTRIES" section (placed
+// after CURRENT STRENGTH SCORES, where the zone state it depends on is
+// already computed) that places real orders off the same signals the
+// indicator already draws on the chart.
+//
+// Default sizing below (percent_of_equity, 10%) is a generic placeholder --
+// this session repeatedly hit real bugs from percent-of-equity sizing on
+// high-notional futures (it can round down to a zero-quantity order that
+// silently never fills). Check this against the actual instrument before
+// trusting backtest results; strategy.fixed with an explicit contract/share
+// count is usually the safer choice for futures.
+strategy('Supply & Demand Zones XL - Strategy', shorttitle = "Supply & Demand XL Strategy", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 5000, pyramiding = 0, initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 10, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 1)
+
+// ═══════════════════════════════════════════════════════════════
+// GROUP LABELS
+// ═══════════════════════════════════════════════════════════════
+string GRP_GENERAL  = 'General'
+string GRP_HISTORY  = 'Historical Zones'
+string GRP_DISPLAY  = 'Display'
+string GRP_FILTERS  = 'Zone Filters'
+string GRP_STRENGTH = 'Strength Engine'
+string GRP_COLORS   = 'Colors'
+string GRP_BREAKS   = 'Break Markers'
+string GRP_FLOWLINE = 'Flow Line'
+string GRP_INFOBOX  = 'Info Box'
+string GRP_VOLPROFILE = 'Volume Profile'
+
+// ═══════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════
+bool   nonRepaint                   = input.bool(true,   'Non-Repainting Mode',           group = GRP_GENERAL, tooltip = 'When enabled, zones and breaks only confirm after the structure-timeframe bar closes, preventing repainting. Disable to see zones form in real time (may repaint).')
+string structureTf                  = input.timeframe('', 'Structure Timeframe',           group = GRP_GENERAL, tooltip = 'Higher timeframe used to detect pivots and zones. Leave blank to use the chart\'s own timeframe. Must be greater than or equal to the chart timeframe.')
+int    leftBars                     = input.int(50,  'Bars Left',  minval = 5,   maxval = 500, step = 1, group = GRP_GENERAL, tooltip = 'Number of bars to the left of a pivot that must be lower/higher for it to qualify as a swing high/low. Larger values find more significant, less frequent pivots.')
+int    rightBars                    = input.int(5,   'Bars Right', minval = 1,   maxval = 100, step = 1, group = GRP_GENERAL, tooltip = 'Number of bars to the right of a pivot required to confirm it. Larger values add confirmation lag but reduce false pivots.')
+int    atrLen                       = input.int(14,  'ATR Length', minval = 1,   maxval = 50,  step = 1, group = GRP_GENERAL, tooltip = 'Lookback period for the Average True Range used to size zones and measure volatility-based scoring.')
+float  zoneATRMult                  = input.float(0.5, 'Zone Size (ATR Multiplier)', minval = 0.1, maxval = 10, step = 0.1, group = GRP_GENERAL, tooltip = 'Multiplies the ATR value to set how tall each supply/demand zone is. Higher values create wider zones.')
+bool   disallowSameZoneOverlap      = input.bool(true,  'Disallow Same-Zone Overlap',      group = GRP_GENERAL, tooltip = 'Prevents a new zone from forming if it overlaps an existing zone of the same type (e.g. supply over supply).')
+bool   disallowDifferentZoneOverlap = input.bool(true,  'Disallow Different-Zone Overlap', group = GRP_GENERAL, tooltip = 'Prevents a new zone from forming if it overlaps an existing zone of the opposite type (e.g. supply over demand).')
+float  overlapBufferATRMult         = input.float(0.1,  'Overlap Buffer (ATR Multiplier)', minval = 0.0, maxval = 10, step = 0.1, group = GRP_GENERAL, tooltip = 'ATR-scaled buffer applied to the two overlap toggles above. At 0 only a literal box overlap blocks a new zone (the original behavior). Above 0, a new zone is also blocked when it lands within this many ATR of an existing zone even if the boxes never touch, which spaces zones out and reduces clustering. Uses the pivot-bar ATR (the same value that sizes zones via Zone Size), so 0.5 is half a zone-height of extra reach. Applies to both Same-Zone and Different-Zone checks.')
+string extendZonesMode              = input.string('Off', 'Zone Extension', options = ['Off', 'All Zones', 'All Zones (No Labels)', 'Active Zones', 'Active Zones (No Labels)'], group = GRP_GENERAL, tooltip = 'Off stops every zone box at the most recent bar. Extend All Zones draws every visible zone box out to the right edge of the chart. Extend Active Zones extends only the current active supply and demand zones while historical zones stop at the most recent bar, so the zone reaching the edge is always the active one. The (No Labels) variants extend the same way but hide all strength score labels, matching the original behavior where extending zones suppressed the labels.')
+bool   extendZonesOff               = extendZonesMode == 'Off'
+bool   extendAllZones               = extendZonesMode == 'All Zones' or extendZonesMode == 'All Zones (No Labels)'
+bool   extendHideLabels             = extendZonesMode == 'All Zones (No Labels)' or extendZonesMode == 'Active Zones (No Labels)'
+
+bool   showHistoricalZones          = input.bool(true, 'Show Historical Zones',         group = GRP_HISTORY, tooltip = 'Keeps older zones visible on the chart instead of only showing the most recent active zone.')
+int    historicalZoneLookback       = input.int(10,    'Historical Zone Lookback',       minval = 0, maxval = 50, step = 1, group = GRP_HISTORY, tooltip = 'Maximum number of past zones to keep displayed when historical zones are enabled. Higher values cost runtime — this is the single biggest performance lever in the script.')
+bool   useHistoricalOverlapEngine   = input.bool(false, 'Use Historical Overlap Engine', group = GRP_HISTORY, tooltip = 'Checks new candidate zones against the full history of stored zones (not just the active one) when applying overlap filters.')
+bool   showHistoricalBrokenZones    = input.bool(true, 'Show Historical Broken Zones',  group = GRP_HISTORY, tooltip = 'Keeps broken historical zones visible instead of hiding them once they are invalidated.')
+int    brokenZoneLookback           = input.int(1,    'Broken Zone Lookback',           minval = 0, maxval = 20, step = 1, group = GRP_HISTORY, tooltip = 'Number of newer broken zones that must appear before an older broken zone is hidden from the chart. Note: at 0, every broken historical zone is hidden immediately.')
+string brokenZoneLookbackMode       = input.string('Break Order', 'Broken Lookback Mode', options = ['Formation Order', 'Break Order'], group = GRP_HISTORY, tooltip = 'Controls how Broken Zone Lookback decides which broken zones to keep. Formation Order keeps the most recently FORMED broken zones — a zone hides once that many newer-formed zones have also broken, so an older zone that breaks late can still be hidden. Break Order keeps the most recently BROKEN zones regardless of when they formed — a zone hides once that many other zones have broken after it. Both modes hide every broken zone immediately at a lookback of 0.')
+
+bool   showZones                    = input.bool(true,  'Show Zones',                      group = GRP_DISPLAY, tooltip = 'Master toggle for drawing supply and demand zone boxes on the chart. Purely visual — zone tracking, touch counting, break detection, strength scoring, and alerts all continue to run even when this is off.')
+bool   showTriangles                = input.bool(true,  'Show Triangles',                  group = GRP_DISPLAY, tooltip = 'Shows small triangle markers at the pivot point where each zone formed.')
+string triangleSizeInput            = input.string('Tiny', 'Triangle Size', options = ['Tiny', 'Small', 'Normal', 'Large', 'Huge'], group = GRP_DISPLAY, tooltip = 'Size of the triangle markers drawn at zone pivots.')
+string triangleAnchorMode           = input.string('Fixed Pixel', 'Triangle Anchor Mode', options = ['Fixed Pixel', 'ATR'], group = GRP_DISPLAY, tooltip = 'How the triangle is pinned to the pivot bar high/low. Fixed Pixel uses the platform\'s native bar attachment (yloc above/below bar) and now pins to the exact chart candle that printed the structure high/low — so on a higher structure timeframe the tip touches the true extreme edge instead of the first sub-candle of the structure bar. ATR places the marker by price with a gap measured in ATR (set below): spacing stays proportional and even across bars, but the tip is an approximation and can drift slightly at extreme zoom. Fixed Pixel keeps the tip truest to the edge; ATR keeps the spacing most consistent.')
+float  triangleTipGapATR            = input.float(1, 'Triangle ATR Offset', minval = 0.0, maxval = 3, step = 0.05, group = GRP_DISPLAY, tooltip = 'Only used when Triangle Anchor Mode is ATR. Distance from the pivot bar high/low to the triangle, in ATR units. Because it scales with volatility the spacing reads consistently across bars. 0 places the marker center on the edge (tip crosses slightly into the box); higher values push the marker outward — above the high for supply, below the low for demand.')
+bool   showEndOfZoneStrengthLabels  = input.bool(true,  'Show Strength Labels',            group = GRP_DISPLAY, tooltip = 'Displays the numeric strength score (e.g. 7/10) at the edge of the active zone.')
+bool   showStrengthArrows           = input.bool(true, 'Show Strength Arrows', group = GRP_DISPLAY, tooltip = 'Appends an arrow to the strength label. The arrow DIRECTION encodes the zone type — up for demand, down for supply. The arrow FILL encodes strength: a FILLED arrow is a strong zone (score at or above the Strong Zone Threshold), a HOLLOW arrow is a weak zone. Reads the zone\'s live score, so the fill matches the zone\'s strong/weak color and can flip as the zone ages, takes touches, or decays. Only appears where strength labels are shown.')
+bool   showHistoricalStrengthLabels = input.bool(false, 'Show Historical Strength Labels', group = GRP_DISPLAY, tooltip = 'Displays strength score labels on past, non-active historical zones as well as the current one.')
+string historicalStrengthLabelFilter = input.string('All', 'Historical Label Filter', options = ['All', 'Active Only', 'Broken Only'], group = GRP_DISPLAY, tooltip = 'Only used when Show Historical Strength Labels is on. Filters WHICH past zones get a strength label. All labels every historical zone (original behavior). Active Only labels only historical zones that have NOT broken. Broken Only labels only historical zones that HAVE broken. The current active zone is unaffected — its label is controlled by Show Strength Labels. Broken zones already hidden by the broken-zone lookback stay hidden regardless of this filter.')
+string strengthLabelStyleInput      = input.string('End of Zone', 'Strength Label Style', options = ['Standard', 'End of Zone'], group = GRP_DISPLAY, tooltip = 'Standard draws the strength label as an up/down pointer at the zone edge. End of Zone draws it as a side tag (pointer touching the zone edge, box extending to the right).')
+int    strengthLabelOffsetBars      = input.int(1, 'End of Zone Offset (Bars)', minval = 0, maxval = 100, step = 1, group = GRP_DISPLAY, tooltip = 'Only used when Strength Label Style is set to End of Zone. Shifts the tag this many bars further right of the zone edge so it clears the candles, similar to how an SMA label floats beside the line.')
+
+bool   showInfoBox           = input.bool(true,           'Show Info Box',      group = GRP_INFOBOX, tooltip = 'Displays the on-chart info panel summarizing current settings and status.')
+string infoBoxDetailInput    = input.string('Medium',     'Info Box Detail',    options = ['Small', 'Medium', 'Large'], group = GRP_INFOBOX, tooltip = 'Controls how many rows of settings information are shown in the info box: Small, Medium, or Large.')
+string infoBoxPositionInput  = input.string('Bottom Left','Position',           options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], group = GRP_INFOBOX, tooltip = 'Screen corner where the info box panel is anchored.')
+string infoBoxTextSizeInput  = input.string('Tiny',       'Text Size',          options = ['Tiny', 'Small', 'Normal'], group = GRP_INFOBOX, tooltip = 'Font size used for the text inside the info box.')
+color  infoBoxBgColor        = input.color(color.new(color.black, 10), 'Background',        group = GRP_INFOBOX, tooltip = 'Background color of the info box panel.')
+color  infoBoxHeaderBgColor  = input.color(color.new(color.blue,  55), 'Header Background', group = GRP_INFOBOX, tooltip = 'Background color of the info box\'s title/header row.')
+color  infoBoxTextColor      = input.color(color.white,  'Text Color',          group = GRP_INFOBOX, tooltip = 'Color used for the primary values displayed in the info box.')
+color  infoBoxMutedTextColor = input.color(color.silver, 'Label Text Color',    group = GRP_INFOBOX, tooltip = 'Color used for the row labels (left column) in the info box.')
+color  infoBoxBorderColor    = input.color(color.gray,   'Border Color',        group = GRP_INFOBOX, tooltip = 'Color of the info box panel\'s outline.')
+
+bool   useVolumeFilter  = input.bool(false,   'Use Volume Filter',    group = GRP_FILTERS, tooltip = 'Requires above-average volume on the pivot bar before a new zone is allowed to form.')
+int    volumeSMALen     = input.int(50,        'Volume SMA Length',    minval = 1, group = GRP_FILTERS, tooltip = 'Length of the moving average used as the volume baseline for the volume filter.')
+float  volumeMult       = input.float(2,     'Volume Multiplier',    minval = 1, maxval = 20, step = 0.5, group = GRP_FILTERS, tooltip = 'Pivot bar volume must exceed the volume SMA by this multiple to pass the volume filter.')
+bool   useRsiConfirm    = input.bool(false,    'Use RSI Confirmation', group = GRP_FILTERS, tooltip = 'Requires RSI to be in overbought/oversold territory on the pivot bar before a zone can form.')
+int    rsiLength        = input.int(14,        'RSI Length',           minval = 1, group = GRP_FILTERS, tooltip = 'Lookback period for the RSI calculation used in zone confirmation.')
+float  rsiOverbought    = input.float(65,    'RSI Overbought Level', minval = 50, maxval = 95, step = 1, group = GRP_FILTERS, tooltip = 'RSI level above which a supply zone pivot is considered confirmed.')
+float  rsiOversold      = input.float(35,    'RSI Oversold Level',   minval = 5, maxval = 50, step = 1, group = GRP_FILTERS, tooltip = 'RSI level below which a demand zone pivot is considered confirmed.')
+
+string strengthLabelSizeInput = input.string('Tiny', 'Strength Label Size', options = ['Tiny', 'Small', 'Normal', 'Large'], group = GRP_STRENGTH, tooltip = 'Font size of the strength score labels (e.g. 7/10) shown on active and historical zones.')
+float  volumeWeight     = input.float(1.0, 'Formation Volume Weight',   minval = 0, step = 0.1, group = GRP_STRENGTH, tooltip = 'Weight given to formation volume (volume vs its average) in the zone strength score.')
+float  departureWeight  = input.float(1.5, 'Departure Velocity Weight', minval = 0, step = 0.1, group = GRP_STRENGTH, tooltip = 'Weight given to how fast/far price moved away from the zone after it formed (departure velocity).')
+float  purityWeight     = input.float(1.0, 'Zone Purity Weight',        minval = 0, step = 0.1, group = GRP_STRENGTH, tooltip = 'Weight given to how \'clean\' the formation candle is (large body relative to its range).')
+float  enduranceWeight  = input.float(1.0, 'Endurance Weight',          minval = 0, step = 0.1, group = GRP_STRENGTH, tooltip = 'Weight given to how long the zone has survived untouched (its age).')
+float  wickTouchWeight  = input.float(0.5, 'Wick Touch Penalty Weight', minval = 0, step = 0.1, group = GRP_STRENGTH, tooltip = 'Weight applied to penalize the score each time price wicks into the zone without closing inside it.')
+float  bodyTouchWeight  = input.float(2.0, 'Body Touch Penalty Weight', minval = 0, step = 0.1, group = GRP_STRENGTH, tooltip = 'Weight applied to penalize the score each time price closes inside the zone (body touch).')
+bool   useRecencyDecay  = input.bool(true, 'Use Recency Decay',         group = GRP_STRENGTH, tooltip = 'Gradually reduces a zone\'s strength score the older it gets, simulating fading relevance over time.')
+int    decayHalfLife    = input.int(100,   'Decay Half-Life (Bars)',    minval = 10, maxval = 500, step = 10, group = GRP_STRENGTH, tooltip = 'Number of bars after which recency decay reduces a zone\'s score by half, when recency decay is enabled.')
+
+int    strongZoneThreshold   = input.int(6,   'Strong Zone Threshold', minval = 1, maxval = 10, group = GRP_COLORS, tooltip = 'Minimum strength score (1-10) required for a zone to be colored as \'strong\' instead of \'weak\'.')
+int    zoneTransparency      = input.int(70,  'Zone Transparency',     minval = 0, maxval = 100, group = GRP_COLORS, tooltip = 'Transparency percentage applied to the zone box fill color (0 = opaque, 100 = invisible).')
+color  supplyZoneStrongColor = input.color(color.rgb(225, 0, 0),     'Supply Strong Color',   group = GRP_COLORS, tooltip = 'Fill/border color for supply zones scoring at or above the strong zone threshold.')
+color  supplyZoneWeakColor   = input.color(color.rgb(255, 120, 120), 'Supply Weak Color',     group = GRP_COLORS, tooltip = 'Fill/border color for supply zones scoring below the strong zone threshold.')
+color  supplyTriangleColor   = input.color(color.rgb(225, 0, 0),     'Supply Triangle Color', group = GRP_COLORS, tooltip = 'Color of the triangle marker drawn at supply zone pivots.')
+color  demandZoneStrongColor = input.color(color.rgb(0, 175, 0),     'Demand Strong Color',   group = GRP_COLORS, tooltip = 'Fill/border color for demand zones scoring at or above the strong zone threshold.')
+color  demandZoneWeakColor   = input.color(color.rgb(100, 255, 100), 'Demand Weak Color',     group = GRP_COLORS, tooltip = 'Fill/border color for demand zones scoring below the strong zone threshold.')
+color  demandTriangleColor   = input.color(color.rgb(0, 175, 0),     'Demand Triangle Color', group = GRP_COLORS, tooltip = 'Color of the triangle marker drawn at demand zone pivots.')
+color  brokenSupplyZoneColor = input.color(color.gray, 'Broken Supply Color', group = GRP_COLORS, tooltip = 'Color used for supply zones once price has closed through and broken them.')
+color  brokenDemandZoneColor = input.color(color.gray, 'Broken Demand Color', group = GRP_COLORS, tooltip = 'Color used for demand zones once price has closed through and broken them.')
+bool   colorActiveBrokenZones     = input.bool(true, 'Color Active Broken Zones',     group = GRP_COLORS, tooltip = 'Recolors the currently active zone using the broken-zone color once it has been broken.')
+bool   colorHistoricalBrokenZones = input.bool(true, 'Color Historical Broken Zones', group = GRP_COLORS, tooltip = 'Recolors past historical zones using the broken-zone color once they have been broken.')
+
+bool   showBreakArrows            = input.bool(true,    'Show Break Markers',           group = GRP_BREAKS, tooltip = 'Displays a marker on the chart at the bar where the active zone is broken.')
+string brokenZoneTriggerInput     = input.string('Close', 'Broken Zone Trigger', options = ['Close', 'Wick'], group = GRP_BREAKS, tooltip = 'Determines what counts as a zone break: a candle CLOSE beyond the zone, or just a WICK (high/low) reaching beyond the zone.')
+bool   showHistoricalBreakMarkers = input.bool(true,    'Show Historical Break Markers',group = GRP_BREAKS, tooltip = 'Displays break markers on historical zones, not just the currently active zone.')
+string breakMarkerPositionInput   = input.string('Zone','Marker Position', options = ['Dynamic', 'Zone', 'Candle'], group = GRP_BREAKS, tooltip = 'Controls the vertical placement of break markers: at the zone edge, at the candle\'s high/low, or dynamically between the two.')
+color  supplyBreakArrowColor      = input.color(color.blue, 'Supply Break Color', group = GRP_BREAKS, tooltip = 'Color of the marker shown when a supply zone is broken.')
+color  demandBreakArrowColor      = input.color(color.blue, 'Demand Break Color', group = GRP_BREAKS, tooltip = 'Color of the marker shown when a demand zone is broken.')
+string breakArrowSize             = input.string('Tiny',   'Marker Size',  options = ['Tiny', 'Small', 'Normal', 'Large', 'Huge'], group = GRP_BREAKS, tooltip = 'Size of the break marker shapes drawn on the chart.')
+string breakArrowShape            = input.string('X Cross','Marker Shape', options = ['Arrow', 'Triangle', 'Circle', 'Square', 'Diamond', 'Cross', 'X Cross', 'Flag'], group = GRP_BREAKS, tooltip = 'Shape used for break markers (arrow, triangle, circle, square, diamond, cross, X, or flag).')
+
+bool   showFlowLine             = input.bool(false,         'Show Flow Line',        group = GRP_FLOWLINE, tooltip = 'Displays a trend-following flow line (EMA-based) overlay on the chart.')
+string flowLineMode             = input.string('Advanced Line','Flow Line Mode',     options = ['Advanced Line', 'Simple Line'], group = GRP_FLOWLINE, tooltip = 'Determines flow line trend logic: \'Advanced Line\' uses slope + ADX strength, \'Simple Line\' uses a basic price-vs-EMA comparison.')
+string flowLineSpeed            = input.string('Medium (34)', 'Flow Line Speed',     options = ['Fast (21)', 'Medium (34)', 'Slow (55)', 'Slower (100)', 'Slowest (200)'], group = GRP_FLOWLINE, tooltip = 'Sets the EMA length of the flow line. Fast (21) reacts quickly; Slowest (200) is a long-term baseline. In Advanced Line mode the slope threshold scales DOWN with the selected speed (a slow EMA physically produces a smaller per-bar slope) and slope is averaged over a longer lookback window, so slower lines still color during genuine trends while staying gray in flat periods.')
+string flowLineTimeframeSource  = input.string('Structure TF','Flow Line Timeframe', options = ['Structure TF', 'Chart TF'], group = GRP_FLOWLINE, tooltip = 'Calculates the flow line from either the structure timeframe or the chart\'s own timeframe.')
+int    flowLineWidth            = input.int(4,              'Flow Line Width',       minval = 1, maxval = 5, group = GRP_FLOWLINE, tooltip = 'Line thickness of the flow line plot.')
+color  flowLineUpColor          = input.color(color.lime,   'Uptrend Color',         group = GRP_FLOWLINE, tooltip = 'Color of the flow line when it signals an uptrend.')
+color  flowLineDownColor        = input.color(color.red,    'Downtrend Color',       group = GRP_FLOWLINE, tooltip = 'Color of the flow line when it signals a downtrend.')
+color  flowLineFlatColor        = input.color(color.gray,   'Consolidation Color',   group = GRP_FLOWLINE, tooltip = 'Color of the flow line during consolidation (no clear trend).')
+bool   showAtrChannel           = input.bool(false,          'Show ATR Channel',      group = GRP_FLOWLINE, tooltip = 'Displays an ATR-based channel band around the flow line.')
+float  flowLineAtrMult          = input.float(0.5,          'ATR Channel',           minval = 0.0, maxval = 5.0, step = 0.1, group = GRP_FLOWLINE, tooltip = 'Multiplies ATR to set the distance of the channel bands from the flow line. Set to 0 to disable the channel.')
+string flowLineAtrStyleInput    = input.string('Solid',     'ATR Line Style',        options = ['Solid', 'Dashed', 'Dotted'], group = GRP_FLOWLINE, tooltip = 'Line style used to draw the ATR channel bands (solid, dashed, or dotted).')
+int    flowLineAtrWidth         = input.int(1,              'ATR Line Width',        minval = 1, maxval = 5, step = 1, group = GRP_FLOWLINE, tooltip = 'Line thickness of the ATR channel bands.')
+color  flowLineAtrColor         = input.color(color.new(color.orange, 0), 'ATR Line Color', group = GRP_FLOWLINE, tooltip = 'Color of the ATR channel band lines.')
+
+// ═══════════════════════════════════════════════════════════════
+// VOLUME PROFILE (Combined)
+// One profile built from the last N Structure-TF bars, drawn beside the latest candle.
+// Shares the single 500-box / 500-line pool with the zone engine. Off by
+// default. Worst case (100 rows split = 200 boxes) plus max zone boxes
+// stays well under 500, so no runtime box budget is needed. No labels.
+// ═══════════════════════════════════════════════════════════════
+bool   showVolumeProfile = input.bool(false, 'Show Volume Profile', group = GRP_VOLPROFILE, tooltip = 'Master toggle for the volume profile overlay. The Timeframe input below chooses whether it is built from the Structure Timeframe or the chart\'s own bars. When off, no VP boxes/lines are drawn and none of the VP work runs.')
+bool   vpSplitVol    = input.bool(true, 'Split Up/Down Volume', group = GRP_VOLPROFILE, tooltip = 'On: each row shows separate up/down segments (2 boxes per row). Off: one box per row colored by the dominant side — halves box use.')
+string vpTimeframeSource = input.string('Structure TF', 'Timeframe', options = ['Structure TF', 'Chart TF'], group = GRP_VOLPROFILE, tooltip = 'Which timeframe the profile is built from, mirroring the Flow Line control. Structure TF uses the Structure Timeframe (General group), so the profile matches the zones and a 15m chart with a 30m Structure TF reads like a native 30m profile. Chart TF ignores the Structure Timeframe and builds from the chart\'s own bars — the original behavior — and stays valid even when the chart TF is higher than the Structure TF.')
+bool   vpUseChartTf  = vpTimeframeSource == 'Chart TF'
+int    vpRows        = input.int(100, 'Number of Rows', minval = 5, maxval = 100, group = GRP_VOLPROFILE, tooltip = 'Price is split into this many horizontal bins. Higher = finer resolution but more boxes.')
+float  vpVaPercent   = input.float(70, 'Value Area %', minval = 1, maxval = 100, group = GRP_VOLPROFILE, tooltip = 'Share of total volume the Value Area covers, centered on the POC. 70% is the standard convention; VAH/VAL mark its edges.') / 100.0
+int    vpLookback    = input.int(200, 'Lookback Bars', minval = 10, maxval = 5000, group = GRP_VOLPROFILE, tooltip = 'How many bars back the profile is built from, counted in bars of the selected VP Timeframe. Also sets the price high/low range it spans. With Timeframe = Structure TF on a higher structure TF this counts structure bars, so the profile covers a longer span than the same number of chart bars would; with Timeframe = Chart TF it counts chart bars.')
+string vpPlacement   = input.string('Left', 'Placement', options = ['Right', 'Left'], group = GRP_VOLPROFILE, tooltip = 'Which side of the latest candle the profile is drawn on.')
+int    vpProfileWidth = input.int(50, 'Max Profile Width (bars)', minval = 10, maxval = 450, group = GRP_VOLPROFILE, tooltip = 'Horizontal length, in bars, of the highest-volume (POC) row. Every other row scales proportionally.')
+int    vpGap         = input.int(10, 'Gap From Price (bars)', minval = 0, maxval = 40, group = GRP_VOLPROFILE, tooltip = 'Empty space, in bars, between the latest candle and the near edge of the profile.')
+color  vpUpColor     = input.color(color.new(#26a69a, 55), 'VP Up Volume', group = GRP_VOLPROFILE, tooltip = 'Fill color for volume on bars that closed at or above their open (buying side).')
+color  vpDownColor   = input.color(color.new(#ef5350, 55), 'VP Down Volume', group = GRP_VOLPROFILE, tooltip = 'Fill color for volume on bars that closed below their open (selling side).')
+bool   vpShowPOC     = input.bool(true, 'Show POC', group = GRP_VOLPROFILE, tooltip = 'Draws the Point of Control — a line at the single highest-volume price row.')
+color  vpPocColor    = input.color(color.new(#ff9800, 0), 'POC Color', group = GRP_VOLPROFILE, tooltip = 'Line color for the Point of Control.')
+string vpPocStyleSel = input.string('Solid', 'POC Line Style', options = ['Solid', 'Dashed', 'Dotted'], group = GRP_VOLPROFILE, tooltip = 'Line style for the Point of Control.')
+int    vpPocWidth    = input.int(3, 'POC Line Width', minval = 1, maxval = 10, group = GRP_VOLPROFILE, tooltip = 'Line thickness for the Point of Control.')
+bool   vpShowVA      = input.bool(true, 'Show Value Area', group = GRP_VOLPROFILE, tooltip = 'Draws the Value Area High (VAH) and Value Area Low (VAL) lines.')
+color  vpVaColor     = input.color(color.new(#2962ff, 0), 'VA Color', group = GRP_VOLPROFILE, tooltip = 'Line color for the Value Area High/Low.')
+string vpVaStyleSel  = input.string('Dashed', 'VA Line Style', options = ['Solid', 'Dashed', 'Dotted'], group = GRP_VOLPROFILE, tooltip = 'Line style for the Value Area High/Low.')
+int    vpVaWidth     = input.int(2, 'VA Line Width', minval = 1, maxval = 10, group = GRP_VOLPROFILE, tooltip = 'Line thickness for the Value Area High/Low.')
+
+string vpPocStyle = vpPocStyleSel == 'Solid' ? line.style_solid : vpPocStyleSel == 'Dashed' ? line.style_dashed : line.style_dotted
+string vpVaStyle  = vpVaStyleSel  == 'Solid' ? line.style_solid : vpVaStyleSel  == 'Dashed' ? line.style_dashed : line.style_dotted
+
+// ═══════════════════════════════════════════════════════════════
+// STRATEGY ENTRIES  (new group -- the only trading-specific inputs)
+// Reversal model: buy the first touch of a demand zone, sell the first
+// touch of a supply zone, on the theory the zone holds and price bounces.
+// Stop sits beyond the zone (so a genuine break invalidates the trade at
+// roughly the same point "Show Break Markers" would flag it); target is
+// a fixed R-multiple of that risk. This is the classic supply/demand
+// reversal read of the indicator's own zones -- not the only valid one
+// (a breakout continuation model is equally defensible) but the one this
+// conversion implements.
+// ═══════════════════════════════════════════════════════════════
+string GRP_STRATEGY = 'Strategy Entries'
+
+string strategyDirectionInput = input.string('Both', 'Trade Direction', options = ['Both', 'Long Only', 'Short Only'], group = GRP_STRATEGY, tooltip = 'Restricts entries to one side, or allows both. Demand-zone touches go long; supply-zone touches go short.')
+int    minEntryScoreInput     = input.int(6, 'Minimum Zone Strength To Enter', minval = 1, maxval = 10, group = GRP_STRATEGY, tooltip = 'A zone must score at least this high (same 1-10 scale as the strength labels) at the moment of the touch to be tradeable. Sits independently of the Strong Zone Threshold used for coloring -- raise this above that threshold to only trade the strongest zones.')
+float  stopBufferAtrMultInput = input.float(0.25, 'Stop Buffer (ATR Multiplier)', minval = 0.0, maxval = 5.0, step = 0.05, group = GRP_STRATEGY, tooltip = 'Extra distance beyond the zone edge, in ATR, added to the protective stop. 0 places the stop exactly on the zone edge; higher values give the trade a little room before a wick invalidates it.')
+float  rewardRiskInput        = input.float(2.0, 'Reward : Risk', minval = 0.25, maxval = 20, step = 0.25, group = GRP_STRATEGY, tooltip = 'Profit target, expressed as a multiple of the stop distance (the R-multiple).')
+bool   exitOnZoneBreakInput   = input.bool(true, 'Exit Immediately If Entry Zone Breaks', group = GRP_STRATEGY, tooltip = 'Closes the position the moment price breaks past the SPECIFIC zone the trade entered on (using the Broken Zone Trigger setting above -- Close or Wick), even if the ATR stop has not been hit yet. A broken zone invalidates the reversal thesis regardless of how much stop room is left. Tracks the zone by its stored price level, not by "the current active zone" -- so this stays correct even if a newer zone has since formed and become the active one.')
+
+// ── Flow Line derived settings ──
+// FIX: An EMA's per-bar responsiveness is ~2/(len+1): ~0.09 for EMA 21 but
+// only ~0.01 for EMA 200. The old thresholds INCREASED with length
+// (0.03→0.10), demanding a per-bar slope a 200 EMA can never physically
+// produce (price would need to sit ~10 ATR from the EMA). Thresholds must
+// SHRINK with length instead. Slope is also averaged over a lookback window
+// so slow EMAs aren't judged on single-bar noise. ADX is always standard
+// 14/14 (Wilder), computed on the Flow Line timeframe; only the minimum
+// floor varies by speed.
+int   flowLineLen           = flowLineSpeed == 'Fast (21)' ? 21 : flowLineSpeed == 'Medium (34)' ? 34 : flowLineSpeed == 'Slow (55)' ? 55 : flowLineSpeed == 'Slower (100)' ? 100 : 200
+int   flowLineSlopeLookback = flowLineSpeed == 'Fast (21)' ? 3 : flowLineSpeed == 'Medium (34)' ? 4 : flowLineSpeed == 'Slow (55)' ? 6 : flowLineSpeed == 'Slower (100)' ? 10 : 15
+float flowLineSlopeAtrMult  = flowLineSpeed == 'Fast (21)' ? 0.030 : flowLineSpeed == 'Medium (34)' ? 0.020 : flowLineSpeed == 'Slow (55)' ? 0.012 : flowLineSpeed == 'Slower (100)' ? 0.008 : 0.005
+int   flowLineAdxLen        = 14
+int   flowLineAdxSmoothing  = 14
+float flowLineMinAdx        = flowLineSpeed == 'Fast (21)' ? 12.0 : flowLineSpeed == 'Medium (34)' ? 15.0 : flowLineSpeed == 'Slow (55)' ? 18.0 : flowLineSpeed == 'Slower (100)' ? 18.0 : 20.0
+
+// ═══════════════════════════════════════════════════════════════
+// RESOLVED TIMEFRAME
+// ═══════════════════════════════════════════════════════════════
+string structureTfResolved = structureTf == '' ? timeframe.period : structureTf
+bool   structureTfIsHigher = timeframe.in_seconds(structureTfResolved) > timeframe.in_seconds(timeframe.period)
+bool   invalidStructureTf  = timeframe.in_seconds(structureTfResolved) < timeframe.in_seconds(timeframe.period)
+bool   useConfirmedHtfData = nonRepaint and structureTfIsHigher
+
+// ═══════════════════════════════════════════════════════════════
+// ALL HELPER & STRENGTH FUNCTIONS
+// ═══════════════════════════════════════════════════════════════
+
+f_clamp_float(float value, float minVal, float maxVal) =>
+    math.max(minVal, math.min(maxVal, value))
+
+f_clamp_int(int value, int minVal, int maxVal) =>
+    math.max(minVal, math.min(maxVal, value))
+
+// ── OVERLAP TEST WITH ATR BUFFER ──
+// The base test is math.max(bot1,bot2) <= math.min(top1,top2): the two zones
+// share vertical space. Adding `buffer` to the right side widens the accepted
+// gap, so two zones separated by up to `buffer` in price are also treated as
+// overlapping. The math is symmetric regardless of which zone sits higher —
+// max(bot) <= min(top) + buffer is exactly "the gap between the zones is
+// <= buffer." At buffer 0 this collapses to the original <= test, including
+// the touching-counts edge, so a buffer of 0 is an exact no-op. nz() guards
+// against an na buffer silently disabling the block.
+f_zones_overlap(float top1, float bot1, float top2, float bot2, float buffer) =>
+    not na(top1) and not na(bot1) and not na(top2) and not na(bot2) and math.max(bot1, bot2) <= math.min(top1, top2) + nz(buffer)
+
+f_any_overlap_in_history(float candTop, float candBot, array<float> tops, array<float> bots, float buffer) =>
+    bool found = false
+    int n = array.size(tops)
+    if n > 0
+        for i = 0 to n - 1 by 1
+            if f_zones_overlap(candTop, candBot, array.get(tops, i), array.get(bots, i), buffer)
+                found := true
+    found
+
+f_is_strong(int score) =>
+    score >= strongZoneThreshold
+
+// ── HISTORICAL STRENGTH LABEL FILTER ──
+// Gates which past (non-active) zones receive a strength label when Show
+// Historical Strength Labels is on. 'All' passes every zone (original
+// behavior). 'Active Only' passes only unbroken zones. 'Broken Only' passes
+// only broken zones. This is an ADDITIONAL gate on top of the existing
+// broken-zone hide logic — a broken zone already hidden by the broken-zone
+// lookback stays hidden even under 'Broken Only'.
+f_hist_label_passes_filter(bool wasBroken) =>
+    historicalStrengthLabelFilter == 'All' or (historicalStrengthLabelFilter == 'Active Only' and not wasBroken) or (historicalStrengthLabelFilter == 'Broken Only' and wasBroken)
+
+// ── STRENGTH ARROW ──
+// Two independent readings in one glyph:
+//   DIRECTION = zone type: demand points up, supply points down.
+//   FILL      = strength: filled = strong, hollow = weak.
+//
+// Fill uses f_is_strong() — the same score >= strongZoneThreshold test that
+// drives the strong/weak zone COLORS — so the arrow fill always agrees with
+// the zone's color. Reads the live score, so it can flip as the zone ages.
+// A BROKEN zone shows no arrow at all: the zone is spent, so the strength
+// read is no longer actionable.
+//
+// Glyphs: ▲ filled-up (demand, strong)   △ hollow-up (demand, weak)
+//         ▼ filled-down (supply, strong) ▽ hollow-down (supply, weak)
+f_strength_arrow(bool isSupply, int score, bool broken) =>
+    if broken
+        ''
+    else
+        bool strong = f_is_strong(score)
+        if isSupply
+            strong ? ' ▼' : ' ▽'
+        else
+            strong ? ' ▲' : ' △'
+
+// Single source of truth for whether a given box extends to the chart edge.
+// In 'Off' nothing extends. In the two 'Extend All Zones' modes every visible
+// box extends. In the two 'Extend Active Zones' modes only the newest box on
+// each side extends, so the zone reaching the right edge is always the active
+// one. The (No Labels) variants differ only in label visibility, handled
+// separately by extendHideLabels.
+f_zone_extends(bool isActiveZone) =>
+    not extendZonesOff and (extendAllZones or isActiveZone)
+
+// ═══════════════════════════════════════════════════════════════
+// ROBUST TRIANGLE ANCHOR LOOKUP
+// Given a completed structure bar's open time, returns the chart-bar time
+// that actually printed that structure bar's high (or low). The buffers are
+// filled every bar in the STRUCTURE-BAR EXTREME TRACKING section below. Each
+// structure bar is pushed exactly once, so the match is unique. Passed the
+// arrays as parameters so this can live up here with the other helpers while
+// the buffers themselves are declared in VAR STATE.
+// ═══════════════════════════════════════════════════════════════
+f_lookup_extreme_time(int structBarTime, array<int> _sbTimes, array<int> _extTimes) =>
+    int result = na
+    int n = array.size(_sbTimes)
+    if n > 0 and not na(structBarTime)
+        for i = 0 to n - 1 by 1
+            if array.get(_sbTimes, i) == structBarTime
+                result := array.get(_extTimes, i)
+    result
+
+// ═══════════════════════════════════════════════════════════════
+// OPTIMIZATION: O(n) NEWER-BROKEN COUNTER
+// Replaces the six nested O(n^2) forward scans. For each index i this
+// produces the count of broken zones at indices j where i < j <= n-2 —
+// identical output to the original inner loops, computed in one reverse
+// pass instead of one scan per element. The active zone (index n-1) is
+// excluded from the count, matching the original `to count - 2` bound.
+// ═══════════════════════════════════════════════════════════════
+f_fill_newer_broken(array<bool> _broken, array<int> _out) =>
+    int n = array.size(_broken)
+    array.clear(_out)
+    if n > 0
+        for i = 0 to n - 1 by 1
+            array.push(_out, 0)
+        if n >= 2
+            int running = 0
+            for k = 0 to n - 2 by 1
+                int i = n - 2 - k
+                array.set(_out, i, running)
+                if array.get(_broken, i)
+                    running += 1
+
+// ═══════════════════════════════════════════════════════════════
+// BREAK-ORDER NEWER-BROKEN COUNTER
+// Parallel to f_fill_newer_broken but ranks by the order zones actually
+// BROKE (their stamped break-sequence number) rather than the order they
+// FORMED (their array index). For each broken historical zone i in 0..n-2 it
+// counts how many OTHER broken historical zones broke after it (a strictly
+// larger break-seq). The active zone (index n-1) is left at 0 so it is never
+// hidden by the historical logic, matching the formation-order pass. Runs only
+// on the draw bar, so the O(n^2) scan over n <= 51 zones is negligible.
+// ═══════════════════════════════════════════════════════════════
+f_fill_newer_broken_by_break_order(array<bool> _broken, array<int> _seq, array<int> _out) =>
+    int n = array.size(_broken)
+    array.clear(_out)
+    if n > 0
+        for i = 0 to n - 1 by 1
+            array.push(_out, 0)
+        if n >= 2
+            for i = 0 to n - 2 by 1
+                if array.get(_broken, i)
+                    int seqI = array.get(_seq, i)
+                    if not na(seqI)
+                        int cnt = 0
+                        for j = 0 to n - 2 by 1
+                            if j != i and array.get(_broken, j)
+                                int seqJ = array.get(_seq, j)
+                                if not na(seqJ) and seqJ > seqI
+                                    cnt += 1
+                        array.set(_out, i, cnt)
+
+f_zone_color(bool isSupply, bool isBroken, bool isHistorical, int score) =>
+    bool useBrokenColor = isBroken and (not isHistorical and colorActiveBrokenZones or isHistorical and colorHistoricalBrokenZones)
+    color baseColor = isSupply ? (f_is_strong(score) ? supplyZoneStrongColor : supplyZoneWeakColor) : (f_is_strong(score) ? demandZoneStrongColor : demandZoneWeakColor)
+    useBrokenColor ? (isSupply ? brokenSupplyZoneColor : brokenDemandZoneColor) : baseColor
+
+f_format_timeframe(string tf) =>
+    float numericTf = str.tonumber(tf)
+    if not na(numericTf)
+        int minutes = int(numericTf)
+        if minutes >= 1440 and minutes % 1440 == 0
+            int days = minutes / 1440
+            days == 1 ? '1 Day' : str.tostring(days) + ' Days'
+        else if minutes >= 60 and minutes % 60 == 0
+            int hours = minutes / 60
+            hours == 1 ? '1 Hr' : str.tostring(hours) + ' Hr'
+        else
+            minutes == 1 ? '1 Min' : str.tostring(minutes) + ' Min'
+    else
+        tf == 'D' ? '1 Day' : tf == 'W' ? '1 Week' : tf == 'M' ? '1 Month' : tf
+
+f_formation_volume(float volRatio) =>
+    na(volRatio) ? 0.0 : f_clamp_float(math.log(math.max(volRatio, 1.0)) / math.log(3.0), 0.0, 1.0)
+
+f_departure_velocity(float move, float atr) =>
+    na(move) or na(atr) or atr <= 0.0 ? 0.0 : f_clamp_float(math.log(move / atr + 1.0) / math.log(4.0), 0.0, 1.0)
+
+f_zone_purity(float o, float c, float h, float l) =>
+    float totalRange = h - l
+    float bodySize   = math.abs(c - o)
+    totalRange > 0.0 ? f_clamp_float(bodySize / totalRange, 0.0, 1.0) : 0.0
+
+f_endurance(int age) =>
+    age <= 0 ? 0.0 : f_clamp_float(math.log(age + 1.0) / math.log(51.0), 0.0, 1.0)
+
+f_recency_decay(int age) =>
+    if not useRecencyDecay or age <= 0
+        1.0
+    else
+        float halfLife = float(decayHalfLife)
+        f_clamp_float(math.pow(0.5, age / halfLife), 0.1, 1.0)
+
+f_touch_penalty(int wickTouches, int bodyTouches) =>
+    float wickPenalty = f_clamp_float(wickTouches * 0.05, 0.0, 0.3)
+    float bodyPenalty = bodyTouches <= 0 ? 0.0 : f_clamp_float(math.log(bodyTouches + 1.0) / math.log(6.0), 0.0, 1.0)
+    f_clamp_float(wickPenalty * wickTouchWeight + bodyPenalty * bodyTouchWeight, 0.0, 1.0)
+
+f_zone_strength_v2(float volRatio, float departureMove, float atr, float purity, int age, int wickTouches, int bodyTouches, bool broken) =>
+    if broken
+        1
+    else
+        float volScore      = f_formation_volume(volRatio)
+        float departScore   = f_departure_velocity(departureMove, atr)
+        float endureScore   = f_endurance(age)
+        float touchPen      = f_touch_penalty(wickTouches, bodyTouches)
+        float decay         = f_recency_decay(age)
+        float positiveScore = volScore * volumeWeight + departScore * departureWeight + purity * purityWeight + endureScore * enduranceWeight
+        float maxPossible   = volumeWeight + departureWeight + purityWeight + enduranceWeight
+        float maxPenalty    = wickTouchWeight * 0.3 + bodyTouchWeight
+        float rawScore      = positiveScore - touchPen * maxPenalty
+        float normalized    = maxPossible > 0 ? f_clamp_float(rawScore / maxPossible, 0.0, 1.0) : 0.0
+        f_clamp_int(int(math.round(1.0 + normalized * decay * 9.0)), 1, 10)
+
+f_supply_break_y(float candleLow, float zoneBot) =>
+    breakMarkerPositionInput == 'Zone' ? zoneBot : breakMarkerPositionInput == 'Candle' ? candleLow : math.min(candleLow, zoneBot)
+
+f_demand_break_y(float candleHigh, float zoneTop) =>
+    breakMarkerPositionInput == 'Zone' ? zoneTop : breakMarkerPositionInput == 'Candle' ? candleHigh : math.max(candleHigh, zoneTop)
+
+f_delete_label_array(array<label> _arr) =>
+    int arrCount = array.size(_arr)
+    if arrCount > 0
+        for i = 0 to arrCount - 1 by 1
+            label lb = array.get(_arr, i)
+            if not na(lb)
+                label.delete(lb)
+                array.set(_arr, i, na)
+
+f_delete_triangle_array(array<label> _arr) =>
+    int arrCount = array.size(_arr)
+    if arrCount > 0
+        for i = 0 to arrCount - 1 by 1
+            label lb = array.get(_arr, i)
+            if not na(lb)
+                label.delete(lb)
+        array.clear(_arr)
+
+// ═══════════════════════════════════════════════════════════════
+// VAR STATE
+// ═══════════════════════════════════════════════════════════════
+
+var float supplyTop = na
+var float supplyBot = na
+var float demandTop = na
+var float demandBot = na
+
+var box activeSupplyBox = na
+var box activeDemandBox = na
+
+var array<box>    supplyBoxes = array.new_box()
+var array<box>    demandBoxes = array.new_box()
+var array<float>  supplyZoneTops = array.new_float()
+var array<float>  supplyZoneBots = array.new_float()
+var array<float>  demandZoneTops = array.new_float()
+var array<float>  demandZoneBots = array.new_float()
+
+var array<label>  supplyHistoricalStrengthLabels = array.new_label()
+var array<label>  demandHistoricalStrengthLabels = array.new_label()
+// ── OPTIMIZATION: scores stored as ints, not text. The old code wrote
+//    '7/10' into a string array and then re-parsed it with str.split +
+//    str.tonumber for every box on every bar. f_score_from_text is gone.
+var array<int>    supplyHistoricalScores        = array.new_int()
+var array<int>    demandHistoricalScores        = array.new_int()
+var array<bool>   supplyHistoricalBrokenStates  = array.new_bool()
+var array<bool>   demandHistoricalBrokenStates  = array.new_bool()
+// ── Break-order tracking: a sequence number stamped on each zone at the exact
+//    moment it breaks. Drives the 'Break Order' lookback mode. na while unbroken.
+var array<int>    supplyHistoricalBreakSeq      = array.new_int()
+var array<int>    demandHistoricalBreakSeq      = array.new_int()
+var int           supplyBreakOrderCounter       = 0
+var int           demandBreakOrderCounter       = 0
+
+// ── OPTIMIZATION: reusable scratch arrays for the O(n) newer-broken pass ──
+var array<int>    supplyNewerBroken = array.new_int()
+var array<int>    demandNewerBroken = array.new_int()
+
+// ── ROBUST TRIANGLE ANCHOR: per-structure-bar extreme-time buffers.
+//    For every completed structure bar we record its open time plus the exact
+//    chart-bar time that printed its high and its low, so Fixed Pixel
+//    triangles can pin to the true extreme candle instead of the first
+//    sub-candle of the structure bar. Filled in the STRUCTURE-BAR EXTREME
+//    TRACKING section, read by f_lookup_extreme_time at zone creation.
+var array<int>    sbTimes     = array.new_int()
+var array<int>    sbLowTimes  = array.new_int()
+var array<int>    sbHighTimes = array.new_int()
+
+var label activeSupplyBreakArrow = na
+var label activeDemandBreakArrow = na
+var array<label> supplyBreakArrowLabels = array.new_label()
+var array<label> demandBreakArrowLabels = array.new_label()
+
+var array<label> supplyTriangleLabels = array.new_label()
+var array<label> demandTriangleLabels = array.new_label()
+
+// ── VOLUME PROFILE persistent drawings (no labels by design) ──
+var array<box>  vpBoxUp = array.new<box>()
+var array<box>  vpBoxDn = array.new<box>()
+var array<line> vpLines = array.new<line>()
+
+f_vp_wipe() =>
+    for b in vpBoxUp
+        box.delete(b)
+    for b in vpBoxDn
+        box.delete(b)
+    for l in vpLines
+        line.delete(l)
+    array.clear(vpBoxUp)
+    array.clear(vpBoxDn)
+    array.clear(vpLines)
+
+var int   lastProcessedSupplyPivotTime = na
+var int   lastProcessedDemandPivotTime = na
+var label invalidTfWarningLabel        = na
+var table infoBoxTable                 = na
+
+var int   activeSupplyStartBar   = na
+var int   activeDemandStartBar   = na
+var float activeSupplyVolRatio   = na
+var float activeDemandVolRatio   = na
+var float activeSupplyDeparture  = na
+var float activeDemandDeparture  = na
+var float activeSupplyPurity     = na
+var float activeDemandPurity     = na
+// ── FIX: ATR captured at zone formation. Scoring previously used the live
+//    atrValue, which moves on every tick of the forming bar and dragged the
+//    departure-velocity term (and therefore the whole score) with it. The
+//    departure move is measured at the pivot, so it must be normalized by the
+//    pivot's ATR — same timeframe AND same bar.
+var float activeSupplyAtrRef     = na
+var float activeDemandAtrRef     = na
+var int   supplyWickTouches      = 0
+var int   demandWickTouches      = 0
+var int   supplyBodyTouches      = 0
+var int   demandBodyTouches      = 0
+var bool  supplyWasWickInside    = false
+var bool  supplyWasBodyInside    = false
+var bool  demandWasWickInside    = false
+var bool  demandWasBodyInside    = false
+var bool  activeSupplyBroken     = false
+var bool  activeDemandBroken     = false
+var int   frozenSupplyScore      = na
+var int   frozenDemandScore      = na
+var label activeSupplyStrengthLabel = na
+var label activeDemandStrengthLabel = na
+
+// ═══════════════════════════════════════════════════════════════
+// TRIM HELPERS
+// ═══════════════════════════════════════════════════════════════
+
+f_trim_supply_triangles(int _maxCount) =>
+    while array.size(supplyTriangleLabels) > _maxCount
+        label oldTri = array.shift(supplyTriangleLabels)
+        if not na(oldTri)
+            label.delete(oldTri)
+
+f_trim_demand_triangles(int _maxCount) =>
+    while array.size(demandTriangleLabels) > _maxCount
+        label oldTri = array.shift(demandTriangleLabels)
+        if not na(oldTri)
+            label.delete(oldTri)
+
+f_trim_supply_history(int _maxCount) =>
+    while array.size(supplyBoxes) > _maxCount
+        box oldBox = array.shift(supplyBoxes)
+        if not na(oldBox)
+            box.delete(oldBox)
+        array.shift(supplyHistoricalScores)
+        array.shift(supplyHistoricalBrokenStates)
+        array.shift(supplyHistoricalBreakSeq)
+        label oldLabel = array.shift(supplyHistoricalStrengthLabels)
+        if not na(oldLabel)
+            label.delete(oldLabel)
+        if array.size(supplyBreakArrowLabels) > 0
+            label oldArrow = array.shift(supplyBreakArrowLabels)
+            if not na(oldArrow)
+                label.delete(oldArrow)
+        if array.size(supplyTriangleLabels) > 0
+            label oldTri = array.shift(supplyTriangleLabels)
+            if not na(oldTri)
+                label.delete(oldTri)
+        if array.size(supplyZoneTops) > 0
+            array.shift(supplyZoneTops)
+        if array.size(supplyZoneBots) > 0
+            array.shift(supplyZoneBots)
+
+f_trim_demand_history(int _maxCount) =>
+    while array.size(demandBoxes) > _maxCount
+        box oldBox = array.shift(demandBoxes)
+        if not na(oldBox)
+            box.delete(oldBox)
+        array.shift(demandHistoricalScores)
+        array.shift(demandHistoricalBrokenStates)
+        array.shift(demandHistoricalBreakSeq)
+        label oldLabel = array.shift(demandHistoricalStrengthLabels)
+        if not na(oldLabel)
+            label.delete(oldLabel)
+        if array.size(demandBreakArrowLabels) > 0
+            label oldArrow = array.shift(demandBreakArrowLabels)
+            if not na(oldArrow)
+                label.delete(oldArrow)
+        if array.size(demandTriangleLabels) > 0
+            label oldTri = array.shift(demandTriangleLabels)
+            if not na(oldTri)
+                label.delete(oldTri)
+        if array.size(demandZoneTops) > 0
+            array.shift(demandZoneTops)
+        if array.size(demandZoneBots) > 0
+            array.shift(demandZoneBots)
+
+// ═══════════════════════════════════════════════════════════════
+// STRUCTURE SERIES
+// The live request is used for repaint-allowed operation and whenever the
+// structure timeframe equals the chart timeframe. The confirmed request is
+// used only when Non-Repainting Mode is enabled on a higher structure TF.
+// It offsets every requested expression by one structure bar and pairs the
+// offset with lookahead_on, TradingView's documented pattern for retrieving
+// only completed higher-timeframe values without lookahead bias.
+// ═══════════════════════════════════════════════════════════════
+
+f_structure_series() =>
+    float _atr    = ta.atr(atrLen)
+    float _ph     = ta.pivothigh(high, leftBars, rightBars)
+    float _pl     = ta.pivotlow(low,  leftBars, rightBars)
+    float _volSMA = ta.sma(volume, volumeSMALen)
+    float _rsi    = ta.rsi(close, rsiLength)
+
+    int   _pivotBarIndex = bar_index - rightBars
+    int   _pivotBarTime  = time[rightBars]
+    float _pivotATR      = _atr[rightBars]
+    float _pivotVol      = volume[rightBars]
+    float _pivotVolSMA   = _volSMA[rightBars]
+    float _pivotRsi      = _rsi[rightBars]
+    float _pivotOpen     = open[rightBars]
+    float _pivotClose    = close[rightBars]
+    float _pivotHighVal  = high[rightBars]
+    float _pivotLowVal   = low[rightBars]
+
+    float _supDepart = not na(_ph) ? math.max(0.0, _ph - close) : na
+    float _demDepart = not na(_pl) ? math.max(0.0, close - _pl) : na
+
+    float _flowLine   = ta.ema(close, flowLineLen)
+    // ── FIX: slope averaged over a per-speed lookback window instead of a
+    //    single bar, so slow EMAs (100/200) aren't judged on one bar of noise ──
+    float _slope      = (_flowLine - _flowLine[flowLineSlopeLookback]) / flowLineSlopeLookback
+    float _slopeTh    = _atr * flowLineSlopeAtrMult
+    [_plusDI, _minusDI, _adx] = ta.dmi(flowLineAdxLen, flowLineAdxSmoothing)
+    bool _flowUp   = _slope >  _slopeTh and close > _flowLine and _adx >= flowLineMinAdx
+    bool _flowDown = _slope < -_slopeTh and close < _flowLine and _adx >= flowLineMinAdx
+
+    [_atr, _ph, _pl, _flowLine, _flowUp, _flowDown, _pivotBarIndex, _pivotBarTime, _pivotATR, _pivotVol, _pivotVolSMA, _pivotRsi, _pivotOpen, _pivotClose, _pivotHighVal, _pivotLowVal, _supDepart, _demDepart, high, low, close, time, bar_index]
+
+// Returns the same tuple as f_structure_series(), shifted back exactly one
+// bar in the requested context. With lookahead_on, these values become
+// available at the opening of the next structure bar, after the source bar
+// has fully closed and can no longer repaint.
+f_structure_series_confirmed() =>
+    [_atr, _ph, _pl, _flowLine, _flowUp, _flowDown, _pivotBarIndex, _pivotBarTime, _pivotATR, _pivotVol, _pivotVolSMA, _pivotRsi, _pivotOpen, _pivotClose, _pivotHighVal, _pivotLowVal, _supDepart, _demDepart, _high, _low, _close, _time, _barIndex] = f_structure_series()
+    [_atr[1], _ph[1], _pl[1], _flowLine[1], _flowUp[1], _flowDown[1], _pivotBarIndex[1], _pivotBarTime[1], _pivotATR[1], _pivotVol[1], _pivotVolSMA[1], _pivotRsi[1], _pivotOpen[1], _pivotClose[1], _pivotHighVal[1], _pivotLowVal[1], _supDepart[1], _demDepart[1], _high[1], _low[1], _close[1], _time[1], _barIndex[1]]
+
+[atrValue, pivotHigh, pivotLow, flowLine, flowLineUp, flowLineDown, pivotBarIndex, pivotBarTime, pivotATR, pivotVol, pivotVolSMA, pivotRsi, pivotOpen, pivotClose, pivotHighVal, pivotLowVal, supplyDepartureMove, demandDepartureMove, structureHigh, structureLow, structureClose, structureTime, structureBarIndex] = if useConfirmedHtfData
+    request.security(syminfo.tickerid, structureTfResolved, f_structure_series_confirmed(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+else
+    request.security(syminfo.tickerid, structureTfResolved, f_structure_series(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+// ═══════════════════════════════════════════════════════════════
+// STRUCTURE-BAR EXTREME TRACKING  (chart-side)
+// Fixed Pixel triangles attach to a chart candle via yloc.abovebar/belowbar.
+// On a higher structure TF the pivot's structure bar spans several chart
+// candles, and the platform attaches the marker to the FIRST sub-candle of
+// that structure bar — which is not necessarily the candle that printed the
+// structure high/low. The zone edge, meanwhile, is drawn at the true
+// structure pivot price, so the tip and the edge end up on different candles.
+//
+// This block records, for every COMPLETED structure bar, the exact chart-bar
+// time that set its high and its low. At zone creation the triangle is pinned
+// to that true extreme candle (see supplyTriX / demandTriX), so the tip lands
+// on the zone edge on every timeframe combination. It runs unconditionally,
+// independent of the zone engine, so it stays correct under Non-Repaint mode
+// and the confirmed-HTF shift. On an equal structure TF each structure bar is
+// a single chart bar, the snapshot maps that bar to itself, and behavior is
+// identical to the original.
+// ═══════════════════════════════════════════════════════════════
+int  sbMaxLen        = rightBars + 10
+int  chartStructTime = time(structureTfResolved)
+bool newStructPeriod = not na(chartStructTime) and not na(chartStructTime[1]) and chartStructTime != chartStructTime[1]
+
+var float curExtremeLow   = na
+var int   curExtremeLowT  = na
+var float curExtremeHigh  = na
+var int   curExtremeHighT = na
+
+if newStructPeriod
+    // The structure period that just ended is fully described by the tracker's
+    // previous-bar values. Push its snapshot, then reset for the new period.
+    if not na(curExtremeLowT[1]) and not na(chartStructTime[1])
+        array.push(sbTimes,     chartStructTime[1])
+        array.push(sbLowTimes,  curExtremeLowT[1])
+        array.push(sbHighTimes, curExtremeHighT[1])
+        while array.size(sbTimes) > sbMaxLen
+            array.shift(sbTimes)
+            array.shift(sbLowTimes)
+            array.shift(sbHighTimes)
+    curExtremeLow   := low
+    curExtremeLowT  := time
+    curExtremeHigh  := high
+    curExtremeHighT := time
+else
+    if na(curExtremeLow)
+        curExtremeLow   := low
+        curExtremeLowT  := time
+        curExtremeHigh  := high
+        curExtremeHighT := time
+    else
+        if low < curExtremeLow
+            curExtremeLow  := low
+            curExtremeLowT := time
+        if high > curExtremeHigh
+            curExtremeHigh  := high
+            curExtremeHighT := time
+
+// ═══════════════════════════════════════════════════════════════
+// BAR CONFIRMATION
+// For a higher structure timeframe in Non-Repainting Mode, the request
+// already contains only the previous completed structure bar, so it is
+// confirmed by construction. On the chart timeframe, barstate.isconfirmed
+// remains the correct close gate. barstate.isconfirmed cannot confirm data
+// inside request.security(), so it is deliberately not requested there.
+// ═══════════════════════════════════════════════════════════════
+bool structureBarConfirmed = useConfirmedHtfData or barstate.isconfirmed
+
+// A confirmed higher-timeframe tuple changes once, at the opening of the
+// next structure period. Equal-timeframe data is processed on every chart
+// bar, with the confirmation gate above controlling non-repainting actions.
+bool processStructureBar = not invalidStructureTf and (ta.change(structureTime) != 0 or not structureTfIsHigher)
+
+// ── FIX: single confirmation gate for every state mutation that feeds the
+//    strength score. On an equal structure TF this collapses to
+//    barstate.isconfirmed; on a higher structure TF in Non-Repaint mode
+//    structureBarConfirmed is true by construction, so it collapses to
+//    processStructureBar (one fire per structure period). With Non-Repaint
+//    off it collapses to processStructureBar, restoring live intrabar
+//    behavior. Break detection reuses this — the expression is identical to
+//    what confirmBreaksNow already evaluated.
+bool confirmStructureNow = processStructureBar and (not nonRepaint or structureBarConfirmed)
+
+// ═══════════════════════════════════════════════════════════════
+// FLOW LINE — chart TF fallback
+// ═══════════════════════════════════════════════════════════════
+float chartAtrValue    = ta.atr(atrLen)
+float chartFlowLine    = ta.ema(close, flowLineLen)
+// ── FIX: same lookback-averaged slope as the structure TF path ──
+float chartSlope       = (chartFlowLine - chartFlowLine[flowLineSlopeLookback]) / flowLineSlopeLookback
+float chartSlopeTh     = chartAtrValue * flowLineSlopeAtrMult
+[chartPlusDI, chartMinusDI, chartAdx] = ta.dmi(flowLineAdxLen, flowLineAdxSmoothing)
+bool chartFlowLineUp   = chartSlope >  chartSlopeTh and close > chartFlowLine and chartAdx >= flowLineMinAdx
+bool chartFlowLineDown = chartSlope < -chartSlopeTh and close < chartFlowLine and chartAdx >= flowLineMinAdx
+
+bool  useChartFlowLine        = flowLineTimeframeSource == 'Chart TF'
+float selectedFlowLine        = useChartFlowLine ? chartFlowLine   : flowLine
+bool  selectedAdvFlowLineUp   = useChartFlowLine ? chartFlowLineUp   : flowLineUp
+bool  selectedAdvFlowLineDown = useChartFlowLine ? chartFlowLineDown : flowLineDown
+bool  selectedFlowLineUp      = flowLineMode == 'Simple Line' ? close > selectedFlowLine : selectedAdvFlowLineUp
+bool  selectedFlowLineDown    = flowLineMode == 'Simple Line' ? close < selectedFlowLine : selectedAdvFlowLineDown
+float selectedFlowLineAtr     = useChartFlowLine ? chartAtrValue : atrValue
+bool  selectedFlowLineCanPlot = useChartFlowLine or not invalidStructureTf
+float flowLineUpperAtr        = selectedFlowLine + selectedFlowLineAtr * flowLineAtrMult
+float flowLineLowerAtr        = selectedFlowLine - selectedFlowLineAtr * flowLineAtrMult
+bool  showFlowLineAtrChannel  = showFlowLine and showAtrChannel and selectedFlowLineCanPlot and flowLineAtrMult > 0 and not na(selectedFlowLineAtr)
+color flowLineColor           = selectedFlowLineUp ? flowLineUpColor : selectedFlowLineDown ? flowLineDownColor : flowLineFlatColor
+
+// ═══════════════════════════════════════════════════════════════
+// ZONE CONDITION SIGNALS
+// ═══════════════════════════════════════════════════════════════
+bool  hasDemand = not na(pivotLow)
+bool  hasSupply = not na(pivotHigh)
+
+float candidateSupplyTop = hasSupply ? pivotHigh                        : na
+float candidateSupplyBot = hasSupply ? pivotHigh - pivotATR * zoneATRMult : na
+float candidateDemandBot = hasDemand ? pivotLow                         : na
+float candidateDemandTop = hasDemand ? pivotLow  + pivotATR * zoneATRMult : na
+
+// ── Triangle anchoring — mode-selectable (Fixed Pixel vs ATR) ──
+// The zone's price-facing edge IS the pivot bar's extreme: candidateSupplyTop
+// is pivotHigh and candidateDemandBot is pivotLow.
+//
+// Fixed Pixel: yloc.abovebar / yloc.belowbar pin the marker natively to the
+// bar's high/low. Combined with supplyTriX / demandTriX below, the marker is
+// pinned to the exact chart candle that printed the structure high/low, so
+// the tip touches the true zone edge even when the structure bar spans several
+// chart candles. The y value is ignored by those yloc modes (the edge is
+// passed as fallback).
+//
+// ATR: yloc.price places the marker by price. The gap is measured in ATR so
+// it scales with volatility and reads evenly across bars. triangleTipGapATR
+// pushes the marker outward (up for supply, down for demand); at 0 the marker
+// center sits on the edge. Tip position is an approximation and can drift a
+// hair at extreme zoom, since marker size is pixels while the gap is price.
+bool  triAnchorFixedPixel = triangleAnchorMode == 'Fixed Pixel'
+float triTipGap           = triAnchorFixedPixel or na(pivotATR) ? 0.0 : pivotATR * triangleTipGapATR
+float supplyTriangleY     = hasSupply ? candidateSupplyTop + triTipGap : na
+float demandTriangleY     = hasDemand ? candidateDemandBot - triTipGap : na
+string supplyTriangleYloc = triAnchorFixedPixel ? yloc.abovebar : yloc.price
+string demandTriangleYloc = triAnchorFixedPixel ? yloc.belowbar : yloc.price
+
+bool demandOK = false
+bool supplyOK = false
+if useVolumeFilter
+    demandOK := not na(pivotVolSMA) and pivotVolSMA > 0 and pivotVol >= pivotVolSMA * volumeMult
+    supplyOK := not na(pivotVolSMA) and pivotVolSMA > 0 and pivotVol >= pivotVolSMA * volumeMult
+else
+    demandOK := true
+    supplyOK := true
+
+bool demandRsiOK = not useRsiConfirm or not na(pivotRsi) and pivotRsi < rsiOversold
+bool supplyRsiOK = not useRsiConfirm or not na(pivotRsi) and pivotRsi > rsiOverbought
+
+bool newDemandRaw    = hasDemand and demandOK and demandRsiOK
+bool newSupplyRaw    = hasSupply  and supplyOK and supplyRsiOK
+
+// ── Non-repaint gate: require the bar to close before a zone confirms ──
+bool newDemandBaseRaw = processStructureBar and (nonRepaint ? newDemandRaw and structureBarConfirmed : newDemandRaw)
+bool newSupplyBaseRaw = processStructureBar and (nonRepaint ? newSupplyRaw and structureBarConfirmed : newSupplyRaw)
+
+bool newDemandBase = newDemandBaseRaw and not na(pivotBarTime) and (na(lastProcessedDemandPivotTime) or pivotBarTime != lastProcessedDemandPivotTime)
+bool newSupplyBase = newSupplyBaseRaw and not na(pivotBarTime) and (na(lastProcessedSupplyPivotTime) or pivotBarTime != lastProcessedSupplyPivotTime)
+
+// ── ATR-scaled overlap buffer. na(pivotATR) forces a clean 0.0 because
+//    na * anything is na in Pine, and a comparison against na evaluates
+//    falsy — which would silently disable the overlap block. The ternary
+//    guarantees the 0-default is an exact no-op. ──
+float overlapBuffer = na(pivotATR) ? 0.0 : pivotATR * overlapBufferATRMult
+
+bool blockNewSupplyForOverlap = false
+bool blockNewDemandForOverlap = false
+
+if disallowSameZoneOverlap
+    if useHistoricalOverlapEngine
+        blockNewSupplyForOverlap := blockNewSupplyForOverlap or f_any_overlap_in_history(candidateSupplyTop, candidateSupplyBot, supplyZoneTops, supplyZoneBots, overlapBuffer)
+        blockNewDemandForOverlap := blockNewDemandForOverlap or f_any_overlap_in_history(candidateDemandTop, candidateDemandBot, demandZoneTops, demandZoneBots, overlapBuffer)
+    else
+        blockNewSupplyForOverlap := blockNewSupplyForOverlap or f_zones_overlap(candidateSupplyTop, candidateSupplyBot, supplyTop, supplyBot, overlapBuffer)
+        blockNewDemandForOverlap := blockNewDemandForOverlap or f_zones_overlap(candidateDemandTop, candidateDemandBot, demandTop, demandBot, overlapBuffer)
+
+if disallowDifferentZoneOverlap
+    if useHistoricalOverlapEngine
+        blockNewSupplyForOverlap := blockNewSupplyForOverlap or f_any_overlap_in_history(candidateSupplyTop, candidateSupplyBot, demandZoneTops, demandZoneBots, overlapBuffer)
+        blockNewDemandForOverlap := blockNewDemandForOverlap or f_any_overlap_in_history(candidateDemandTop, candidateDemandBot, supplyZoneTops, supplyZoneBots, overlapBuffer)
+    else
+        blockNewSupplyForOverlap := blockNewSupplyForOverlap or f_zones_overlap(candidateSupplyTop, candidateSupplyBot, demandTop, demandBot, overlapBuffer)
+        blockNewDemandForOverlap := blockNewDemandForOverlap or f_zones_overlap(candidateDemandTop, candidateDemandBot, supplyTop, supplyBot, overlapBuffer)
+
+bool newSupply = not invalidStructureTf and newSupplyBase and not blockNewSupplyForOverlap
+bool newDemand = not invalidStructureTf and newDemandBase and not blockNewDemandForOverlap
+
+if not invalidStructureTf and newSupplyBase
+    lastProcessedSupplyPivotTime := pivotBarTime
+if not invalidStructureTf and newDemandBase
+    lastProcessedDemandPivotTime := pivotBarTime
+
+// ═══════════════════════════════════════════════════════════════
+// MARKER STYLE RESOLVERS
+// ═══════════════════════════════════════════════════════════════
+string arrowLabelSize    = breakArrowSize   == 'Tiny' ? size.tiny : breakArrowSize   == 'Small' ? size.small : breakArrowSize   == 'Normal' ? size.normal : breakArrowSize   == 'Large' ? size.large : size.huge
+string triangleLabelSize = triangleSizeInput == 'Tiny' ? size.tiny : triangleSizeInput == 'Small' ? size.small : triangleSizeInput == 'Normal' ? size.normal : triangleSizeInput == 'Large' ? size.large : size.huge
+string supplyArrowStyle = breakArrowShape == 'Arrow' ? label.style_arrowup    : breakArrowShape == 'Triangle' ? label.style_triangleup   : breakArrowShape == 'Circle'  ? label.style_circle  : breakArrowShape == 'Square'  ? label.style_square  : breakArrowShape == 'Diamond' ? label.style_diamond : breakArrowShape == 'Cross' ? label.style_cross : breakArrowShape == 'X Cross' ? label.style_xcross : label.style_flag
+string demandArrowStyle = breakArrowShape == 'Arrow' ? label.style_arrowdown  : breakArrowShape == 'Triangle' ? label.style_triangledown  : breakArrowShape == 'Circle'  ? label.style_circle  : breakArrowShape == 'Square'  ? label.style_square  : breakArrowShape == 'Diamond' ? label.style_diamond : breakArrowShape == 'Cross' ? label.style_cross : breakArrowShape == 'X Cross' ? label.style_xcross : label.style_flag
+
+// ═══════════════════════════════════════════════════════════════
+// CREATE SUPPLY ZONE
+// ═══════════════════════════════════════════════════════════════
+if newSupply
+    supplyTop := candidateSupplyTop
+    supplyBot := candidateSupplyBot
+
+    color initialSupplyColor = f_zone_color(true, false, false, 1)
+
+    if showZones
+        if not showHistoricalZones and not na(activeSupplyBox)
+            box.delete(activeSupplyBox)
+        activeSupplyBox := box.new(left = pivotBarTime, top = supplyTop, right = time, bottom = supplyBot, xloc = xloc.bar_time, bgcolor = color.new(initialSupplyColor, zoneTransparency), border_color = color.new(initialSupplyColor, 20))
+        if showHistoricalZones
+            array.push(supplyBoxes, activeSupplyBox)
+            array.push(supplyHistoricalScores, na)
+            array.push(supplyHistoricalBrokenStates, false)
+            array.push(supplyHistoricalBreakSeq, na)
+            array.push(supplyHistoricalStrengthLabels, na)
+            array.push(supplyBreakArrowLabels, na)
+            int prevIdx = array.size(supplyBreakArrowLabels) - 2
+            if prevIdx >= 0
+                label prevArrow = array.get(supplyBreakArrowLabels, prevIdx)
+                if na(prevArrow) and not na(activeSupplyBreakArrow)
+                    array.set(supplyBreakArrowLabels, prevIdx, activeSupplyBreakArrow)
+            activeSupplyBreakArrow := na
+            f_trim_supply_history(historicalZoneLookback + 1)
+
+    array.push(supplyZoneTops, supplyTop)
+    array.push(supplyZoneBots, supplyBot)
+    if not showHistoricalZones
+        while array.size(supplyZoneTops) > historicalZoneLookback
+            array.shift(supplyZoneTops)
+        while array.size(supplyZoneBots) > historicalZoneLookback
+            array.shift(supplyZoneBots)
+
+    activeSupplyStartBar  := pivotBarIndex
+    activeSupplyVolRatio  := not na(pivotVolSMA) and pivotVolSMA > 0 ? pivotVol / pivotVolSMA : na
+    activeSupplyDeparture := supplyDepartureMove
+    activeSupplyPurity    := f_zone_purity(pivotOpen, pivotClose, pivotHighVal, pivotLowVal)
+    activeSupplyAtrRef    := pivotATR
+    supplyWickTouches     := 0
+    supplyBodyTouches     := 0
+    supplyWasWickInside   := false
+    supplyWasBodyInside   := false
+    activeSupplyBroken    := false
+    frozenSupplyScore     := na
+
+    if not na(activeSupplyBreakArrow)
+        label.delete(activeSupplyBreakArrow)
+        activeSupplyBreakArrow := na
+
+    if showTriangles
+        if not showHistoricalZones
+            f_delete_triangle_array(supplyTriangleLabels)
+        // ── ROBUST ANCHOR: in Fixed Pixel mode pin the triangle to the exact
+        //    chart candle that printed this structure bar's HIGH (falling back
+        //    to the structure bar open time if the buffer has no entry yet).
+        //    ATR mode is price-anchored, so it keeps the structure bar column.
+        int supplyTriX = triAnchorFixedPixel ? nz(f_lookup_extreme_time(pivotBarTime, sbTimes, sbHighTimes), pivotBarTime) : pivotBarTime
+        label supplyTri = label.new(x = supplyTriX, y = supplyTriangleY, text = '', xloc = xloc.bar_time, style = label.style_triangledown, color = supplyTriangleColor, textcolor = color.white, size = triangleLabelSize, yloc = supplyTriangleYloc)
+        array.push(supplyTriangleLabels, supplyTri)
+        if showHistoricalZones
+            f_trim_supply_triangles(historicalZoneLookback + 1)
+
+// ═══════════════════════════════════════════════════════════════
+// CREATE DEMAND ZONE
+// ═══════════════════════════════════════════════════════════════
+if newDemand
+    demandBot := candidateDemandBot
+    demandTop := candidateDemandTop
+
+    color initialDemandColor = f_zone_color(false, false, false, 1)
+
+    if showZones
+        if not showHistoricalZones and not na(activeDemandBox)
+            box.delete(activeDemandBox)
+        activeDemandBox := box.new(left = pivotBarTime, top = demandTop, right = time, bottom = demandBot, xloc = xloc.bar_time, bgcolor = color.new(initialDemandColor, zoneTransparency), border_color = color.new(initialDemandColor, 20))
+        if showHistoricalZones
+            array.push(demandBoxes, activeDemandBox)
+            array.push(demandHistoricalScores, na)
+            array.push(demandHistoricalBrokenStates, false)
+            array.push(demandHistoricalBreakSeq, na)
+            array.push(demandHistoricalStrengthLabels, na)
+            array.push(demandBreakArrowLabels, na)
+            int prevDemandIdx = array.size(demandBreakArrowLabels) - 2
+            if prevDemandIdx >= 0
+                label prevDemandArrow = array.get(demandBreakArrowLabels, prevDemandIdx)
+                if na(prevDemandArrow) and not na(activeDemandBreakArrow)
+                    array.set(demandBreakArrowLabels, prevDemandIdx, activeDemandBreakArrow)
+            activeDemandBreakArrow := na
+            f_trim_demand_history(historicalZoneLookback + 1)
+
+    array.push(demandZoneTops, demandTop)
+    array.push(demandZoneBots, demandBot)
+    if not showHistoricalZones
+        while array.size(demandZoneTops) > historicalZoneLookback
+            array.shift(demandZoneTops)
+        while array.size(demandZoneBots) > historicalZoneLookback
+            array.shift(demandZoneBots)
+
+    activeDemandStartBar  := pivotBarIndex
+    activeDemandVolRatio  := not na(pivotVolSMA) and pivotVolSMA > 0 ? pivotVol / pivotVolSMA : na
+    activeDemandDeparture := demandDepartureMove
+    activeDemandPurity    := f_zone_purity(pivotOpen, pivotClose, pivotHighVal, pivotLowVal)
+    activeDemandAtrRef    := pivotATR
+    demandWickTouches     := 0
+    demandBodyTouches     := 0
+    demandWasWickInside   := false
+    demandWasBodyInside   := false
+    activeDemandBroken    := false
+    frozenDemandScore     := na
+
+    if not na(activeDemandBreakArrow)
+        label.delete(activeDemandBreakArrow)
+        activeDemandBreakArrow := na
+
+    if showTriangles
+        if not showHistoricalZones
+            f_delete_triangle_array(demandTriangleLabels)
+        // ── ROBUST ANCHOR: in Fixed Pixel mode pin the triangle to the exact
+        //    chart candle that printed this structure bar's LOW (falling back
+        //    to the structure bar open time if the buffer has no entry yet).
+        //    ATR mode is price-anchored, so it keeps the structure bar column.
+        int demandTriX = triAnchorFixedPixel ? nz(f_lookup_extreme_time(pivotBarTime, sbTimes, sbLowTimes), pivotBarTime) : pivotBarTime
+        label demandTri = label.new(x = demandTriX, y = demandTriangleY, text = '', xloc = xloc.bar_time, style = label.style_triangleup, color = demandTriangleColor, textcolor = color.white, size = triangleLabelSize, yloc = demandTriangleYloc)
+        array.push(demandTriangleLabels, demandTri)
+        if showHistoricalZones
+            f_trim_demand_triangles(historicalZoneLookback + 1)
+
+// ═══════════════════════════════════════════════════════════════
+// TOUCH DETECTION
+// ═══════════════════════════════════════════════════════════════
+bool supplyWickNow = false
+bool supplyBodyNow = false
+bool demandWickNow = false
+bool demandBodyNow = false
+
+if processStructureBar and not na(supplyTop) and not na(supplyBot)
+    supplyWickNow := structureHigh >= supplyBot and structureHigh <= supplyTop and structureClose < supplyBot
+    supplyBodyNow := structureClose >= supplyBot and structureClose <= supplyTop
+
+if processStructureBar and not na(demandTop) and not na(demandBot)
+    demandWickNow := structureLow <= demandTop and structureLow >= demandBot and structureClose > demandTop
+    demandBodyNow := structureClose >= demandBot and structureClose <= demandTop
+
+// ═══════════════════════════════════════════════════════════════
+// STRATEGY ENTRY SIGNALS — captured HERE, not after touch counting below.
+// "not demandWasWickInside" / "not supplyWasWickInside" must read last bar's
+// value -- the exact same edge-trigger the touch counters use to decide a
+// touch is a NEW touch. The counting block just below overwrites those
+// vars in place, so capturing the signal after that point would always see
+// this bar's own value and never fire. activeSupplyBroken/activeDemandBroken
+// are also read here, before today's break-detection block (further down)
+// can flip them -- so this correctly reflects "was this zone still good
+// coming into this touch," not "is it still good after this bar resolves."
+bool longZoneTouchSignal  = confirmStructureNow and not na(demandTop) and not na(demandBot) and demandWickNow and not demandWasWickInside and not activeDemandBroken
+bool shortZoneTouchSignal = confirmStructureNow and not na(supplyTop) and not na(supplyBot) and supplyWickNow and not supplyWasWickInside and not activeSupplyBroken
+
+// ═══════════════════════════════════════════════════════════════
+// FIX: TOUCH COUNTING DECOUPLED FROM "SHOW ZONES"
+// Gate on the zone's price levels (set unconditionally whenever a zone
+// forms) rather than on the boxes, which only exist when showZones is on.
+// ═══════════════════════════════════════════════════════════════
+if confirmStructureNow and not na(supplyTop) and not na(supplyBot)
+    if supplyWickNow and not supplyWasWickInside
+        supplyWickTouches := supplyWickTouches + 1
+    if supplyBodyNow and not supplyWasBodyInside
+        supplyBodyTouches := supplyBodyTouches + 1
+    supplyWasWickInside := supplyWickNow
+    supplyWasBodyInside := supplyBodyNow
+
+if confirmStructureNow and not na(demandTop) and not na(demandBot)
+    if demandWickNow and not demandWasWickInside
+        demandWickTouches := demandWickTouches + 1
+    if demandBodyNow and not demandWasBodyInside
+        demandBodyTouches := demandBodyTouches + 1
+    demandWasWickInside := demandWickNow
+    demandWasBodyInside := demandBodyNow
+
+// ═══════════════════════════════════════════════════════════════
+// BREAK DETECTION — ACTIVE ZONES
+// Runs every bar: this sets persistent state and must NOT be gated on
+// barstate.islast.
+// ═══════════════════════════════════════════════════════════════
+bool confirmBreaksNow = confirmStructureNow
+int  breakMarkerTime  = nonRepaint ? structureTime : time
+bool useWickBreakTrigger = brokenZoneTriggerInput == 'Wick'
+float supplyBreakPrice = useWickBreakTrigger ? structureHigh : structureClose
+float demandBreakPrice = useWickBreakTrigger ? structureLow  : structureClose
+
+if not invalidStructureTf and not na(supplyTop) and not na(supplyBot)
+    if confirmBreaksNow and supplyBreakPrice > supplyTop and not activeSupplyBroken
+        int supplyAgeAtBreak = math.max(0, structureBarIndex - activeSupplyStartBar)
+        frozenSupplyScore := f_zone_strength_v2(activeSupplyVolRatio, activeSupplyDeparture, nz(activeSupplyAtrRef, atrValue), activeSupplyPurity, supplyAgeAtBreak, supplyWickTouches, supplyBodyTouches, false)
+        activeSupplyBroken := true
+        if showHistoricalZones and array.size(supplyHistoricalBreakSeq) > 0
+            supplyBreakOrderCounter += 1
+            array.set(supplyHistoricalBreakSeq, array.size(supplyHistoricalBreakSeq) - 1, supplyBreakOrderCounter)
+        if showBreakArrows
+            float supplyBreakY = f_supply_break_y(structureLow, supplyBot)
+            activeSupplyBreakArrow := label.new(x = breakMarkerTime, y = supplyBreakY, text = '', xloc = xloc.bar_time, style = supplyArrowStyle, color = supplyBreakArrowColor, textcolor = color.white, size = arrowLabelSize, yloc = yloc.price)
+            if showHistoricalZones
+                int targetIdx = array.size(supplyBreakArrowLabels) - 1
+                if targetIdx >= 0
+                    label existingArrow = array.get(supplyBreakArrowLabels, targetIdx)
+                    if not na(existingArrow)
+                        label.delete(existingArrow)
+                    array.set(supplyBreakArrowLabels, targetIdx, activeSupplyBreakArrow)
+
+if not invalidStructureTf and not na(demandTop) and not na(demandBot)
+    if confirmBreaksNow and demandBreakPrice < demandBot and not activeDemandBroken
+        int demandAgeAtBreak = math.max(0, structureBarIndex - activeDemandStartBar)
+        frozenDemandScore := f_zone_strength_v2(activeDemandVolRatio, activeDemandDeparture, nz(activeDemandAtrRef, atrValue), activeDemandPurity, demandAgeAtBreak, demandWickTouches, demandBodyTouches, false)
+        activeDemandBroken := true
+        if showHistoricalZones and array.size(demandHistoricalBreakSeq) > 0
+            demandBreakOrderCounter += 1
+            array.set(demandHistoricalBreakSeq, array.size(demandHistoricalBreakSeq) - 1, demandBreakOrderCounter)
+        if showBreakArrows
+            float demandBreakY = f_demand_break_y(structureHigh, demandTop)
+            activeDemandBreakArrow := label.new(x = breakMarkerTime, y = demandBreakY, text = '', xloc = xloc.bar_time, style = demandArrowStyle, color = demandBreakArrowColor, textcolor = color.white, size = arrowLabelSize, yloc = yloc.price)
+            if showHistoricalZones
+                int targetIdx = array.size(demandBreakArrowLabels) - 1
+                if targetIdx >= 0
+                    label existingArrow = array.get(demandBreakArrowLabels, targetIdx)
+                    if not na(existingArrow)
+                        label.delete(existingArrow)
+                    array.set(demandBreakArrowLabels, targetIdx, activeDemandBreakArrow)
+
+// ═══════════════════════════════════════════════════════════════
+// UNIFIED HISTORICAL ZONE BREAK DETECTION
+// Also state-setting — stays per-bar. This is a single O(n) pass.
+// ═══════════════════════════════════════════════════════════════
+if not invalidStructureTf and confirmBreaksNow and showHistoricalZones
+    // ── Supply historical breaks ──
+    int histSupplyCount = array.size(supplyBoxes)
+    if histSupplyCount > 1
+        for i = 0 to histSupplyCount - 2 by 1
+            if not array.get(supplyHistoricalBrokenStates, i)
+                box bx = array.get(supplyBoxes, i)
+                if not na(bx)
+                    float histTop = box.get_top(bx)
+                    float histBot = box.get_bottom(bx)
+                    if not na(histTop) and supplyBreakPrice > histTop
+                        array.set(supplyHistoricalBrokenStates, i, true)
+                        supplyBreakOrderCounter += 1
+                        array.set(supplyHistoricalBreakSeq, i, supplyBreakOrderCounter)
+                        if showBreakArrows and showHistoricalBreakMarkers and showHistoricalBrokenZones
+                            label histBreakLbl = label.new(x = breakMarkerTime, y = f_supply_break_y(structureLow, histBot), text = '', xloc = xloc.bar_time, style = supplyArrowStyle, color = supplyBreakArrowColor, textcolor = color.white, size = arrowLabelSize, yloc = yloc.price)
+                            if array.size(supplyBreakArrowLabels) > i
+                                label existingArrow = array.get(supplyBreakArrowLabels, i)
+                                if not na(existingArrow)
+                                    label.delete(existingArrow)
+                                array.set(supplyBreakArrowLabels, i, histBreakLbl)
+
+    // ── Demand historical breaks ──
+    int histDemandCount = array.size(demandBoxes)
+    if histDemandCount > 1
+        for i = 0 to histDemandCount - 2 by 1
+            if not array.get(demandHistoricalBrokenStates, i)
+                box bx = array.get(demandBoxes, i)
+                if not na(bx)
+                    float histBot = box.get_bottom(bx)
+                    float histTop = box.get_top(bx)
+                    if not na(histBot) and demandBreakPrice < histBot
+                        array.set(demandHistoricalBrokenStates, i, true)
+                        demandBreakOrderCounter += 1
+                        array.set(demandHistoricalBreakSeq, i, demandBreakOrderCounter)
+                        if showBreakArrows and showHistoricalBreakMarkers and showHistoricalBrokenZones
+                            label histBreakLbl = label.new(x = breakMarkerTime, y = f_demand_break_y(structureHigh, histTop), text = '', xloc = xloc.bar_time, style = demandArrowStyle, color = demandBreakArrowColor, textcolor = color.white, size = arrowLabelSize, yloc = yloc.price)
+                            if array.size(demandBreakArrowLabels) > i
+                                label existingArrow = array.get(demandBreakArrowLabels, i)
+                                if not na(existingArrow)
+                                    label.delete(existingArrow)
+                                array.set(demandBreakArrowLabels, i, histBreakLbl)
+
+// ═══════════════════════════════════════════════════════════════
+// CURRENT STRENGTH SCORES
+// ── OPTIMIZATION: moved ABOVE the box-color block and computed once.
+//    The old code called f_zone_strength_v2 here AND again in the color
+//    block with identical arguments on the same bar.
+// ── Stays per-bar: the array.set calls below keep each zone's recorded
+//    score fresh right up to the moment a new zone displaces it.
+// ═══════════════════════════════════════════════════════════════
+string currentSupplyText  = ''
+string currentDemandText  = ''
+int    currentSupplyScore = na
+int    currentDemandScore = na
+
+if not invalidStructureTf and not na(activeSupplyStartBar) and not na(supplyTop)
+    int supplyAge = math.max(0, structureBarIndex - activeSupplyStartBar)
+    currentSupplyScore := activeSupplyBroken and not na(frozenSupplyScore) ? frozenSupplyScore : f_zone_strength_v2(activeSupplyVolRatio, activeSupplyDeparture, nz(activeSupplyAtrRef, atrValue), activeSupplyPurity, supplyAge, supplyWickTouches, supplyBodyTouches, false)
+    currentSupplyText  := str.tostring(currentSupplyScore) + '/10' + (showStrengthArrows ? f_strength_arrow(true, currentSupplyScore, activeSupplyBroken) : '')
+
+if not invalidStructureTf and not na(activeDemandStartBar) and not na(demandBot)
+    int demandAge = math.max(0, structureBarIndex - activeDemandStartBar)
+    currentDemandScore := activeDemandBroken and not na(frozenDemandScore) ? frozenDemandScore : f_zone_strength_v2(activeDemandVolRatio, activeDemandDeparture, nz(activeDemandAtrRef, atrValue), activeDemandPurity, demandAge, demandWickTouches, demandBodyTouches, false)
+    currentDemandText  := str.tostring(currentDemandScore) + '/10' + (showStrengthArrows ? f_strength_arrow(false, currentDemandScore, activeDemandBroken) : '')
+
+if not invalidStructureTf and showHistoricalZones and array.size(supplyBoxes) > 0
+    int lastSupplyIdx = array.size(supplyBoxes) - 1
+    array.set(supplyHistoricalScores,        lastSupplyIdx, currentSupplyScore)
+    array.set(supplyHistoricalBrokenStates,  lastSupplyIdx, activeSupplyBroken)
+
+if not invalidStructureTf and showHistoricalZones and array.size(demandBoxes) > 0
+    int lastDemandIdx = array.size(demandBoxes) - 1
+    array.set(demandHistoricalScores,        lastDemandIdx, currentDemandScore)
+    array.set(demandHistoricalBrokenStates,  lastDemandIdx, activeDemandBroken)
+
+// ═══════════════════════════════════════════════════════════════
+// STRATEGY ENTRIES
+// Runs every bar (not gated on barstate.islast -- this places real orders,
+// unlike everything in the DRAWING GATE section below). Placed here because
+// this is the first point where currentSupplyScore/currentDemandScore exist;
+// longZoneTouchSignal/shortZoneTouchSignal were captured earlier, before the
+// touch counters overwrote the "was inside" state they depend on.
+// ═══════════════════════════════════════════════════════════════
+bool allowLong  = strategyDirectionInput != 'Short Only'
+bool allowShort = strategyDirectionInput != 'Long Only'
+
+var float entryZoneBot = na
+var float entryZoneTop = na
+
+bool longEntrySignal  = not invalidStructureTf and allowLong  and strategy.position_size == 0 and longZoneTouchSignal  and not na(currentDemandScore) and currentDemandScore >= minEntryScoreInput
+bool shortEntrySignal = not invalidStructureTf and allowShort and strategy.position_size == 0 and shortZoneTouchSignal and not na(currentSupplyScore) and currentSupplyScore >= minEntryScoreInput
+
+if longEntrySignal
+    float stopPrice = demandBot - atrValue * stopBufferAtrMultInput
+    float riskPerUnit = close - stopPrice
+    if riskPerUnit > syminfo.mintick
+        float targetPrice = close + riskPerUnit * rewardRiskInput
+        entryZoneBot := demandBot
+        entryZoneTop := na
+        strategy.entry('Long', strategy.long, comment = 'Demand Zone Long')
+        strategy.exit('Long Zone Exit', from_entry = 'Long', stop = stopPrice, limit = targetPrice)
+
+if shortEntrySignal
+    float stopPrice = supplyTop + atrValue * stopBufferAtrMultInput
+    float riskPerUnit = stopPrice - close
+    if riskPerUnit > syminfo.mintick
+        float targetPrice = close - riskPerUnit * rewardRiskInput
+        entryZoneTop := supplyTop
+        entryZoneBot := na
+        strategy.entry('Short', strategy.short, comment = 'Supply Zone Short')
+        strategy.exit('Short Zone Exit', from_entry = 'Short', stop = stopPrice, limit = targetPrice)
+
+// ── Exit if the SPECIFIC zone the open trade is based on breaks, even before
+//    the ATR stop is hit. Checked against the stored entryZoneBot/entryZoneTop
+//    level directly (not activeDemandBroken/activeSupplyBroken), so this stays
+//    correct even if a newer zone has since formed and become "active" --
+//    the trade only cares about the zone it actually entered on. ──
+if exitOnZoneBreakInput and confirmBreaksNow
+    if strategy.position_size > 0 and not na(entryZoneBot) and demandBreakPrice < entryZoneBot
+        strategy.close('Long', comment = 'Entry Zone Broke')
+    if strategy.position_size < 0 and not na(entryZoneTop) and supplyBreakPrice > entryZoneTop
+        strategy.close('Short', comment = 'Entry Zone Broke')
+
+if strategy.position_size == 0
+    entryZoneBot := na
+    entryZoneTop := na
+
+// ═══════════════════════════════════════════════════════════════
+// DRAWING GATE
+// Everything below that only sets cosmetic properties (box colors, box
+// right edges, label positions) runs once, on the last bar. Drawing
+// objects retain whatever they were last set to, so every historical-bar
+// pass was overwritten by the next one and never seen. This is the same
+// reasoning TradingView documents for tables.
+// ═══════════════════════════════════════════════════════════════
+bool doDraw = barstate.islast and not invalidStructureTf
+
+// ── OPTIMIZATION: one O(n) reverse pass replaces six nested O(n^2) scans ──
+// ── Break Order routes to the parallel counter that ranks by stamped break
+//    sequence instead of array index; both fill the same output arrays, so
+//    every downstream hide decision reads them identically. ──
+if doDraw and showHistoricalZones
+    if brokenZoneLookbackMode == 'Break Order'
+        f_fill_newer_broken_by_break_order(supplyHistoricalBrokenStates, supplyHistoricalBreakSeq, supplyNewerBroken)
+        f_fill_newer_broken_by_break_order(demandHistoricalBrokenStates, demandHistoricalBreakSeq, demandNewerBroken)
+    else
+        f_fill_newer_broken(supplyHistoricalBrokenStates, supplyNewerBroken)
+        f_fill_newer_broken(demandHistoricalBrokenStates, demandNewerBroken)
+
+// ═══════════════════════════════════════════════════════════════
+// UPDATE ACTIVE BOX COLORS
+// ═══════════════════════════════════════════════════════════════
+if doDraw and not na(activeSupplyBox) and not na(currentSupplyScore)
+    color supplyBoxColor = f_zone_color(true, activeSupplyBroken, false, currentSupplyScore)
+    box.set_bgcolor(activeSupplyBox, color.new(supplyBoxColor, zoneTransparency))
+    box.set_border_color(activeSupplyBox, color.new(supplyBoxColor, 20))
+
+if doDraw and not na(activeDemandBox) and not na(currentDemandScore)
+    color demandBoxColor = f_zone_color(false, activeDemandBroken, false, currentDemandScore)
+    box.set_bgcolor(activeDemandBox, color.new(demandBoxColor, zoneTransparency))
+    box.set_border_color(activeDemandBox, color.new(demandBoxColor, 20))
+
+// ═══════════════════════════════════════════════════════════════
+// EXTEND ZONES TO CHART EDGE
+// Both the active boxes and the historical loop route through
+// f_zone_extends, so every mode is decided in one place. The
+// historical loop passes its own last-element test, because that element IS
+// the active box — without the index guard, 'Extend Active Zones' would
+// reset the active box to extend.none one line after extending it.
+// ═══════════════════════════════════════════════════════════════
+if doDraw and showZones
+    if not na(activeSupplyBox)
+        if f_zone_extends(true)
+            box.set_extend(activeSupplyBox, extend.right)
+        else
+            box.set_extend(activeSupplyBox, extend.none)
+            box.set_right(activeSupplyBox, time)
+    if not na(activeDemandBox)
+        if f_zone_extends(true)
+            box.set_extend(activeDemandBox, extend.right)
+        else
+            box.set_extend(activeDemandBox, extend.none)
+            box.set_right(activeDemandBox, time)
+
+    if showHistoricalZones
+        int extSupplyCount = array.size(supplyBoxes)
+        if extSupplyCount > 0
+            for ei = 0 to extSupplyCount - 1 by 1
+                box ebx = array.get(supplyBoxes, ei)
+                if not na(ebx)
+                    bool eBroken = array.get(supplyHistoricalBrokenStates, ei)
+                    int eNewerBroken = array.get(supplyNewerBroken, ei)
+                    if not (eBroken and (not showHistoricalBrokenZones or eNewerBroken >= brokenZoneLookback))
+                        if f_zone_extends(ei == extSupplyCount - 1)
+                            box.set_extend(ebx, extend.right)
+                        else
+                            box.set_extend(ebx, extend.none)
+                            box.set_right(ebx, time)
+
+        int extDemandCount = array.size(demandBoxes)
+        if extDemandCount > 0
+            for ei = 0 to extDemandCount - 1 by 1
+                box ebx = array.get(demandBoxes, ei)
+                if not na(ebx)
+                    bool eBroken = array.get(demandHistoricalBrokenStates, ei)
+                    int eNewerBroken = array.get(demandNewerBroken, ei)
+                    if not (eBroken and (not showHistoricalBrokenZones or eNewerBroken >= brokenZoneLookback))
+                        if f_zone_extends(ei == extDemandCount - 1)
+                            box.set_extend(ebx, extend.right)
+                        else
+                            box.set_extend(ebx, extend.none)
+                            box.set_right(ebx, time)
+
+// ═══════════════════════════════════════════════════════════════
+// UPDATE HISTORICAL BOX COLORS + BROKEN ZONE CLEANUP
+// ═══════════════════════════════════════════════════════════════
+if doDraw and showHistoricalZones
+    int supplyHistCount = array.size(supplyBoxes)
+    if supplyHistCount > 0
+        for i = 0 to supplyHistCount - 1 by 1
+            if i != supplyHistCount - 1
+                box bx = array.get(supplyBoxes, i)
+                bool wasBroken = array.get(supplyHistoricalBrokenStates, i)
+                int rawScore   = array.get(supplyHistoricalScores, i)
+                int histScore  = na(rawScore) ? 1 : rawScore
+                int newerBrokenCount = array.get(supplyNewerBroken, i)
+                bool hideBroken = wasBroken and (not showHistoricalBrokenZones or newerBrokenCount >= brokenZoneLookback)
+                if not na(bx)
+                    if hideBroken
+                        box.set_bgcolor(bx, color.new(color.black, 100))
+                        box.set_border_color(bx, color.new(color.black, 100))
+                        if array.size(supplyTriangleLabels) > i
+                            label tri = array.get(supplyTriangleLabels, i)
+                            if not na(tri)
+                                label.set_color(tri, color.new(color.black, 100))
+                                label.set_textcolor(tri, color.new(color.black, 100))
+                        if array.size(supplyBreakArrowLabels) > i
+                            label arw = array.get(supplyBreakArrowLabels, i)
+                            if not na(arw)
+                                label.delete(arw)
+                                array.set(supplyBreakArrowLabels, i, na)
+                        if array.size(supplyHistoricalStrengthLabels) > i
+                            label lbl = array.get(supplyHistoricalStrengthLabels, i)
+                            if not na(lbl)
+                                label.set_color(lbl, color.new(color.black, 100))
+                                label.set_textcolor(lbl, color.new(color.black, 100))
+                    else
+                        color bxColor = f_zone_color(true, wasBroken, true, histScore)
+                        box.set_bgcolor(bx, color.new(bxColor, zoneTransparency))
+                        box.set_border_color(bx, color.new(bxColor, 20))
+                        if array.size(supplyTriangleLabels) > i
+                            label tri = array.get(supplyTriangleLabels, i)
+                            if not na(tri)
+                                label.set_color(tri, supplyTriangleColor)
+                                label.set_textcolor(tri, color.white)
+                        if array.size(supplyBreakArrowLabels) > i
+                            label arw = array.get(supplyBreakArrowLabels, i)
+                            if not na(arw)
+                                label.set_color(arw, supplyBreakArrowColor)
+                                label.set_textcolor(arw, color.white)
+
+    int demandHistCount = array.size(demandBoxes)
+    if demandHistCount > 0
+        for i = 0 to demandHistCount - 1 by 1
+            if i != demandHistCount - 1
+                box bx = array.get(demandBoxes, i)
+                bool wasBroken = array.get(demandHistoricalBrokenStates, i)
+                int rawScore   = array.get(demandHistoricalScores, i)
+                int histScore  = na(rawScore) ? 1 : rawScore
+                int newerBrokenCount = array.get(demandNewerBroken, i)
+                bool hideBroken = wasBroken and (not showHistoricalBrokenZones or newerBrokenCount >= brokenZoneLookback)
+                if not na(bx)
+                    if hideBroken
+                        box.set_bgcolor(bx, color.new(color.black, 100))
+                        box.set_border_color(bx, color.new(color.black, 100))
+                        if array.size(demandTriangleLabels) > i
+                            label tri = array.get(demandTriangleLabels, i)
+                            if not na(tri)
+                                label.set_color(tri, color.new(color.black, 100))
+                                label.set_textcolor(tri, color.new(color.black, 100))
+                        if array.size(demandBreakArrowLabels) > i
+                            label arw = array.get(demandBreakArrowLabels, i)
+                            if not na(arw)
+                                label.delete(arw)
+                                array.set(demandBreakArrowLabels, i, na)
+                        if array.size(demandHistoricalStrengthLabels) > i
+                            label lbl = array.get(demandHistoricalStrengthLabels, i)
+                            if not na(lbl)
+                                label.set_color(lbl, color.new(color.black, 100))
+                                label.set_textcolor(lbl, color.new(color.black, 100))
+                    else
+                        color bxColor = f_zone_color(false, wasBroken, true, histScore)
+                        box.set_bgcolor(bx, color.new(bxColor, zoneTransparency))
+                        box.set_border_color(bx, color.new(bxColor, 20))
+                        if array.size(demandTriangleLabels) > i
+                            label tri = array.get(demandTriangleLabels, i)
+                            if not na(tri)
+                                label.set_color(tri, demandTriangleColor)
+                                label.set_textcolor(tri, color.white)
+                        if array.size(demandBreakArrowLabels) > i
+                            label arw = array.get(demandBreakArrowLabels, i)
+                            if not na(arw)
+                                label.set_color(arw, demandBreakArrowColor)
+                                label.set_textcolor(arw, color.white)
+
+// ═══════════════════════════════════════════════════════════════
+// ACTIVE STRENGTH LABELS
+// The anchor follows the same rule as the box. An extended box keeps its
+// stored right coordinate frozen at creation while rendering past it, so
+// box.get_right() would drop the tag inside the box instead of at its edge —
+// which is why the original code suppressed these labels rather than
+// repositioning them. Extended boxes tag at `time`, non-extended boxes tag
+// at their stored right edge, so the labels now work in all three modes.
+// ═══════════════════════════════════════════════════════════════
+string strengthLabelSize = strengthLabelSizeInput == 'Tiny' ? size.tiny : strengthLabelSizeInput == 'Normal' ? size.normal : strengthLabelSizeInput == 'Large' ? size.large : size.small
+string supplyStrengthLabelStyle = strengthLabelStyleInput == 'End of Zone' ? label.style_label_left : label.style_label_down
+string demandStrengthLabelStyle = strengthLabelStyleInput == 'End of Zone' ? label.style_label_left : label.style_label_up
+int    strengthLabelOffsetMs    = strengthLabelStyleInput == 'End of Zone' ? strengthLabelOffsetBars * timeframe.in_seconds(timeframe.period) * 1000 : 0
+
+if doDraw
+    if showZones and showEndOfZoneStrengthLabels and not extendHideLabels
+        if not na(activeSupplyBox) and currentSupplyText != '' and not na(currentSupplyScore)
+            int supplyLabelX = (f_zone_extends(true) ? time : box.get_right(activeSupplyBox)) + strengthLabelOffsetMs
+            color supplyLabelColor = f_zone_color(true, activeSupplyBroken, false, currentSupplyScore)
+            if na(activeSupplyStrengthLabel)
+                activeSupplyStrengthLabel := label.new(x = supplyLabelX, y = supplyTop, text = currentSupplyText, xloc = xloc.bar_time, style = supplyStrengthLabelStyle, color = supplyLabelColor, textcolor = color.white, size = strengthLabelSize)
+            else
+                label.set_x(activeSupplyStrengthLabel, supplyLabelX)
+                label.set_y(activeSupplyStrengthLabel, supplyTop)
+                label.set_text(activeSupplyStrengthLabel, currentSupplyText)
+                label.set_color(activeSupplyStrengthLabel, supplyLabelColor)
+                label.set_style(activeSupplyStrengthLabel, supplyStrengthLabelStyle)
+                label.set_size(activeSupplyStrengthLabel, strengthLabelSize)
+        else
+            if not na(activeSupplyStrengthLabel)
+                label.delete(activeSupplyStrengthLabel)
+                activeSupplyStrengthLabel := na
+
+        if not na(activeDemandBox) and currentDemandText != '' and not na(currentDemandScore)
+            int demandLabelX = (f_zone_extends(true) ? time : box.get_right(activeDemandBox)) + strengthLabelOffsetMs
+            color demandLabelColor = f_zone_color(false, activeDemandBroken, false, currentDemandScore)
+            if na(activeDemandStrengthLabel)
+                activeDemandStrengthLabel := label.new(x = demandLabelX, y = demandBot, text = currentDemandText, xloc = xloc.bar_time, style = demandStrengthLabelStyle, color = demandLabelColor, textcolor = color.white, size = strengthLabelSize)
+            else
+                label.set_x(activeDemandStrengthLabel, demandLabelX)
+                label.set_y(activeDemandStrengthLabel, demandBot)
+                label.set_text(activeDemandStrengthLabel, currentDemandText)
+                label.set_color(activeDemandStrengthLabel, demandLabelColor)
+                label.set_style(activeDemandStrengthLabel, demandStrengthLabelStyle)
+                label.set_size(activeDemandStrengthLabel, strengthLabelSize)
+        else
+            if not na(activeDemandStrengthLabel)
+                label.delete(activeDemandStrengthLabel)
+                activeDemandStrengthLabel := na
+    else
+        if not na(activeSupplyStrengthLabel)
+            label.delete(activeSupplyStrengthLabel)
+            activeSupplyStrengthLabel := na
+        if not na(activeDemandStrengthLabel)
+            label.delete(activeDemandStrengthLabel)
+            activeDemandStrengthLabel := na
+
+// ═══════════════════════════════════════════════════════════════
+// HISTORICAL STRENGTH LABELS
+// Anchor follows the same rule as the box: extended boxes tag at `time`,
+// non-extended boxes tag at their stored right edge. In 'Off' and 'Extend
+// Active Zones' the historical boxes are pinned to `time` anyway, so both
+// branches resolve to the same coordinate there.
+//
+// The 'Historical Label Filter' input gates WHICH past zones get a label:
+// All (every zone), Active Only (unbroken zones), or Broken Only (broken
+// zones). f_hist_label_passes_filter() is an additional gate layered on top
+// of the existing broken-zone hide logic, so a broken zone already hidden by
+// the broken-zone lookback stays hidden even under Broken Only. The else
+// branch deletes any label that no longer passes, so switching the filter
+// live cleans up stale tags on the next draw.
+// ═══════════════════════════════════════════════════════════════
+if doDraw
+    if showZones and showHistoricalZones and showEndOfZoneStrengthLabels and showHistoricalStrengthLabels and not extendHideLabels
+        int supplyCount = array.size(supplyBoxes)
+        if supplyCount > 0
+            for i = 0 to supplyCount - 1 by 1
+                bool isActiveSupply = i == supplyCount - 1
+                box bx      = array.get(supplyBoxes, i)
+                label lb    = array.get(supplyHistoricalStrengthLabels, i)
+                int rawScore = array.get(supplyHistoricalScores, i)
+                bool wasBroken = array.get(supplyHistoricalBrokenStates, i)
+                int sNewerBroken = array.get(supplyNewerBroken, i)
+                bool sHide = wasBroken and (not showHistoricalBrokenZones or sNewerBroken >= brokenZoneLookback)
+                if not isActiveSupply and not na(rawScore) and not sHide and f_hist_label_passes_filter(wasBroken)
+                    int labelX   = (f_zone_extends(false) ? time : box.get_right(bx)) + strengthLabelOffsetMs
+                    float labelY = box.get_top(bx)
+                    string txt = str.tostring(rawScore) + '/10' + (showStrengthArrows ? f_strength_arrow(true, rawScore, wasBroken) : '')
+                    color labelColor = f_zone_color(true, wasBroken, true, rawScore)
+                    if na(lb)
+                        lb := label.new(x = labelX, y = labelY, text = txt, xloc = xloc.bar_time, style = supplyStrengthLabelStyle, color = labelColor, textcolor = color.white, size = strengthLabelSize)
+                        array.set(supplyHistoricalStrengthLabels, i, lb)
+                    else
+                        label.set_x(lb, labelX)
+                        label.set_y(lb, labelY)
+                        label.set_text(lb, txt)
+                        label.set_color(lb, labelColor)
+                        label.set_style(lb, supplyStrengthLabelStyle)
+                        label.set_size(lb, strengthLabelSize)
+                else
+                    if not na(lb)
+                        label.delete(lb)
+                        array.set(supplyHistoricalStrengthLabels, i, na)
+
+        int demandCount = array.size(demandBoxes)
+        if demandCount > 0
+            for i = 0 to demandCount - 1 by 1
+                bool isActiveDemand = i == demandCount - 1
+                box bx      = array.get(demandBoxes, i)
+                label lb    = array.get(demandHistoricalStrengthLabels, i)
+                int rawScore = array.get(demandHistoricalScores, i)
+                bool wasBroken = array.get(demandHistoricalBrokenStates, i)
+                int dNewerBroken = array.get(demandNewerBroken, i)
+                bool dHide = wasBroken and (not showHistoricalBrokenZones or dNewerBroken >= brokenZoneLookback)
+                if not isActiveDemand and not na(rawScore) and not dHide and f_hist_label_passes_filter(wasBroken)
+                    int labelX   = (f_zone_extends(false) ? time : box.get_right(bx)) + strengthLabelOffsetMs
+                    float labelY = box.get_bottom(bx)
+                    string txt = str.tostring(rawScore) + '/10' + (showStrengthArrows ? f_strength_arrow(false, rawScore, wasBroken) : '')
+                    color labelColor = f_zone_color(false, wasBroken, true, rawScore)
+                    if na(lb)
+                        lb := label.new(x = labelX, y = labelY, text = txt, xloc = xloc.bar_time, style = demandStrengthLabelStyle, color = labelColor, textcolor = color.white, size = strengthLabelSize)
+                        array.set(demandHistoricalStrengthLabels, i, lb)
+                    else
+                        label.set_x(lb, labelX)
+                        label.set_y(lb, labelY)
+                        label.set_text(lb, txt)
+                        label.set_color(lb, labelColor)
+                        label.set_style(lb, demandStrengthLabelStyle)
+                        label.set_size(lb, strengthLabelSize)
+                else
+                    if not na(lb)
+                        label.delete(lb)
+                        array.set(demandHistoricalStrengthLabels, i, na)
+    else
+        f_delete_label_array(supplyHistoricalStrengthLabels)
+        f_delete_label_array(demandHistoricalStrengthLabels)
+
+// ═══════════════════════════════════════════════════════════════
+// VISIBILITY CLEANUP
+// ═══════════════════════════════════════════════════════════════
+if doDraw and not showBreakArrows
+    if not na(activeSupplyBreakArrow)
+        label.delete(activeSupplyBreakArrow)
+        activeSupplyBreakArrow := na
+    if not na(activeDemandBreakArrow)
+        label.delete(activeDemandBreakArrow)
+        activeDemandBreakArrow := na
+    f_delete_label_array(supplyBreakArrowLabels)
+    f_delete_label_array(demandBreakArrowLabels)
+
+if doDraw and not showTriangles
+    f_delete_triangle_array(supplyTriangleLabels)
+    f_delete_triangle_array(demandTriangleLabels)
+
+// ═══════════════════════════════════════════════════════════════
+// INVALID STRUCTURE TIMEFRAME WARNING
+// ═══════════════════════════════════════════════════════════════
+if invalidStructureTf and barstate.islast
+    string warnText = 'Chart TF Must Be <= Structure TF\nChart: ' + f_format_timeframe(timeframe.period) + ' | Structure: ' + f_format_timeframe(structureTfResolved)
+    if na(invalidTfWarningLabel)
+        invalidTfWarningLabel := label.new(x = time, y = high, text = warnText, xloc = xloc.bar_time, yloc = yloc.abovebar, style = label.style_label_down, color = color.red, textcolor = color.white, size = size.normal)
+    else
+        label.set_x(invalidTfWarningLabel, time)
+        label.set_y(invalidTfWarningLabel, high)
+        label.set_text(invalidTfWarningLabel, warnText)
+else if barstate.islast
+    if not na(invalidTfWarningLabel)
+        label.delete(invalidTfWarningLabel)
+        invalidTfWarningLabel := na
+
+// ═══════════════════════════════════════════════════════════════
+// INFO BOX
+// ═══════════════════════════════════════════════════════════════
+string infoBoxPosition = infoBoxPositionInput == 'Top Left' ? position.top_left : infoBoxPositionInput == 'Bottom Right' ? position.bottom_right : infoBoxPositionInput == 'Bottom Left' ? position.bottom_left : position.top_right
+string infoBoxTextSize = infoBoxTextSizeInput == 'Tiny' ? size.tiny : infoBoxTextSizeInput == 'Normal' ? size.normal : size.small
+bool showMediumInfoBox = infoBoxDetailInput == 'Medium' or infoBoxDetailInput == 'Large'
+bool showLargeInfoBox  = infoBoxDetailInput == 'Large'
+int  infoBoxRowCount   = showLargeInfoBox ? 21 : showMediumInfoBox ? 15 : 9
+
+if showInfoBox and barstate.islast
+    if na(infoBoxTable)
+        infoBoxTable := table.new(position = infoBoxPosition, columns = 2, rows = infoBoxRowCount, bgcolor = infoBoxBgColor, frame_color = infoBoxBorderColor, frame_width = 1, border_color = infoBoxBorderColor, border_width = 1)
+        table.merge_cells(infoBoxTable, 0, 0, 1, 0)
+
+    string modeText      = nonRepaint ? 'Non-Repaint ON' : 'Repaint Allowed'
+    string structureText = structureTf == '' ? 'Chart TF' : f_format_timeframe(structureTfResolved)
+    string chartText     = f_format_timeframe(timeframe.period)
+    string pivotText     = str.tostring(leftBars) + 'L / ' + str.tostring(rightBars) + 'R'
+    string zoneText      = str.tostring(zoneATRMult) + ' ATR'
+    // ── CHANGE: use the derived EMA length (single source of truth for the
+    //    plotted line) instead of the spelled-out flowLineSpeed input string.
+    string flowLineText  = showFlowLine ? str.tostring(flowLineLen) + ' / ' + (flowLineTimeframeSource == 'Structure TF' ? 'St' : 'Ch') + ' / ' + (flowLineMode == 'Advanced Line' ? 'Adv' : 'Sim') : 'OFF'
+    // ── Overlap buffer readout. Now a BASE row so it shows in every info box
+    //    size. Reads OFF when the buffer is 0 (the original literal-overlap
+    //    behavior) or when both overlap toggles are off, otherwise the active
+    //    ATR multiplier. ──
+    bool   overlapBufferLive = overlapBufferATRMult > 0 and (disallowSameZoneOverlap or disallowDifferentZoneOverlap)
+    string overlapBufferText = overlapBufferLive ? str.tostring(overlapBufferATRMult) + ' ATR' : 'OFF'
+    // ── Volume Profile readout. Reads OFF when the overlay is off, otherwise
+    //    lookback / source, where the source is the literal VP Timeframe label
+    //    ('Structure' or 'Chart') from the VP Timeframe input. ──
+    string vpText = showVolumeProfile ? str.tostring(vpLookback) + ' / ' + (vpUseChartTf ? 'Chart' : 'Structure') : 'OFF'
+
+    table.cell(infoBoxTable, 0, 0, 'Supply & Demand XL', text_color = infoBoxTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxHeaderBgColor, text_halign = text.align_center)
+    table.cell(infoBoxTable, 0, 1, 'Mode',        text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 1, 1, modeText,      text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 0, 2, 'Structure',   text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 1, 2, structureText, text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 0, 3, 'Chart',       text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 1, 3, chartText,     text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 0, 4, 'Pivots',      text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 1, 4, pivotText,     text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 0, 5, 'Zone',        text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 1, 5, zoneText,      text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 0, 6, 'Flow Line',   text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 1, 6, flowLineText,  text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 0, 7, 'Ovlp Buffer', text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 1, 7, overlapBufferText, text_color = infoBoxTextColor,  text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 0, 8, 'Vol Profile', text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+    table.cell(infoBoxTable, 1, 8, vpText,        text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+
+    if showMediumInfoBox
+        string histZonesText    = showHistoricalZones ? 'Shown' : 'Hidden'
+        string histLookbackText = showHistoricalZones ? str.tostring(historicalZoneLookback) : '--'
+        string histEngineText   = useHistoricalOverlapEngine ? 'ON' : 'OFF'
+        string histBrokenText   = showHistoricalBrokenZones  ? 'Shown' : 'Hidden'
+        string brLookbackText   = showHistoricalBrokenZones  ? str.tostring(brokenZoneLookback) + ' (' + (brokenZoneLookbackMode == 'Break Order' ? 'Break' : 'Form') + ')' : '--'
+        string brModeText       = brokenZoneTriggerInput
+        table.cell(infoBoxTable, 0, 9,  'Historical',    text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 1, 9,  histZonesText,   text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 0, 10, 'Hist Lookback', text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 1, 10, histLookbackText,text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 0, 11, 'Hist Engine',   text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 1, 11, histEngineText,  text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 0, 12, 'Hist Broken',   text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 1, 12, histBrokenText,  text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 0, 13, 'Br Lookback',   text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 1, 13, brLookbackText,  text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 0, 14, 'Br Mode',       text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 1, 14, brModeText,      text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+
+    if showLargeInfoBox
+        string sameOverlapText    = disallowSameZoneOverlap      ? 'Blocked' : 'Allowed'
+        string diffOverlapText    = disallowDifferentZoneOverlap ? 'Blocked' : 'Allowed'
+        string volumeFilterText   = useVolumeFilter ? 'ON' : 'OFF'
+        string volumeSettingsText = str.tostring(volumeSMALen) + ' SMA / ' + str.tostring(volumeMult) + 'x'
+        string rsiConfirmText     = useRsiConfirm   ? 'ON' : 'OFF'
+        string rsiLengthText      = str.tostring(rsiLength)
+        string rsiLevelsText      = str.tostring(rsiOverbought) + ' OB / ' + str.tostring(rsiOversold) + ' OS'
+        table.cell(infoBoxTable, 0, 15, 'Same Overlap',    text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 1, 15, sameOverlapText,   text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 0, 16, 'Cross Overlap',   text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 1, 16, diffOverlapText,   text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 0, 17, 'Vol Filter',      text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 1, 17, volumeFilterText,  text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 0, 18, 'Vol Settings',    text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 1, 18, volumeSettingsText,text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 0, 19, 'RSI Confirm',     text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 1, 19, rsiConfirmText,    text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 0, 20, 'RSI Levels',      text_color = infoBoxMutedTextColor, text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+        table.cell(infoBoxTable, 1, 20, rsiLevelsText,     text_color = infoBoxTextColor,      text_size = infoBoxTextSize, bgcolor = infoBoxBgColor)
+else if barstate.islast
+    if not na(infoBoxTable)
+        table.delete(infoBoxTable)
+        infoBoxTable := na
+
+// ═══════════════════════════════════════════════════════════════
+// VOLUME PROFILE — DATA (evaluated every bar)
+// The Timeframe input selects the source. Structure TF builds from the
+// Structure Timeframe, matching the zones and flow line; Chart TF
+// builds from the chart's own bars (the original behavior).
+//
+// STRUCTURE TF: OHLCV is requested with the same non-repaint pattern as the
+// zone engine — confirmed-shift + lookahead_on when Non-Repaint is on AND the
+// structure TF is higher, live values otherwise. A requested series is HELD
+// constant across the chart bars inside one structure bar, so indexing it with
+// [i] would count the same structure bar many times and inflate volume.
+// Instead one sample per structure bar is accumulated into arrays — the current
+// (forming) structure bar is updated in place and a fresh element is pushed when
+// a new structure bar opens. On an equal structure TF each chart bar is its own
+// structure bar, so this reduces to the original chart-based profile.
+//
+// CHART TF: the request result is ignored and raw chart OHLCV feeds the same
+// accumulator, pushing a fresh element every bar (vpIsNewBar is always true).
+// The last vpLookback elements are then exactly the last vpLookback chart bars,
+// identical to the original high[i]/low[i] loop. This path is valid even when
+// the chart TF is higher than the Structure TF, so the VP no longer goes dark
+// there. request.security is still called unconditionally (Pine requires it) but
+// its output is unused in this mode.
+// ═══════════════════════════════════════════════════════════════
+f_vp_htf_series() =>
+    [open, high, low, close, volume, time]
+
+f_vp_htf_series_confirmed() =>
+    [open[1], high[1], low[1], close[1], volume[1], time[1]]
+
+[vpHtfO, vpHtfH, vpHtfL, vpHtfC, vpHtfV, vpHtfT] = if useConfirmedHtfData
+    request.security(syminfo.tickerid, structureTfResolved, f_vp_htf_series_confirmed(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+else
+    request.security(syminfo.tickerid, structureTfResolved, f_vp_htf_series(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+// Source select: chart bars vs structure bars.
+float vpBarO = vpUseChartTf ? open   : vpHtfO
+float vpBarH = vpUseChartTf ? high   : vpHtfH
+float vpBarL = vpUseChartTf ? low    : vpHtfL
+float vpBarC = vpUseChartTf ? close  : vpHtfC
+float vpBarV = vpUseChartTf ? volume : vpHtfV
+int   vpBarT = vpUseChartTf ? time   : vpHtfT
+
+// Chart TF has no invalid-TF concept; Structure TF still requires a valid TF.
+bool vpActive = showVolumeProfile and (vpUseChartTf or not invalidStructureTf)
+
+var array<float> vpAccOpen   = array.new<float>()
+var array<float> vpAccHigh   = array.new<float>()
+var array<float> vpAccLow    = array.new<float>()
+var array<float> vpAccClose  = array.new<float>()
+var array<float> vpAccVolume = array.new<float>()
+
+// Chart TF: every bar is its own bar → always push. Structure TF: push on a new
+// structure-bar timestamp, update in place otherwise.
+bool vpIsNewBar = vpUseChartTf ? true : (not na(vpBarT) and (na(vpBarT[1]) or vpBarT != vpBarT[1]))
+
+if vpActive and not na(vpBarT) and not na(vpBarH) and not na(vpBarL)
+    if vpIsNewBar
+        array.push(vpAccOpen,   vpBarO)
+        array.push(vpAccHigh,   vpBarH)
+        array.push(vpAccLow,    vpBarL)
+        array.push(vpAccClose,  vpBarC)
+        array.push(vpAccVolume, vpBarV)
+    else
+        int vpLastIdx = array.size(vpAccHigh) - 1
+        if vpLastIdx >= 0
+            array.set(vpAccOpen,   vpLastIdx, vpBarO)
+            array.set(vpAccHigh,   vpLastIdx, vpBarH)
+            array.set(vpAccLow,    vpLastIdx, vpBarL)
+            array.set(vpAccClose,  vpLastIdx, vpBarC)
+            array.set(vpAccVolume, vpLastIdx, vpBarV)
+    int vpAccCap = vpLookback + 5
+    while array.size(vpAccHigh) > vpAccCap
+        array.shift(vpAccOpen)
+        array.shift(vpAccHigh)
+        array.shift(vpAccLow)
+        array.shift(vpAccClose)
+        array.shift(vpAccVolume)
+
+// ═══════════════════════════════════════════════════════════════
+// VOLUME PROFILE — MAIN (last bar only)
+// Combined-only: no per-day budget needed. Worst-case box use
+// (vpRows * 2) plus max zone boxes stays under the 500 pool. Range and
+// volume come from the accumulated bars of the selected VP Timeframe, so on
+// Structure TF the profile is consistent with the zones and identical to a
+// native chart on that TF, and on Chart TF it matches the original behavior.
+// ═══════════════════════════════════════════════════════════════
+if barstate.islast and vpActive
+    f_vp_wipe()
+
+    int   vpBarCount  = array.size(vpAccHigh)
+    int   vpUse       = math.min(vpLookback, vpBarCount)
+    int   vpStart     = vpBarCount - vpUse
+    float vpRangeHigh = na
+    float vpRangeLow  = na
+    if vpUse > 0
+        for i = vpStart to vpBarCount - 1
+            float hh = array.get(vpAccHigh, i)
+            float ll = array.get(vpAccLow,  i)
+            vpRangeHigh := na(vpRangeHigh) ? hh : math.max(vpRangeHigh, hh)
+            vpRangeLow  := na(vpRangeLow)  ? ll : math.min(vpRangeLow,  ll)
+
+    if vpUse > 0 and not na(vpRangeHigh) and not na(vpRangeLow) and vpRangeHigh > vpRangeLow
+        float rowH = (vpRangeHigh - vpRangeLow) / vpRows
+        array<float> upVol = array.new<float>(vpRows, 0.0)
+        array<float> dnVol = array.new<float>(vpRows, 0.0)
+        for i = vpStart to vpBarCount - 1
+            float bH = array.get(vpAccHigh, i)
+            float bL = array.get(vpAccLow,  i)
+            float bVol = nz(array.get(vpAccVolume, i))
+            float bRange = bH - bL
+            bool isUp = array.get(vpAccClose, i) >= array.get(vpAccOpen, i)
+            if bRange <= 0
+                int idx = math.max(0, math.min(vpRows - 1, int((array.get(vpAccClose, i) - vpRangeLow) / rowH)))
+                array.set(isUp ? upVol : dnVol, idx, array.get(isUp ? upVol : dnVol, idx) + bVol)
+            else
+                for r = 0 to vpRows - 1
+                    float rLow = vpRangeLow + r * rowH
+                    float rHigh = rLow + rowH
+                    float overlap = math.min(bH, rHigh) - math.max(bL, rLow)
+                    if overlap > 0
+                        array.set(isUp ? upVol : dnVol, r, array.get(isUp ? upVol : dnVol, r) + bVol * overlap / bRange)
+        float maxVol = 0.0
+        int   pocIdx = 0
+        float grandTot = 0.0
+        array<float> totVol = array.new<float>(vpRows, 0.0)
+        for r = 0 to vpRows - 1
+            float t = array.get(upVol, r) + array.get(dnVol, r)
+            array.set(totVol, r, t)
+            grandTot += t
+            if t > maxVol
+                maxVol := t
+                pocIdx := r
+        float vaSum = array.get(totVol, pocIdx)
+        int upPtr = pocIdx
+        int dnPtr = pocIdx
+        while vaSum < grandTot * vpVaPercent and (upPtr < vpRows - 1 or dnPtr > 0)
+            float va = upPtr < vpRows - 1 ? array.get(totVol, upPtr + 1) : -1.0
+            float vb = dnPtr > 0 ? array.get(totVol, dnPtr - 1) : -1.0
+            if va >= vb
+                upPtr += 1
+                vaSum += va
+            else
+                dnPtr -= 1
+                vaSum += vb
+        bool isRight = vpPlacement == 'Right'
+        int anchor = bar_index
+        for r = 0 to vpRows - 1
+            float rLow = vpRangeLow + r * rowH
+            float rHigh = rLow + rowH
+            float uV = array.get(upVol, r)
+            float dV = array.get(dnVol, r)
+            float tV = uV + dV
+            if tV > 0
+                int wTot = math.max(1, int(math.round(tV / maxVol * vpProfileWidth)))
+                if not vpSplitVol
+                    color col = uV >= dV ? vpUpColor : vpDownColor
+                    if isRight
+                        array.push(vpBoxUp, box.new(anchor + vpGap, rHigh, anchor + vpGap + wTot, rLow, xloc = xloc.bar_index, border_width = 0, bgcolor = col))
+                    else
+                        array.push(vpBoxUp, box.new(anchor - vpGap - wTot, rHigh, anchor - vpGap, rLow, xloc = xloc.bar_index, border_width = 0, bgcolor = col))
+                else
+                    int wUp = int(math.round(wTot * uV / tV))
+                    int wDn = wTot - wUp
+                    if isRight
+                        int base = anchor + vpGap
+                        if wDn > 0
+                            array.push(vpBoxDn, box.new(base, rHigh, base + wDn, rLow, xloc = xloc.bar_index, border_width = 0, bgcolor = vpDownColor))
+                        if wUp > 0
+                            array.push(vpBoxUp, box.new(base + wDn, rHigh, base + wDn + wUp, rLow, xloc = xloc.bar_index, border_width = 0, bgcolor = vpUpColor))
+                    else
+                        int base = anchor - vpGap
+                        if wDn > 0
+                            array.push(vpBoxDn, box.new(base - wDn, rHigh, base, rLow, xloc = xloc.bar_index, border_width = 0, bgcolor = vpDownColor))
+                        if wUp > 0
+                            array.push(vpBoxUp, box.new(base - wDn - wUp, rHigh, base - wDn, rLow, xloc = xloc.bar_index, border_width = 0, bgcolor = vpUpColor))
+        int lineL = isRight ? anchor + vpGap : anchor - vpGap - vpProfileWidth
+        int lineR = isRight ? anchor + vpGap + vpProfileWidth : anchor - vpGap
+        if vpShowPOC
+            float pocP = vpRangeLow + pocIdx * rowH + rowH / 2
+            array.push(vpLines, line.new(lineL, pocP, lineR, pocP, xloc = xloc.bar_index, color = vpPocColor, width = vpPocWidth, style = vpPocStyle))
+        if vpShowVA
+            float vah = vpRangeLow + (upPtr + 1) * rowH
+            float val = vpRangeLow + dnPtr * rowH
+            array.push(vpLines, line.new(lineL, vah, lineR, vah, xloc = xloc.bar_index, color = vpVaColor, width = vpVaWidth, style = vpVaStyle))
+            array.push(vpLines, line.new(lineL, val, lineR, val, xloc = xloc.bar_index, color = vpVaColor, width = vpVaWidth, style = vpVaStyle))
+else if barstate.islast
+    f_vp_wipe()
+
+// ═══════════════════════════════════════════════════════════════
+// FLOW LINE PLOTS
+// ═══════════════════════════════════════════════════════════════
+bool flAtrSolid  = flowLineAtrStyleInput == 'Solid'
+bool flAtrDashed = flowLineAtrStyleInput == 'Dashed'
+bool flAtrDotted = flowLineAtrStyleInput == 'Dotted'
+bool flDashOn    = bar_index % 8 < 4
+
+plot(showFlowLine and selectedFlowLineCanPlot ? selectedFlowLine : na, title = 'Flow Line', color = flowLineColor, linewidth = math.max(1, flowLineWidth), editable = false)
+plot(showFlowLineAtrChannel and flAtrSolid  ? flowLineUpperAtr : na, title = 'FL Upper Solid',  color = flowLineAtrColor, linewidth = flowLineAtrWidth, style = plot.style_line,    editable = false)
+plot(showFlowLineAtrChannel and flAtrSolid  ? flowLineLowerAtr : na, title = 'FL Lower Solid',  color = flowLineAtrColor, linewidth = flowLineAtrWidth, style = plot.style_line,    editable = false)
+plot(showFlowLineAtrChannel and flAtrDashed and flDashOn ? flowLineUpperAtr : na, title = 'FL Upper Dashed', color = flowLineAtrColor, linewidth = flowLineAtrWidth, style = plot.style_linebr, editable = false)
+plot(showFlowLineAtrChannel and flAtrDashed and flDashOn ? flowLineLowerAtr : na, title = 'FL Lower Dashed', color = flowLineAtrColor, linewidth = flowLineAtrWidth, style = plot.style_linebr, editable = false)
+plot(showFlowLineAtrChannel and flAtrDotted ? flowLineUpperAtr : na, title = 'FL Upper Dotted', color = flowLineAtrColor, linewidth = flowLineAtrWidth, style = plot.style_circles,  editable = false)
+plot(showFlowLineAtrChannel and flAtrDotted ? flowLineLowerAtr : na, title = 'FL Lower Dotted', color = flowLineAtrColor, linewidth = flowLineAtrWidth, style = plot.style_circles,  editable = false)
+
+// ═══════════════════════════════════════════════════════════════
+// ALERTS  (always last in file)
+// ═══════════════════════════════════════════════════════════════
+bool supplyBroke = not invalidStructureTf and not na(supplyTop) and not na(supplyBot) and processStructureBar and activeSupplyBroken and not activeSupplyBroken[1]
+bool demandBroke = not invalidStructureTf and not na(demandTop) and not na(demandBot) and processStructureBar and activeDemandBroken and not activeDemandBroken[1]
+
+alertcondition(not invalidStructureTf and newSupply,   title = 'New Supply Zone',    message = 'Supply zone formed — {{ticker}} {{interval}}')
+alertcondition(not invalidStructureTf and newDemand,   title = 'New Demand Zone',    message = 'Demand zone formed — {{ticker}} {{interval}}')
+alertcondition(not invalidStructureTf and supplyBroke, title = 'Supply Zone Broken', message = 'Supply zone broken — {{ticker}} {{interval}}')
+alertcondition(not invalidStructureTf and demandBroke, title = 'Demand Zone Broken', message = 'Demand zone broken — {{ticker}} {{interval}}')
+alertcondition(not invalidStructureTf and not na(supplyTop) and not na(supplyBot) and supplyWickNow and not supplyWasWickInside[1], title = 'Supply Zone Retouch', message = 'Supply zone retouched (wick) — {{ticker}} {{interval}}')
+alertcondition(not invalidStructureTf and not na(demandTop) and not na(demandBot) and demandWickNow and not demandWasWickInside[1], title = 'Demand Zone Retouch', message = 'Demand zone retouched (wick) — {{ticker}} {{interval}}')

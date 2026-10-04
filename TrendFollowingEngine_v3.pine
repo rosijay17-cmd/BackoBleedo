@@ -1,0 +1,890 @@
+//@version=6
+indicator("Trend Following Engine v3 - Non-Repainting Continuation", overlay=true, max_labels_count=500)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+groupCore = "Core Settings"
+atrLen   = input.int(14, "ATR Length", group=groupCore)
+adxLen   = input.int(14, "ADX Length", group=groupCore)
+rvolLen  = input.int(50, "RVOL Median Length", group=groupCore)
+emaLen   = input.int(50, "EMA Length For RAP", group=groupCore)
+slopeLen = input.int(10, "VWAP / HTF Slope Length", group=groupCore)
+effLen   = input.int(20, "Trend Efficiency Length", group=groupCore)
+
+groupTrend = "Trend Logic"
+adxTrendMin      = input.float(22.0, "Min ADX For Trend", group=groupTrend)
+rangeEffTrendMin = input.float(0.28, "Min Trend Efficiency", group=groupTrend)
+rvolTrendMin     = input.float(0.65, "Min RVOL", group=groupTrend)
+trendScoreFire   = input.int(75, "Continuation Score Fire (0-100)", group=groupTrend)
+adxPullbackTolerance = input.float(1.0, "ADX Pullback Weakening Tolerance", group=groupTrend, tooltip="Pullback setups tolerate ADX falling by up to this many points/bar. Breakout setups always require ADX to be rising.")
+
+useHtf = input.bool(true, "Use HTF Direction Filter", group=groupTrend)
+htfTf  = input.string("60", "HTF Timeframe", group=groupTrend, options=["15","30","60","240","D"])
+
+groupNorm = "Normalization Bounds"
+adxNormLo   = input.float(15.0, "ADX Norm Low", group=groupNorm)
+adxNormHi   = input.float(35.0, "ADX Norm High", group=groupNorm)
+effNormLo   = input.float(0.15, "Trend Efficiency Norm Low", group=groupNorm)
+effNormHi   = input.float(0.55, "Trend Efficiency Norm High", group=groupNorm)
+rvolNormLo  = input.float(0.50, "RVOL Norm Low", group=groupNorm)
+rvolNormHi  = input.float(2.00, "RVOL Norm High", group=groupNorm)
+diSepNormLo = input.float(0.05, "DI Separation Norm Low", group=groupNorm)
+diSepNormHi = input.float(0.35, "DI Separation Norm High", group=groupNorm)
+slopeNormLo = input.float(0.05, "Slope Norm Low", group=groupNorm)
+slopeNormHi = input.float(0.40, "Slope Norm High", group=groupNorm)
+momNormLo   = input.float(0.10, "Momentum Norm Low", group=groupNorm)
+momNormHi   = input.float(0.80, "Momentum Norm High", group=groupNorm)
+
+groupMisprice = "Relative Accepted Mispricing"
+misRich    = input.float(1.50, "Rich/Cheap Threshold", group=groupMisprice)
+misExtreme = input.float(2.50, "Extreme Threshold", group=groupMisprice)
+
+groupPullback = "Pullback Setup"
+pullbackLookbackLen  = input.int(5, "Pullback Interaction Lookback (bars)", group=groupPullback)
+maxLongExtPullback   = input.float(1.25, "Max Long RAP-Distance (ATR) — Pullback", group=groupPullback)
+maxShortExtPullback  = input.float(1.25, "Max Short RAP-Distance (ATR) — Pullback", group=groupPullback)
+
+groupBreakout = "Breakout Setup"
+breakoutLookbackLen = input.int(20, "Breakout Rolling High/Low Length", group=groupBreakout)
+breakoutRvolMin      = input.float(1.20, "Min RVOL For Breakout", group=groupBreakout)
+maxLongExtBreakout  = input.float(2.00, "Max Long RAP-Distance (ATR) — Breakout", group=groupBreakout)
+maxShortExtBreakout = input.float(2.00, "Max Short RAP-Distance (ATR) — Breakout", group=groupBreakout)
+
+groupVolume = "Relative Volume"
+useRvolFilter = input.bool(true, "Require RVOL Filter", group=groupVolume)
+
+groupRAP = "RAP Blend (VWAP + EMA)"
+rapVwapWeight              = input.float(0.60, "VWAP Weight (0-1)", minval=0.0, maxval=1.0, group=groupRAP)
+minSessionBarsForFullVWAP  = input.int(20, "Min Session Bars For Full VWAP Weight", minval=1, group=groupRAP)
+
+groupVol = "Volatility Regime & Shock Filter"
+atrPctLen        = input.int(100, "ATR% Percentile Lookback", group=groupVol)
+lowVolPctThresh  = input.float(25.0, "Low-Vol Percentile Threshold", group=groupVol)
+highVolPctThresh = input.float(75.0, "High-Vol Percentile Threshold", group=groupVol)
+shockATRMult     = input.float(3.0, "Shock Bar True-Range / ATR Multiple", group=groupVol)
+shockBlockBars   = input.int(5, "Bars To Block New Entries After Shock", group=groupVol)
+
+groupRisk = "Risk Management"
+stopATRBuffer        = input.float(0.25, "Stop ATR Buffer", group=groupRisk)
+structuralStopLookback = input.int(5, "Structural Stop Lookback (bars)", group=groupRisk)
+rrMultiple           = input.float(2.0, "Reward:Risk Multiple", group=groupRisk)
+cooldownBars         = input.int(6, "Cooldown Bars (Long And Short Tracked Independently)", group=groupRisk, minval=0)
+maxHoldingBars       = input.int(60, "Max Holding Period (bars) Before Expiration", group=groupRisk, minval=1)
+
+groupAlerts = "Alerts"
+enableAlerts      = input.bool(true, "Enable alert() Calls", group=groupAlerts)
+alertOnBarClose   = input.bool(true, "Alert Frequency: Once Per Bar Close", group=groupAlerts)
+alertWatchSignals = input.bool(false, "Alert Watch Contexts Too", group=groupAlerts)
+
+groupDisplay = "Display"
+showTable            = input.bool(true, "Show Dashboard", group=groupDisplay)
+dashboardPos         = input.string("Top Right", "Dashboard Position", group=groupDisplay, options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
+showSignals          = input.bool(true, "Show Signals", group=groupDisplay)
+showBG               = input.bool(true, "Color Background (Trend Favor)", group=groupDisplay)
+showBands            = input.bool(true, "Show RAP Bands", group=groupDisplay)
+showFrozenLevels     = input.bool(true, "Plot Frozen Stop / Target", group=groupDisplay)
+showIntrabarPreview  = input.bool(false, "Show Intrabar Preview Markers (Display Only, Not Alerted)", group=groupDisplay)
+
+groupResearch = "Outcome Tracking (Indicator Only — Not Strategy Tester)"
+enableOutcomeTracking = input.bool(false, "Track Fired-Signal Outcomes", group=groupResearch, tooltip="Approximate research counters based on this indicator's own frozen levels. Not equivalent to TradingView Strategy Tester fills, slippage, or commission modeling.")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// COLOR PALETTE (strict semantic rules)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Blue   = bullish favor (always)
+// Purple = bearish favor (always) — never red for bearish bias/tape/HTF/score/setup
+// Red    = danger, invalidation, stop, blocked, error, failed-condition ONLY
+// Green  = ready / valid / confirmed neutral-positive operational state
+// Orange = watch / caution / cooldown / mixed / transitional
+// Gray   = neutral / inactive
+color COL_BULL    = color.rgb(0, 140, 255)
+color COL_BEAR    = color.rgb(160, 90, 255)
+color COL_DANGER  = color.rgb(255, 50, 70)
+color COL_READY   = color.rgb(0, 180, 100)
+color COL_WATCH   = color.rgb(255, 150, 40)
+color COL_NEUTRAL = color.gray
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HELPER FUNCTIONS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+f_clamp(_v) =>
+    math.max(0.0, math.min(1.0, _v))
+
+f_norm(_v, _lo, _hi) =>
+    _hi > _lo ? f_clamp((_v - _lo) / (_hi - _lo)) : 0.0
+
+f_dirColor(_bull, _bear) =>
+    _bull ? COL_BULL : _bear ? COL_BEAR : COL_NEUTRAL
+
+f_readyColor(_ok) =>
+    _ok ? COL_READY : COL_WATCH
+
+f_blockColor(_txt) =>
+    _txt == "CLEAR"    ? COL_READY :
+     _txt == "COOLDOWN" ? COL_WATCH :
+     COL_DANGER
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// CORE MEASURES
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+atr = ta.atr(atrLen)
+
+emaRAP = ta.ema(close, emaLen)
+
+// Session-aware VWAP weighting: ramp VWAP influence up from zero at the
+// start of a new session to full configured weight after N session bars.
+var int sessionBarCount = 0
+bool newSession = ta.change(time("D")) != 0
+if newSession
+    sessionBarCount := 1
+else
+    sessionBarCount += 1
+
+vwapVal = ta.vwap(hlc3)
+bool vwapValid = not na(vwapVal)
+
+float vwapRampFrac = minSessionBarsForFullVWAP > 0 ? f_clamp(sessionBarCount / float(minSessionBarsForFullVWAP)) : 1.0
+float vwapWeightEff = rapVwapWeight * vwapRampFrac
+float emaWeightEff  = 1.0 - vwapWeightEff
+
+float rap = vwapValid ? vwapVal * vwapWeightEff + emaRAP * emaWeightEff : emaRAP
+
+float ramZ = atr > 0 ? (close - rap) / atr : 0.0
+
+// Relative volume via median baseline with safe fallback.
+float volMedian     = ta.percentile_nearest_rank(volume, rvolLen, 50)
+bool  volumeDataOK  = not na(volume) and not na(volMedian) and volMedian > 0
+bool  rvolActive    = useRvolFilter and volumeDataOK
+float rvol          = volumeDataOK ? volume / volMedian : 1.0
+bool  rvolTrendOK   = not rvolActive or rvol >= rvolTrendMin
+string rvolBypassLabel =
+     not useRvolFilter ? "OFF" :
+     not volumeDataOK  ? "NO DATA" :
+     "ACTIVE"
+
+[plusDI, minusDI, adx] = ta.dmi(adxLen, adxLen)
+
+float adxDelta   = adx - adx[1]
+bool  adxRising  = adxDelta > 0.0
+bool  adxStableForPullback = adxDelta >= -adxPullbackTolerance
+string adxDirText =
+     adxDelta > 0.05  ? "RISING" :
+     adxDelta < -0.05 ? "FALLING" :
+     "FLAT"
+
+float diSum = plusDI + minusDI
+float diSepRaw = diSum > 0 ? math.abs(plusDI - minusDI) / diSum : 0.0
+
+vwapSlope     = vwapVal - vwapVal[slopeLen]
+vwapSlopeNorm = atr > 0 and vwapValid ? vwapSlope / atr : 0.0
+
+// Kaufman-style trend efficiency: net move / sum of absolute bar-to-bar moves.
+bool  effReady    = bar_index >= effLen
+float absChange   = math.abs(close - close[1])
+float sumAbsMove  = math.sum(absChange, effLen)
+float netMoveEff  = effReady ? math.abs(close - close[effLen]) : 0.0
+float rangeEff    = effReady and sumAbsMove > 0 ? netMoveEff / sumAbsMove : 0.0
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HTF TREND ANCHOR — single non-repainting request, confirmed prior bar
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+int htfSecondsRaw   = timeframe.in_seconds(htfTf)
+int chartSecondsRaw = timeframe.in_seconds(timeframe.period)
+bool htfValid       = htfSecondsRaw > chartSecondsRaw
+bool htfFilterActive = useHtf and htfValid
+
+[htfCloseC, htfEma20C, htfAtrC, htfSlopeRawC] = request.security(
+     syminfo.tickerid,
+     htfTf,
+     [close[1], ta.ema(close, 20)[1], ta.atr(atrLen)[1], (close - close[slopeLen])[1]],
+     gaps      = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_on)
+
+float htfClose = htfCloseC
+float htfEma20 = htfEma20C
+float htfAtr   = htfAtrC
+float htfSlopeRaw = htfSlopeRawC
+
+float htfSlopeNorm = htfAtr > 0 ? htfSlopeRaw / htfAtr : 0.0
+
+bool htfBull = htfValid and htfClose > htfEma20 and htfSlopeNorm > 0.0
+bool htfBear = htfValid and htfClose < htfEma20 and htfSlopeNorm < 0.0
+
+bool longAllowed  = not htfFilterActive or htfBull
+bool shortAllowed = not htfFilterActive or htfBear
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// VOLATILITY REGIME & SHOCK FILTER
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float atrPct     = close > 0 ? atr / close * 100.0 : na
+float atrPctRank = ta.percentrank(atrPct, atrPctLen)
+
+string volRegime =
+     na(atrPctRank)                    ? "N/A" :
+     atrPctRank <= lowVolPctThresh     ? "LOW" :
+     atrPctRank >= highVolPctThresh    ? "HIGH" :
+     "NORMAL"
+
+float trueRangeNow = ta.tr(true)
+bool  isShockBar    = atr > 0 and trueRangeNow >= atr * shockATRMult
+
+var int lastShockBar = na
+if isShockBar
+    lastShockBar := bar_index
+
+int  barsSinceShock   = na(lastShockBar) ? 1000000 : bar_index - lastShockBar
+bool shockBlockActive = barsSinceShock < shockBlockBars
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// MISPRICE LABEL (diagnostic distance, not directional favor)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+string mispriceLabel =
+     ramZ >= misExtreme  ? "EXT RICH" :
+     ramZ >= misRich     ? "RICH" :
+     ramZ <= -misExtreme ? "EXT CHEAP" :
+     ramZ <= -misRich    ? "CHEAP" :
+     "FAIR"
+
+color mispriceColor =
+     ramZ >= misExtreme  ? COL_DANGER :
+     ramZ >= misRich     ? COL_WATCH :
+     ramZ <= -misExtreme ? COL_DANGER :
+     ramZ <= -misRich    ? COL_WATCH :
+     COL_NEUTRAL
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FAST TAPE (trigger-quality inputs, each condition counted once)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+fastLen  = input.int(9, "Fast EMA Length", group=groupTrend)
+slowLen  = input.int(21, "Slow EMA Length", group=groupTrend)
+rocLen   = input.int(4, "ROC Length", group=groupTrend)
+
+fastEma = ta.ema(close, fastLen)
+slowEma = ta.ema(close, slowLen)
+
+float rocRaw = close - close[rocLen]
+float rocAtr = atr > 0 ? rocRaw / atr : 0.0
+
+bool fastEmaRising  = fastEma > fastEma[1]
+bool fastEmaFalling = fastEma < fastEma[1]
+
+bool aboveRAP = close > rap
+bool belowRAP = close < rap
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// TREND QUALIFICATION (state-machine step 1)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool bullTrendBase =
+     aboveRAP and
+     plusDI > minusDI and
+     adx >= adxTrendMin and
+     rangeEff >= rangeEffTrendMin and
+     rvolTrendOK and
+     longAllowed and
+     not shockBlockActive
+
+bool bearTrendBase =
+     belowRAP and
+     minusDI > plusDI and
+     adx >= adxTrendMin and
+     rangeEff >= rangeEffTrendMin and
+     rvolTrendOK and
+     shortAllowed and
+     not shockBlockActive
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// EXTENSION LIMITS (per setup type, hard caps — no band-walk exemption)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool longExtOKPullback   = ramZ <= maxLongExtPullback
+bool longExtOKBreakout   = ramZ <= maxLongExtBreakout
+bool shortExtOKPullback  = ramZ >= -maxShortExtPullback
+bool shortExtOKBreakout  = ramZ >= -maxShortExtBreakout
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PULLBACK SETUPS — interaction with fast EMA/RAP, then confirmed reclaim
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+int  barsSinceTouchLong  = ta.barssince(low <= fastEma or low <= rap)
+bool touchLong           = not na(barsSinceTouchLong) and barsSinceTouchLong <= pullbackLookbackLen
+bool reclaimLong         = ta.crossover(close, fastEma) or ta.crossover(close, rap)
+bool pullbackSetupLong   = touchLong and reclaimLong and adxStableForPullback and longExtOKPullback
+
+int  barsSinceTouchShort = ta.barssince(high >= fastEma or high >= rap)
+bool touchShort          = not na(barsSinceTouchShort) and barsSinceTouchShort <= pullbackLookbackLen
+bool reclaimShort        = ta.crossunder(close, fastEma) or ta.crossunder(close, rap)
+bool pullbackSetupShort  = touchShort and reclaimShort and adxStableForPullback and shortExtOKPullback
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BREAKOUT SETUPS — beyond rolling high/low, volume, rising ADX, extension
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float priorHighLong  = ta.highest(high[1], breakoutLookbackLen)
+float priorLowShort  = ta.lowest(low[1], breakoutLookbackLen)
+
+bool breakoutVolumeOK   = not rvolActive or rvol >= breakoutRvolMin
+bool breakoutTriggerLong  = close > priorHighLong
+bool breakoutTriggerShort = close < priorLowShort
+
+bool breakoutSetupLong  = breakoutTriggerLong  and breakoutVolumeOK and adxRising and longExtOKBreakout
+bool breakoutSetupShort = breakoutTriggerShort and breakoutVolumeOK and adxRising and shortExtOKBreakout
+
+bool setupTriggerLong  = pullbackSetupLong or breakoutSetupLong
+bool setupTriggerShort = pullbackSetupShort or breakoutSetupShort
+
+string setupCandidateLong  = pullbackSetupLong  ? "PULLBACK" : breakoutSetupLong  ? "BREAKOUT" : "NONE"
+string setupCandidateShort = pullbackSetupShort ? "PULLBACK" : breakoutSetupShort ? "BREAKOUT" : "NONE"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// RE-ACCELERATION
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool reAccelLong  = fastEmaRising  and close > close[1] and rocAtr > 0.0
+bool reAccelShort = fastEmaFalling and close < close[1] and rocAtr < 0.0
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STATE VARIABLES — declared before scoring so latched setup credit is
+// available to the trigger-quality score on every bar, not just the
+// one bar the raw setup trigger is true.
+// 0 = idle, 1 = trend qualified, 2 = setup observed, 3 = re-accel confirmed,
+// 4 = fired (awaiting rearm).
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var int longState  = 0
+var int shortState = 0
+
+var string longSetupTypeVar  = "NONE"
+var string shortSetupTypeVar = "NONE"
+
+var bool longSetupLatched  = false
+var bool shortSetupLatched = false
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SCORING — four independent groups, no double-counted components, sum = 100
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Regime quality (max 35) — direction-agnostic, shared by both sides.
+float adxScoreN  = f_norm(adx, adxNormLo, adxNormHi) * 15.0
+float effScoreN  = f_norm(rangeEff, effNormLo, effNormHi) * 10.0
+float rvolScoreN = rvolActive ? f_norm(rvol, rvolNormLo, rvolNormHi) * 10.0 : 10.0
+float regimeScore = adxScoreN + effScoreN + rvolScoreN
+
+// Directional alignment (max 30).
+float slopeForLong  = htfFilterActive ? math.max(vwapSlopeNorm, htfSlopeNorm) : vwapSlopeNorm
+float slopeForShort = htfFilterActive ? math.min(vwapSlopeNorm, htfSlopeNorm) : vwapSlopeNorm
+
+float diScoreLong   = plusDI > minusDI  ? f_norm(diSepRaw, diSepNormLo, diSepNormHi) * 10.0 : 0.0
+float diScoreShort  = minusDI > plusDI  ? f_norm(diSepRaw, diSepNormLo, diSepNormHi) * 10.0 : 0.0
+float slopeScoreLong  = slopeForLong  > 0.0 ? f_norm(slopeForLong,  slopeNormLo, slopeNormHi) * 10.0 : 0.0
+float slopeScoreShort = slopeForShort < 0.0 ? f_norm(-slopeForShort, slopeNormLo, slopeNormHi) * 10.0 : 0.0
+
+float alignScoreLong  = (aboveRAP ? 10.0 : 0.0) + diScoreLong  + slopeScoreLong
+float alignScoreShort = (belowRAP ? 10.0 : 0.0) + diScoreShort + slopeScoreShort
+
+// Trigger quality (max 20). Setup credit latches once observed so the
+// score doesn't collapse back to 0 on the bar after a one-bar setup
+// event, before the state machine has reached the fire gate.
+float momScoreLong =
+     rocAtr > 0.0
+         ? f_norm(rocAtr, momNormLo, momNormHi) * 10.0
+         : 0.0
+
+float momScoreShort =
+     rocAtr < 0.0
+         ? f_norm(-rocAtr, momNormLo, momNormHi) * 10.0
+         : 0.0
+
+bool setupCreditLong =
+     setupTriggerLong or
+     longSetupLatched
+
+bool setupCreditShort =
+     setupTriggerShort or
+     shortSetupLatched
+
+float triggerScoreLong =
+     (setupCreditLong ? 10.0 : 0.0) +
+     momScoreLong
+
+float triggerScoreShort =
+     (setupCreditShort ? 10.0 : 0.0) +
+     momScoreShort
+
+// Tradeability & extension (max 15).
+float tradeScoreLong =
+     (longExtOKPullback or longExtOKBreakout ? 8.0 : 0.0) +
+     (shockBlockActive ? 0.0 : volRegime == "HIGH" ? 3.0 : 7.0)
+
+float tradeScoreShort =
+     (shortExtOKPullback or shortExtOKBreakout ? 8.0 : 0.0) +
+     (shockBlockActive ? 0.0 : volRegime == "HIGH" ? 3.0 : 7.0)
+
+int trendScoreLong  = int(math.round(regimeScore + alignScoreLong  + triggerScoreLong  + tradeScoreLong))
+int trendScoreShort = int(math.round(regimeScore + alignScoreShort + triggerScoreShort + tradeScoreShort))
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BIAS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+string trendBias = "NONE"
+
+if htfFilterActive and htfBull
+    trendBias := "BULL"
+else if htfFilterActive and htfBear
+    trendBias := "BEAR"
+else if trendScoreLong > trendScoreShort and trendScoreLong >= 40
+    trendBias := "BULL"
+else if trendScoreShort > trendScoreLong and trendScoreShort >= 40
+    trendBias := "BEAR"
+
+color trendBiasColor = f_dirColor(trendBias == "BULL", trendBias == "BEAR")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// STRUCTURAL RISK LEVELS (live — only copied into frozen vars at signal time)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+float minStopDist = math.max(syminfo.mintick * 2.0, atr * 0.05)
+
+float structuralLongRef  = math.min(ta.lowest(low, structuralStopLookback),  math.min(fastEma, rap))
+float structuralShortRef = math.max(ta.highest(high, structuralStopLookback), math.max(fastEma, rap))
+
+float longStopRaw  = structuralLongRef  - atr * stopATRBuffer
+float shortStopRaw = structuralShortRef + atr * stopATRBuffer
+
+float longStop  = math.min(longStopRaw,  close - minStopDist)
+float shortStop = math.max(shortStopRaw, close + minStopDist)
+
+float longRiskDist  = close - longStop
+float shortRiskDist = shortStop - close
+
+float longTarget  = close + longRiskDist  * rrMultiple
+float shortTarget = close - shortRiskDist * rrMultiple
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// COOLDOWNS — independent long/short trackers
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var int lastLongSignalBar  = na
+var int lastShortSignalBar = na
+
+int barsSinceLong  = na(lastLongSignalBar)  ? 1000000 : bar_index - lastLongSignalBar
+int barsSinceShort = na(lastShortSignalBar) ? 1000000 : bar_index - lastShortSignalBar
+
+bool cooldownOKLong  = barsSinceLong  >= cooldownBars
+bool cooldownOKShort = barsSinceShort >= cooldownBars
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FROZEN TRADE STATE — persistent, mutated only on confirmed bars
+// (longState/shortState/longSetupTypeVar/shortSetupTypeVar/latches are
+// declared earlier, above the scoring section)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var float frozenEntry      = na
+var float frozenAtrAtEntry = na
+var float frozenStop       = na
+var float frozenTarget     = na
+var string frozenSide       = "NONE"
+var string frozenSetupType  = "NONE"
+var int   frozenSignalBar  = na
+var bool  frozenActive     = false
+
+var float mfeCurrent = na
+var float maeCurrent = na
+
+var int countTargetFirst = 0
+var int countStopFirst   = 0
+var int countExpired     = 0
+var string lastOutcome    = "NONE"
+
+bool longSignalEdge  = false
+bool shortSignalEdge = false
+
+if barstate.isconfirmed
+    longSignalEdge  := false
+    shortSignalEdge := false
+
+    // ---- LONG STATE MACHINE ----
+    // Sequential ifs (not if/else-if) so more than one state transition —
+    // qualify, setup, re-accel, fire — can happen on the same confirmed bar.
+    if longState > 0 and not bullTrendBase
+        longState := 0
+        longSetupTypeVar := "NONE"
+        longSetupLatched := false
+
+    if longState == 0 and bullTrendBase
+        longState := 1
+
+    if longState == 1 and bullTrendBase and setupTriggerLong
+        longSetupTypeVar := setupCandidateLong
+        longSetupLatched := true
+        longState := 2
+
+    if longState == 2 and bullTrendBase and reAccelLong
+        longState := 3
+
+    bool longExtensionGate =
+         longSetupTypeVar == "BREAKOUT"
+             ? longExtOKBreakout
+             : longSetupTypeVar == "PULLBACK"
+                 ? longExtOKPullback
+                 : false
+
+    bool longFinalGateNow =
+         longState == 3 and
+         bullTrendBase and
+         trendScoreLong >= trendScoreFire and
+         cooldownOKLong and
+         not shockBlockActive and
+         longExtensionGate
+
+    if longFinalGateNow
+        longSignalEdge := true
+        lastLongSignalBar := bar_index
+        longState := 4
+
+    if longState == 4 and (not bullTrendBase or bar_index - lastLongSignalBar >= cooldownBars)
+        longState := 0
+        longSetupTypeVar := "NONE"
+        longSetupLatched := false
+
+    // ---- SHORT STATE MACHINE ----
+    if shortState > 0 and not bearTrendBase
+        shortState := 0
+        shortSetupTypeVar := "NONE"
+        shortSetupLatched := false
+
+    if shortState == 0 and bearTrendBase
+        shortState := 1
+
+    if shortState == 1 and bearTrendBase and setupTriggerShort
+        shortSetupTypeVar := setupCandidateShort
+        shortSetupLatched := true
+        shortState := 2
+
+    if shortState == 2 and bearTrendBase and reAccelShort
+        shortState := 3
+
+    bool shortExtensionGate =
+         shortSetupTypeVar == "BREAKOUT"
+             ? shortExtOKBreakout
+             : shortSetupTypeVar == "PULLBACK"
+                 ? shortExtOKPullback
+                 : false
+
+    bool shortFinalGateNow =
+         shortState == 3 and
+         bearTrendBase and
+         trendScoreShort >= trendScoreFire and
+         cooldownOKShort and
+         not shockBlockActive and
+         shortExtensionGate
+
+    if shortFinalGateNow
+        shortSignalEdge := true
+        lastShortSignalBar := bar_index
+        shortState := 4
+
+    if shortState == 4 and (not bearTrendBase or bar_index - lastShortSignalBar >= cooldownBars)
+        shortState := 0
+        shortSetupTypeVar := "NONE"
+        shortSetupLatched := false
+
+    // ---- FROZEN TRADE MANAGEMENT ----
+    if frozenActive
+        bool longStopHit    = frozenSide == "LONG"  and low  <= frozenStop
+        bool longTargetHit  = frozenSide == "LONG"  and high >= frozenTarget
+        bool shortStopHit   = frozenSide == "SHORT" and high >= frozenStop
+        bool shortTargetHit = frozenSide == "SHORT" and low  <= frozenTarget
+        int  barsHeld       = bar_index - frozenSignalBar
+        bool expiredNow     = barsHeld >= maxHoldingBars
+
+        if frozenSide == "LONG"
+            mfeCurrent := na(mfeCurrent) ? math.max(0.0, high - frozenEntry) : math.max(mfeCurrent, high - frozenEntry)
+            maeCurrent := na(maeCurrent) ? math.min(0.0, low  - frozenEntry) : math.min(maeCurrent, low  - frozenEntry)
+        else if frozenSide == "SHORT"
+            mfeCurrent := na(mfeCurrent) ? math.max(0.0, frozenEntry - low)  : math.max(mfeCurrent, frozenEntry - low)
+            maeCurrent := na(maeCurrent) ? math.min(0.0, frozenEntry - high) : math.min(maeCurrent, frozenEntry - high)
+
+        if longStopHit or shortStopHit
+            if enableOutcomeTracking
+                countStopFirst += 1
+            lastOutcome := "STOP FIRST"
+            frozenActive := false
+        else if longTargetHit or shortTargetHit
+            if enableOutcomeTracking
+                countTargetFirst += 1
+            lastOutcome := "TARGET FIRST"
+            frozenActive := false
+        else if expiredNow
+            if enableOutcomeTracking
+                countExpired += 1
+            lastOutcome := "EXPIRED"
+            frozenActive := false
+
+        if not frozenActive
+            frozenSide      := "NONE"
+            frozenSetupType := "NONE"
+
+    // ---- FREEZE NEW SIGNALS (opposite valid setup replaces existing) ----
+    if longSignalEdge
+        frozenEntry      := close
+        frozenAtrAtEntry := atr
+        frozenStop       := longStop
+        frozenTarget     := longTarget
+        frozenSide       := "LONG"
+        frozenSetupType  := longSetupTypeVar
+        frozenSignalBar  := bar_index
+        frozenActive     := true
+        mfeCurrent       := 0.0
+        maeCurrent       := 0.0
+
+    if shortSignalEdge
+        frozenEntry      := close
+        frozenAtrAtEntry := atr
+        frozenStop       := shortStop
+        frozenTarget     := shortTarget
+        frozenSide       := "SHORT"
+        frozenSetupType  := shortSetupTypeVar
+        frozenSignalBar  := bar_index
+        frozenActive     := true
+        mfeCurrent       := 0.0
+        maeCurrent       := 0.0
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// OPTIONAL INTRABAR PREVIEW (display only — never drives alerts or state)
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool previewLongActive  = showIntrabarPreview and not barstate.isconfirmed and bullTrendBase and setupTriggerLong  and reAccelLong
+bool previewShortActive = showIntrabarPreview and not barstate.isconfirmed and bearTrendBase and setupTriggerShort and reAccelShort
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SETUP TYPE / STATE TEXT
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+string activeSetupType =
+     frozenActive        ? frozenSetupType :
+     longState >= 2       ? longSetupTypeVar :
+     shortState >= 2       ? shortSetupTypeVar :
+     "NONE"
+
+string trendState =
+     longSignalEdge  ? "CONT LONG" :
+     shortSignalEdge ? "CONT SHORT" :
+     longState >= 1 and longState <= 3   ? "WATCH LONG" :
+     shortState >= 1 and shortState <= 3 ? "WATCH SHORT" :
+     (adx < adxTrendMin or rangeEff < rangeEffTrendMin) ? "NO TREND" :
+     "WAIT"
+
+color setupTypeColor =
+     frozenActive    ? f_dirColor(frozenSide == "LONG", frozenSide == "SHORT") :
+     longState >= 2  ? COL_BULL :
+     shortState >= 2 ? COL_BEAR :
+     COL_NEUTRAL
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PLOTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+plot(rap, "RAP", color=color.white, linewidth=2)
+plot(vwapVal, "VWAP", color=color.aqua, linewidth=1)
+plot(emaRAP, "EMA RAP", color=color.fuchsia, linewidth=1)
+plot(fastEma, "Fast EMA", color=color.yellow, linewidth=1)
+plot(slowEma, "Slow EMA", color=color.orange, linewidth=1)
+
+float upperBand    = rap + atr * misRich
+float lowerBand    = rap - atr * misRich
+float upperExtreme = rap + atr * misExtreme
+float lowerExtreme = rap - atr * misExtreme
+
+plot(showBands ? upperBand : na, "Rich Band", color=color.new(color.orange, 30), linewidth=1)
+plot(showBands ? lowerBand : na, "Cheap Band", color=color.new(color.teal, 30), linewidth=1)
+plot(showBands ? upperExtreme : na, "Extreme Rich", color=color.new(color.red, 40), linewidth=1)
+plot(showBands ? lowerExtreme : na, "Extreme Cheap", color=color.new(color.lime, 40), linewidth=1)
+
+float plotFrozenStop   = showFrozenLevels and frozenActive ? frozenStop   : na
+float plotFrozenTarget = showFrozenLevels and frozenActive ? frozenTarget : na
+
+plot(plotFrozenStop, "Frozen Stop", color=COL_DANGER, style=plot.style_linebr, linewidth=2)
+plot(plotFrozenTarget, "Frozen Target", color=frozenSide == "LONG" ? COL_BULL : COL_BEAR, style=plot.style_linebr, linewidth=2)
+
+// Background reflects trend favor only: blue = bullish, purple = bearish.
+color bgColorFinal =
+     trendBias == "BULL" ? color.new(COL_BULL, 88) :
+     trendBias == "BEAR" ? color.new(COL_BEAR, 88) :
+     na
+
+bgcolor(showBG ? bgColorFinal : na)
+
+plotshape(showSignals and longSignalEdge,  title="Cont Long",  style=shape.triangleup,   location=location.belowbar, color=COL_BULL, size=size.small)
+plotshape(showSignals and shortSignalEdge, title="Cont Short", style=shape.triangledown, location=location.abovebar, color=COL_BEAR, size=size.small)
+
+plotshape(previewLongActive,  title="Preview Long",  style=shape.circle, location=location.belowbar, color=color.new(COL_WATCH, 40), size=size.tiny)
+plotshape(previewShortActive, title="Preview Short", style=shape.circle, location=location.abovebar, color=color.new(COL_WATCH, 40), size=size.tiny)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DASHBOARD
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tablePosition =
+     dashboardPos == "Top Left"     ? position.top_left :
+     dashboardPos == "Bottom Right" ? position.bottom_right :
+     dashboardPos == "Bottom Left"  ? position.bottom_left :
+     position.top_right
+
+var table dash = table.new(tablePosition, 2, 22, border_width=1)
+
+darkCell = color.rgb(40, 44, 55)
+whiteTxt = color.white
+
+f_row(_row, _left, _right, _bgRight) =>
+    table.cell(dash, 0, _row, _left, text_color=whiteTxt, bgcolor=darkCell, text_size=size.small)
+    table.cell(dash, 1, _row, _right, text_color=whiteTxt, bgcolor=_bgRight, text_size=size.small)
+
+string engineStatus =
+     longSignalEdge  ? "FIRE LONG" :
+     shortSignalEdge ? "FIRE SHORT" :
+     longState >= 1 and longState <= 3   ? "WATCH LONG" :
+     shortState >= 1 and shortState <= 3 ? "WATCH SHORT" :
+     adx < adxTrendMin           ? "ADX LOW" :
+     rangeEff < rangeEffTrendMin ? "EFF LOW" :
+     rvolActive and not rvolTrendOK ? "RVOL LOW" :
+     shockBlockActive ? "SHOCK BLOCK" :
+     "WAIT"
+
+color engineColor =
+     engineStatus == "FIRE LONG"    ? COL_BULL :
+     engineStatus == "FIRE SHORT"   ? COL_BEAR :
+     engineStatus == "WATCH LONG"   ? COL_BULL :
+     engineStatus == "WATCH SHORT"  ? COL_BEAR :
+     engineStatus == "SHOCK BLOCK"  ? COL_DANGER :
+     engineStatus == "WAIT"         ? COL_NEUTRAL :
+     COL_WATCH
+
+string longBlocker =
+     not longAllowed        ? "HTF BLOCK" :
+     shockBlockActive       ? "SHOCK BLOCK" :
+     not cooldownOKLong     ? "COOLDOWN" :
+     not aboveRAP           ? "BELOW RAP" :
+     plusDI <= minusDI      ? "DI BEAR" :
+     adx < adxTrendMin      ? "ADX LOW" :
+     rangeEff < rangeEffTrendMin ? "EFF LOW" :
+     (rvolActive and rvol < rvolTrendMin) ? "RVOL LOW" :
+     longState < 2          ? "NO SETUP" :
+     longState == 2          ? "AWAIT REACCEL" :
+     longState == 3 and trendScoreLong < trendScoreFire ? "SCORE LOW" :
+     longState == 3 and longSetupTypeVar == "PULLBACK" and not longExtOKPullback ? "TOO EXTENDED" :
+     longState == 3 and longSetupTypeVar == "BREAKOUT" and not longExtOKBreakout ? "TOO EXTENDED" :
+     "CLEAR"
+
+string shortBlocker =
+     not shortAllowed       ? "HTF BLOCK" :
+     shockBlockActive       ? "SHOCK BLOCK" :
+     not cooldownOKShort    ? "COOLDOWN" :
+     not belowRAP           ? "ABOVE RAP" :
+     minusDI <= plusDI      ? "DI BULL" :
+     adx < adxTrendMin      ? "ADX LOW" :
+     rangeEff < rangeEffTrendMin ? "EFF LOW" :
+     (rvolActive and rvol < rvolTrendMin) ? "RVOL LOW" :
+     shortState < 2          ? "NO SETUP" :
+     shortState == 2          ? "AWAIT REACCEL" :
+     shortState == 3 and trendScoreShort < trendScoreFire ? "SCORE LOW" :
+     shortState == 3 and shortSetupTypeVar == "PULLBACK" and not shortExtOKPullback ? "TOO EXTENDED" :
+     shortState == 3 and shortSetupTypeVar == "BREAKOUT" and not shortExtOKBreakout ? "TOO EXTENDED" :
+     "CLEAR"
+
+string htfStateText =
+     useHtf and not htfValid ? "INVALID TF" :
+     not useHtf              ? "OFF" :
+     htfBull                 ? "BULL ▲" :
+     htfBear                 ? "BEAR ▼" :
+     "NEUTRAL"
+
+color htfStateColor =
+     useHtf and not htfValid ? COL_WATCH :
+     not useHtf               ? COL_NEUTRAL :
+     f_dirColor(htfBull, htfBear)
+
+string cooldownText =
+     "L:" + (cooldownOKLong  ? "READY" : str.tostring(math.max(cooldownBars - barsSinceLong,  0), "#")) +
+     " S:" + (cooldownOKShort ? "READY" : str.tostring(math.max(cooldownBars - barsSinceShort, 0), "#"))
+
+color cooldownColor = cooldownOKLong and cooldownOKShort ? COL_READY : COL_WATCH
+
+string expirationText =
+     frozenActive ? str.tostring(math.max(maxHoldingBars - (bar_index - frozenSignalBar), 0), "#") + " BARS LEFT" :
+     "N/A"
+
+color expirationColor = frozenActive ? (maxHoldingBars - (bar_index - frozenSignalBar) <= 5 ? COL_WATCH : COL_READY) : COL_NEUTRAL
+
+color volRegimeColor =
+     shockBlockActive  ? COL_DANGER :
+     volRegime == "HIGH" ? COL_WATCH :
+     volRegime == "LOW"  ? COL_NEUTRAL :
+     volRegime == "N/A"  ? COL_NEUTRAL :
+     COL_READY
+
+string shockText = shockBlockActive ? "BLOCKED " + str.tostring(shockBlockBars - barsSinceShock, "#") + " BARS" : "CLEAR"
+color shockColor = shockBlockActive ? COL_DANGER : COL_READY
+
+if showTable and barstate.islast
+    f_row(0,  "ENGINE", engineStatus, engineColor)
+    f_row(1,  "BIAS", trendBias, trendBiasColor)
+    f_row(2,  "SETUP TYPE", activeSetupType, setupTypeColor)
+    f_row(3,  "LONG SCORE", str.tostring(trendScoreLong, "#") + "/100", trendScoreLong >= trendScoreFire ? COL_BULL : trendScoreLong >= 50 ? COL_WATCH : COL_NEUTRAL)
+    f_row(4,  "SHORT SCORE", str.tostring(trendScoreShort, "#") + "/100", trendScoreShort >= trendScoreFire ? COL_BEAR : trendScoreShort >= 50 ? COL_WATCH : COL_NEUTRAL)
+    f_row(5,  "HTF (confirmed)", htfStateText, htfStateColor)
+    f_row(6,  "HTF SLOPE", str.tostring(htfSlopeNorm, "#.##"), f_dirColor(htfSlopeNorm > 0, htfSlopeNorm < 0))
+    f_row(7,  "RAP DIST", str.tostring(ramZ, "#.##") + " " + mispriceLabel, mispriceColor)
+    f_row(8,  "ADX", str.tostring(adx, "#.##") + " / " + str.tostring(adxTrendMin, "#.##") + " " + adxDirText, f_readyColor(adx >= adxTrendMin))
+    f_row(9,  "TREND EFF (norm)", str.tostring(f_norm(rangeEff, effNormLo, effNormHi), "#.##") + " (raw " + str.tostring(rangeEff, "#.##") + ")", f_readyColor(rangeEff >= rangeEffTrendMin))
+    f_row(10, "RVOL", rvolActive ? str.tostring(rvol, "#.##") + " / " + str.tostring(rvolTrendMin, "#.##") : rvolBypassLabel, rvolActive ? f_readyColor(rvolTrendOK) : COL_NEUTRAL)
+    f_row(11, "VOL REGIME", volRegime, volRegimeColor)
+    f_row(12, "SHOCK FILTER", shockText, shockColor)
+    f_row(13, "LONG BLOCK", longBlocker, f_blockColor(longBlocker))
+    f_row(14, "SHORT BLOCK", shortBlocker, f_blockColor(shortBlocker))
+    f_row(15, "FROZEN ENTRY", na(frozenEntry) or not frozenActive ? "N/A" : str.tostring(frozenEntry, format.mintick), frozenActive ? f_dirColor(frozenSide == "LONG", frozenSide == "SHORT") : COL_NEUTRAL)
+    f_row(16, "FROZEN STOP", na(frozenStop) or not frozenActive ? "N/A" : str.tostring(frozenStop, format.mintick), COL_DANGER)
+    f_row(17, "FROZEN TARGET", na(frozenTarget) or not frozenActive ? "N/A" : str.tostring(frozenTarget, format.mintick), frozenActive ? f_dirColor(frozenSide == "LONG", frozenSide == "SHORT") : COL_NEUTRAL)
+    f_row(18, "REWARD:RISK", str.tostring(rrMultiple, "#.##") + " : 1", COL_NEUTRAL)
+    f_row(19, "COOLDOWN", cooldownText, cooldownColor)
+    f_row(20, "EXPIRATION", expirationText, expirationColor)
+    f_row(21, "OUTCOMES (T/S/E)", enableOutcomeTracking ? str.tostring(countTargetFirst, "#") + "/" + str.tostring(countStopFirst, "#") + "/" + str.tostring(countExpired, "#") + " last:" + lastOutcome : "OFF (not Strategy Tester)", COL_NEUTRAL)
+
+if not showTable and barstate.islast
+    table.clear(dash, 0, 0, 1, 21)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ALERTS — confirmed-bar signals only; timeframe text uses timeframe.period
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bool on5min = timeframe.isminutes and timeframe.multiplier == 5
+
+alertcondition(longSignalEdge,  "Cont Long Signal",  "CONTINUATION LONG on {{ticker}}")
+alertcondition(shortSignalEdge, "Cont Short Signal", "CONTINUATION SHORT on {{ticker}}")
+alertcondition(trendState == "WATCH LONG" and barstate.isconfirmed,  "Watch Long",  "WATCH LONG context on {{ticker}}")
+alertcondition(trendState == "WATCH SHORT" and barstate.isconfirmed, "Watch Short", "WATCH SHORT context on {{ticker}}")
+
+bool rangerLongTFE  = longSignalEdge  and on5min
+bool rangerShortTFE = shortSignalEdge and on5min
+
+alertcondition(rangerLongTFE,  "Ranger Tab — LONG",  "LONG | {{ticker}} | {{interval}} | Trend Engine | Price {{close}}")
+alertcondition(rangerShortTFE, "Ranger Tab — SHORT", "SHORT | {{ticker}} | {{interval}} | Trend Engine | Price {{close}}")
+
+alertFreq = alertOnBarClose ? alert.freq_once_per_bar_close : alert.freq_once_per_bar
+bool canAlert = enableAlerts
+
+if canAlert and longSignalEdge
+    alert(
+         "RANGER TAB ▲ LONG\n" +
+         syminfo.ticker + " | " + timeframe.period + " | Trend Engine\n" +
+         "Setup: " + longSetupTypeVar + "\n" +
+         "─────────────────────\n" +
+         "ENTRY   " + str.tostring(close, format.mintick) + "\n" +
+         "STOP    " + str.tostring(longStop, format.mintick) + "\n" +
+         "TARGET  " + str.tostring(longTarget, format.mintick) + "\n" +
+         "SCORE   " + str.tostring(trendScoreLong, "#") + "/100",
+         alertFreq)
+
+if canAlert and shortSignalEdge
+    alert(
+         "RANGER TAB ▼ SHORT\n" +
+         syminfo.ticker + " | " + timeframe.period + " | Trend Engine\n" +
+         "Setup: " + shortSetupTypeVar + "\n" +
+         "─────────────────────\n" +
+         "ENTRY   " + str.tostring(close, format.mintick) + "\n" +
+         "STOP    " + str.tostring(shortStop, format.mintick) + "\n" +
+         "TARGET  " + str.tostring(shortTarget, format.mintick) + "\n" +
+         "SCORE   " + str.tostring(trendScoreShort, "#") + "/100",
+         alertFreq)
+
+if canAlert and alertWatchSignals and barstate.isconfirmed and trendState == "WATCH LONG" and cooldownOKLong
+    alert("WATCH LONG | " + syminfo.ticker + " | " + timeframe.period + " | Score " + str.tostring(trendScoreLong, "#") + " | Setup " + setupCandidateLong, alertFreq)
+
+if canAlert and alertWatchSignals and barstate.isconfirmed and trendState == "WATCH SHORT" and cooldownOKShort
+    alert("WATCH SHORT | " + syminfo.ticker + " | " + timeframe.period + " | Score " + str.tostring(trendScoreShort, "#") + " | Setup " + setupCandidateShort, alertFreq)

@@ -1,0 +1,513 @@
+//@version=6
+indicator("Market Structure Physics Lab v1.0", shorttitle="StructPhys", overlay=true,
+     max_labels_count=300, max_lines_count=100, max_boxes_count=50)
+
+// "Physics" = normalized market-behavior proxies, not literal mechanics.
+// Position = ATR distance to a level.
+// Velocity = ATR-normalized displacement per bar.
+// Acceleration = change in velocity.
+// Effort = relative volume.
+// Result = directional candle efficiency.
+// Absorption = high effort + weak result + opposing flow.
+// Friction = dwell/overlap inside a zone.
+// Break/Hold pressure are descriptive scores, not probabilities.
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+string G0="00 — Display"
+bool showZones=input.bool(true,"Show Structure Zones",group=G0)
+bool showPivots=input.bool(true,"Show Confirmed Swing Markers",group=G0)
+bool showCP=input.bool(true,"Show Change Points",group=G0)
+bool showLabels=input.bool(true,"Show Zone-Test Outcome Labels",group=G0)
+bool showDash=input.bool(true,"Show Dashboard",group=G0)
+string dashPos=input.string("Top Right","Dashboard Position",
+     options=["Top Left","Top Right","Bottom Left","Bottom Right"],group=G0)
+string dashSize=input.string("Small","Dashboard Text Size",
+     options=["Tiny","Small","Normal","Large"],group=G0)
+
+string G1="01 — Structure"
+int pL=input.int(3,"Pivot Left",minval=1,maxval=20,group=G1)
+int pR=input.int(3,"Pivot Right",minval=1,maxval=20,group=G1)
+float zoneAtr=input.float(0.25,"Zone Half Width (ATR)",minval=0.05,maxval=1.5,step=0.05,group=G1)
+float maxFocusAtr=input.float(3.0,"Max Focus Distance (ATR)",minval=0.5,maxval=10,step=0.25,group=G1)
+int erLen=input.int(20,"Trend Efficiency Length",minval=5,maxval=100,group=G1)
+
+string G2="02 — Change Points"
+int cpLen=input.int(50,"CUSUM Lookback",minval=10,maxval=300,group=G2)
+float cpH=input.float(4.0,"CUSUM Threshold",minval=0.5,maxval=12,step=0.25,group=G2)
+float cpK=input.float(0.5,"CUSUM Slack",minval=0,maxval=4,step=0.05,group=G2)
+
+string G3="03 — Motion / Flow"
+int velLen=input.int(3,"Velocity Lookback",minval=1,maxval=20,group=G3)
+int rvolLen=input.int(20,"RVOL Length",minval=5,maxval=200,group=G3)
+int deltaWin=input.int(3,"Delta Pressure Window",minval=1,maxval=10,group=G3)
+string ltfInput=input.timeframe("1","Lower Timeframe For Volume",group=G3)
+int compFast=input.int(5,"Compression Fast Range",minval=2,maxval=30,group=G3)
+int compSlow=input.int(20,"Compression Slow Range",minval=5,maxval=100,group=G3)
+int dwellLen=input.int(6,"Zone Dwell Lookback",minval=2,maxval=30,group=G3)
+
+string G4="04 — Zone Test"
+float resolveAtr=input.float(0.50,"Resolution Distance (ATR)",minval=0.2,maxval=3,step=0.05,group=G4)
+int testHorizon=input.int(12,"Test Horizon Bars",minval=2,maxval=100,group=G4)
+int followBars=input.int(6,"Follow Bars After Close-Through",minval=1,maxval=50,group=G4)
+
+//------------------------------------------------------------------------------
+// Helpers
+//------------------------------------------------------------------------------
+f_clamp(float x,float lo,float hi)=>math.max(lo,math.min(hi,x))
+f_score(float x,float target)=>target<=0?0.0:f_clamp(x/target*100.0,0.0,100.0)
+f_pos(string p)=>p=="Top Left"?position.top_left:p=="Bottom Left"?position.bottom_left:p=="Bottom Right"?position.bottom_right:position.top_right
+f_size(string s)=>s=="Tiny"?size.tiny:s=="Normal"?size.normal:s=="Large"?size.large:size.small
+f_signed(float x)=>(x>=0?"+":"")+str.tostring(x,"#.00")
+f_roleText(int role)=>role==1?"RES":role==-1?"SUP":"--"
+f_roleColor(int role)=>role==1?color.rgb(245,75,85):role==-1?color.rgb(0,200,140):color.gray
+f_effectiveRole(float level,int nominal,float half,float px)=>
+    int r=nominal
+    if not na(level)
+        if nominal==1 and px>level+half
+            r:=-1
+        else if nominal==-1 and px<level-half
+            r:=1
+    r
+f_er(int len)=>
+    float net=math.abs(close-close[len])
+    float path=0.0
+    for i=0 to len-1
+        path+=math.abs(close[i]-close[i+1])
+    path>0?net/path:0.0
+
+//------------------------------------------------------------------------------
+// Base measurements
+//------------------------------------------------------------------------------
+float atr=math.max(nz(ta.atr(14),ta.tr(true)),syminfo.mintick)
+float half=atr*zoneAtr
+float rng=math.max(high-low,syminfo.mintick)
+float body=math.abs(close-open)
+float bodyFrac=body/rng
+float closeLoc=(close-low)/rng
+
+float volAvg=ta.sma(volume,rvolLen)
+float rvol=volAvg>0?nz(volume,0.0)/volAvg:0.0
+float vel=(close-close[velLen])/atr/velLen
+float accel=vel-vel[1]
+float er=f_er(erLen)*100.0
+
+float fastR=ta.sma(ta.tr(true),compFast)
+float slowR=ta.sma(ta.tr(true),compSlow)
+float compression=slowR>0?f_clamp((1.0-fastR/slowR)*100.0,0.0,100.0):0.0
+
+string effLtf=timeframe.in_seconds(ltfInput)>timeframe.in_seconds(timeframe.period)?timeframe.period:ltfInput
+[upV,dnV,dV]=ta.requestUpAndDownVolume(effLtf)
+float dSum=0.0
+float vSum=0.0
+for i=0 to deltaWin-1
+    dSum+=nz(dV[i],0.0)
+    vSum+=nz(upV[i],0.0)+nz(dnV[i],0.0)
+float deltaPressure=vSum>0?dSum/vSum*100.0:0.0
+
+//------------------------------------------------------------------------------
+// Swing structure
+//------------------------------------------------------------------------------
+float ph=ta.pivothigh(high,pL,pR)
+float pl=ta.pivotlow(low,pL,pR)
+var float lastH=na
+var float prevH=na
+var float lastL=na
+var float prevL=na
+
+if not na(ph)
+    prevH:=lastH
+    lastH:=ph
+if not na(pl)
+    prevL:=lastL
+    lastL:=pl
+
+bool have=not na(lastH) and not na(prevH) and not na(lastL) and not na(prevL)
+bool hh=have and lastH>prevH
+bool lh=have and lastH<prevH
+bool hl=have and lastL>prevL
+bool ll=have and lastL<prevL
+
+string structure=hh and hl?"UP TREND":lh and ll?"DOWN TREND":hh and ll?"EXPANDING / TRANSITION":lh and hl?"COMPRESSION / TRANSITION":"BUILDING"
+
+plotshape(showPivots and not na(ph),title="Swing High",style=shape.triangledown,location=location.abovebar,
+     offset=-pR,color=color.new(color.red,10),size=size.tiny,text="SH")
+plotshape(showPivots and not na(pl),title="Swing Low",style=shape.triangleup,location=location.belowbar,
+     offset=-pR,color=color.new(color.aqua,10),size=size.tiny,text="SL")
+
+//------------------------------------------------------------------------------
+// CUSUM change points
+//------------------------------------------------------------------------------
+float lr=math.log(close/nz(close[1],close))
+float mu=ta.sma(lr,cpLen)
+float sd=ta.stdev(lr,cpLen)
+float z=(lr-mu)/(sd==0?1.0:sd)
+
+var float sPos=0.0
+var float sNeg=0.0
+var float cpLevel=na
+var int cpDir=0
+var int cpBar=na
+var float cpImpulse=na
+bool changeUp=false
+bool changeDn=false
+
+if barstate.isconfirmed and not na(z)
+    sPos:=math.max(0.0,sPos+z-cpK)
+    sNeg:=math.min(0.0,sNeg+z+cpK)
+    changeUp:=sPos>cpH
+    changeDn:=sNeg<-cpH
+    if changeUp or changeDn
+        cpDir:=changeUp?1:-1
+        cpLevel:=close
+        cpBar:=bar_index
+        cpImpulse:=f_clamp(math.abs(z)*15.0+math.min(rvol,3.0)*15.0+math.min(math.abs(deltaPressure),50.0)*0.8,0.0,100.0)
+        sPos:=0.0
+        sNeg:=0.0
+
+plotshape(showCP and changeUp,title="Bull CP",style=shape.diamond,location=location.belowbar,color=color.aqua,size=size.tiny,text="CP")
+plotshape(showCP and changeDn,title="Bear CP",style=shape.diamond,location=location.abovebar,color=color.orange,size=size.tiny,text="CP")
+
+//------------------------------------------------------------------------------
+// Role reversal + nearest focus level
+//------------------------------------------------------------------------------
+int highRole=f_effectiveRole(lastH,1,half,close)
+int lowRole=f_effectiveRole(lastL,-1,half,close)
+int cpNomRole=cpDir==1?-1:cpDir==-1?1:0
+int cpRole=f_effectiveRole(cpLevel,cpNomRole,half,close)
+
+float focus=na
+int role=0
+int key=0
+string source="--"
+float dist=1e10
+
+if not na(lastH)
+    float d=math.abs(close-lastH)/atr
+    if d<dist and d<=maxFocusAtr
+        dist:=d
+        focus:=lastH
+        role:=highRole
+        key:=1
+        source:=highRole==1?"SWING HIGH":"SWING HIGH → SUPPORT"
+
+if not na(lastL)
+    float d=math.abs(close-lastL)/atr
+    if d<dist and d<=maxFocusAtr
+        dist:=d
+        focus:=lastL
+        role:=lowRole
+        key:=2
+        source:=lowRole==-1?"SWING LOW":"SWING LOW → RESISTANCE"
+
+if not na(cpLevel)
+    float d=math.abs(close-cpLevel)/atr
+    if d<dist and d<=maxFocusAtr
+        dist:=d
+        focus:=cpLevel
+        role:=cpRole
+        key:=3
+        source:=cpRole==cpNomRole?(cpDir==1?"BULL CHANGE POINT":"BEAR CHANGE POINT"):"CHANGE POINT → FLIPPED"
+
+bool hasFocus=key!=0 and not na(focus)
+float zLow=hasFocus?focus-half:na
+float zHigh=hasFocus?focus+half:na
+bool inZone=hasFocus and high>=zLow and low<=zHigh
+bool through=hasFocus and (role==1?close>zHigh:role==-1?close<zLow:false)
+bool approachSide=hasFocus and (role==1?close<=zHigh:role==-1?close>=zLow:false)
+
+//------------------------------------------------------------------------------
+// Zone plots
+//------------------------------------------------------------------------------
+float hU=not na(lastH)?lastH+half:na
+float hL=not na(lastH)?lastH-half:na
+float lU=not na(lastL)?lastL+half:na
+float lL=not na(lastL)?lastL-half:na
+float cU=not na(cpLevel)?cpLevel+half:na
+float cL=not na(cpLevel)?cpLevel-half:na
+
+pHU=plot(showZones?hU:na,"High Zone Upper",color=color.new(f_roleColor(highRole),55),style=plot.style_stepline)
+pHL=plot(showZones?hL:na,"High Zone Lower",color=color.new(f_roleColor(highRole),55),style=plot.style_stepline)
+fill(pHU,pHL,color=showZones?color.new(f_roleColor(highRole),92):na)
+
+pLU=plot(showZones?lU:na,"Low Zone Upper",color=color.new(f_roleColor(lowRole),55),style=plot.style_stepline)
+pLL=plot(showZones?lL:na,"Low Zone Lower",color=color.new(f_roleColor(lowRole),55),style=plot.style_stepline)
+fill(pLU,pLL,color=showZones?color.new(f_roleColor(lowRole),92):na)
+
+pCU=plot(showZones?cU:na,"CP Zone Upper",color=color.new(f_roleColor(cpRole),65),style=plot.style_stepline)
+pCL=plot(showZones?cL:na,"CP Zone Lower",color=color.new(f_roleColor(cpRole),65),style=plot.style_stepline)
+fill(pCU,pCL,color=showZones?color.new(f_roleColor(cpRole),95):na)
+plot(showZones?cpLevel:na,"Latest Change Point",color=color.new(color.yellow,20),linewidth=1,style=plot.style_stepline)
+
+//------------------------------------------------------------------------------
+// Physics relative to focused zone
+//------------------------------------------------------------------------------
+float dirVel=role==1?vel:role==-1?-vel:0.0
+float dirAccel=role==1?accel:role==-1?-accel:0.0
+float dirDelta=role==1?deltaPressure:role==-1?-deltaPressure:0.0
+float dirClose=role==1?closeLoc*100.0:role==-1?(1.0-closeLoc)*100.0:50.0
+
+float upW=high-math.max(open,close)
+float dnW=math.min(open,close)-low
+float rejectWick=role==1?upW/rng*100.0:role==-1?dnW/rng*100.0:0.0
+
+float effort=f_clamp(rvol/2.0*100.0,0.0,100.0)
+float result=bodyFrac*100.0
+float oppFlow=f_score(math.max(-dirDelta,0.0),25.0)
+float absorption=f_clamp((effort*(100.0-result)/100.0)*0.65+oppFlow*0.35,0.0,100.0)
+
+// ta.sma() must run unconditionally on every bar to build its rolling
+// average correctly -- calling it only inside the hasFocus ternary (as
+// this section originally did, in both the dwell and friction lines)
+// starves it of per-bar history and returns an unreliable value, flagged
+// by the editor itself (CW10004) on the dwell line. Both raw series are
+// now computed unconditionally; only the final hasFocus gate stays
+// conditional.
+float inZonePct=inZone?100.0:0.0
+float overlap=hasFocus?math.max(0.0,math.min(high,zHigh)-math.max(low,zLow)):0.0
+float overlapFrac=hasFocus?f_clamp(overlap/rng,0.0,1.0):0.0
+float dwellRaw=ta.sma(inZonePct,dwellLen)
+float overlapSma=ta.sma(overlapFrac*100.0,dwellLen)
+float dwell=hasFocus?dwellRaw:0.0
+float friction=hasFocus?f_clamp(dwell*0.60+overlapSma*0.40,0.0,100.0):0.0
+
+float penAtr=not hasFocus?0.0:role==1?math.max(0.0,close-zHigh)/atr:role==-1?math.max(0.0,zLow-close)/atr:0.0
+
+float brkVel=f_score(math.max(dirVel,0.0),0.75)
+float brkAcc=f_score(math.max(dirAccel,0.0),0.35)
+float brkDelta=f_score(math.max(dirDelta,0.0),25.0)
+float penScore=f_score(penAtr,0.50)
+float antiWick=100.0-rejectWick
+
+float breakScore=hasFocus?f_clamp(brkVel*0.20+brkAcc*0.10+brkDelta*0.25+dirClose*0.15+penScore*0.15+antiWick*0.15,0.0,100.0):0.0
+float awayVel=f_score(math.max(-dirVel,0.0),0.75)
+float holdScore=hasFocus?f_clamp(oppFlow*0.20+rejectWick*0.20+absorption*0.25+awayVel*0.20+(100.0-penScore)*0.15,0.0,100.0):0.0
+float impulse=f_clamp(math.min(rvol,3.0)/3.0*30.0+f_score(math.abs(dirVel),1.0)*0.30+f_score(math.abs(dirDelta),30.0)*0.40,0.0,100.0)
+
+string read="NO NEARBY LEVEL"
+if hasFocus
+    if through
+        read:=breakScore>=holdScore+15?"BREAKING → ACCEPTANCE PRESSURE":"THROUGH LEVEL → VERIFY FOLLOW-THROUGH"
+    else if inZone
+        read:=breakScore>=holdScore+15?"TESTING → BREAK PRESSURE":holdScore>=breakScore+15?"TESTING → HOLD / REJECTION":"TESTING → CONTESTED"
+    else if approachSide
+        read:=dirVel>0.05?"APPROACHING LEVEL":dirVel<-0.05?"MOVING AWAY FROM LEVEL":"STALLING NEAR LEVEL"
+    else
+        read:="ROLE-REVERSAL SIDE"
+
+//------------------------------------------------------------------------------
+// Zone-test state machine
+//------------------------------------------------------------------------------
+var bool testActive=false
+var bool closedThrough=false
+var int testRole=0
+var float testLevel=na
+var float testAtr=na
+var int testStart=na
+var int breakBar=na
+var string testSource=""
+var float impactVel=na
+var float impactDelta=na
+var float impactRvol=na
+var float impactAbs=na
+var string impactStructure=""
+
+var string lastOutcome="NONE"
+var string lastSource="--"
+var int lastOutcomeBar=na
+
+if barstate.isconfirmed and hasFocus and inZone and not testActive
+    testActive:=true
+    closedThrough:=false
+    testRole:=role
+    testLevel:=focus
+    testAtr:=atr
+    testStart:=bar_index
+    breakBar:=na
+    testSource:=source
+    impactVel:=dirVel
+    impactDelta:=dirDelta
+    impactRvol:=rvol
+    impactAbs:=absorption
+    impactStructure:=structure
+
+if barstate.isconfirmed and testActive and bar_index>testStart
+    int age=bar_index-testStart
+    float resolveD=resolveAtr*testAtr
+    float frozenHalf=zoneAtr*testAtr
+
+    bool didCloseThrough=
+         testRole==1?
+         close>testLevel+frozenHalf:
+         close<testLevel-frozenHalf
+
+    bool rejectResolved=
+         testRole==1?
+         low<=testLevel-resolveD:
+         high>=testLevel+resolveD
+
+    bool breakResolved=
+         testRole==1?
+         high>=testLevel+resolveD:
+         low<=testLevel-resolveD
+
+    bool returned=
+         testRole==1?
+         close<testLevel:
+         close>testLevel
+
+    string outcome=""
+
+    if not closedThrough
+        if rejectResolved
+            outcome:=testRole==1?"RESISTANCE HELD / REJECTED":"SUPPORT HELD / BOUNCED"
+        else if didCloseThrough
+            closedThrough:=true
+            breakBar:=bar_index
+        else if age>=testHorizon
+            outcome:="TEST EXPIRED / NO RESOLUTION"
+    else
+        int sinceBreak=bar_index-breakBar
+        if bar_index>breakBar and breakResolved
+            outcome:=testRole==1?"RESISTANCE BROKE / ACCEPTED ABOVE":"SUPPORT BROKE / ACCEPTED BELOW"
+        else if returned
+            outcome:="FAILED BREAK / RETURNED THROUGH LEVEL"
+        else if sinceBreak>=followBars
+            outcome:="BREAK STALLED / NO FOLLOW-THROUGH"
+
+    if outcome!=""
+        lastOutcome:=outcome
+        lastSource:=testSource
+        lastOutcomeBar:=bar_index
+
+        if showLabels
+            label.new(
+                 bar_index,
+                 close,
+                 outcome+
+                 "\nImpact v "+f_signed(impactVel)+
+                 " | Δ "+f_signed(impactDelta)+"%"+
+                 " | RV "+str.tostring(impactRvol,"#.0")+"x"+
+                 "\nAbs "+str.tostring(impactAbs,"#")+
+                 " | "+impactStructure,
+                 style=testRole==1?label.style_label_down:label.style_label_up,
+                 color=color.new(
+                     str.contains(outcome,"BROKE")?color.aqua:
+                     str.contains(outcome,"FAILED") or str.contains(outcome,"STALLED")?color.orange:
+                     str.contains(outcome,"HELD")?color.green:
+                     color.gray,15),
+                 textcolor=color.white,
+                 size=size.tiny
+            )
+
+        testActive:=false
+        closedThrough:=false
+        testRole:=0
+        testLevel:=na
+        testAtr:=na
+        testStart:=na
+        breakBar:=na
+        testSource:=""
+
+//------------------------------------------------------------------------------
+// Dashboard
+//------------------------------------------------------------------------------
+var table dash=table.new(
+     f_pos(dashPos),
+     2,
+     12,
+     bgcolor=color.new(color.rgb(15,20,27),8),
+     border_width=1
+)
+
+if barstate.islast and showDash
+    ds=f_size(dashSize)
+
+    color structureColor=
+         str.contains(structure,"UP")?color.aqua:
+         str.contains(structure,"DOWN")?color.orange:
+         color.gray
+
+    color focusColor=f_roleColor(role)
+
+    string focusText=
+         hasFocus?
+         f_roleText(role)+" "+source+" @ "+str.tostring(focus,format.mintick):
+         "--"
+
+    string testText=
+         not hasFocus?"--":
+         inZone?"IN ZONE":
+         through?"THROUGH":
+         "DIST "+str.tostring(dist,"#.00")+"A"
+
+    string motionText="v "+f_signed(dirVel)+" A/b | a "+f_signed(dirAccel)
+    string flowText="Δ "+f_signed(dirDelta)+"% | RV "+str.tostring(rvol,"#.0")+"x"
+    string effortText="Eff "+str.tostring(effort,"#")+" | Res "+str.tostring(result,"#")
+    string absorbText="Abs "+str.tostring(absorption,"#")+" | Wick "+str.tostring(rejectWick,"#")
+    string compText="Comp "+str.tostring(compression,"#")+" | Fric "+str.tostring(friction,"#")
+    string pressureText="BRK "+str.tostring(breakScore,"#")+" | HOLD "+str.tostring(holdScore,"#")
+
+    string cpText=
+         na(cpLevel)?
+         "--":
+         (cpDir==1?"BULL":"BEAR")+
+         " CP "+str.tostring(bar_index-cpBar)+" bars"+
+         " | Imp "+str.tostring(cpImpulse,"#")
+
+    string activeText=
+         testActive?
+         (closedThrough?"POST-BREAK FOLLOW":"TEST ACTIVE")+
+         " | age "+str.tostring(bar_index-testStart):
+         "IDLE"
+
+    string lastText=
+         lastOutcome+
+         (not na(lastOutcomeBar)?" | "+str.tostring(bar_index-lastOutcomeBar)+" bars ago":"")
+
+    table.cell(dash,0,0,"STRUCTURE PHYSICS",text_color=color.white,bgcolor=color.rgb(22,52,86),text_size=ds)
+    table.cell(dash,1,0,syminfo.ticker+" "+timeframe.period,text_color=color.white,bgcolor=color.rgb(22,52,86),text_size=ds)
+
+    table.cell(dash,0,1,"Structure",text_color=color.white,text_size=ds)
+    table.cell(dash,1,1,structure+" | ER "+str.tostring(er,"#")+"%",text_color=structureColor,text_size=ds)
+
+    table.cell(dash,0,2,"Focus Zone",text_color=color.white,text_size=ds)
+    table.cell(dash,1,2,focusText,text_color=focusColor,text_size=ds)
+
+    table.cell(dash,0,3,"Position / Test",text_color=color.white,text_size=ds)
+    table.cell(dash,1,3,testText,text_color=inZone?color.yellow:color.white,text_size=ds)
+
+    table.cell(dash,0,4,"Velocity / Accel",text_color=color.white,text_size=ds)
+    table.cell(dash,1,4,motionText,text_color=dirVel>=0?color.aqua:color.orange,text_size=ds)
+
+    table.cell(dash,0,5,"Flow / RVOL",text_color=color.white,text_size=ds)
+    table.cell(dash,1,5,flowText,text_color=dirDelta>=0?color.aqua:color.orange,text_size=ds)
+
+    table.cell(dash,0,6,"Effort / Result",text_color=color.white,text_size=ds)
+    table.cell(dash,1,6,effortText,text_color=color.white,text_size=ds)
+
+    table.cell(dash,0,7,"Absorb / Wick",text_color=color.white,text_size=ds)
+    table.cell(dash,1,7,absorbText,text_color=absorption>=60 or rejectWick>=45?color.orange:color.gray,text_size=ds)
+
+    table.cell(dash,0,8,"Compression / Friction",text_color=color.white,text_size=ds)
+    table.cell(dash,1,8,compText,text_color=compression>=40 or friction>=50?color.yellow:color.gray,text_size=ds)
+
+    table.cell(dash,0,9,"Pressure",text_color=color.white,text_size=ds)
+    table.cell(dash,1,9,pressureText,text_color=breakScore>holdScore?color.aqua:color.orange,text_size=ds)
+
+    table.cell(dash,0,10,"Read / CP",text_color=color.white,text_size=ds)
+    table.cell(dash,1,10,read+" | "+cpText,text_color=color.white,text_size=ds)
+
+    table.cell(dash,0,11,"Test State",text_color=color.white,text_size=ds)
+    table.cell(dash,1,11,activeText+" | Last: "+lastText,text_color=testActive?color.yellow:color.gray,text_size=ds)
+
+//------------------------------------------------------------------------------
+// Alerts
+//------------------------------------------------------------------------------
+alertcondition(changeUp,title="Structure Physics: Bull Change Point",
+     message="Bullish CUSUM change point on {{ticker}} {{interval}} @ {{close}}")
+alertcondition(changeDn,title="Structure Physics: Bear Change Point",
+     message="Bearish CUSUM change point on {{ticker}} {{interval}} @ {{close}}")
+alertcondition(hasFocus and inZone,title="Structure Physics: Zone Test",
+     message="Price is testing the active structure zone on {{ticker}} {{interval}} @ {{close}}")
