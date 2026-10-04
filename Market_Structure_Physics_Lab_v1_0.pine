@@ -2,6 +2,13 @@
 indicator("Market Structure Physics Lab v1.0", shorttitle="StructPhys", overlay=true,
      max_labels_count=300, max_lines_count=100, max_boxes_count=50)
 
+import TradingView/ta/9
+
+// ta.requestUpAndDownVolume() below is exported by this library, not a
+// built-in -- every OTHER ta.* call in this file (atr, sma, pivothigh,
+// stdev, etc.) is a genuine built-in and works with or without this
+// import, which is what made the import look unused on a first pass.
+
 // "Physics" = normalized market-behavior proxies, not literal mechanics.
 // Position = ATR distance to a level.
 // Velocity = ATR-normalized displacement per bar.
