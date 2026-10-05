@@ -1,0 +1,2053 @@
+//@version=6
+strategy(
+     "Structure Physics v4.2 — Rotation Confirmation Strategy",
+     shorttitle = "Structure Physics v4.2 STRAT",
+     overlay = true,
+     initial_capital = 50000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     pyramiding = 0,
+     margin_long = 5,
+     margin_short = 5,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 0.0,
+     slippage = 0,
+     process_orders_on_close = true,
+     use_bar_magnifier = true,
+     max_labels_count = 100,
+     max_lines_count = 100,
+     max_boxes_count = 50
+)
+
+import TradingView/ta/9
+
+//=============================================================================
+// STRUCTURE PHYSICS v4.2 STRATEGY — ROTATION CONFIRMATION & EXECUTION ENGINE
+//-----------------------------------------------------------------------------
+// "Physics" = normalized market-behavior proxies, not literal mechanics.
+//
+// The strategy studies HOW price interacts with confirmed structure:
+//   • confirmed swing highs / lows
+//   • confirmed role reversals
+//   • CUSUM change-point levels with age/relevance decay
+//   • trend / transition regimes
+//
+// The model separates:
+//   1) APPROACH      — how price arrives
+//   2) IMPACT        — first interaction with the zone
+//   3) CONTEST       — what changes while price is in/around the zone
+//   4) PENETRATION   — how far price gets through
+//   5) RETENTION     — how much penetration is retained
+//   6) RESOLUTION    — hold, accepted break, failed break, stall, expiry
+//
+// BRK / HOLD scores are descriptive diagnostics, NOT probabilities.
+// Outside the active interaction radius they are shown only as POTENTIAL.
+//
+// v3 foundations:
+//   • separates displacement efficiency from participation quality
+//   • measures empirical flow-data quality before trusting delta
+//   • separates level origin from current structural role
+//   • tracks trend integrity / early structural degradation
+//
+// v4 additions:
+//   • causal level -> impulse -> pullback -> HL/LH -> HH/LL state machine
+//   • freezes the reaction H1/L1, corrective HL/LH and confirmation close
+//   • grades confirmation as HOLLOW, FRAGILE, DEVELOPING, ACCEPTED or A++
+//   • research-derived defaults from the supplied NQ 2023-2025 dataset
+//   • builds a non-predictive execution plan after accepted structure
+//   • A++ uses deeper 80% retracement geometry; ACCEPTED uses 60%
+//   • tracks waiting / armed / filled / target / stop / expired states
+//   • v4.1 persists historical ACCEPTED/A++ and BUY/SELL markers on-chart
+//   • v4.2 submits the frozen ACCEPTED/A++ plans to Strategy Tester
+//   • one contract by default; pyramiding disabled; Bar Magnifier enabled
+//
+// IMPORTANT:
+//   The acceptance thresholds are empirical research candidates. The execution
+//   parameters have been inspected on 2023-2025 and require fresh-data
+//   validation before being treated as production rules.
+//
+//   NOTE ON "NO ENTRIES": "Require 5-Minute Chart" (group 08) defaults ON.
+//   If this chart is not running at an exact 5-minute interval, every
+//   strategy order is gated off at strategyTimeframeOk regardless of how
+//   the rotation engine resolves. Check the "Strategy Position" dashboard
+//   row -- it reads "5m REQUIRED" explicitly when this is the blocker.
+//=============================================================================
+
+string G_DISPLAY = "00 — Display"
+bool showZonesInput = input.bool(true, "Show Structure Zones", group = G_DISPLAY)
+bool showPivotsInput = input.bool(true, "Show Confirmed Swing Markers", group = G_DISPLAY)
+bool showChangePointsInput = input.bool(true, "Show Change-Point Markers", group = G_DISPLAY)
+bool showLastOutcomeLabelInput = input.bool(true, "Show Only Most Recent Outcome Label", group = G_DISPLAY)
+bool showDashboardInput = input.bool(true, "Show Physics Dashboard", group = G_DISPLAY)
+string dashboardPositionInput = input.string("Top Right", "Dashboard Position", options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group = G_DISPLAY)
+string dashboardTextSizeInput = input.string("Tiny", "Dashboard Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_DISPLAY)
+
+string G_STRUCTURE = "01 — Structure"
+int pivotLeftInput = input.int(3, "Pivot Left", minval = 1, maxval = 20, group = G_STRUCTURE)
+int pivotRightInput = input.int(3, "Pivot Right", minval = 1, maxval = 20, group = G_STRUCTURE)
+float zoneHalfWidthAtrInput = input.float(0.25, "Zone Half Width (ATR)", minval = 0.05, maxval = 1.50, step = 0.05, group = G_STRUCTURE)
+float maxFocusDistanceAtrInput = input.float(3.0, "Maximum Focus Distance (ATR)", minval = 0.50, maxval = 10.0, step = 0.25, group = G_STRUCTURE)
+float activeInteractionRadiusAtrInput = input.float(0.90, "Active Pressure Radius (ATR)", minval = 0.20, maxval = 3.0, step = 0.05, tooltip = "BRK/HOLD becomes ACTIVE only inside this distance. Outside it the dashboard labels the scores POTENTIAL.", group = G_STRUCTURE)
+int trendEfficiencyLengthInput = input.int(20, "Trend Efficiency Ratio Length", minval = 5, maxval = 100, group = G_STRUCTURE)
+
+string G_FLIP = "02 — Confirmed Role Reversal"
+int roleFlipConfirmBarsInput = input.int(2, "Closes Required Beyond Level", minval = 1, maxval = 10, group = G_FLIP)
+float roleFlipBufferAtrInput = input.float(0.10, "Role-Flip Confirmation Buffer (ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = G_FLIP)
+
+string G_CP = "03 — Change Points"
+int changePointLengthInput = input.int(50, "CUSUM Lookback", minval = 10, maxval = 300, group = G_CP)
+float changePointThresholdInput = input.float(4.0, "CUSUM Threshold", minval = 0.5, maxval = 12.0, step = 0.25, group = G_CP)
+float changePointSlackInput = input.float(0.5, "CUSUM Slack", minval = 0.0, maxval = 4.0, step = 0.05, group = G_CP)
+int changePointHalfLifeBarsInput = input.int(72, "Change-Point Relevance Half-Life (Bars)", minval = 5, maxval = 1000, group = G_CP)
+float minimumChangePointRelevanceInput = input.float(15.0, "Minimum CP Relevance %", minval = 0.0, maxval = 100.0, step = 5.0, group = G_CP)
+float changePointStickyDistanceAtrInput = input.float(0.75, "Keep Old CP If Within ATR", minval = 0.10, maxval = 3.0, step = 0.05, group = G_CP)
+
+string G_FLOW = "04 — Motion / Flow"
+int velocityLookbackInput = input.int(3, "Velocity Lookback", minval = 1, maxval = 20, group = G_FLOW)
+int relativeVolumeLengthInput = input.int(20, "RVOL Length", minval = 5, maxval = 200, group = G_FLOW)
+int deltaWindowInput = input.int(3, "Delta Pressure Window", minval = 1, maxval = 10, group = G_FLOW)
+string executionLtfInput = input.timeframe("1", "Lower Timeframe For Volume Pressure", tooltip = "If this timeframe is above the chart timeframe, the chart timeframe is used instead.", group = G_FLOW)
+int compressionFastLengthInput = input.int(5, "Compression Fast Range", minval = 2, maxval = 30, group = G_FLOW)
+int compressionSlowLengthInput = input.int(20, "Compression Slow Range", minval = 5, maxval = 100, group = G_FLOW)
+int dwellLookbackInput = input.int(6, "Zone Dwell Lookback", minval = 2, maxval = 30, group = G_FLOW)
+float transferEfficiencyTargetInput = input.float(0.40, "Strong Displacement Efficiency (ATR / RVOL)", minval = 0.05, maxval = 2.0, step = 0.05, group = G_FLOW)
+float participationRvolTargetInput = input.float(1.50, "Strong Participation RVOL", minval = 0.50, maxval = 5.0, step = 0.10, group = G_FLOW)
+int flowQualityLookbackInput = input.int(20, "Flow Quality Lookback", minval = 5, maxval = 100, group = G_FLOW)
+
+string G_TEST = "05 — Interaction / Resolution"
+float resolutionDistanceAtrInput = input.float(0.50, "Resolution Distance From Level (ATR)", minval = 0.20, maxval = 3.0, step = 0.05, group = G_TEST)
+int preBreakHorizonBarsInput = input.int(12, "Maximum Bars Before Close-Through / Hold Resolution", minval = 2, maxval = 100, group = G_TEST)
+int postBreakFollowBarsInput = input.int(6, "Follow Bars After Close-Through", minval = 1, maxval = 50, group = G_TEST)
+float eventRearmDistanceAtrInput = input.float(1.0, "Move Away Before Same Zone Can Re-Arm (ATR)", minval = 0.25, maxval = 5.0, step = 0.25, group = G_TEST)
+int eventCooldownBarsInput = input.int(3, "Minimum Bars Between Resolved Events", minval = 0, maxval = 50, group = G_TEST)
+
+string G_ROT = "06 — Rotation Confirmation"
+bool rotationEngineInput = input.bool(true, "Enable Rotation Confirmation Engine", group = G_ROT)
+int rotationMaxBarsInput = input.int(48, "Maximum Bars To Complete Rotation", minval = 10, maxval = 300, group = G_ROT)
+float rotationMinHigherLowAtrInput = input.float(0.05, "Minimum HL/LH Separation From Impact Extreme (ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = G_ROT)
+float hollowExtensionAtrInput = input.float(0.15, "Hollow Maximum Close-Through (ATR)", minval = 0.05, maxval = 0.50, step = 0.05, group = G_ROT)
+float hollowRvolInput = input.float(0.60, "Hollow Maximum Confirmation RVOL", minval = 0.10, maxval = 2.0, step = 0.05, group = G_ROT)
+float fragileExtensionAtrInput = input.float(0.20, "Fragile Maximum Close-Through (ATR)", minval = 0.05, maxval = 0.75, step = 0.05, group = G_ROT)
+float acceptedExtensionAtrInput = input.float(0.65, "Accepted Minimum Close-Through (ATR)", minval = 0.20, maxval = 2.0, step = 0.05, group = G_ROT)
+float aPlusPlusExtensionAtrInput = input.float(1.00, "A++ Minimum Close-Through (ATR)", minval = 0.40, maxval = 3.0, step = 0.05, group = G_ROT)
+float aPlusPlusRvolInput = input.float(1.50, "A++ Minimum Confirmation RVOL", minval = 0.50, maxval = 4.0, step = 0.05, group = G_ROT)
+float aPlusPlusVelocityInput = input.float(0.20, "A++ Minimum Directional Velocity (ATR/bar)", minval = 0.05, maxval = 1.5, step = 0.05, group = G_ROT)
+
+string G_EXEC = "07 — Execution Plan (Research Candidate)"
+bool showExecutionPlanInput = input.bool(true, "Show Frozen Entry / Stop / Target Plan", group = G_EXEC)
+bool showConfirmationMarkersInput = input.bool(true, "Show ACCEPTED / A++ Confirmation Markers", group = G_EXEC)
+bool showEntryMarkersInput = input.bool(true, "Show BUY / SELL Entry Markers", group = G_EXEC)
+bool showPlanOutcomeMarkersInput = input.bool(true, "Show TP / SL Outcome Markers", group = G_EXEC)
+float aPlusRetraceInput = input.float(0.80, "A++ Confirmation-Leg Retracement", minval = 0.10, maxval = 0.95, step = 0.05, group = G_EXEC)
+float aPlusStopAtrInput = input.float(0.35, "A++ Stop Beyond H1/L1 (ATR)", minval = 0.10, maxval = 2.0, step = 0.05, group = G_EXEC)
+float aPlusTargetRInput = input.float(0.75, "A++ Target (R)", minval = 0.25, maxval = 5.0, step = 0.25, group = G_EXEC)
+int aPlusEntryTimeoutMinutesInput = input.int(30, "A++ Entry Timeout (Minutes)", minval = 5, maxval = 240, group = G_EXEC)
+float acceptedRetraceInput = input.float(0.60, "Accepted Confirmation-Leg Retracement", minval = 0.10, maxval = 0.95, step = 0.05, group = G_EXEC)
+float acceptedStopAtrInput = input.float(0.50, "Accepted Stop Beyond H1/L1 (ATR)", minval = 0.10, maxval = 2.0, step = 0.05, group = G_EXEC)
+float acceptedTargetRInput = input.float(0.50, "Accepted Target (R)", minval = 0.25, maxval = 5.0, step = 0.25, group = G_EXEC)
+int acceptedEntryTimeoutMinutesInput = input.int(40, "Accepted Entry Timeout (Minutes)", minval = 5, maxval = 240, group = G_EXEC)
+int planMaximumHoldMinutesInput = input.int(90, "Maximum Hold After Fill (Minutes)", minval = 15, maxval = 480, group = G_EXEC)
+float entryArmedDistanceAtrInput = input.float(0.15, "Show ENTRY ARMED Within ATR", minval = 0.05, maxval = 1.0, step = 0.05, group = G_EXEC)
+
+string G_STRATEGY = "08 — Strategy Tester"
+bool enableStrategyOrdersInput = input.bool(true, "Enable Strategy Orders", group = G_STRATEGY)
+int strategyQtyInput = input.int(1, "Contracts", minval = 1, maxval = 100, group = G_STRATEGY)
+string strategyDirectionInput = input.string("Both", "Trade Direction", options = ["Both", "Long Only", "Short Only"], group = G_STRATEGY)
+bool strategyEnableAPlusInput = input.bool(true, "Trade A++ Rotations", group = G_STRATEGY)
+bool strategyEnableAcceptedInput = input.bool(true, "Trade ACCEPTED Rotations", group = G_STRATEGY)
+bool strategyFiveMinuteOnlyInput = input.bool(true, "Require 5-Minute Chart", tooltip = "Research defaults were developed on 5-minute rotations. Disable only for separate timeframe research.", group = G_STRATEGY)
+bool strategyShowOrderLevelsInput = input.bool(true, "Show Strategy Entry / Stop / Target Levels", group = G_STRATEGY)
+
+f_clamp(float value, float lowValue, float highValue) =>
+    math.max(lowValue, math.min(highValue, value))
+
+f_score(float value, float target) =>
+    target <= 0 ? 0.0 : f_clamp(value / target * 100.0, 0.0, 100.0)
+
+f_dashboardPosition(string p) =>
+    p == "Top Left" ? position.top_left :
+     p == "Bottom Left" ? position.bottom_left :
+     p == "Bottom Right" ? position.bottom_right :
+     position.top_right
+
+f_dashboardSize(string s) =>
+    s == "Tiny" ? size.tiny :
+     s == "Normal" ? size.normal :
+     s == "Large" ? size.large :
+     size.small
+
+f_signed(float value) =>
+    (value >= 0 ? "+" : "") + str.tostring(value, "#.00")
+
+f_roleText(int role) =>
+    role == 1 ? "RES" : role == -1 ? "SUP" : "--"
+
+f_roleColor(int role) =>
+    role == 1 ? color.rgb(245, 75, 85) :
+     role == -1 ? color.rgb(0, 200, 140) :
+     color.gray
+
+f_efficiencyRatio(int length) =>
+    float netMove = math.abs(close - close[length])
+    float path = 0.0
+    for i = 0 to length - 1
+        path += math.abs(close[i] - close[i + 1])
+    path > 0 ? netMove / path : 0.0
+
+f_dirValue(float rawValue, int role) =>
+    role == 1 ? rawValue : role == -1 ? -rawValue : 0.0
+
+f_isSameLevel(int keyA, float levelA, int keyB, float levelB, float tolerance) =>
+    keyA == keyB and not na(levelA) and not na(levelB) and math.abs(levelA - levelB) <= tolerance
+
+float atr = math.max(nz(ta.atr(14), ta.tr(true)), syminfo.mintick)
+float zoneHalfWidth = atr * zoneHalfWidthAtrInput
+float roleFlipBuffer = atr * roleFlipBufferAtrInput
+float barRange = math.max(high - low, syminfo.mintick)
+float body = math.abs(close - open)
+float bodyFraction = body / barRange
+float closeLocation = (close - low) / barRange
+
+float volumeAverage = ta.sma(volume, relativeVolumeLengthInput)
+float relativeVolume = volumeAverage > 0 ? nz(volume, 0.0) / volumeAverage : 0.0
+
+float rawVelocity = (close - close[velocityLookbackInput]) / atr / velocityLookbackInput
+float rawAcceleration = rawVelocity - rawVelocity[1]
+float trendEfficiency = f_efficiencyRatio(trendEfficiencyLengthInput) * 100.0
+
+float fastRange = ta.sma(ta.tr(true), compressionFastLengthInput)
+float slowRange = ta.sma(ta.tr(true), compressionSlowLengthInput)
+float compressionPercent = slowRange > 0 ? f_clamp((1.0 - fastRange / slowRange) * 100.0, 0.0, 100.0) : 0.0
+
+float chartSeconds = nz(timeframe.in_seconds(timeframe.period), 60.0)
+float requestedLtfSeconds = nz(timeframe.in_seconds(executionLtfInput), chartSeconds)
+
+string effectiveExecutionLtf = requestedLtfSeconds > chartSeconds ? timeframe.period : executionLtfInput
+float effectiveLtfSeconds = nz(timeframe.in_seconds(effectiveExecutionLtf), chartSeconds)
+
+[upVolume, downVolume, deltaVolume] = ta.requestUpAndDownVolume(effectiveExecutionLtf)
+
+float deltaSum = 0.0
+float flowVolumeSum = 0.0
+
+for i = 0 to deltaWindowInput - 1
+    deltaSum += nz(deltaVolume[i], 0.0)
+    flowVolumeSum += nz(upVolume[i], 0.0) + nz(downVolume[i], 0.0)
+
+float deltaPressure = flowVolumeSum > 0 ? deltaSum / flowVolumeSum * 100.0 : 0.0
+
+int nominalSubBars = math.max(1, int(math.round(chartSeconds / math.max(effectiveLtfSeconds, 1.0))))
+string flowGranularity = nominalSubBars >= 10 ? "HIGH" : nominalSubBars >= 4 ? "MED" : "LOW"
+
+// Flow quality is based on whether the requested volume decomposition is
+// actually informative on this symbol/feed, not merely on theoretical LTF count.
+int flowValidBars = 0
+int flowNonZeroBars = 0
+int flowBothSidesBars = 0
+
+for i = 0 to flowQualityLookbackInput - 1
+    float qUp = nz(upVolume[i], 0.0)
+    float qDn = nz(downVolume[i], 0.0)
+    float qDelta = nz(deltaVolume[i], 0.0)
+    float qTotal = qUp + qDn
+
+    if qTotal > 0
+        flowValidBars += 1
+
+        if math.abs(qDelta) / qTotal >= 0.005
+            flowNonZeroBars += 1
+
+        if qUp > 0 and qDn > 0
+            flowBothSidesBars += 1
+
+float flowValidShare = flowValidBars * 100.0 / flowQualityLookbackInput
+float flowNonZeroShare = flowNonZeroBars * 100.0 / flowQualityLookbackInput
+float flowBothSidesShare = flowBothSidesBars * 100.0 / flowQualityLookbackInput
+
+float granularityFactor = nominalSubBars >= 10 ? 1.0 : nominalSubBars >= 4 ? 0.85 : 0.65
+
+float flowQualityScore =
+     f_clamp(
+         (
+             flowValidShare * 0.25 +
+             flowNonZeroShare * 0.50 +
+             flowBothSidesShare * 0.25
+         ) * granularityFactor,
+         0.0,
+         100.0
+     )
+
+string flowQualityText =
+     flowQualityScore >= 65 ? "GOOD" :
+     flowQualityScore >= 35 ? "LIMITED" :
+     "UNUSABLE"
+
+float flowQualityWeight = flowQualityScore / 100.0
+bool flowUsable = flowQualityText != "UNUSABLE"
+
+float pivotHigh = ta.pivothigh(high, pivotLeftInput, pivotRightInput)
+float pivotLow = ta.pivotlow(low, pivotLeftInput, pivotRightInput)
+
+var float lastSwingHigh = na
+var float previousSwingHigh = na
+var float lastSwingLow = na
+var float previousSwingLow = na
+
+if not na(pivotHigh)
+    previousSwingHigh := lastSwingHigh
+    lastSwingHigh := pivotHigh
+
+if not na(pivotLow)
+    previousSwingLow := lastSwingLow
+    lastSwingLow := pivotLow
+
+bool haveStructure = not na(lastSwingHigh) and not na(previousSwingHigh) and not na(lastSwingLow) and not na(previousSwingLow)
+bool higherHigh = haveStructure and lastSwingHigh > previousSwingHigh
+bool lowerHigh = haveStructure and lastSwingHigh < previousSwingHigh
+bool higherLow = haveStructure and lastSwingLow > previousSwingLow
+bool lowerLow = haveStructure and lastSwingLow < previousSwingLow
+
+string structureState =
+     higherHigh and higherLow ? "UP TREND" :
+     lowerHigh and lowerLow ? "DOWN TREND" :
+     higherHigh and lowerLow ? "EXPANDING / TRANSITION" :
+     lowerHigh and higherLow ? "COMPRESSION / TRANSITION" :
+     "BUILDING"
+
+plotshape(showPivotsInput and not na(pivotHigh), title = "Confirmed Swing High", style = shape.triangledown, location = location.abovebar, offset = -pivotRightInput, color = color.new(color.red, 10), size = size.tiny, text = "SH")
+plotshape(showPivotsInput and not na(pivotLow), title = "Confirmed Swing Low", style = shape.triangleup, location = location.belowbar, offset = -pivotRightInput, color = color.new(color.aqua, 10), size = size.tiny, text = "SL")
+
+bool newSwingHighLevel = not na(lastSwingHigh) and (na(lastSwingHigh[1]) or lastSwingHigh != lastSwingHigh[1])
+bool newSwingLowLevel = not na(lastSwingLow) and (na(lastSwingLow[1]) or lastSwingLow != lastSwingLow[1])
+
+var int swingHighBreakCount = 0
+var int swingLowBreakCount = 0
+var bool swingHighFlipped = false
+var bool swingLowFlipped = false
+
+if newSwingHighLevel
+    swingHighBreakCount := 0
+    swingHighFlipped := false
+
+if newSwingLowLevel
+    swingLowBreakCount := 0
+    swingLowFlipped := false
+
+if barstate.isconfirmed and not na(lastSwingHigh) and not swingHighFlipped
+    if close > lastSwingHigh + roleFlipBuffer
+        swingHighBreakCount += 1
+    else
+        swingHighBreakCount := 0
+    if swingHighBreakCount >= roleFlipConfirmBarsInput
+        swingHighFlipped := true
+
+if barstate.isconfirmed and not na(lastSwingLow) and not swingLowFlipped
+    if close < lastSwingLow - roleFlipBuffer
+        swingLowBreakCount += 1
+    else
+        swingLowBreakCount := 0
+    if swingLowBreakCount >= roleFlipConfirmBarsInput
+        swingLowFlipped := true
+
+int swingHighRole = swingHighFlipped ? -1 : 1
+int swingLowRole = swingLowFlipped ? 1 : -1
+
+// Trend integrity deliberately updates faster than pivot-defined structure.
+// This exposes the "trend still says UP, but its last support has failed"
+// phase that is often hidden until a later pivot confirms.
+string structureIntegrity =
+     structureState == "UP TREND" ?
+         (swingLowFlipped ? "BROKEN → TRANSITION" :
+          swingLowBreakCount > 0 ? "WEAKENING" :
+          close < lastSwingLow ? "PRESSURED" :
+          "INTACT") :
+     structureState == "DOWN TREND" ?
+         (swingHighFlipped ? "BROKEN → TRANSITION" :
+          swingHighBreakCount > 0 ? "WEAKENING" :
+          close > lastSwingHigh ? "PRESSURED" :
+          "INTACT") :
+     str.contains(structureState, "TRANSITION") ? "TRANSITION" :
+     "BUILDING"
+
+var string lastStructuralWarning = "NONE"
+var int lastStructuralWarningBar = na
+
+bool newUpTrendSupportFailure =
+     structureState == "UP TREND" and
+     swingLowFlipped and
+     not swingLowFlipped[1]
+
+bool newDownTrendResistanceFailure =
+     structureState == "DOWN TREND" and
+     swingHighFlipped and
+     not swingHighFlipped[1]
+
+if newUpTrendSupportFailure
+    lastStructuralWarning := "UPTREND SWING SUPPORT ACCEPTED BELOW"
+    lastStructuralWarningBar := bar_index
+
+if newDownTrendResistanceFailure
+    lastStructuralWarning := "DOWNTREND SWING RESISTANCE ACCEPTED ABOVE"
+    lastStructuralWarningBar := bar_index
+
+float logReturn = math.log(close / nz(close[1], close))
+float rollingMean = ta.sma(logReturn, changePointLengthInput)
+float rollingStd = ta.stdev(logReturn, changePointLengthInput)
+float returnZ = (logReturn - rollingMean) / (rollingStd == 0 ? 1.0 : rollingStd)
+
+var float cusumPositive = 0.0
+var float cusumNegative = 0.0
+var float changePointLevel = na
+var int changePointDirection = 0
+var int changePointBar = na
+var float changePointImpulse = na
+var int changePointBreakCount = 0
+var bool changePointFlipped = false
+
+bool changeUp = false
+bool changeDown = false
+
+if barstate.isconfirmed and not na(returnZ)
+    cusumPositive := math.max(0.0, cusumPositive + returnZ - changePointSlackInput)
+    cusumNegative := math.min(0.0, cusumNegative + returnZ + changePointSlackInput)
+
+    changeUp := cusumPositive > changePointThresholdInput
+    changeDown := cusumNegative < -changePointThresholdInput
+
+    if changeUp or changeDown
+        changePointDirection := changeUp ? 1 : -1
+        changePointLevel := close
+        changePointBar := bar_index
+        changePointImpulse := f_clamp(math.abs(returnZ) * 15.0 + math.min(relativeVolume, 3.0) * 15.0 + math.min(math.abs(deltaPressure), 50.0) * 0.8, 0.0, 100.0)
+        changePointBreakCount := 0
+        changePointFlipped := false
+        cusumPositive := 0.0
+        cusumNegative := 0.0
+
+int changePointAgeBars = na(changePointBar) ? 100000 : bar_index - changePointBar
+
+float changePointRelevance =
+     na(changePointBar) ? 0.0 :
+     100.0 * math.exp(-math.log(2.0) * changePointAgeBars / math.max(changePointHalfLifeBarsInput, 1))
+
+int changePointNominalRole = changePointDirection == 1 ? -1 : changePointDirection == -1 ? 1 : 0
+
+if barstate.isconfirmed and not na(changePointLevel) and not changePointFlipped
+    bool breakBeyondCp =
+         changePointNominalRole == 1 ? close > changePointLevel + roleFlipBuffer :
+         changePointNominalRole == -1 ? close < changePointLevel - roleFlipBuffer :
+         false
+
+    if breakBeyondCp
+        changePointBreakCount += 1
+    else
+        changePointBreakCount := 0
+
+    if changePointBreakCount >= roleFlipConfirmBarsInput
+        changePointFlipped := true
+
+int changePointRole = changePointFlipped ? -changePointNominalRole : changePointNominalRole
+
+plotshape(showChangePointsInput and changeUp, title = "Bullish Change Point", style = shape.diamond, location = location.belowbar, color = color.aqua, size = size.tiny, text = "CP")
+plotshape(showChangePointsInput and changeDown, title = "Bearish Change Point", style = shape.diamond, location = location.abovebar, color = color.orange, size = size.tiny, text = "CP")
+
+float focusLevel = na
+int focusRole = 0
+int focusKey = 0
+string focusOrigin = "--"
+string focusRoleStatus = "--"
+float focusDistanceAtr = 1e10
+
+if not na(lastSwingHigh)
+    float candidateDistance = math.abs(close - lastSwingHigh) / atr
+    if candidateDistance < focusDistanceAtr and candidateDistance <= maxFocusDistanceAtrInput
+        focusDistanceAtr := candidateDistance
+        focusLevel := lastSwingHigh
+        focusRole := swingHighRole
+        focusKey := 1
+        focusOrigin := "SWING HIGH"
+        focusRoleStatus := swingHighFlipped ? "CONFIRMED FLIP" : "ORIGINAL ROLE"
+
+if not na(lastSwingLow)
+    float candidateDistance = math.abs(close - lastSwingLow) / atr
+    if candidateDistance < focusDistanceAtr and candidateDistance <= maxFocusDistanceAtrInput
+        focusDistanceAtr := candidateDistance
+        focusLevel := lastSwingLow
+        focusRole := swingLowRole
+        focusKey := 2
+        focusOrigin := "SWING LOW"
+        focusRoleStatus := swingLowFlipped ? "CONFIRMED FLIP" : "ORIGINAL ROLE"
+
+if not na(changePointLevel)
+    float cpDistance = math.abs(close - changePointLevel) / atr
+    bool cpStillEligible = changePointRelevance >= minimumChangePointRelevanceInput or cpDistance <= changePointStickyDistanceAtrInput
+    if cpStillEligible and cpDistance < focusDistanceAtr and cpDistance <= maxFocusDistanceAtrInput
+        focusDistanceAtr := cpDistance
+        focusLevel := changePointLevel
+        focusRole := changePointRole
+        focusKey := 3
+        focusOrigin := changePointDirection == 1 ? "BULL CHANGE POINT" : "BEAR CHANGE POINT"
+        focusRoleStatus := changePointFlipped ? "CONFIRMED FLIP" : "ORIGINAL ROLE"
+
+bool hasFocus = focusKey != 0 and not na(focusLevel)
+float focusZoneLow = hasFocus ? focusLevel - zoneHalfWidth : na
+float focusZoneHigh = hasFocus ? focusLevel + zoneHalfWidth : na
+
+bool inFocusZone = hasFocus and high >= focusZoneLow and low <= focusZoneHigh
+
+bool beyondBreakSide =
+     hasFocus and
+     (focusRole == 1 ? close > focusZoneHigh : focusRole == -1 ? close < focusZoneLow : false)
+
+bool onApproachSide =
+     hasFocus and
+     (focusRole == 1 ? close <= focusZoneHigh : focusRole == -1 ? close >= focusZoneLow : false)
+
+bool pressureActive = hasFocus and focusDistanceAtr <= activeInteractionRadiusAtrInput
+
+float swingHighUpper = not na(lastSwingHigh) ? lastSwingHigh + zoneHalfWidth : na
+float swingHighLower = not na(lastSwingHigh) ? lastSwingHigh - zoneHalfWidth : na
+float swingLowUpper = not na(lastSwingLow) ? lastSwingLow + zoneHalfWidth : na
+float swingLowLower = not na(lastSwingLow) ? lastSwingLow - zoneHalfWidth : na
+float cpUpper = not na(changePointLevel) ? changePointLevel + zoneHalfWidth : na
+float cpLower = not na(changePointLevel) ? changePointLevel - zoneHalfWidth : na
+
+pSwingHighUpper = plot(showZonesInput ? swingHighUpper : na, "Swing High Zone Upper", color = color.new(f_roleColor(swingHighRole), 55), style = plot.style_stepline)
+pSwingHighLower = plot(showZonesInput ? swingHighLower : na, "Swing High Zone Lower", color = color.new(f_roleColor(swingHighRole), 55), style = plot.style_stepline)
+fill(pSwingHighUpper, pSwingHighLower, color = showZonesInput ? color.new(f_roleColor(swingHighRole), 92) : na, title = "Swing High Zone Fill")
+
+pSwingLowUpper = plot(showZonesInput ? swingLowUpper : na, "Swing Low Zone Upper", color = color.new(f_roleColor(swingLowRole), 55), style = plot.style_stepline)
+pSwingLowLower = plot(showZonesInput ? swingLowLower : na, "Swing Low Zone Lower", color = color.new(f_roleColor(swingLowRole), 55), style = plot.style_stepline)
+fill(pSwingLowUpper, pSwingLowLower, color = showZonesInput ? color.new(f_roleColor(swingLowRole), 92) : na, title = "Swing Low Zone Fill")
+
+pCpUpper = plot(showZonesInput ? cpUpper : na, "Change Point Zone Upper", color = color.new(f_roleColor(changePointRole), 70), style = plot.style_stepline)
+pCpLower = plot(showZonesInput ? cpLower : na, "Change Point Zone Lower", color = color.new(f_roleColor(changePointRole), 70), style = plot.style_stepline)
+fill(pCpUpper, pCpLower, color = showZonesInput ? color.new(f_roleColor(changePointRole), 95) : na, title = "Change Point Zone Fill")
+
+plot(showZonesInput ? changePointLevel : na, "Latest Change Point", color = color.new(color.yellow, 25), linewidth = 1, style = plot.style_stepline)
+
+float directionalVelocity = f_dirValue(rawVelocity, focusRole)
+float directionalAcceleration = f_dirValue(rawAcceleration, focusRole)
+float directionalDelta = f_dirValue(deltaPressure, focusRole)
+
+float directionalCloseQuality =
+     focusRole == 1 ? closeLocation * 100.0 :
+     focusRole == -1 ? (1.0 - closeLocation) * 100.0 :
+     50.0
+
+float directionalBodyProgressAtr =
+     focusRole == 1 ? (close - open) / atr :
+     focusRole == -1 ? (open - close) / atr :
+     0.0
+
+float upperWick = high - math.max(open, close)
+float lowerWick = math.min(open, close) - low
+
+float rejectionWickPercent =
+     focusRole == 1 ? upperWick / barRange * 100.0 :
+     focusRole == -1 ? lowerWick / barRange * 100.0 :
+     0.0
+
+float effortScore = f_clamp(relativeVolume / 2.0 * 100.0, 0.0, 100.0)
+float resultScore = f_score(math.max(directionalBodyProgressAtr, 0.0), 0.50)
+
+float participationQualityScore =
+     f_score(relativeVolume, participationRvolTargetInput)
+
+float opposingFlowScoreRaw =
+     f_score(math.max(-directionalDelta, 0.0), 25.0)
+
+float opposingFlowScore =
+     opposingFlowScoreRaw * flowQualityWeight
+
+float absorptionScore =
+     f_clamp(
+         (effortScore * (100.0 - resultScore) / 100.0) * 0.75 +
+         opposingFlowScore * 0.25,
+         0.0,
+         100.0
+     )
+
+// ta.sma() must run unconditionally on every bar to build its rolling
+// average correctly -- the original dwellPercent/frictionScore lines called
+// it only inside the hasFocus ternary (the identical bug already found and
+// fixed in Market_Structure_Physics_Lab_v1_0.pine and
+// Structure_Physics_v4_Rotation_Confirmation.pine), which starves it of
+// per-bar history and returns an unreliable value. Both raw series are now
+// computed unconditionally; only the final hasFocus gate on the result
+// stays conditional.
+float overlapWithZone = hasFocus ? math.max(0.0, math.min(high, focusZoneHigh) - math.max(low, focusZoneLow)) : 0.0
+float overlapFraction = hasFocus ? f_clamp(overlapWithZone / barRange, 0.0, 1.0) : 0.0
+float inFocusZonePct = inFocusZone ? 100.0 : 0.0
+float dwellRaw = ta.sma(inFocusZonePct, dwellLookbackInput)
+float overlapSma = ta.sma(overlapFraction * 100.0, dwellLookbackInput)
+float dwellPercent = hasFocus ? dwellRaw : 0.0
+
+float frictionScore =
+     hasFocus ? f_clamp(dwellPercent * 0.60 + overlapSma * 0.40, 0.0, 100.0) : 0.0
+
+float penetrationAtr =
+     not hasFocus ? 0.0 :
+     focusRole == 1 ? math.max(0.0, close - focusZoneHigh) / atr :
+     focusRole == -1 ? math.max(0.0, focusZoneLow - close) / atr :
+     0.0
+
+float transferEfficiencyRaw = math.max(directionalVelocity, 0.0) / math.max(relativeVolume, 0.25)
+float displacementEfficiencyScore = f_score(transferEfficiencyRaw, transferEfficiencyTargetInput)
+
+// High displacement efficiency on tiny RVOL is a THIN move, not automatically
+// high-quality continuation. This term is what BRK actually receives.
+float sponsoredTransferScore =
+     displacementEfficiencyScore *
+     (0.35 + 0.65 * participationQualityScore / 100.0)
+
+string transferRead =
+     displacementEfficiencyScore >= 60 and participationQualityScore < 35 ? "THIN MOVE" :
+     displacementEfficiencyScore >= 60 and participationQualityScore >= 60 ? "SPONSORED MOVE" :
+     displacementEfficiencyScore < 35 and participationQualityScore >= 60 ? "HIGH EFFORT / LOW RESULT" :
+     "NORMAL"
+
+float breakVelocityScore = f_score(math.max(directionalVelocity, 0.0), 0.75)
+float breakAccelerationScore = f_score(math.max(directionalAcceleration, 0.0), 0.35)
+float breakDeltaScoreRaw = f_score(math.max(directionalDelta, 0.0), 25.0)
+float breakDeltaScore = breakDeltaScoreRaw * flowQualityWeight
+float penetrationScore = f_score(penetrationAtr, 0.50)
+float antiWickScore = 100.0 - rejectionWickPercent
+
+float potentialBreakScore =
+     hasFocus ?
+     f_clamp(
+         breakVelocityScore * 0.15 +
+         breakAccelerationScore * 0.10 +
+         breakDeltaScore * 0.20 +
+         directionalCloseQuality * 0.10 +
+         penetrationScore * 0.15 +
+         antiWickScore * 0.10 +
+         sponsoredTransferScore * 0.20,
+         0.0,
+         100.0
+     ) :
+     0.0
+
+float awayVelocityScore = f_score(math.max(-directionalVelocity, 0.0), 0.75)
+
+float potentialHoldScore =
+     hasFocus ?
+     f_clamp(
+         opposingFlowScore * 0.20 +
+         rejectionWickPercent * 0.20 +
+         absorptionScore * 0.25 +
+         awayVelocityScore * 0.15 +
+         frictionScore * 0.10 +
+         (100.0 - penetrationScore) * 0.10,
+         0.0,
+         100.0
+     ) :
+     0.0
+
+float activeBreakScore = pressureActive ? potentialBreakScore : 0.0
+float activeHoldScore = pressureActive ? potentialHoldScore : 0.0
+
+string physicsRead = "NO NEARBY LEVEL"
+
+if hasFocus
+    if not pressureActive
+        physicsRead := directionalVelocity > 0.05 ? "DISTANT → APPROACH ENERGY BUILDING" : directionalVelocity < -0.05 ? "DISTANT → MOVING AWAY" : "DISTANT → POTENTIAL ONLY"
+    else if beyondBreakSide
+        physicsRead := activeBreakScore >= activeHoldScore + 15 ? "THROUGH → ACCEPTANCE PRESSURE" : "THROUGH → VERIFY RETENTION"
+    else if inFocusZone
+        physicsRead := activeBreakScore >= activeHoldScore + 15 ? "TESTING → BREAK PRESSURE" : activeHoldScore >= activeBreakScore + 15 ? "TESTING → HOLD / REJECTION" : "TESTING → CONTESTED"
+    else if onApproachSide
+        physicsRead := directionalVelocity > 0.05 ? "ACTIVE APPROACH" : directionalVelocity < -0.05 ? "ACTIVE → MOVING AWAY" : "ACTIVE → STALLING"
+    else
+        physicsRead := "ROLE-REVERSAL SIDE"
+
+//=============================================================================
+// ONE-EVENT-PER-ZONE INTERACTION ENGINE
+//=============================================================================
+
+var bool testActive = false
+var bool testClosedThrough = false
+
+var int testKey = 0
+var int testRole = 0
+var float testLevel = na
+var float testAtr = na
+var float testZoneHalf = na
+var int testStartBar = na
+var int testBreakBar = na
+var string testSource = ""
+var string testRoleStatus = ""
+
+var float impactVelocity = na
+var float impactAcceleration = na
+var float impactDelta = na
+var float impactRvol = na
+var float impactAbsorption = na
+var float impactTransfer = na
+var float impactParticipation = na
+var float impactFlowQuality = na
+var string impactFlowQualityText = ""
+var float impactCompression = na
+var float impactFriction = na
+var string impactStructure = ""
+
+var float testMaxPenetrationAtr = 0.0
+var float testPeakFriction = 0.0
+var float testPeakAbsorption = 0.0
+
+var int blockedKey = 0
+var float blockedLevel = na
+var bool blockedRearmReady = true
+var int lastResolvedBar = -10000
+
+var string lastOutcome = "NONE"
+var string lastOutcomeSource = "--"
+var int lastOutcomeBar = na
+
+var int outcomeHolds = 0
+var int outcomeBreaks = 0
+var int outcomeFails = 0
+var int outcomeStalls = 0
+var int outcomeExpires = 0
+
+var label lastOutcomeLabel = na
+
+float sameLevelTolerance = math.max(atr * 0.10, syminfo.mintick * 4)
+
+bool currentFocusIsBlocked =
+     hasFocus and
+     f_isSameLevel(focusKey, focusLevel, blockedKey, blockedLevel, sameLevelTolerance)
+
+if not blockedRearmReady and not na(blockedLevel)
+    bool movedAwayEnough = math.abs(close - blockedLevel) / atr >= eventRearmDistanceAtrInput
+    if movedAwayEnough
+        blockedRearmReady := true
+
+bool eventCooldownOk = bar_index - lastResolvedBar > eventCooldownBarsInput
+
+bool canArmCurrentFocus =
+     hasFocus and
+     inFocusZone and
+     eventCooldownOk and
+     (blockedRearmReady or not currentFocusIsBlocked)
+
+bool interactionStartedNow = false
+
+if barstate.isconfirmed and canArmCurrentFocus and not testActive
+    testActive := true
+    testClosedThrough := false
+
+    testKey := focusKey
+    testRole := focusRole
+    testLevel := focusLevel
+    testAtr := atr
+    testZoneHalf := zoneHalfWidth
+    testStartBar := bar_index
+    testBreakBar := na
+    testSource := focusOrigin
+    testRoleStatus := focusRoleStatus
+    interactionStartedNow := true
+
+    impactVelocity := f_dirValue(rawVelocity, testRole)
+    impactAcceleration := f_dirValue(rawAcceleration, testRole)
+    impactDelta := f_dirValue(deltaPressure, testRole)
+    impactRvol := relativeVolume
+    impactAbsorption := absorptionScore
+    impactTransfer := transferEfficiencyRaw
+    impactParticipation := participationQualityScore
+    impactFlowQuality := flowQualityScore
+    impactFlowQualityText := flowQualityText
+    impactCompression := compressionPercent
+    impactFriction := frictionScore
+    impactStructure := structureState
+
+    testMaxPenetrationAtr := 0.0
+    testPeakFriction := frictionScore
+    testPeakAbsorption := absorptionScore
+
+if barstate.isconfirmed and testActive
+    float testDirectionalVelocity = f_dirValue(rawVelocity, testRole)
+    float testDirectionalAcceleration = f_dirValue(rawAcceleration, testRole)
+    float testDirectionalDelta = f_dirValue(deltaPressure, testRole)
+
+    float testDirectionalBodyProgressAtr =
+         testRole == 1 ? (close - open) / testAtr : (open - close) / testAtr
+
+    float testResultScore = f_score(math.max(testDirectionalBodyProgressAtr, 0.0), 0.50)
+    float testOpposingFlowRaw = f_score(math.max(-testDirectionalDelta, 0.0), 25.0)
+    float testOpposingFlow = testOpposingFlowRaw * flowQualityWeight
+    float testEffort = f_clamp(relativeVolume / 2.0 * 100.0, 0.0, 100.0)
+    float testParticipation = f_score(relativeVolume, participationRvolTargetInput)
+
+    float testAbsorption =
+         f_clamp(
+             (testEffort * (100.0 - testResultScore) / 100.0) * 0.75 +
+             testOpposingFlow * 0.25,
+             0.0,
+             100.0
+         )
+
+    float testTransfer =
+         math.max(testDirectionalVelocity, 0.0) /
+         math.max(relativeVolume, 0.25)
+
+    float frozenZoneHigh = testLevel + testZoneHalf
+    float frozenZoneLow = testLevel - testZoneHalf
+
+    float currentMaxExcursionAtr =
+         testRole == 1 ?
+         math.max(0.0, high - frozenZoneHigh) / testAtr :
+         math.max(0.0, frozenZoneLow - low) / testAtr
+
+    testMaxPenetrationAtr :=
+         math.max(testMaxPenetrationAtr, currentMaxExcursionAtr)
+
+    float retainedPenetrationAtr =
+         testRole == 1 ?
+         math.max(0.0, close - frozenZoneHigh) / testAtr :
+         math.max(0.0, frozenZoneLow - close) / testAtr
+
+    float retainedPenetrationPercent =
+         testMaxPenetrationAtr > 0 ?
+         f_clamp(retainedPenetrationAtr / testMaxPenetrationAtr * 100.0, 0.0, 100.0) :
+         0.0
+
+    testPeakFriction := math.max(testPeakFriction, frictionScore)
+    testPeakAbsorption := math.max(testPeakAbsorption, testAbsorption)
+
+    float velocityChange = testDirectionalVelocity - impactVelocity
+    float deltaChange = testDirectionalDelta - impactDelta
+    float absorptionChange = testAbsorption - impactAbsorption
+    float transferChange = testTransfer - impactTransfer
+    float participationChange = testParticipation - impactParticipation
+
+    int testAge = bar_index - testStartBar
+    float resolutionDistance = resolutionDistanceAtrInput * testAtr
+
+    bool closeThrough =
+         testRole == 1 ?
+         close > frozenZoneHigh :
+         close < frozenZoneLow
+
+    bool holdResolved =
+         testRole == 1 ?
+         low <= testLevel - resolutionDistance :
+         high >= testLevel + resolutionDistance
+
+    bool breakResolved =
+         testRole == 1 ?
+         high >= testLevel + resolutionDistance :
+         low <= testLevel - resolutionDistance
+
+    bool returnedInside =
+         testRole == 1 ?
+         close < testLevel :
+         close > testLevel
+
+    string outcome = ""
+
+    if not testClosedThrough
+        if bar_index > testStartBar and holdResolved
+            outcome := testRole == 1 ? "RESISTANCE HELD / REJECTED" : "SUPPORT HELD / BOUNCED"
+        else if closeThrough
+            testClosedThrough := true
+            testBreakBar := bar_index
+        else if testAge >= preBreakHorizonBarsInput
+            outcome := "TEST EXPIRED / NO RESOLUTION"
+    else
+        int barsSinceBreak = bar_index - testBreakBar
+
+        if bar_index > testBreakBar and breakResolved and retainedPenetrationPercent >= 35.0
+            outcome := testRole == 1 ? "RESISTANCE BROKE / ACCEPTED ABOVE" : "SUPPORT BROKE / ACCEPTED BELOW"
+        else if returnedInside
+            outcome := "FAILED BREAK / RETURNED THROUGH LEVEL"
+        else if barsSinceBreak >= postBreakFollowBarsInput
+            outcome := "BREAK STALLED / NO FOLLOW-THROUGH"
+
+    if outcome != ""
+        lastOutcome := outcome
+        lastOutcomeSource := testSource
+        lastOutcomeBar := bar_index
+        lastResolvedBar := bar_index
+
+        blockedKey := testKey
+        blockedLevel := testLevel
+        blockedRearmReady := false
+
+        if str.contains(outcome, "HELD")
+            outcomeHolds += 1
+        else if str.contains(outcome, "BROKE")
+            outcomeBreaks += 1
+        else if str.contains(outcome, "FAILED")
+            outcomeFails += 1
+        else if str.contains(outcome, "STALLED")
+            outcomeStalls += 1
+        else
+            outcomeExpires += 1
+
+        if showLastOutcomeLabelInput
+            if not na(lastOutcomeLabel)
+                label.delete(lastOutcomeLabel)
+
+            lastOutcomeLabel :=
+                 label.new(
+                     bar_index,
+                     close,
+                     outcome +
+                     "\n" + f_roleText(testRole) + " | " + testSource + " | " + testRoleStatus +
+                     "\n" + impactStructure +
+                     "\nImpact v " + f_signed(impactVelocity) +
+                     " | a " + f_signed(impactAcceleration) +
+                     " | Δ " + (impactFlowQualityText == "UNUSABLE" ? "N/A" : f_signed(impactDelta) + "%") +
+                     " | Q " + str.tostring(impactFlowQuality, "#") + " " + impactFlowQualityText +
+                     "\nΔv " + f_signed(velocityChange) +
+                     " | Δflow " + f_signed(deltaChange) +
+                     " | Δabs " + f_signed(absorptionChange) +
+                     "\nDispEff Δ " + f_signed(transferChange) +
+                     " | Part Δ " + f_signed(participationChange) +
+                     " | PenMax " + str.tostring(testMaxPenetrationAtr, "#.00") + "A" +
+                     " | Ret " + str.tostring(retainedPenetrationPercent, "#") + "%",
+                     style = testRole == 1 ? label.style_label_down : label.style_label_up,
+                     color = color.new(
+                         str.contains(outcome, "BROKE") ? color.aqua :
+                         str.contains(outcome, "HELD") ? color.green :
+                         str.contains(outcome, "FAILED") ? color.orange :
+                         str.contains(outcome, "STALLED") ? color.orange :
+                         color.gray,
+                         10
+                     ),
+                     textcolor = color.white,
+                     size = size.tiny
+                 )
+
+        testActive := false
+        testClosedThrough := false
+        testKey := 0
+        testRole := 0
+        testLevel := na
+        testAtr := na
+        testZoneHalf := na
+        testStartBar := na
+        testBreakBar := na
+        testSource := ""
+        testRoleStatus := ""
+
+        impactVelocity := na
+        impactAcceleration := na
+        impactDelta := na
+        impactRvol := na
+        impactAbsorption := na
+        impactTransfer := na
+        impactParticipation := na
+        impactFlowQuality := na
+        impactFlowQualityText := ""
+        impactCompression := na
+        impactFriction := na
+        impactStructure := ""
+
+        testMaxPenetrationAtr := 0.0
+        testPeakFriction := 0.0
+        testPeakAbsorption := 0.0
+
+//=============================================================================
+// LIVE INTERACTION DIAGNOSTICS
+//=============================================================================
+
+float liveTestVelocity = testActive ? f_dirValue(rawVelocity, testRole) : na
+float liveTestDelta = testActive ? f_dirValue(deltaPressure, testRole) : na
+
+float liveTestBodyProgressAtr =
+     testActive ?
+     (testRole == 1 ? (close - open) / testAtr : (open - close) / testAtr) :
+     na
+
+float liveTestResult =
+     testActive ?
+     f_score(math.max(liveTestBodyProgressAtr, 0.0), 0.50) :
+     na
+
+float liveTestOppFlow =
+     testActive ?
+     f_score(math.max(-liveTestDelta, 0.0), 25.0) :
+     na
+
+float liveTestEffort =
+     testActive ?
+     f_clamp(relativeVolume / 2.0 * 100.0, 0.0, 100.0) :
+     na
+
+float liveTestAbsorption =
+     testActive ?
+     f_clamp(
+         (liveTestEffort * (100.0 - liveTestResult) / 100.0) * 0.65 +
+         liveTestOppFlow * 0.35,
+         0.0,
+         100.0
+     ) :
+     na
+
+float liveTestTransfer =
+     testActive ?
+     math.max(liveTestVelocity, 0.0) /
+     math.max(relativeVolume, 0.25) :
+     na
+
+float liveVelocityChange = testActive ? liveTestVelocity - impactVelocity : na
+float liveDeltaChange = testActive ? liveTestDelta - impactDelta : na
+float liveAbsorptionChange = testActive ? liveTestAbsorption - impactAbsorption : na
+float liveTransferChange = testActive ? liveTestTransfer - impactTransfer : na
+float liveParticipationChange = testActive ? participationQualityScore - impactParticipation : na
+
+float liveRetainedPenetrationPercent = na
+
+if testActive
+    float liveFrozenHigh = testLevel + testZoneHalf
+    float liveFrozenLow = testLevel - testZoneHalf
+
+    float liveRetainedAtr =
+         testRole == 1 ?
+         math.max(0.0, close - liveFrozenHigh) / testAtr :
+         math.max(0.0, liveFrozenLow - close) / testAtr
+
+    liveRetainedPenetrationPercent :=
+         testMaxPenetrationAtr > 0 ?
+         f_clamp(liveRetainedAtr / testMaxPenetrationAtr * 100.0, 0.0, 100.0) :
+         0.0
+
+//=============================================================================
+// ROTATION CONFIRMATION & EXECUTION STATE MACHINE
+//=============================================================================
+//
+// The engine is deliberately causal:
+//   interaction -> first confirmed reaction pivot -> confirmed corrective pivot
+//   -> close beyond reaction H1/L1 -> freeze acceptance grade.
+//
+// A bullish rotation starts from SUPPORT and seeks:
+//   impact low -> H1 -> higher low -> close above H1.
+//
+// A bearish rotation starts from RESISTANCE and seeks:
+//   impact high -> L1 -> lower high -> close below L1.
+//
+// Pivot values are used only when they are confirmed. No future pivot is
+// backfilled into the state machine.
+//
+// rotationPhase:
+//   0 = idle / last confirmation frozen
+//   1 = building first impulse
+//   2 = waiting for HL/LH
+//   3 = HL/LH formed, waiting for H1/L1 break
+//   4 = confirmed
+//  -1 = failed / timed out
+//
+// planState:
+//   "NONE", "WAITING PULLBACK", "ENTRY ARMED", "FILLED",
+//   "TARGET HIT", "STOPPED", "EXPIRED", "INVALIDATED"
+//
+//=============================================================================
+
+var int rotationPhase = 0
+var int rotationDirection = 0
+var int rotationStartBar = na
+var int rotationStartTime = na
+var float rotationAtr = na
+var float rotationAnchorLevel = na
+var float rotationAnchorExtreme = na
+var string rotationOrigin = ""
+var string rotationRoleStatus = ""
+
+var float rotationReactionLevel = na
+var int rotationReactionBar = na
+var float rotationCorrectionLevel = na
+var int rotationCorrectionBar = na
+
+var float rotationConfirmClose = na
+var int rotationConfirmBar = na
+var int rotationConfirmTime = na
+var float rotationExtensionAtr = na
+var float rotationConfirmRvol = na
+var float rotationConfirmVelocity = na
+var float rotationConfirmAcceleration = na
+var float rotationConfirmDelta = na
+var float rotationConfirmFlowQuality = na
+var string rotationGrade = "NONE"
+var string rotationLastMessage = "NONE"
+
+var float planEntry = na
+var float planStop = na
+var float planTarget = na
+var float planRisk = na
+var float planRetraceFraction = na
+var float planTargetR = na
+var int planTimeoutMinutes = na
+var string planState = "NONE"
+var int planFillBar = na
+var int planFillTime = na
+var int planLastTerminalBar = na
+
+var int planWins = 0
+var int planStops = 0
+var int planExpired = 0
+var int planInvalidated = 0
+
+bool rotationConfirmedNow = false
+bool rotationAPlusPlusNow = false
+bool rotationAcceptedNow = false
+bool rotationHollowNow = false
+bool planFilledNow = false
+bool planTargetNow = false
+bool planStoppedNow = false
+
+int confirmedPivotBar = bar_index - pivotRightInput
+
+// New focused structure interaction starts a fresh rotation thesis only when
+// there is no live execution plan. This prevents overlapping plans.
+bool executionPlanBusy =
+     planState == "WAITING PULLBACK" or
+     planState == "ENTRY ARMED" or
+     planState == "FILLED"
+
+if rotationEngineInput and interactionStartedNow and not executionPlanBusy
+    rotationPhase := 1
+    rotationDirection := testRole == -1 ? 1 : testRole == 1 ? -1 : 0
+    rotationStartBar := bar_index
+    rotationStartTime := time
+    rotationAtr := atr
+    rotationAnchorLevel := testLevel
+    rotationAnchorExtreme := rotationDirection == 1 ? low : high
+    rotationOrigin := testSource
+    rotationRoleStatus := testRoleStatus
+
+    rotationReactionLevel := na
+    rotationReactionBar := na
+    rotationCorrectionLevel := na
+    rotationCorrectionBar := na
+
+    rotationConfirmClose := na
+    rotationConfirmBar := na
+    rotationConfirmTime := na
+    rotationExtensionAtr := na
+    rotationConfirmRvol := na
+    rotationConfirmVelocity := na
+    rotationConfirmAcceleration := na
+    rotationConfirmDelta := na
+    rotationConfirmFlowQuality := na
+    rotationGrade := "BUILDING"
+    rotationLastMessage := rotationDirection == 1 ? "BULL ROTATION BUILDING" : "BEAR ROTATION BUILDING"
+
+    planEntry := na
+    planStop := na
+    planTarget := na
+    planRisk := na
+    planRetraceFraction := na
+    planTargetR := na
+    planTimeoutMinutes := na
+    planState := "NONE"
+    planFillBar := na
+    planFillTime := na
+
+// Build the first directional impulse and freeze its confirmed reaction pivot.
+if rotationEngineInput and barstate.isconfirmed and rotationPhase == 1 and rotationDirection != 0
+    // The impact extreme is allowed to evolve while the initial sweep/impact
+    // is still forming. Once H1/L1 is confirmed it freezes.
+    rotationAnchorExtreme :=
+         rotationDirection == 1 ?
+         math.min(rotationAnchorExtreme, low) :
+         math.max(rotationAnchorExtreme, high)
+
+    bool validBullReaction =
+         rotationDirection == 1 and
+         not na(pivotHigh) and
+         confirmedPivotBar > rotationStartBar
+
+    bool validBearReaction =
+         rotationDirection == -1 and
+         not na(pivotLow) and
+         confirmedPivotBar > rotationStartBar
+
+    if validBullReaction
+        rotationReactionLevel := pivotHigh
+        rotationReactionBar := confirmedPivotBar
+        rotationPhase := 2
+        rotationGrade := "PULLBACK FORMING"
+        rotationLastMessage := "H1 FROZEN — WAITING FOR HIGHER LOW"
+
+    if validBearReaction
+        rotationReactionLevel := pivotLow
+        rotationReactionBar := confirmedPivotBar
+        rotationPhase := 2
+        rotationGrade := "PULLBACK FORMING"
+        rotationLastMessage := "L1 FROZEN — WAITING FOR LOWER HIGH"
+
+// During the pullback, a still-more-extreme reaction pivot can replace H1/L1
+// until the corrective HL/LH is actually confirmed.
+if rotationEngineInput and barstate.isconfirmed and rotationPhase == 2
+    if rotationDirection == 1
+        if not na(pivotHigh) and confirmedPivotBar > rotationReactionBar and pivotHigh > rotationReactionLevel
+            rotationReactionLevel := pivotHigh
+            rotationReactionBar := confirmedPivotBar
+
+        bool impactLowLost =
+             close < rotationAnchorExtreme - rotationMinHigherLowAtrInput * rotationAtr
+
+        if impactLowLost
+            rotationPhase := -1
+            rotationGrade := "FAILED"
+            rotationLastMessage := "BULL ROTATION FAILED — IMPACT LOW LOST"
+        else
+            bool validHigherLow =
+                 not na(pivotLow) and
+                 confirmedPivotBar > rotationReactionBar and
+                 pivotLow > rotationAnchorExtreme + rotationMinHigherLowAtrInput * rotationAtr
+
+            if validHigherLow
+                rotationCorrectionLevel := pivotLow
+                rotationCorrectionBar := confirmedPivotBar
+                rotationPhase := 3
+                rotationGrade := "HL FORMED"
+                rotationLastMessage := "HIGHER LOW CONFIRMED — WAITING FOR H1 CLOSE-THROUGH"
+
+    if rotationDirection == -1
+        if not na(pivotLow) and confirmedPivotBar > rotationReactionBar and pivotLow < rotationReactionLevel
+            rotationReactionLevel := pivotLow
+            rotationReactionBar := confirmedPivotBar
+
+        bool impactHighLost =
+             close > rotationAnchorExtreme + rotationMinHigherLowAtrInput * rotationAtr
+
+        if impactHighLost
+            rotationPhase := -1
+            rotationGrade := "FAILED"
+            rotationLastMessage := "BEAR ROTATION FAILED — IMPACT HIGH LOST"
+        else
+            bool validLowerHigh =
+                 not na(pivotHigh) and
+                 confirmedPivotBar > rotationReactionBar and
+                 pivotHigh < rotationAnchorExtreme - rotationMinHigherLowAtrInput * rotationAtr
+
+            if validLowerHigh
+                rotationCorrectionLevel := pivotHigh
+                rotationCorrectionBar := confirmedPivotBar
+                rotationPhase := 3
+                rotationGrade := "LH FORMED"
+                rotationLastMessage := "LOWER HIGH CONFIRMED — WAITING FOR L1 CLOSE-THROUGH"
+
+// Once HL/LH exists, the reaction H1/L1 must be closed through.
+if rotationEngineInput and barstate.isconfirmed and rotationPhase == 3
+    bool lostBullCorrection =
+         rotationDirection == 1 and
+         close < rotationCorrectionLevel
+
+    bool lostBearCorrection =
+         rotationDirection == -1 and
+         close > rotationCorrectionLevel
+
+    if lostBullCorrection or lostBearCorrection
+        // The exact HL/LH failed, but the original impact extreme can still be
+        // intact. Return to pullback search rather than pretending the thesis
+        // is permanently dead.
+        rotationCorrectionLevel := na
+        rotationCorrectionBar := na
+        rotationPhase := 2
+        rotationGrade := "PULLBACK RESET"
+        rotationLastMessage := rotationDirection == 1 ? "HL LOST — SEARCHING FOR NEW HL" : "LH LOST — SEARCHING FOR NEW LH"
+    else
+        bool confirmedBullBreak =
+             rotationDirection == 1 and
+             close > rotationReactionLevel
+
+        bool confirmedBearBreak =
+             rotationDirection == -1 and
+             close < rotationReactionLevel
+
+        if confirmedBullBreak or confirmedBearBreak
+            rotationConfirmClose := close
+            rotationConfirmBar := bar_index
+            rotationConfirmTime := time
+            rotationExtensionAtr :=
+                 rotationDirection == 1 ?
+                 (close - rotationReactionLevel) / rotationAtr :
+                 (rotationReactionLevel - close) / rotationAtr
+
+            rotationConfirmRvol := relativeVolume
+            rotationConfirmVelocity := rotationDirection * rawVelocity
+            rotationConfirmAcceleration := rotationDirection * rawAcceleration
+            rotationConfirmDelta := rotationDirection * deltaPressure
+            rotationConfirmFlowQuality := flowQualityScore
+
+            bool isAPlusPlus =
+                 rotationExtensionAtr >= aPlusPlusExtensionAtrInput and
+                 rotationConfirmRvol >= aPlusPlusRvolInput and
+                 rotationConfirmVelocity >= aPlusPlusVelocityInput
+
+            bool isHollow =
+                 rotationExtensionAtr < hollowExtensionAtrInput and
+                 rotationConfirmRvol <= hollowRvolInput
+
+            if isAPlusPlus
+                rotationGrade := "A++"
+            else if isHollow
+                rotationGrade := "HOLLOW"
+            else if rotationExtensionAtr < fragileExtensionAtrInput
+                rotationGrade := "FRAGILE"
+            else if rotationExtensionAtr >= acceptedExtensionAtrInput
+                rotationGrade := "ACCEPTED"
+            else
+                rotationGrade := "DEVELOPING"
+
+            rotationPhase := 4
+            rotationConfirmedNow := true
+            rotationAPlusPlusNow := rotationGrade == "A++"
+            rotationAcceptedNow := rotationGrade == "ACCEPTED"
+            rotationHollowNow := rotationGrade == "HOLLOW"
+
+            rotationLastMessage :=
+                 (rotationDirection == 1 ? "BULL " : "BEAR ") +
+                 rotationGrade +
+                 " | CLOSE-THROUGH " +
+                 str.tostring(rotationExtensionAtr, "#.00") +
+                 "A"
+
+// Candidate rotation timeout.
+if rotationEngineInput and barstate.isconfirmed and (rotationPhase == 1 or rotationPhase == 2 or rotationPhase == 3)
+    bool rotationTimedOut =
+         bar_index - rotationStartBar >= rotationMaxBarsInput
+
+    if rotationTimedOut
+        rotationPhase := -1
+        rotationGrade := "FAILED"
+        rotationLastMessage := "ROTATION EXPIRED BEFORE CONFIRMATION"
+
+// Build a frozen execution plan only after ACCEPTED or A++ confirmation.
+if rotationConfirmedNow
+    bool tradableGrade =
+         rotationGrade == "A++" or
+         rotationGrade == "ACCEPTED"
+
+    if tradableGrade
+        bool isAPlan = rotationGrade == "A++"
+
+        planRetraceFraction := isAPlan ? aPlusRetraceInput : acceptedRetraceInput
+        float stopAtrDistance = isAPlan ? aPlusStopAtrInput : acceptedStopAtrInput
+        planTargetR := isAPlan ? aPlusTargetRInput : acceptedTargetRInput
+        planTimeoutMinutes := isAPlan ? aPlusEntryTimeoutMinutesInput : acceptedEntryTimeoutMinutesInput
+
+        float confirmationLeg =
+             math.abs(rotationConfirmClose - rotationReactionLevel)
+
+        planEntry :=
+             rotationDirection == 1 ?
+             rotationConfirmClose - planRetraceFraction * confirmationLeg :
+             rotationConfirmClose + planRetraceFraction * confirmationLeg
+
+        planStop :=
+             rotationDirection == 1 ?
+             rotationReactionLevel - stopAtrDistance * rotationAtr :
+             rotationReactionLevel + stopAtrDistance * rotationAtr
+
+        planRisk := math.abs(planEntry - planStop)
+
+        planTarget :=
+             rotationDirection == 1 ?
+             planEntry + planTargetR * planRisk :
+             planEntry - planTargetR * planRisk
+
+        planState := "WAITING PULLBACK"
+        rotationLastMessage +=
+             " | PLAN " +
+             str.tostring(planRetraceFraction * 100.0, "#") +
+             "% RETRACE"
+    else
+        planState := "NONE"
+
+// Live plan state. Before a fill, structural invalidation is checked before
+// entry-touch. This deliberately handles ambiguous bars conservatively.
+if barstate.isconfirmed and (planState == "WAITING PULLBACK" or planState == "ENTRY ARMED") and bar_index > rotationConfirmBar
+    bool planTimedOut =
+         not na(rotationConfirmTime) and
+         time >= rotationConfirmTime + planTimeoutMinutes * 60 * 1000
+
+    bool preEntryInvalidated =
+         rotationDirection == 1 ?
+         low <= planStop :
+         high >= planStop
+
+    bool entryTouched =
+         rotationDirection == 1 ?
+         low <= planEntry :
+         high >= planEntry
+
+    float entryDistanceAtr =
+         not na(planEntry) and not na(rotationAtr) ?
+         math.abs(close - planEntry) / rotationAtr :
+         999.0
+
+    if preEntryInvalidated
+        planState := "INVALIDATED"
+        planInvalidated += 1
+        planLastTerminalBar := bar_index
+        rotationLastMessage := "PLAN INVALIDATED BEFORE ENTRY"
+    else if entryTouched
+        planState := "FILLED"
+        planFillBar := bar_index
+        planFillTime := time
+        planFilledNow := true
+        rotationLastMessage := "PLAN FILLED @ " + str.tostring(planEntry, format.mintick)
+    else if planTimedOut
+        planState := "EXPIRED"
+        planExpired += 1
+        planLastTerminalBar := bar_index
+        rotationLastMessage := "PLAN EXPIRED — NO RETRACEMENT ENTRY"
+    else
+        planState := entryDistanceAtr <= entryArmedDistanceAtrInput ? "ENTRY ARMED" : "WAITING PULLBACK"
+
+// After a fill, do not credit a same-bar target. On subsequent bars, stop is
+// checked before target, again conservative when intrabar order is unknown.
+if barstate.isconfirmed and planState == "FILLED" and bar_index > planFillBar
+    bool holdTimedOut =
+         not na(planFillTime) and
+         time >= planFillTime + planMaximumHoldMinutesInput * 60 * 1000
+
+    bool stopTouched =
+         rotationDirection == 1 ?
+         low <= planStop :
+         high >= planStop
+
+    bool targetTouched =
+         rotationDirection == 1 ?
+         high >= planTarget :
+         low <= planTarget
+
+    if stopTouched
+        planState := "STOPPED"
+        planStops += 1
+        planStoppedNow := true
+        planLastTerminalBar := bar_index
+        rotationLastMessage := "EXECUTION STOPPED"
+    else if targetTouched
+        planState := "TARGET HIT"
+        planWins += 1
+        planTargetNow := true
+        planLastTerminalBar := bar_index
+        rotationLastMessage := "EXECUTION TARGET HIT"
+    else if holdTimedOut
+        planState := "EXPIRED"
+        planExpired += 1
+        planLastTerminalBar := bar_index
+        rotationLastMessage := "EXECUTION TIME EXIT / EXPIRED"
+
+//=============================================================================
+// TRADINGVIEW STRATEGY ORDERS
+//-----------------------------------------------------------------------------
+// The research state machine above decides when a plan exists. This section
+// translates the frozen plan into actual TradingView Strategy Tester orders.
+//
+// IMPORTANT DIFFERENCE FROM THE MANUAL RESEARCH COUNTER:
+// TradingView's broker emulator decides intrabar order sequencing. Bar
+// Magnifier is enabled in strategy() to improve that sequencing when lower-
+// timeframe data is available. Strategy Tester results can therefore differ
+// slightly from the conservative manual plan counters on ambiguous bars.
+//=============================================================================
+
+bool strategyTimeframeOk =
+     not strategyFiveMinuteOnlyInput or
+     (timeframe.isminutes and timeframe.multiplier == 5)
+
+bool strategyLongAllowed =
+     strategyDirectionInput == "Both" or
+     strategyDirectionInput == "Long Only"
+
+bool strategyShortAllowed =
+     strategyDirectionInput == "Both" or
+     strategyDirectionInput == "Short Only"
+
+bool strategyGradeAllowed =
+     (rotationGrade == "A++" and strategyEnableAPlusInput) or
+     (rotationGrade == "ACCEPTED" and strategyEnableAcceptedInput)
+
+bool strategyPlanCreatedNow =
+     enableStrategyOrdersInput and
+     strategyTimeframeOk and
+     rotationConfirmedNow and
+     strategyGradeAllowed and
+     not na(planEntry) and
+     not na(planStop) and
+     not na(planTarget) and
+     strategy.position_size == 0
+
+if strategyPlanCreatedNow
+    // Ensure no stale pending order from a prior plan remains.
+    strategy.cancel("SP Long")
+    strategy.cancel("SP Short")
+    strategy.cancel("SP Long Exit")
+    strategy.cancel("SP Short Exit")
+
+    if rotationDirection == 1 and strategyLongAllowed
+        strategy.entry(
+             "SP Long",
+             strategy.long,
+             qty = strategyQtyInput,
+             limit = planEntry,
+             comment = rotationGrade + " LONG"
+        )
+        strategy.exit(
+             "SP Long Exit",
+             from_entry = "SP Long",
+             stop = planStop,
+             limit = planTarget,
+             comment_profit = "TP",
+             comment_loss = "SL"
+        )
+
+    if rotationDirection == -1 and strategyShortAllowed
+        strategy.entry(
+             "SP Short",
+             strategy.short,
+             qty = strategyQtyInput,
+             limit = planEntry,
+             comment = rotationGrade + " SHORT"
+        )
+        strategy.exit(
+             "SP Short Exit",
+             from_entry = "SP Short",
+             stop = planStop,
+             limit = planTarget,
+             comment_profit = "TP",
+             comment_loss = "SL"
+        )
+
+// Keep bracket orders refreshed while the plan remains live.
+if enableStrategyOrdersInput and strategyTimeframeOk
+    bool strategyPlanLive =
+         planState == "WAITING PULLBACK" or
+         planState == "ENTRY ARMED" or
+         planState == "FILLED"
+
+    if strategyPlanLive and rotationDirection == 1 and strategyLongAllowed and not na(planStop) and not na(planTarget)
+        strategy.exit(
+             "SP Long Exit",
+             from_entry = "SP Long",
+             stop = planStop,
+             limit = planTarget,
+             comment_profit = "TP",
+             comment_loss = "SL"
+        )
+
+    if strategyPlanLive and rotationDirection == -1 and strategyShortAllowed and not na(planStop) and not na(planTarget)
+        strategy.exit(
+             "SP Short Exit",
+             from_entry = "SP Short",
+             stop = planStop,
+             limit = planTarget,
+             comment_profit = "TP",
+             comment_loss = "SL"
+        )
+
+// Cancel unfilled limits when the causal plan expires or is invalidated.
+bool strategyPlanDeadBeforeFill =
+     planState == "INVALIDATED" or
+     (planState == "EXPIRED" and na(planFillBar))
+
+if enableStrategyOrdersInput and strategyPlanDeadBeforeFill
+    strategy.cancel("SP Long")
+    strategy.cancel("SP Short")
+    strategy.cancel("SP Long Exit")
+    strategy.cancel("SP Short Exit")
+
+    // If TradingView's intrabar emulator filled before the manual conservative
+    // invalidation was observed, flatten the position instead of leaving an
+    // orphaned trade.
+    if strategy.position_size > 0
+        strategy.close("SP Long", comment = "PLAN INVALIDATED", immediately = true)
+    if strategy.position_size < 0
+        strategy.close("SP Short", comment = "PLAN INVALIDATED", immediately = true)
+
+// Enforce the research maximum holding window.
+bool strategyTimeExit =
+     planState == "EXPIRED" and
+     not na(planFillBar)
+
+if enableStrategyOrdersInput and strategyTimeExit
+    if strategy.position_size > 0
+        strategy.close("SP Long", comment = "TIME EXIT", immediately = true)
+    if strategy.position_size < 0
+        strategy.close("SP Short", comment = "TIME EXIT", immediately = true)
+
+// If strategy orders are disabled mid-run, remove pending entries. Existing
+// positions retain their protective strategy.exit orders until closed.
+if not enableStrategyOrdersInput and strategy.position_size == 0
+    strategy.cancel("SP Long")
+    strategy.cancel("SP Short")
+
+// Frozen lines. H1/L1 and HL/LH remain visible while the latest rotation is
+// being built or while its execution plan remains relevant.
+bool showRotationLevels =
+     rotationEngineInput and
+     rotationDirection != 0 and
+     rotationPhase != 0
+
+plot(
+     showRotationLevels ? rotationReactionLevel : na,
+     "Rotation H1/L1",
+     color = color.new(color.yellow, 5),
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     showRotationLevels ? rotationCorrectionLevel : na,
+     "Rotation HL/LH",
+     color = color.new(color.aqua, 15),
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     showRotationLevels and rotationPhase == 4 ? rotationConfirmClose : na,
+     "Rotation Confirmation Close",
+     color = color.new(color.white, 25),
+     linewidth = 1,
+     style = plot.style_linebr
+)
+
+bool showLivePlan =
+     showExecutionPlanInput and
+     strategyShowOrderLevelsInput and
+     not na(planEntry) and
+     (
+         planState == "WAITING PULLBACK" or
+         planState == "ENTRY ARMED" or
+         planState == "FILLED"
+     )
+
+plot(
+     showLivePlan ? planEntry : na,
+     "Research Entry Plan",
+     color = color.new(color.aqua, 0),
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     showLivePlan ? planStop : na,
+     "Research Structural Stop",
+     color = color.new(color.red, 0),
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     showLivePlan ? planTarget : na,
+     "Research Target",
+     color = color.new(color.green, 0),
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+//-----------------------------------------------------------------------------
+// HISTORICAL CONFIRMATION + ENTRY MARKERS
+//-----------------------------------------------------------------------------
+// Confirmation markers are NOT entries. They show when the 5m rotation has
+// completed and the new H1/L1 structure has been accepted strongly enough to
+// freeze an execution plan.
+//
+// BUY / SELL markers are the actual research-entry events: price has retraced
+// to the frozen planEntry after an ACCEPTED or A++ confirmation.
+//
+// This fixes a visibility problem in v4: v4 tracked fills internally and drew
+// only the live entry/stop/target lines, so completed historical fills could
+// disappear from the chart even though Plan Stats counted them.
+
+bool bullAPlusMarker =
+     showConfirmationMarkersInput and
+     rotationAPlusPlusNow and
+     rotationDirection == 1
+
+bool bearAPlusMarker =
+     showConfirmationMarkersInput and
+     rotationAPlusPlusNow and
+     rotationDirection == -1
+
+bool bullAcceptedMarker =
+     showConfirmationMarkersInput and
+     rotationAcceptedNow and
+     rotationDirection == 1
+
+bool bearAcceptedMarker =
+     showConfirmationMarkersInput and
+     rotationAcceptedNow and
+     rotationDirection == -1
+
+bool bullEntryMarker =
+     showEntryMarkersInput and
+     planFilledNow and
+     rotationDirection == 1
+
+bool bearEntryMarker =
+     showEntryMarkersInput and
+     planFilledNow and
+     rotationDirection == -1
+
+bool bullTargetMarker =
+     showPlanOutcomeMarkersInput and
+     planTargetNow and
+     rotationDirection == 1
+
+bool bearTargetMarker =
+     showPlanOutcomeMarkersInput and
+     planTargetNow and
+     rotationDirection == -1
+
+bool bullStopMarker =
+     showPlanOutcomeMarkersInput and
+     planStoppedNow and
+     rotationDirection == 1
+
+bool bearStopMarker =
+     showPlanOutcomeMarkersInput and
+     planStoppedNow and
+     rotationDirection == -1
+
+plotshape(
+     bullAPlusMarker,
+     title = "Bull A++ Confirmation",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.new(color.aqua, 0),
+     textcolor = color.black,
+     size = size.tiny,
+     text = "A++"
+)
+
+plotshape(
+     bearAPlusMarker,
+     title = "Bear A++ Confirmation",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.new(color.aqua, 0),
+     textcolor = color.black,
+     size = size.tiny,
+     text = "A++"
+)
+
+plotshape(
+     bullAcceptedMarker,
+     title = "Bull Accepted Confirmation",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.new(color.green, 0),
+     textcolor = color.white,
+     size = size.tiny,
+     text = "ACC"
+)
+
+plotshape(
+     bearAcceptedMarker,
+     title = "Bear Accepted Confirmation",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.new(color.green, 0),
+     textcolor = color.white,
+     size = size.tiny,
+     text = "ACC"
+)
+
+plotshape(
+     bullEntryMarker,
+     title = "Bull Research Entry",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.new(color.lime, 0),
+     textcolor = color.black,
+     size = size.small,
+     text = "BUY"
+)
+
+plotshape(
+     bearEntryMarker,
+     title = "Bear Research Entry",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.new(color.red, 0),
+     textcolor = color.white,
+     size = size.small,
+     text = "SELL"
+)
+
+plotshape(
+     bullTargetMarker,
+     title = "Bull Research Target",
+     style = shape.circle,
+     location = location.abovebar,
+     color = color.new(color.green, 0),
+     size = size.tiny,
+     text = "TP"
+)
+
+plotshape(
+     bearTargetMarker,
+     title = "Bear Research Target",
+     style = shape.circle,
+     location = location.belowbar,
+     color = color.new(color.green, 0),
+     size = size.tiny,
+     text = "TP"
+)
+
+plotshape(
+     bullStopMarker,
+     title = "Bull Research Stop",
+     style = shape.xcross,
+     location = location.belowbar,
+     color = color.new(color.orange, 0),
+     size = size.tiny,
+     text = "SL"
+)
+
+plotshape(
+     bearStopMarker,
+     title = "Bear Research Stop",
+     style = shape.xcross,
+     location = location.abovebar,
+     color = color.new(color.orange, 0),
+     size = size.tiny,
+     text = "SL"
+)
+
+//=============================================================================
+// DASHBOARD (compact — 13 rows for phone use)
+//-----------------------------------------------------------------------------
+// The original 25-row layout is preserved in git history if you want it back
+// for desktop use. Kept front and center: Rotation (which of the 6 phases),
+// H1/L1 + HL/LH, Acceptance, Plan, Plan Stats, Last Event -- the same set
+// that matters for diagnosing a stuck rotation -- plus two new rows specific
+// to this strategy build: Strategy Position (reads "5m REQUIRED" directly if
+// that's what's blocking orders) and Strategy Tester (closed/win/loss/net).
+//=============================================================================
+
+var table dashboard = table.new(
+     f_dashboardPosition(dashboardPositionInput),
+     2,
+     13,
+     bgcolor = color.new(color.rgb(15, 20, 27), 8),
+     border_width = 1
+)
+
+if barstate.islast and showDashboardInput
+    dashboardSize = f_dashboardSize(dashboardTextSizeInput)
+
+    color structureColor =
+         str.contains(structureState, "UP") ? color.aqua :
+         str.contains(structureState, "DOWN") ? color.orange :
+         color.gray
+
+    color focusColor = f_roleColor(focusRole)
+
+    string deltaDisplay =
+         flowUsable ?
+         f_signed(directionalDelta) + "%" :
+         "N/A"
+
+    string levelLine =
+         hasFocus ?
+         f_roleText(focusRole) + " " + focusOrigin + " @ " + str.tostring(focusLevel, format.mintick) :
+         "--"
+
+    string zoneLine =
+         not hasFocus ? "--" :
+         (inFocusZone ? "IN ZONE" : pressureActive ? "ACTIVE " + str.tostring(focusDistanceAtr, "#.00") + "A" : "POTENTIAL " + str.tostring(focusDistanceAtr, "#.00") + "A") +
+         " | BRK " + str.tostring(pressureActive ? activeBreakScore : potentialBreakScore, "#") +
+         " HOLD " + str.tostring(pressureActive ? activeHoldScore : potentialHoldScore, "#")
+
+    string motionFlowLine =
+         "v " + f_signed(directionalVelocity) +
+         " a " + f_signed(directionalAcceleration) +
+         " | Δ " + deltaDisplay +
+         " RV " + str.tostring(relativeVolume, "#.0") + "x"
+
+    string rotationDirectionText =
+         rotationDirection == 1 ? "BULL" :
+         rotationDirection == -1 ? "BEAR" :
+         "--"
+
+    string rotationPhaseText =
+         rotationPhase == 1 ? "IMPULSE BUILDING" :
+         rotationPhase == 2 ? "PULLBACK / WAIT HL-LH" :
+         rotationPhase == 3 ? "HL-LH FORMED / WAIT BREAK" :
+         rotationPhase == 4 ? "CONFIRMED" :
+         rotationPhase == -1 ? "FAILED" :
+         "IDLE"
+
+    string rotationLine =
+         rotationDirectionText + " " + rotationPhaseText +
+         (rotationPhase == 4 ? " " + rotationGrade : "")
+
+    string rotationStructureText =
+         rotationDirection == 0 ?
+         "--" :
+         "H1/L1 " +
+         (na(rotationReactionLevel) ? "--" : str.tostring(rotationReactionLevel, format.mintick)) +
+         " | HL/LH " +
+         (na(rotationCorrectionLevel) ? "--" : str.tostring(rotationCorrectionLevel, format.mintick))
+
+    string acceptanceText =
+         rotationPhase == 4 ?
+         rotationGrade +
+         " | Ext " + str.tostring(rotationExtensionAtr, "#.00") + "A" +
+         " | RV " + str.tostring(rotationConfirmRvol, "#.00") + "x" +
+         " | v " + f_signed(rotationConfirmVelocity) :
+         rotationGrade
+
+    string planPriceText =
+         not na(planEntry) ?
+         "Entry " + str.tostring(planEntry, format.mintick) +
+         " | Stop " + str.tostring(planStop, format.mintick) +
+         " | Tgt " + str.tostring(planTarget, format.mintick) :
+         "--"
+
+    color planColor =
+         planState == "TARGET HIT" ? color.green :
+         planState == "FILLED" or planState == "ENTRY ARMED" ? color.aqua :
+         planState == "STOPPED" or planState == "INVALIDATED" ? color.orange :
+         planState == "WAITING PULLBACK" ? color.yellow :
+         color.gray
+
+    int totalPlanTerminals =
+         planWins + planStops + planExpired + planInvalidated
+
+    string planStatsText =
+         "W " + str.tostring(planWins) +
+         " | S " + str.tostring(planStops) +
+         " | X " + str.tostring(planExpired) +
+         " | I " + str.tostring(planInvalidated) +
+         " | n" + str.tostring(totalPlanTerminals)
+
+    string lastOutcomeText =
+         lastOutcome +
+         (not na(lastOutcomeBar) ? " | " + str.tostring(bar_index - lastOutcomeBar) + "b ago" : "")
+
+    color rotationColor =
+         rotationGrade == "A++" ? color.aqua :
+         rotationGrade == "ACCEPTED" ? color.green :
+         rotationGrade == "DEVELOPING" ? color.yellow :
+         rotationGrade == "HOLLOW" or rotationGrade == "FRAGILE" or rotationGrade == "FAILED" ? color.orange :
+         color.gray
+
+    string strategyPositionText =
+         not enableStrategyOrdersInput ? "DISABLED" :
+         not strategyTimeframeOk ? "5m REQUIRED" :
+         strategy.position_size > 0 ? "LONG " + str.tostring(math.abs(strategy.position_size), "#") :
+         strategy.position_size < 0 ? "SHORT " + str.tostring(math.abs(strategy.position_size), "#") :
+         "FLAT"
+
+    string strategyStatsText =
+         "Closed " + str.tostring(strategy.closedtrades) +
+         " | Win " + str.tostring(strategy.wintrades) +
+         " | Loss " + str.tostring(strategy.losstrades) +
+         " | Net $" + str.tostring(strategy.netprofit, "#.##")
+
+    table.cell(dashboard, 0, 0, "STRUCT PHYSICS v4.2", text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = dashboardSize)
+    table.cell(dashboard, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = color.rgb(22, 52, 86), text_size = dashboardSize)
+
+    table.cell(dashboard, 0, 1, "Structure", text_color = color.white, text_size = dashboardSize)
+    table.cell(dashboard, 1, 1, structureState + " | " + structureIntegrity, text_color = structureColor, text_size = dashboardSize)
+
+    table.cell(dashboard, 0, 2, "Level", text_color = color.white, text_size = dashboardSize)
+    table.cell(dashboard, 1, 2, levelLine, text_color = focusColor, text_size = dashboardSize)
+
+    table.cell(dashboard, 0, 3, "Zone", text_color = color.white, text_size = dashboardSize)
+    table.cell(dashboard, 1, 3, zoneLine, text_color = inFocusZone ? color.yellow : color.white, text_size = dashboardSize)
+
+    table.cell(dashboard, 0, 4, "Motion / Flow", text_color = color.white, text_size = dashboardSize)
+    table.cell(dashboard, 1, 4, motionFlowLine, text_color = directionalVelocity >= 0 ? color.aqua : color.orange, text_size = dashboardSize)
+
+    table.cell(dashboard, 0, 5, "Rotation", text_color = color.white, text_size = dashboardSize)
+    table.cell(dashboard, 1, 5, rotationLine, text_color = rotationColor, text_size = dashboardSize)
+
+    table.cell(dashboard, 0, 6, "H1/L1 + HL/LH", text_color = color.white, text_size = dashboardSize)
+    table.cell(dashboard, 1, 6, rotationStructureText, text_color = color.white, text_size = dashboardSize)
+
+    table.cell(dashboard, 0, 7, "Acceptance", text_color = color.white, text_size = dashboardSize)
+    table.cell(dashboard, 1, 7, acceptanceText, text_color = rotationColor, text_size = dashboardSize)
+
+    table.cell(dashboard, 0, 8, "Plan", text_color = color.white, text_size = dashboardSize)
+    table.cell(dashboard, 1, 8, planState + " | " + planPriceText, text_color = planColor, text_size = dashboardSize)
+
+    table.cell(dashboard, 0, 9, "Plan Stats", text_color = color.white, text_size = dashboardSize)
+    table.cell(dashboard, 1, 9, planStatsText, text_color = color.gray, text_size = dashboardSize)
+
+    table.cell(dashboard, 0, 10, "Last Event", text_color = color.white, text_size = dashboardSize)
+    table.cell(dashboard, 1, 10, lastOutcomeText, text_color = color.gray, text_size = dashboardSize)
+
+    table.cell(dashboard, 0, 11, "Strategy Position", text_color = color.white, text_size = dashboardSize)
+    table.cell(
+         dashboard,
+         1,
+         11,
+         strategyPositionText,
+         text_color = strategy.position_size != 0 ? color.aqua : (not strategyTimeframeOk ? color.orange : color.gray),
+         text_size = dashboardSize
+    )
+
+    table.cell(dashboard, 0, 12, "Strategy Tester", text_color = color.white, text_size = dashboardSize)
+    table.cell(dashboard, 1, 12, strategyStatsText, text_color = color.gray, text_size = dashboardSize)
+
+//=============================================================================
+// ALERTS
+//=============================================================================
+
+alertcondition(
+     changeUp,
+     title = "Structure Physics v4.2 Strategy: Bull Change Point",
+     message = "Bullish CUSUM change point on {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     changeDown,
+     title = "Structure Physics v4.2 Strategy: Bear Change Point",
+     message = "Bearish CUSUM change point on {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     interactionStartedNow,
+     title = "Structure Physics v4.2 Strategy: Structure Interaction Started",
+     message = "A new focused structure interaction started on {{ticker}} {{interval}} @ {{close}}"
+)
+
+
+alertcondition(
+     rotationAPlusPlusNow,
+     title = "Structure Physics v4.2 Strategy: A++ Rotation Confirmed",
+     message = "A++ structural rotation confirmed on {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     rotationAcceptedNow,
+     title = "Structure Physics v4.2 Strategy: Accepted Rotation Confirmed",
+     message = "Accepted structural rotation confirmed on {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     rotationHollowNow,
+     title = "Structure Physics v4.2 Strategy: Hollow Rotation",
+     message = "Hollow / fragile structural break detected on {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     planFilledNow,
+     title = "Structure Physics v4.2 Strategy: Research Entry Filled",
+     message = "Research execution level touched on {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     planTargetNow,
+     title = "Structure Physics v4.2 Strategy: Research Target Hit",
+     message = "Research execution target touched on {{ticker}} {{interval}} @ {{close}}"
+)
+
+alertcondition(
+     planStoppedNow,
+     title = "Structure Physics v4.2 Strategy: Research Stop Hit",
+     message = "Research execution stop touched on {{ticker}} {{interval}} @ {{close}}"
+)
