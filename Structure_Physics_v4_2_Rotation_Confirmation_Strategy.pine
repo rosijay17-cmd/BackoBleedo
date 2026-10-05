@@ -14,7 +14,7 @@ strategy(
      commission_value = 0.0,
      slippage = 0,
      process_orders_on_close = true,
-     use_bar_magnifier = true,
+     use_bar_magnifier = false,
      max_labels_count = 100,
      max_lines_count = 100,
      max_boxes_count = 50
