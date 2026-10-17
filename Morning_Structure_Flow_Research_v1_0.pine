@@ -1,0 +1,453 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © rosijay17
+
+//@version=6
+indicator(
+     "Morning Structure + Flow Research v1.0",
+     shorttitle="MSF v1.0",
+     overlay=true,
+     max_lines_count=300,
+     max_labels_count=300,
+     max_boxes_count=100)
+
+int DIR_NONE = 0
+int DIR_LONG = 1
+int DIR_SHORT = -1
+
+color BULL = #089981
+color BEAR = #f23645
+color BLUE = #2962ff
+color ORANGE = #ff9800
+color NEUTRAL = #787b86
+color WARNING = #ffb300
+
+string G_SESSION = "01 - Morning Window"
+string G_BIAS = "02 - 1H Bias"
+string G_STRUCTURE = "03 - 5m Structure"
+string G_MOMENTUM = "04 - Momentum"
+string G_VOLUME = "05 - Volume"
+string G_DELTA = "06 - Delta Proxy"
+string G_SIGNAL = "07 - Research Signal"
+string G_VIS = "08 - Visuals"
+string G_ALERT = "09 - Alerts"
+
+string sessionInput = input.session("0830-1130", "Research Window", group=G_SESSION)
+string timezoneInput = input.string("America/New_York", "Session Time Zone", group=G_SESSION)
+bool showSessionBackgroundInput = input.bool(true, "Shade Research Window", group=G_SESSION)
+bool showSessionRangeInput = input.bool(true, "Show Developing Session High / Low", group=G_SESSION)
+
+string biasTfInput = input.timeframe("60", "Bias Timeframe", group=G_BIAS)
+string biasModeInput = input.string("Structure + EMA", "Bias Model", options=["Structure + EMA", "Structure Only", "EMA Only"], group=G_BIAS)
+int biasPivotInput = input.int(2, "1H Swing Pivot Length", minval=1, maxval=8, group=G_BIAS)
+int biasFastEmaInput = input.int(20, "1H Fast EMA", minval=2, maxval=200, group=G_BIAS)
+int biasSlowEmaInput = input.int(50, "1H Slow EMA", minval=5, maxval=400, group=G_BIAS)
+int biasSlopeBarsInput = input.int(2, "1H Fast EMA Slope Bars", minval=1, maxval=10, group=G_BIAS)
+bool requireBiasAlignmentInput = input.bool(true, "Require 1H Bias Alignment", group=G_BIAS)
+
+string structureModeInput = input.string("Any", "Break Structure Type", options=["Any", "Swing", "Channel", "Session Extreme"], group=G_STRUCTURE)
+int swingPivotInput = input.int(2, "5m Swing Pivot Length", minval=1, maxval=8, group=G_STRUCTURE)
+int channelLengthInput = input.int(12, "Channel Lookback Bars", minval=3, maxval=100, group=G_STRUCTURE)
+float breakBufferAtrInput = input.float(0.05, "Break Close Buffer (ATR)", minval=0.0, maxval=1.0, step=0.05, group=G_STRUCTURE)
+bool requireFreshCrossInput = input.bool(true, "Require Fresh Close Through Level", group=G_STRUCTURE)
+
+int atrLengthInput = input.int(14, "ATR Length", minval=1, group=G_MOMENTUM)
+int velocityBarsInput = input.int(3, "Velocity Lookback Bars", minval=1, maxval=10, group=G_MOMENTUM)
+float minRangeAtrInput = input.float(0.80, "Minimum Break Candle Range / ATR", minval=0.10, maxval=4.0, step=0.05, group=G_MOMENTUM)
+float minBodyFractionInput = input.float(0.55, "Minimum Body / Candle Range", minval=0.10, maxval=0.95, step=0.05, group=G_MOMENTUM)
+float minCloseLocationInput = input.float(0.70, "Minimum Directional Close Location", minval=0.50, maxval=0.95, step=0.05, group=G_MOMENTUM)
+float minVelocityAtrInput = input.float(0.35, "Minimum Velocity / ATR", minval=0.0, maxval=5.0, step=0.05, group=G_MOMENTUM)
+float minPenetrationAtrInput = input.float(0.05, "Minimum Close-Through / ATR", minval=0.0, maxval=2.0, step=0.05, group=G_MOMENTUM)
+
+int volumeLengthInput = input.int(20, "Relative Volume Length", minval=2, maxval=200, group=G_VOLUME)
+float minRvolInput = input.float(1.20, "Minimum Relative Volume", minval=0.1, maxval=10.0, step=0.05, group=G_VOLUME)
+int recentVolumeBarsInput = input.int(3, "Recent Volume Comparison Bars", minval=1, maxval=10, group=G_VOLUME)
+
+string deltaTfInput = input.timeframe("1", "Intrabar Delta Timeframe", group=G_DELTA)
+float minDeltaRatioInput = input.float(0.10, "Minimum Directional Delta Ratio", minval=0.0, maxval=1.0, step=0.05, group=G_DELTA)
+bool requireDeltaAgreementInput = input.bool(false, "Hard Require Delta Direction", group=G_DELTA)
+
+int minimumScoreInput = input.int(3, "Minimum Quality Score (0-4)", minval=0, maxval=4, group=G_SIGNAL)
+bool requireMomentumInput = input.bool(false, "Hard Require Momentum", group=G_SIGNAL)
+bool requireVolumeInput = input.bool(false, "Hard Require Relative Volume", group=G_SIGNAL)
+int cooldownBarsInput = input.int(3, "Signal Cooldown Bars", minval=0, maxval=50, group=G_SIGNAL)
+
+bool showStructureLevelsInput = input.bool(true, "Show Active Structure Levels", group=G_VIS)
+bool showBreakLabelsInput = input.bool(true, "Show Structure Break Labels", group=G_VIS)
+bool showEntryTrianglesInput = input.bool(true, "Show Research Entry Triangles", group=G_VIS)
+string entryMarkerSizeInput = input.string("Small", "Entry Marker Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=G_VIS)
+color longMarkerColorInput = input.color(color.lime, "Long Marker", inline="mclr", group=G_VIS)
+color shortMarkerColorInput = input.color(color.red, "Short Marker", inline="mclr", group=G_VIS)
+int markerTransparencyInput = input.int(5, "Entry Marker Transparency", minval=0, maxval=100, group=G_VIS)
+
+bool showDashboardInput = input.bool(true, "Show Dashboard", group=G_VIS)
+string dashboardPositionInput = input.string("Bottom Left", "Dashboard Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=G_VIS)
+string dashboardTextSizeInput = input.string("Small", "Dashboard Text Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=G_VIS)
+int dashboardBgTransparencyInput = input.int(10, "Dashboard Background Transparency", minval=0, maxval=100, group=G_VIS)
+
+bool enableDynamicAlertsInput = input.bool(true, "Enable Dynamic Entry Alerts", group=G_ALERT)
+bool alertRawBreakInput = input.bool(false, "Alert Raw Structure Break", group=G_ALERT)
+bool alertQualifiedEntryInput = input.bool(true, "Alert Qualified Research Entry", group=G_ALERT)
+
+if biasSlowEmaInput <= biasFastEmaInput
+    runtime.error("1H Slow EMA must be greater than 1H Fast EMA.")
+
+if timeframe.in_seconds(deltaTfInput) >= timeframe.in_seconds(timeframe.period)
+    runtime.error("Intrabar Delta Timeframe must be lower than the chart timeframe.")
+
+f_size(string sizeText) =>
+    sizeText == "Tiny" ? size.tiny : sizeText == "Small" ? size.small : sizeText == "Large" ? size.large : sizeText == "Huge" ? size.huge : size.normal
+
+f_tablePosition(string positionText) =>
+    positionText == "Top Left" ? position.top_left :
+     positionText == "Top Center" ? position.top_center :
+     positionText == "Middle Left" ? position.middle_left :
+     positionText == "Middle Center" ? position.middle_center :
+     positionText == "Middle Right" ? position.middle_right :
+     positionText == "Bottom Left" ? position.bottom_left :
+     positionText == "Bottom Center" ? position.bottom_center :
+     positionText == "Bottom Right" ? position.bottom_right :
+     position.top_right
+
+f_biasSnapshot() =>
+    float ph = ta.pivothigh(high, biasPivotInput, biasPivotInput)
+    float pl = ta.pivotlow(low, biasPivotInput, biasPivotInput)
+    float lastH = ta.valuewhen(not na(ph), ph, 0)
+    float prevH = ta.valuewhen(not na(ph), ph, 1)
+    float lastL = ta.valuewhen(not na(pl), pl, 0)
+    float prevL = ta.valuewhen(not na(pl), pl, 1)
+
+    bool structureBull = not na(lastH) and not na(prevH) and not na(lastL) and not na(prevL) and lastH > prevH and lastL > prevL
+    bool structureBear = not na(lastH) and not na(prevH) and not na(lastL) and not na(prevL) and lastH < prevH and lastL < prevL
+
+    float fast = ta.ema(close, biasFastEmaInput)
+    float slow = ta.ema(close, biasSlowEmaInput)
+    bool emaBull = close > fast and fast > slow and fast > fast[biasSlopeBarsInput]
+    bool emaBear = close < fast and fast < slow and fast < fast[biasSlopeBarsInput]
+
+    int structureCode = structureBull ? DIR_LONG : structureBear ? DIR_SHORT : DIR_NONE
+    int emaCode = emaBull ? DIR_LONG : emaBear ? DIR_SHORT : DIR_NONE
+
+    [time[1], close[1], ta.atr(14)[1], structureCode[1], emaCode[1], lastH[1], lastL[1], fast[1], slow[1]]
+
+bool chartIs5m = timeframe.isminutes and timeframe.multiplier == 5
+bool inMorningWindow = not na(time(timeframe.period, sessionInput, timezoneInput))
+bool sessionStarted = inMorningWindow and not inMorningWindow[1]
+bool sessionEnded = not inMorningWindow and inMorningWindow[1]
+
+var float sessionHigh = na
+var float sessionLow = na
+
+float priorSessionHigh = sessionHigh
+float priorSessionLow = sessionLow
+
+if sessionStarted
+    sessionHigh := high
+    sessionLow := low
+else if inMorningWindow
+    sessionHigh := math.max(nz(sessionHigh, high), high)
+    sessionLow := math.min(nz(sessionLow, low), low)
+
+if sessionEnded
+    sessionHigh := na
+    sessionLow := na
+
+[biasTime, biasClose, biasAtrRaw, biasStructureCode, biasEmaCode, biasLastHigh, biasLastLow, biasFast, biasSlow] = request.security(
+     syminfo.tickerid,
+     biasTfInput,
+     f_biasSnapshot(),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+int biasCode = biasModeInput == "Structure Only" ? biasStructureCode :
+     biasModeInput == "EMA Only" ? biasEmaCode :
+     biasStructureCode == biasEmaCode ? biasStructureCode :
+     biasStructureCode != DIR_NONE and biasEmaCode == DIR_NONE ? biasStructureCode :
+     biasEmaCode != DIR_NONE and biasStructureCode == DIR_NONE ? biasEmaCode :
+     DIR_NONE
+
+bool biasAllowsLong = not requireBiasAlignmentInput or biasCode == DIR_LONG
+bool biasAllowsShort = not requireBiasAlignmentInput or biasCode == DIR_SHORT
+
+float atr = math.max(nz(ta.atr(atrLengthInput), ta.tr(true)), syminfo.mintick)
+float breakBuffer = atr * breakBufferAtrInput
+
+float swingHighPivot = ta.pivothigh(high, swingPivotInput, swingPivotInput)
+float swingLowPivot = ta.pivotlow(low, swingPivotInput, swingPivotInput)
+
+float lastSwingHigh = ta.valuewhen(not na(swingHighPivot), swingHighPivot, 0)
+float lastSwingLow = ta.valuewhen(not na(swingLowPivot), swingLowPivot, 0)
+
+float channelHigh = ta.highest(high[1], channelLengthInput)
+float channelLow = ta.lowest(low[1], channelLengthInput)
+
+float sessionHighLevel = sessionStarted ? na : priorSessionHigh
+float sessionLowLevel = sessionStarted ? na : priorSessionLow
+
+bool swingLongRaw = not na(lastSwingHigh) and close > lastSwingHigh + breakBuffer
+bool swingShortRaw = not na(lastSwingLow) and close < lastSwingLow - breakBuffer
+
+bool channelLongRaw = not na(channelHigh) and close > channelHigh + breakBuffer
+bool channelShortRaw = not na(channelLow) and close < channelLow - breakBuffer
+
+bool sessionLongRaw = inMorningWindow and not na(sessionHighLevel) and close > sessionHighLevel + breakBuffer
+bool sessionShortRaw = inMorningWindow and not na(sessionLowLevel) and close < sessionLowLevel - breakBuffer
+
+bool swingLongFresh = swingLongRaw and (not requireFreshCrossInput or close[1] <= lastSwingHigh + breakBuffer)
+bool swingShortFresh = swingShortRaw and (not requireFreshCrossInput or close[1] >= lastSwingLow - breakBuffer)
+bool channelLongFresh = channelLongRaw and (not requireFreshCrossInput or close[1] <= channelHigh + breakBuffer)
+bool channelShortFresh = channelShortRaw and (not requireFreshCrossInput or close[1] >= channelLow - breakBuffer)
+bool sessionLongFresh = sessionLongRaw and (not requireFreshCrossInput or close[1] <= sessionHighLevel + breakBuffer)
+bool sessionShortFresh = sessionShortRaw and (not requireFreshCrossInput or close[1] >= sessionLowLevel - breakBuffer)
+
+bool rawLongBreak = structureModeInput == "Swing" ? swingLongFresh :
+     structureModeInput == "Channel" ? channelLongFresh :
+     structureModeInput == "Session Extreme" ? sessionLongFresh :
+     swingLongFresh or channelLongFresh or sessionLongFresh
+
+bool rawShortBreak = structureModeInput == "Swing" ? swingShortFresh :
+     structureModeInput == "Channel" ? channelShortFresh :
+     structureModeInput == "Session Extreme" ? sessionShortFresh :
+     swingShortFresh or channelShortFresh or sessionShortFresh
+
+float longBreakLevel = sessionLongFresh ? sessionHighLevel : swingLongFresh ? lastSwingHigh : channelLongFresh ? channelHigh : na
+float shortBreakLevel = sessionShortFresh ? sessionLowLevel : swingShortFresh ? lastSwingLow : channelShortFresh ? channelLow : na
+
+string longBreakType = sessionLongFresh and (swingLongFresh or channelLongFresh) ? "MULTI" :
+     sessionLongFresh ? "SESSION" :
+     swingLongFresh and channelLongFresh ? "SWING + CHANNEL" :
+     swingLongFresh ? "SWING" :
+     channelLongFresh ? "CHANNEL" :
+     "--"
+
+string shortBreakType = sessionShortFresh and (swingShortFresh or channelShortFresh) ? "MULTI" :
+     sessionShortFresh ? "SESSION" :
+     swingShortFresh and channelShortFresh ? "SWING + CHANNEL" :
+     swingShortFresh ? "SWING" :
+     channelShortFresh ? "CHANNEL" :
+     "--"
+
+float candleRange = math.max(high - low, syminfo.mintick)
+float body = math.abs(close - open)
+float bodyFraction = body / candleRange
+float closeLocation = (close - low) / candleRange
+float rangeAtr = candleRange / atr
+float velocityAtr = (close - close[velocityBarsInput]) / atr
+
+float longPenetrationAtr = not na(longBreakLevel) ? math.max(0.0, close - longBreakLevel) / atr : 0.0
+float shortPenetrationAtr = not na(shortBreakLevel) ? math.max(0.0, shortBreakLevel - close) / atr : 0.0
+
+bool longMomentumOK = close > open and rangeAtr >= minRangeAtrInput and bodyFraction >= minBodyFractionInput and closeLocation >= minCloseLocationInput and velocityAtr >= minVelocityAtrInput and longPenetrationAtr >= minPenetrationAtrInput
+bool shortMomentumOK = close < open and rangeAtr >= minRangeAtrInput and bodyFraction >= minBodyFractionInput and closeLocation <= 1.0 - minCloseLocationInput and velocityAtr <= -minVelocityAtrInput and shortPenetrationAtr >= minPenetrationAtrInput
+
+float volumeAverage = ta.sma(volume, volumeLengthInput)
+float rvol = not na(volumeAverage) and volumeAverage > 0 ? volume / volumeAverage : na
+float recentVolumeAverage = ta.sma(volume[1], recentVolumeBarsInput)
+
+bool volumeExpansion = not na(recentVolumeAverage) and recentVolumeAverage > 0 ? volume > recentVolumeAverage : false
+bool volumeOK = not na(rvol) and rvol >= minRvolInput and volumeExpansion
+
+[lowerClose, lowerOpen, lowerVolume] = request.security_lower_tf(
+     syminfo.tickerid,
+     deltaTfInput,
+     [close, open, volume])
+
+float buyVolumeProxy = 0.0
+float sellVolumeProxy = 0.0
+
+int intrabarCount = array.size(lowerClose)
+
+if intrabarCount > 0
+    for i = 0 to intrabarCount - 1
+        float c = array.get(lowerClose, i)
+        float o = array.get(lowerOpen, i)
+        float v = nz(array.get(lowerVolume, i))
+
+        if c > o
+            buyVolumeProxy += v
+        else if c < o
+            sellVolumeProxy += v
+        else
+            buyVolumeProxy += v * 0.5
+            sellVolumeProxy += v * 0.5
+
+float totalDirectionalVolume = buyVolumeProxy + sellVolumeProxy
+float deltaProxy = buyVolumeProxy - sellVolumeProxy
+float deltaRatio = totalDirectionalVolume > 0 ? deltaProxy / totalDirectionalVolume : 0.0
+
+bool longDeltaOK = deltaRatio >= minDeltaRatioInput
+bool shortDeltaOK = deltaRatio <= -minDeltaRatioInput
+
+bool longAbsorptionWarning = rawLongBreak and deltaRatio < 0
+bool shortAbsorptionWarning = rawShortBreak and deltaRatio > 0
+
+int longScore = (biasCode == DIR_LONG ? 1 : 0) + (longMomentumOK ? 1 : 0) + (volumeOK ? 1 : 0) + (longDeltaOK ? 1 : 0)
+int shortScore = (biasCode == DIR_SHORT ? 1 : 0) + (shortMomentumOK ? 1 : 0) + (volumeOK ? 1 : 0) + (shortDeltaOK ? 1 : 0)
+
+bool longHardFilters = biasAllowsLong and (not requireMomentumInput or longMomentumOK) and (not requireVolumeInput or volumeOK) and (not requireDeltaAgreementInput or longDeltaOK)
+bool shortHardFilters = biasAllowsShort and (not requireMomentumInput or shortMomentumOK) and (not requireVolumeInput or volumeOK) and (not requireDeltaAgreementInput or shortDeltaOK)
+
+var int lastSignalBar = na
+bool cooldownOK = na(lastSignalBar) or bar_index - lastSignalBar > cooldownBarsInput
+
+bool longEntryEvent = chartIs5m and barstate.isconfirmed and inMorningWindow and rawLongBreak and longHardFilters and longScore >= minimumScoreInput and cooldownOK
+bool shortEntryEvent = chartIs5m and barstate.isconfirmed and inMorningWindow and rawShortBreak and shortHardFilters and shortScore >= minimumScoreInput and cooldownOK
+
+if longEntryEvent or shortEntryEvent
+    lastSignalBar := bar_index
+
+var int lastEventDir = DIR_NONE
+var string lastEventType = "--"
+var int lastEventScore = 0
+var int lastEventBar = na
+
+if longEntryEvent
+    lastEventDir := DIR_LONG
+    lastEventType := longBreakType
+    lastEventScore := longScore
+    lastEventBar := bar_index
+
+if shortEntryEvent
+    lastEventDir := DIR_SHORT
+    lastEventType := shortBreakType
+    lastEventScore := shortScore
+    lastEventBar := bar_index
+
+if barstate.isconfirmed and enableDynamicAlertsInput
+    if alertRawBreakInput and inMorningWindow and rawLongBreak
+        alert("MORNING FLOW | RAW LONG BREAK | " + longBreakType + " | " + syminfo.ticker + " " + timeframe.period + " | SCORE Q" + str.tostring(longScore) + "/4 | RVOL " + str.tostring(rvol, "#.00") + " | DELTA " + str.tostring(deltaRatio * 100.0, "#.0") + "% | VEL " + str.tostring(velocityAtr, "#.00") + " ATR", alert.freq_once_per_bar_close)
+
+    if alertRawBreakInput and inMorningWindow and rawShortBreak
+        alert("MORNING FLOW | RAW SHORT BREAK | " + shortBreakType + " | " + syminfo.ticker + " " + timeframe.period + " | SCORE Q" + str.tostring(shortScore) + "/4 | RVOL " + str.tostring(rvol, "#.00") + " | DELTA " + str.tostring(deltaRatio * 100.0, "#.0") + "% | VEL " + str.tostring(velocityAtr, "#.00") + " ATR", alert.freq_once_per_bar_close)
+
+    if alertQualifiedEntryInput and longEntryEvent
+        alert("MORNING FLOW | LONG READY | " + longBreakType + " | Q" + str.tostring(longScore) + "/4 | RVOL " + str.tostring(rvol, "#.00") + " | DELTA " + str.tostring(deltaRatio * 100.0, "#.0") + "% | VEL " + str.tostring(velocityAtr, "#.00") + " ATR | PRICE " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+    if alertQualifiedEntryInput and shortEntryEvent
+        alert("MORNING FLOW | SHORT READY | " + shortBreakType + " | Q" + str.tostring(shortScore) + "/4 | RVOL " + str.tostring(rvol, "#.00") + " | DELTA " + str.tostring(deltaRatio * 100.0, "#.0") + "% | VEL " + str.tostring(velocityAtr, "#.00") + " ATR | PRICE " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+bgcolor(showSessionBackgroundInput and inMorningWindow ? color.new(BLUE, 95) : na, title="0830-1130 Research Window")
+
+plot(showSessionRangeInput and inMorningWindow ? sessionHigh : na, "Session High", color=color.new(BULL, 15), linewidth=1, style=plot.style_linebr)
+plot(showSessionRangeInput and inMorningWindow ? sessionLow : na, "Session Low", color=color.new(BEAR, 15), linewidth=1, style=plot.style_linebr)
+plot(showStructureLevelsInput ? lastSwingHigh : na, "Last 5m Swing High", color=color.new(BLUE, 55), linewidth=1, style=plot.style_linebr)
+plot(showStructureLevelsInput ? lastSwingLow : na, "Last 5m Swing Low", color=color.new(BEAR, 55), linewidth=1, style=plot.style_linebr)
+plot(showStructureLevelsInput ? channelHigh : na, "5m Channel High", color=color.new(ORANGE, 70), linewidth=1, style=plot.style_linebr)
+plot(showStructureLevelsInput ? channelLow : na, "5m Channel Low", color=color.new(ORANGE, 70), linewidth=1, style=plot.style_linebr)
+
+if showBreakLabelsInput and barstate.isconfirmed and inMorningWindow and rawLongBreak
+    label.new(bar_index, high, "BRK UP\n" + longBreakType, style=label.style_label_down, color=color.new(BULL, 78), textcolor=BULL, size=size.tiny)
+
+if showBreakLabelsInput and barstate.isconfirmed and inMorningWindow and rawShortBreak
+    label.new(bar_index, low, "BRK DOWN\n" + shortBreakType, style=label.style_label_up, color=color.new(BEAR, 78), textcolor=BEAR, size=size.tiny)
+
+string markerSize = f_size(entryMarkerSizeInput)
+
+if showEntryTrianglesInput and longEntryEvent
+    label.new(bar_index, low, "UP\nQ" + str.tostring(longScore), style=label.style_none, color=color.new(longMarkerColorInput, 100), textcolor=color.new(longMarkerColorInput, markerTransparencyInput), size=markerSize)
+
+if showEntryTrianglesInput and shortEntryEvent
+    label.new(bar_index, high, "DOWN\nQ" + str.tostring(shortScore), style=label.style_none, color=color.new(shortMarkerColorInput, 100), textcolor=color.new(shortMarkerColorInput, markerTransparencyInput), size=markerSize)
+
+string dashPos = f_tablePosition(dashboardPositionInput)
+string dashSize = f_size(dashboardTextSizeInput)
+
+string biasText = biasCode == DIR_LONG ? "BULL" : biasCode == DIR_SHORT ? "BEAR" : "MIXED"
+string liveBreakText = rawLongBreak ? "LONG " + longBreakType : rawShortBreak ? "SHORT " + shortBreakType : "--"
+int liveScore = rawLongBreak ? longScore : rawShortBreak ? shortScore : 0
+bool liveMomentum = rawLongBreak ? longMomentumOK : rawShortBreak ? shortMomentumOK : false
+bool liveDelta = rawLongBreak ? longDeltaOK : rawShortBreak ? shortDeltaOK : false
+bool liveAbsorption = rawLongBreak ? longAbsorptionWarning : rawShortBreak ? shortAbsorptionWarning : false
+
+string flowText = deltaRatio >= minDeltaRatioInput ? "BUY +" + str.tostring(deltaRatio * 100.0, "#.0") + "%" :
+     deltaRatio <= -minDeltaRatioInput ? "SELL " + str.tostring(deltaRatio * 100.0, "#.0") + "%" :
+     "BALANCED " + str.tostring(deltaRatio * 100.0, "#.0") + "%"
+
+string stateText = not chartIs5m ? "USE 5m CHART" :
+     not inMorningWindow ? "OUTSIDE WINDOW" :
+     longEntryEvent ? "LONG READY" :
+     shortEntryEvent ? "SHORT READY" :
+     rawLongBreak or rawShortBreak ? "BREAK / CHECK QUALITY" :
+     "WAIT STRUCTURE BREAK"
+
+string lastSignalText = lastEventDir == DIR_LONG ? "LONG " + lastEventType : lastEventDir == DIR_SHORT ? "SHORT " + lastEventType : "--"
+string lastAgeText = na(lastEventBar) ? "--" : str.tostring(bar_index - lastEventBar) + " bars"
+
+var table dash = table.new(dashPos, 2, 14, bgcolor=color.new(color.rgb(42, 48, 60), dashboardBgTransparencyInput), frame_color=color.new(color.white, 45), frame_width=1, border_color=color.new(color.white, 70), border_width=1)
+
+if barstate.islast and showDashboardInput
+    table.set_position(dash, dashPos)
+    table.cell(dash, 0, 0, "MORNING STRUCTURE + FLOW", text_color=color.white, bgcolor=color.new(color.blue, 25), text_size=dashSize)
+    table.cell(dash, 1, 0, "0830-1130 NY", text_color=color.aqua, bgcolor=color.new(color.blue, 25), text_size=dashSize)
+
+    table.cell(dash, 0, 1, "Execution", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 1, chartIs5m ? "5m READY" : "USE 5m", text_color=chartIs5m ? color.lime : WARNING, text_size=dashSize)
+
+    table.cell(dash, 0, 2, "1H Bias", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 2, biasText, text_color=biasCode == DIR_LONG ? BULL : biasCode == DIR_SHORT ? BEAR : color.white, text_size=dashSize)
+
+    table.cell(dash, 0, 3, "State", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 3, stateText, text_color=longEntryEvent ? BULL : shortEntryEvent ? BEAR : color.yellow, text_size=dashSize)
+
+    table.cell(dash, 0, 4, "Current Break", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 4, liveBreakText, text_color=rawLongBreak ? BULL : rawShortBreak ? BEAR : color.white, text_size=dashSize)
+
+    table.cell(dash, 0, 5, "Quality Score", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 5, "Q" + str.tostring(liveScore) + " / 4", text_color=liveScore >= minimumScoreInput ? color.lime : color.white, text_size=dashSize)
+
+    table.cell(dash, 0, 6, "Momentum", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 6, liveMomentum ? "CONFIRMED" : "WEAK / NORMAL", text_color=liveMomentum ? color.lime : color.white, text_size=dashSize)
+
+    table.cell(dash, 0, 7, "Relative Volume", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 7, na(rvol) ? "--" : str.tostring(rvol, "#.00") + "x", text_color=volumeOK ? color.lime : color.white, text_size=dashSize)
+
+    table.cell(dash, 0, 8, "Delta Proxy", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 8, flowText, text_color=deltaRatio > 0 ? BULL : deltaRatio < 0 ? BEAR : color.white, text_size=dashSize)
+
+    table.cell(dash, 0, 9, "Flow Agreement", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 9, liveDelta ? "YES" : "NO", text_color=liveDelta ? color.lime : color.white, text_size=dashSize)
+
+    table.cell(dash, 0, 10, "Absorption Warning", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 10, liveAbsorption ? "OPPOSING DELTA" : "NO", text_color=liveAbsorption ? WARNING : color.white, text_size=dashSize)
+
+    table.cell(dash, 0, 11, "Velocity", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 11, str.tostring(velocityAtr, "#.00") + " ATR", text_color=velocityAtr > 0 ? BULL : velocityAtr < 0 ? BEAR : color.white, text_size=dashSize)
+
+    table.cell(dash, 0, 12, "Last Signal", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 12, lastSignalText, text_color=lastEventDir == DIR_LONG ? BULL : lastEventDir == DIR_SHORT ? BEAR : color.white, text_size=dashSize)
+
+    table.cell(dash, 0, 13, "Signal Age", text_color=color.white, text_size=dashSize)
+    table.cell(dash, 1, 13, lastAgeText, text_color=color.white, text_size=dashSize)
+
+if barstate.islast and not showDashboardInput
+    table.clear(dash, 0, 0, 1, 13)
+
+plot(biasCode, "1H Bias +1 Bull / -1 Bear", display=display.data_window)
+plot(biasStructureCode, "1H Structure Bias +1 Bull / -1 Bear", display=display.data_window)
+plot(biasEmaCode, "1H EMA Bias +1 Bull / -1 Bear", display=display.data_window)
+plot(lastSwingHigh, "5m Last Swing High", display=display.data_window)
+plot(lastSwingLow, "5m Last Swing Low", display=display.data_window)
+plot(channelHigh, "5m Channel High", display=display.data_window)
+plot(channelLow, "5m Channel Low", display=display.data_window)
+plot(sessionHigh, "Morning Session High", display=display.data_window)
+plot(sessionLow, "Morning Session Low", display=display.data_window)
+plot(rangeAtr, "Break Candle Range / ATR", display=display.data_window)
+plot(bodyFraction, "Break Candle Body / Range", display=display.data_window)
+plot(closeLocation, "Close Location 0 Low / 1 High", display=display.data_window)
+plot(velocityAtr, "3-Bar Velocity / ATR", display=display.data_window)
+plot(longPenetrationAtr, "Long Close-Through / ATR", display=display.data_window)
+plot(shortPenetrationAtr, "Short Close-Through / ATR", display=display.data_window)
+plot(rvol, "Relative Volume", display=display.data_window)
+plot(volumeExpansion ? 1 : 0, "Volume > Recent Average", display=display.data_window)
+plot(buyVolumeProxy, "Intrabar Buy Volume Proxy", display=display.data_window)
+plot(sellVolumeProxy, "Intrabar Sell Volume Proxy", display=display.data_window)
+plot(deltaProxy, "Intrabar Delta Proxy", display=display.data_window)
+plot(deltaRatio, "Delta Ratio -1 to +1", display=display.data_window)
+plot(longScore, "Current Long Quality Score 0-4", display=display.data_window)
+plot(shortScore, "Current Short Quality Score 0-4", display=display.data_window)
+plot(longAbsorptionWarning ? 1 : 0, "Bull Break Opposing Delta Warning", display=display.data_window)
+plot(shortAbsorptionWarning ? 1 : 0, "Bear Break Opposing Delta Warning", display=display.data_window)
+
+alertcondition(longEntryEvent, "Morning Flow Long Ready", "Morning Structure + Flow LONG READY on {{ticker}} {{interval}}.")
+alertcondition(shortEntryEvent, "Morning Flow Short Ready", "Morning Structure + Flow SHORT READY on {{ticker}} {{interval}}.")
+alertcondition(rawLongBreak and inMorningWindow, "Morning Raw Long Structure Break", "Morning raw bullish structure break on {{ticker}} {{interval}}.")
+alertcondition(rawShortBreak and inMorningWindow, "Morning Raw Short Structure Break", "Morning raw bearish structure break on {{ticker}} {{interval}}.")

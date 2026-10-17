@@ -302,6 +302,68 @@ after TradingView's compiler had already flagged it. Worth running this scan
 as a standing habit on any newly-written multi-line string/expression
 concatenation, not just when debugging an existing CE10156 report.
 
+**Correction / new sub-case confirmed on-device (2026-10-17):** a bare
+trailing `=` (not `+`/`-`/`*`/`/`) at the end of a **tuple/array destructuring
+assignment**'s left side, with the right-hand side starting fresh on the next
+line, hits this exact same CE10156 error — even though the next line IS
+indented more than the statement's own start (which the "is it indented past
+the statement's start" framing above would predict is safe). Confirmed via a
+screenshot pinpointing the exact line and column (end of the `] =` line) in
+`Morning Structure + Flow Research v1.0` (not yet in this repo at time of
+writing):
+
+```pine
+// INVALID -- CE10156, confirmed on-device
+[biasTime, biasClose, biasAtrRaw, ...] =
+    request.security(
+         syminfo.tickerid,
+         biasTfInput,
+         f_biasSnapshot(),
+         gaps=barmerge.gaps_off,
+         lookahead=barmerge.lookahead_on)
+```
+
+**Fix:** keep `=` and at least the start of the right-hand side on the same
+physical line, exactly like the proven `mtf-confirmed-pivot-pull.md` pattern
+already does for every one of its own examples:
+
+```pine
+[biasTime, biasClose, biasAtrRaw, ...] = request.security(
+     syminfo.tickerid,
+     biasTfInput,
+     f_biasSnapshot(),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+```
+
+This was NOT separately confirmed for a **scalar** assignment (`float x =`
+followed by an indented multi-line ternary chain on the next lines) — that
+shape is used pervasively and without incident elsewhere in this session's
+scripts (e.g. `Structure_Rejection_Research_v1_5_1.pine`), so it is presumed
+still safe. But given the confirmed tuple-destructure failure contradicts the
+general "depth 0 + deeper indentation = safe" rule this entry previously
+stated without qualification, treat that rule as unproven for an `=`/`:=`
+specifically (as opposed to `+`/`-`/`*`/`/`/`and`/`or`/`?`/`:`) trailing a
+line at depth 0 until there's a confirmed positive case, not just an absence
+of a reported failure. The defensive, zero-cost fix either way: never let a
+bare `=` or `:=` end a line with nothing after it — always keep it on the
+same line as at least the start of its right-hand side.
+
+**Depth-at-line-end checker limitation found while debugging this:** a naive
+depth-only scan (ignoring indentation entirely) over-flags enormously on
+files written in this repo's common hanging-indent ternary style (166 "hits"
+on an ~2800-line file, nearly all false positives). A corrected checker needs
+to also track each statement's own starting indentation and only flag a
+depth-0 continuation line whose indentation is NOT deeper than that anchor —
+and even that corrected checker still has to treat "depth > 0 carried in
+from a prior line" as unconditionally safe (indentation-independent),
+separately from the depth-0 case the indentation rule actually governs.
+Getting this right took three iterations against a real file before it
+produced zero false positives. See `depth_check4.py` in past sessions'
+scratch output for the naive version; a corrected version living outside
+the repo (scratchpad-only, not committed) is referenced here for future
+sessions to rebuild rather than repeat the same three iterations.
+
 ## When to check this file
 
 Before writing a new `for i = 0 to array.size(x) - 1` loop, a new `type`
