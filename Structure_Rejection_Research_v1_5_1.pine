@@ -1,0 +1,2791 @@
+//@version=6
+indicator(
+     "Structure Rejection Research v1.5.1 - Syntax Safe",
+     shorttitle="SRR1.5.1",
+     overlay=true,
+     max_lines_count=500,
+     max_labels_count=500)
+
+//=============================================================================
+// STRUCTURE REJECTION RESEARCH v1.5.1
+// Syntax-safe mobile revision: multiline if / else-if conditions were
+// collapsed to single-line conditions to avoid Pine CE10156
+// 'end of line without line continuation' parsing errors.
+//-----------------------------------------------------------------------------
+// NON-TRADING research indicator.
+//
+// PURPOSE
+// -------
+// Reduce the latency created by requiring every W/M leg to be a confirmed
+// 15-minute inside pivot.
+//
+// Architecture:
+//   15m EXTERNAL STRUCTURE
+//      -> major HH/HL or LH/LL
+//      -> confirmed external BOS
+//      -> freeze the broken swing as the thesis / key level
+//
+//   5m INTERNAL GEOMETRY
+//      -> first retest pivot
+//      -> rotation / neckline pivot
+//      -> second retest pivot
+//      -> classify HOLD / SHALLOW SWEEP / DEEP SWEEP
+//      -> classify favorable HL / LH versus deterioration
+//
+//   5m EARLY CONFIRMATION
+//      -> directional micro-BOS + displacement after the second leg
+//
+//   15m FULL CONFIRMATION
+//      -> confirmed 15m close through the internal neckline
+//
+//   1m EXECUTION QUALITY
+//      -> directional projection / stepping proxy
+//
+// IMPORTANT
+// ---------
+// For the lowest-latency internal geometry, use this indicator on a 5m or 1m
+// chart. The 15m external thesis remains fixed regardless of chart timeframe.
+// On a 15m chart, lower-timeframe history is sampled by request.security(), so
+// the structure thesis is valid but the early/internal research layer is less
+// granular.
+//
+// This script does NOT place strategy orders.
+//=============================================================================
+
+//=============================================================================
+// CONSTANTS
+//=============================================================================
+
+int DIR_NONE = 0
+int DIR_BULL = 1
+int DIR_BEAR = -1
+
+int ST_IDLE = 0
+int ST_WAIT_FIRST = 1
+int ST_WAIT_NECK = 2
+int ST_WAIT_SECOND = 3
+int ST_WAIT_CONFIRM = 4
+int ST_EARLY = 5
+int ST_FULL = 6
+
+int CLASS_NONE = 0
+int CLASS_HOLD = 1
+int CLASS_SHALLOW = 2
+int CLASS_DEEP = 3
+
+int EVENT_NONE = 0
+int EVENT_EARLY_BULL = 1
+int EVENT_EARLY_BEAR = -1
+int EVENT_FULL_BULL = 2
+int EVENT_FULL_BEAR = -2
+
+color BULL = #2962ff
+color BEAR = #ff4081
+color HOLD = #00c853
+color SHALLOW = #ffb300
+color DEEP = #d50000
+color KEY = #ff9800
+color NEUTRAL = #787b86
+
+string G_EXT = "01 - External 15m Structure"
+string G_INT = "02 - Internal Geometry"
+string G_EARLY = "03 - Early / Full Confirmation"
+string G_PROJ = "04 - 1m Projection"
+string G_VIS = "05 - Visuals"
+string G_ALERT = "06 - Alerts"
+
+//=============================================================================
+// INPUTS
+//=============================================================================
+
+string structureTfInput = input.timeframe(
+     "15",
+     "External Structure Timeframe",
+     group=G_EXT)
+
+int externalPivotInput = input.int(
+     3,
+     "External Swing Pivot Length",
+     minval=1,
+     maxval=10,
+     tooltip="Major swing definition used only for the external thesis / BOS anchor.",
+     group=G_EXT)
+
+bool requireExternalTrendInput = input.bool(
+     true,
+     "Require HH/HL or LH/LL Before External BOS",
+     group=G_EXT)
+
+float externalBosBufferAtrInput = input.float(
+     0.00,
+     "External BOS Close Buffer (ATR)",
+     minval=0.0,
+     maxval=1.0,
+     step=0.05,
+     group=G_EXT)
+
+string internalTfInput = input.timeframe(
+     "5",
+     "Internal Geometry Timeframe",
+     tooltip="5m is the research default. For best historical fidelity, view the chart at this timeframe or lower.",
+     group=G_INT)
+
+int internalPivotInput = input.int(
+     1,
+     "Internal Pivot Length",
+     minval=1,
+     maxval=5,
+     tooltip="1 means the internal leg is confirmed after one lower-timeframe bar instead of waiting for a 15m pivot.",
+     group=G_INT)
+
+int maxInternalBarsInput = input.int(
+     96,
+     "Maximum Internal Bars After BOS",
+     minval=12,
+     maxval=500,
+     tooltip="Default 96 x 5m = 8 hours.",
+     group=G_INT)
+
+float retestZoneAtrInput = input.float(
+     0.60,
+     "Retest Zone Half-Width (15m ATR)",
+     minval=0.10,
+     maxval=3.00,
+     step=0.05,
+     group=G_INT)
+
+float minRotationAtrInput = input.float(
+     0.40,
+     "Minimum First Rotation (15m ATR)",
+     minval=0.10,
+     maxval=3.00,
+     step=0.05,
+     tooltip="Minimum distance from first retest leg to internal neckline.",
+     group=G_INT)
+
+float shallowSweepAtrInput = input.float(
+     0.30,
+     "Shallow Sweep Threshold (15m ATR)",
+     minval=0.05,
+     maxval=1.00,
+     step=0.05,
+     group=G_INT)
+
+float hardInvalidationAtrInput = input.float(
+     1.00,
+     "Hard Thesis Invalidation Beyond Key Level (15m ATR)",
+     minval=0.25,
+     maxval=4.00,
+     step=0.05,
+     group=G_INT)
+
+int microBosLookbackInput = input.int(
+     5,
+     "5m Micro-BOS Lookback",
+     minval=2,
+     maxval=20,
+     group=G_EARLY)
+
+float microDispRangeAtrInput = input.float(
+     0.80,
+     "5m Displacement Range (5m ATR)",
+     minval=0.10,
+     maxval=3.00,
+     step=0.05,
+     group=G_EARLY)
+
+float microBodyFracInput = input.float(
+     0.55,
+     "5m Minimum Body / Range",
+     minval=0.10,
+     maxval=0.95,
+     step=0.05,
+     group=G_EARLY)
+
+bool requireEarlyMicroBosInput = input.bool(
+     true,
+     "Early Confirm Requires 5m Micro-BOS + Displacement",
+     group=G_EARLY)
+
+bool requireFullNeckCrossInput = input.bool(
+     true,
+     "Full Confirm Requires Fresh 15m Neckline Cross",
+     tooltip="If OFF, any later confirmed 15m close beyond the neckline can create full confirmation.",
+     group=G_EARLY)
+
+string projectionTfInput = input.timeframe(
+     "1",
+     "Projection Timeframe",
+     group=G_PROJ)
+
+float projectionRangeAtrInput = input.float(
+     0.50,
+     "1m Projection Range (1m ATR)",
+     minval=0.10,
+     maxval=2.00,
+     step=0.05,
+     group=G_PROJ)
+
+int projectionRecentBarsInput = input.int(
+     5,
+     "Recent 1m Projection Window",
+     minval=1,
+     maxval=30,
+     group=G_PROJ)
+
+bool showExternalSwingsInput = input.bool(
+     false,
+     "Show External HH / HL / LH / LL",
+     group=G_VIS)
+
+bool showExternalBosInput = input.bool(
+     true,
+     "Show External BOS",
+     group=G_VIS)
+
+bool showKeyZoneInput = input.bool(
+     true,
+     "Show Frozen Key Level / Retest Zone",
+     group=G_VIS)
+
+bool showInternalGeometryInput = input.bool(
+     true,
+     "Draw Internal W / M Geometry",
+     group=G_VIS)
+
+bool showLegLabelsInput = input.bool(
+     true,
+     "Show First / Neck / Second Leg Labels",
+     group=G_VIS)
+
+bool showEarlyTrianglesInput = input.bool(
+     true,
+     "Show EARLY Confirmation Triangles",
+     group=G_VIS)
+
+bool showFullMarkersInput = input.bool(
+     true,
+     "Show FULL Confirmation Markers",
+     group=G_VIS)
+
+bool showDashboardInput = input.bool(
+     true,
+     "Show Research Dashboard",
+     group=G_VIS)
+
+string dashboardReferenceInput = input.string(
+     "Latest Bar",
+     "Dashboard Reference",
+     options=[
+         "Latest Bar",
+         "Visible Right Edge"
+     ],
+     group=G_VIS)
+
+string dashboardPositionInput = input.string(
+     "Bottom Left",
+     "Dashboard Position",
+     options=[
+         "Top Left",
+         "Top Center",
+         "Top Right",
+         "Middle Left",
+         "Middle Center",
+         "Middle Right",
+         "Bottom Left",
+         "Bottom Center",
+         "Bottom Right"
+     ],
+     group=G_VIS)
+
+string dashboardTextSizeInput = input.string(
+     "Small",
+     "Dashboard Text Size",
+     options=[
+         "Tiny",
+         "Small",
+         "Normal",
+         "Large",
+         "Huge"
+     ],
+     group=G_VIS)
+
+int dashboardBgTransparencyInput = input.int(
+     10,
+     "Dashboard Background Transparency",
+     minval=0,
+     maxval=100,
+     group=G_VIS)
+
+bool enableDynamicAlertsInput = input.bool(
+     true,
+     "Enable Dynamic Alerts",
+     group=G_ALERT)
+
+bool alertExternalBosInput = input.bool(
+     false,
+     "Alert External BOS",
+     group=G_ALERT)
+
+bool alertEarlyInput = input.bool(
+     true,
+     "Alert EARLY Confirmation",
+     group=G_ALERT)
+
+bool alertFullInput = input.bool(
+     true,
+     "Alert FULL Confirmation",
+     group=G_ALERT)
+
+//=============================================================================
+// VALIDATION
+//=============================================================================
+
+if timeframe.in_seconds(internalTfInput) > timeframe.in_seconds(structureTfInput)
+
+    runtime.error(
+         "Internal Geometry Timeframe must be <= External Structure Timeframe.")
+
+if timeframe.in_seconds(projectionTfInput) > timeframe.in_seconds(internalTfInput)
+
+    runtime.error(
+         "Projection Timeframe must be <= Internal Geometry Timeframe.")
+
+//=============================================================================
+// EXTERNAL 15m SNAPSHOT - PREVIOUS COMPLETED STRUCTURE BAR
+//=============================================================================
+
+f_externalSnapshot() =>
+    float ph = ta.pivothigh(
+         high,
+         externalPivotInput,
+         externalPivotInput)
+
+    float pl = ta.pivotlow(
+         low,
+         externalPivotInput,
+         externalPivotInput)
+
+    [
+         time[1],
+         open[1],
+         high[1],
+         low[1],
+         close[1],
+         ta.atr(14)[1],
+         ph[1],
+         pl[1],
+         not na(ph[1]) ? time[externalPivotInput + 1] : na,
+         not na(pl[1]) ? time[externalPivotInput + 1] : na
+    ]
+
+[
+     extTime,
+     extOpen,
+     extHigh,
+     extLow,
+     extClose,
+     extAtrRaw,
+     extPivotHigh,
+     extPivotLow,
+     extPivotHighTime,
+     extPivotLowTime
+] = request.security(
+     syminfo.tickerid,
+     structureTfInput,
+     f_externalSnapshot(),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+float extAtr = math.max(
+     nz(
+         extAtrRaw,
+         syminfo.mintick * 10.0),
+     syminfo.mintick)
+
+bool newExternalBar =
+     not na(extTime) and
+     (
+         na(extTime[1]) or
+         extTime != extTime[1]
+     )
+
+//=============================================================================
+// INTERNAL 5m SNAPSHOT - PREVIOUS COMPLETED INTERNAL BAR
+//=============================================================================
+
+f_bullMicroBosDisp() =>
+    float a = math.max(
+         nz(
+             ta.atr(14),
+             ta.tr(true)),
+         syminfo.mintick)
+
+    float r = math.max(
+         high - low,
+         syminfo.mintick)
+
+    float bodyFrac =
+         math.abs(
+             close - open) /
+         r
+
+    float closeLoc =
+         (close - low) /
+         r
+
+    bool bos =
+         close >
+         ta.highest(
+             high,
+             microBosLookbackInput)[1]
+
+    bool disp =
+         r >=
+         a *
+         microDispRangeAtrInput and
+         bodyFrac >=
+         microBodyFracInput and
+         closeLoc >=
+         0.70
+
+    bos and disp
+
+f_bearMicroBosDisp() =>
+    float a = math.max(
+         nz(
+             ta.atr(14),
+             ta.tr(true)),
+         syminfo.mintick)
+
+    float r = math.max(
+         high - low,
+         syminfo.mintick)
+
+    float bodyFrac =
+         math.abs(
+             close - open) /
+         r
+
+    float closeLoc =
+         (close - low) /
+         r
+
+    bool bos =
+         close <
+         ta.lowest(
+             low,
+             microBosLookbackInput)[1]
+
+    bool disp =
+         r >=
+         a *
+         microDispRangeAtrInput and
+         bodyFrac >=
+         microBodyFracInput and
+         closeLoc <=
+         0.30
+
+    bos and disp
+
+f_internalSnapshot() =>
+    float ph = ta.pivothigh(
+         high,
+         internalPivotInput,
+         internalPivotInput)
+
+    float pl = ta.pivotlow(
+         low,
+         internalPivotInput,
+         internalPivotInput)
+
+    [
+         time[1],
+         open[1],
+         high[1],
+         low[1],
+         close[1],
+         ta.atr(14)[1],
+         ph[1],
+         pl[1],
+         not na(ph[1]) ? time[internalPivotInput + 1] : na,
+         not na(pl[1]) ? time[internalPivotInput + 1] : na,
+         f_bullMicroBosDisp()[1],
+         f_bearMicroBosDisp()[1]
+    ]
+
+[
+     intTime,
+     intOpen,
+     intHigh,
+     intLow,
+     intClose,
+     intAtrRaw,
+     intPivotHigh,
+     intPivotLow,
+     intPivotHighTime,
+     intPivotLowTime,
+     intBullBosDisp,
+     intBearBosDisp
+] = request.security(
+     syminfo.tickerid,
+     internalTfInput,
+     f_internalSnapshot(),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+float intAtr = math.max(
+     nz(
+         intAtrRaw,
+         syminfo.mintick * 10.0),
+     syminfo.mintick)
+
+bool newInternalBar =
+     not na(intTime) and
+     (
+         na(intTime[1]) or
+         intTime != intTime[1]
+     )
+
+//=============================================================================
+// 1m PROJECTION EVENT TIME
+//=============================================================================
+
+f_bullProjection() =>
+    float a = math.max(
+         nz(
+             ta.atr(14),
+             ta.tr(true)),
+         syminfo.mintick)
+
+    float r = math.max(
+         high - low,
+         syminfo.mintick)
+
+    float closeLoc =
+         (close - low) /
+         r
+
+    close > open and
+     close > close[1] and
+     low >= low[1] and
+     r >=
+     a *
+     projectionRangeAtrInput and
+     closeLoc >=
+     0.65
+
+f_bearProjection() =>
+    float a = math.max(
+         nz(
+             ta.atr(14),
+             ta.tr(true)),
+         syminfo.mintick)
+
+    float r = math.max(
+         high - low,
+         syminfo.mintick)
+
+    float closeLoc =
+         (close - low) /
+         r
+
+    close < open and
+     close < close[1] and
+     high <= high[1] and
+     r >=
+     a *
+     projectionRangeAtrInput and
+     closeLoc <=
+     0.35
+
+int bullProjectionEventTime = request.security(
+     syminfo.tickerid,
+     projectionTfInput,
+     ta.valuewhen(
+         f_bullProjection(),
+         time,
+         0)[1],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+int bearProjectionEventTime = request.security(
+     syminfo.tickerid,
+     projectionTfInput,
+     ta.valuewhen(
+         f_bearProjection(),
+         time,
+         0)[1],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+//=============================================================================
+// EXTERNAL STRUCTURE STATE
+//=============================================================================
+
+var float extLastHigh = na
+var float extPrevHigh = na
+var int extLastHighTime = na
+
+var float extLastLow = na
+var float extPrevLow = na
+var int extLastLowTime = na
+
+var string extHighType = "--"
+var string extLowType = "--"
+
+var bool extBullStructure = false
+var bool extBearStructure = false
+
+var float lastProcessedExtClose = na
+
+//=============================================================================
+// ACTIVE THESIS / INTERNAL GEOMETRY
+//=============================================================================
+
+var int thesisDir = DIR_NONE
+var int buildStage = ST_IDLE
+
+var float keyLevel = na
+var int bosTime = na
+var int internalBarsSinceBos = 0
+
+var float firstLeg = na
+var int firstLegTime = na
+
+var float neckline = na
+var int necklineTime = na
+
+var float secondLeg = na
+var int secondLegTime = na
+
+var int secondClass = CLASS_NONE
+var bool secondFavorable = false
+
+var bool earlyConfirmed = false
+var int earlyTime = na
+var float earlyPrice = na
+
+var bool fullConfirmed = false
+var int fullTime = na
+var float fullPrice = na
+
+var int consumedBullSwingTime = na
+var int consumedBearSwingTime = na
+
+//=============================================================================
+// LAST EVENT STATE
+//=============================================================================
+
+var int lastEventCode = EVENT_NONE
+var int lastEventClass = CLASS_NONE
+var bool lastEventFavorable = false
+var bool lastEventProjection = false
+var int lastEventScore = 0
+var float lastEventKey = na
+var float lastEventNeck = na
+var int lastEventTime = na
+
+//=============================================================================
+// BAR EVENTS
+//=============================================================================
+
+bool bullExternalBosEvent = false
+bool bearExternalBosEvent = false
+
+bool bullEarlyEvent = false
+bool bearEarlyEvent = false
+
+bool bullFullEvent = false
+bool bearFullEvent = false
+
+//=============================================================================
+// DRAWING HISTORY
+//=============================================================================
+
+var line[] geometryLines = array.new_line()
+var label[] geometryLabels = array.new_label()
+
+f_keepLine(line id) =>
+    array.push(
+         geometryLines,
+         id)
+
+    if array.size( geometryLines) > 240
+
+        line.delete(
+             array.shift(
+                 geometryLines))
+
+f_keepLabel(label id) =>
+    array.push(
+         geometryLabels,
+         id)
+
+    if array.size( geometryLabels) > 120
+
+        label.delete(
+             array.shift(
+                 geometryLabels))
+
+//=============================================================================
+// EXTERNAL STRUCTURE / BOS ENGINE
+//=============================================================================
+
+if newExternalBar
+
+    float priorExtClose =
+         lastProcessedExtClose
+
+    if not na(extPivotHigh)
+        extPrevHigh := extLastHigh
+        extLastHigh := extPivotHigh
+        extLastHighTime := extPivotHighTime
+
+        extHighType :=
+             na(extPrevHigh) ?
+             "H" :
+             extLastHigh >
+             extPrevHigh ?
+             "HH" :
+             extLastHigh <
+             extPrevHigh ?
+             "LH" :
+             "EH"
+
+        if showExternalSwingsInput
+            label lab = label.new(
+                 extLastHighTime,
+                 extLastHigh,
+                 extHighType,
+                 xloc=xloc.bar_time,
+                 style=label.style_label_down,
+                 color=color.new(
+                     NEUTRAL,
+                     100),
+                 textcolor=
+                     extHighType ==
+                     "HH" ?
+                     BULL :
+                     BEAR,
+                 size=size.tiny)
+
+            f_keepLabel(lab)
+
+    if not na(extPivotLow)
+        extPrevLow := extLastLow
+        extLastLow := extPivotLow
+        extLastLowTime := extPivotLowTime
+
+        extLowType :=
+             na(extPrevLow) ?
+             "L" :
+             extLastLow >
+             extPrevLow ?
+             "HL" :
+             extLastLow <
+             extPrevLow ?
+             "LL" :
+             "EL"
+
+        if showExternalSwingsInput
+            label lab = label.new(
+                 extLastLowTime,
+                 extLastLow,
+                 extLowType,
+                 xloc=xloc.bar_time,
+                 style=label.style_label_up,
+                 color=color.new(
+                     NEUTRAL,
+                     100),
+                 textcolor=
+                     extLowType ==
+                     "HL" ?
+                     BULL :
+                     BEAR,
+                 size=size.tiny)
+
+            f_keepLabel(lab)
+
+    extBullStructure :=
+         not na(extPrevHigh) and
+         not na(extPrevLow) and
+         extLastHigh >
+         extPrevHigh and
+         extLastLow >
+         extPrevLow
+
+    extBearStructure :=
+         not na(extPrevHigh) and
+         not na(extPrevLow) and
+         extLastHigh <
+         extPrevHigh and
+         extLastLow <
+         extPrevLow
+
+    bool bullSwingUnused =
+         not na(extLastHighTime) and
+         (
+             na(
+                 consumedBullSwingTime) or
+             extLastHighTime !=
+             consumedBullSwingTime
+         )
+
+    bool bearSwingUnused =
+         not na(extLastLowTime) and
+         (
+             na(
+                 consumedBearSwingTime) or
+             extLastLowTime !=
+             consumedBearSwingTime
+         )
+
+    float bullBosLevel =
+         extLastHigh +
+         extAtr *
+         externalBosBufferAtrInput
+
+    float bearBosLevel =
+         extLastLow -
+         extAtr *
+         externalBosBufferAtrInput
+
+    bool bullBos =
+         bullSwingUnused and
+         not na(
+             priorExtClose) and
+         extClose >
+         bullBosLevel and
+         priorExtClose <=
+         bullBosLevel and
+         (
+             not requireExternalTrendInput or
+             extBullStructure
+         )
+
+    bool bearBos =
+         bearSwingUnused and
+         not na(
+             priorExtClose) and
+         extClose <
+         bearBosLevel and
+         priorExtClose >=
+         bearBosLevel and
+         (
+             not requireExternalTrendInput or
+             extBearStructure
+         )
+
+    if bullBos
+        bullExternalBosEvent := true
+
+        thesisDir := DIR_BULL
+        buildStage := ST_WAIT_FIRST
+        keyLevel := extLastHigh
+        bosTime := extTime
+        internalBarsSinceBos := 0
+
+        firstLeg := na
+        firstLegTime := na
+        neckline := na
+        necklineTime := na
+        secondLeg := na
+        secondLegTime := na
+
+        secondClass := CLASS_NONE
+        secondFavorable := false
+
+        earlyConfirmed := false
+        earlyTime := na
+        earlyPrice := na
+
+        fullConfirmed := false
+        fullTime := na
+        fullPrice := na
+
+        consumedBullSwingTime :=
+             extLastHighTime
+
+        if showExternalBosInput
+            label lab = label.new(
+                 extTime,
+                 extHigh,
+                 "EXT BOS UP",
+                 xloc=xloc.bar_time,
+                 style=label.style_label_down,
+                 color=color.new(
+                     BULL,
+                     75),
+                 textcolor=BULL,
+                 size=size.small)
+
+            f_keepLabel(lab)
+
+        if enableDynamicAlertsInput and alertExternalBosInput
+
+            alert(
+                 "STRUCTURE RESEARCH | EXTERNAL BULL BOS | KEY " +
+                 str.tostring(
+                     keyLevel,
+                     format.mintick) +
+                 " | " +
+                 syminfo.ticker,
+                 alert.freq_once_per_bar_close)
+
+    if bearBos
+        bearExternalBosEvent := true
+
+        thesisDir := DIR_BEAR
+        buildStage := ST_WAIT_FIRST
+        keyLevel := extLastLow
+        bosTime := extTime
+        internalBarsSinceBos := 0
+
+        firstLeg := na
+        firstLegTime := na
+        neckline := na
+        necklineTime := na
+        secondLeg := na
+        secondLegTime := na
+
+        secondClass := CLASS_NONE
+        secondFavorable := false
+
+        earlyConfirmed := false
+        earlyTime := na
+        earlyPrice := na
+
+        fullConfirmed := false
+        fullTime := na
+        fullPrice := na
+
+        consumedBearSwingTime :=
+             extLastLowTime
+
+        if showExternalBosInput
+            label lab = label.new(
+                 extTime,
+                 extLow,
+                 "EXT BOS DOWN",
+                 xloc=xloc.bar_time,
+                 style=label.style_label_up,
+                 color=color.new(
+                     BEAR,
+                     75),
+                 textcolor=BEAR,
+                 size=size.small)
+
+            f_keepLabel(lab)
+
+        if enableDynamicAlertsInput and alertExternalBosInput
+
+            alert(
+                 "STRUCTURE RESEARCH | EXTERNAL BEAR BOS | KEY " +
+                 str.tostring(
+                     keyLevel,
+                     format.mintick) +
+                 " | " +
+                 syminfo.ticker,
+                 alert.freq_once_per_bar_close)
+
+    // FULL confirmation is deliberately evaluated on completed 15m bars.
+    if thesisDir == DIR_BULL and ( buildStage == ST_WAIT_CONFIRM or buildStage == ST_EARLY ) and not na( neckline) and not fullConfirmed
+
+        bool fullBeyond =
+             extClose >
+             neckline
+
+        bool freshCross =
+             not na(
+                 priorExtClose) and
+             priorExtClose <=
+             neckline
+
+        bool fullOK =
+             fullBeyond and
+             (
+                 not requireFullNeckCrossInput or
+                 freshCross
+             )
+
+        if fullOK
+            bullFullEvent := true
+            fullConfirmed := true
+            fullTime := extTime
+            fullPrice := extClose
+            buildStage := ST_FULL
+
+            int score =
+                 (
+                     secondClass ==
+                     CLASS_HOLD ?
+                     2 :
+                     secondClass ==
+                     CLASS_SHALLOW ?
+                     1 :
+                     0
+                 ) +
+                 (
+                     secondFavorable ?
+                     1 :
+                     0
+                 ) +
+                 (
+                     earlyConfirmed ?
+                     1 :
+                     0
+                 ) +
+                 (
+                     not na(
+                         bullProjectionEventTime) and
+                     bullProjectionEventTime >=
+                     secondLegTime ?
+                     1 :
+                     0
+                 )
+
+            lastEventCode :=
+                 EVENT_FULL_BULL
+            lastEventClass :=
+                 secondClass
+            lastEventFavorable :=
+                 secondFavorable
+            lastEventProjection :=
+                 not na(
+                     bullProjectionEventTime) and
+                 bullProjectionEventTime >=
+                 secondLegTime
+            lastEventScore := score
+            lastEventKey := keyLevel
+            lastEventNeck := neckline
+            lastEventTime := extTime
+
+            if showFullMarkersInput
+                label lab = label.new(
+                     extTime,
+                     extLow,
+                     "FULL W\nQ" +
+                     str.tostring(
+                         score),
+                     xloc=xloc.bar_time,
+                     style=label.style_label_up,
+                     color=color.new(
+                         BULL,
+                         15),
+                     textcolor=color.white,
+                     size=size.small)
+
+                f_keepLabel(lab)
+
+            if enableDynamicAlertsInput and alertFullInput
+
+                alert(
+                     "STRUCTURE RESEARCH | FULL BULL W | KEY " +
+                     str.tostring(
+                         keyLevel,
+                         format.mintick) +
+                     " | NECK " +
+                     str.tostring(
+                         neckline,
+                         format.mintick) +
+                     " | Q" +
+                     str.tostring(
+                         score) +
+                     " | " +
+                     syminfo.ticker,
+                     alert.freq_once_per_bar_close)
+
+    if thesisDir == DIR_BEAR and ( buildStage == ST_WAIT_CONFIRM or buildStage == ST_EARLY ) and not na( neckline) and not fullConfirmed
+
+        bool fullBeyond =
+             extClose <
+             neckline
+
+        bool freshCross =
+             not na(
+                 priorExtClose) and
+             priorExtClose >=
+             neckline
+
+        bool fullOK =
+             fullBeyond and
+             (
+                 not requireFullNeckCrossInput or
+                 freshCross
+             )
+
+        if fullOK
+            bearFullEvent := true
+            fullConfirmed := true
+            fullTime := extTime
+            fullPrice := extClose
+            buildStage := ST_FULL
+
+            int score =
+                 (
+                     secondClass ==
+                     CLASS_HOLD ?
+                     2 :
+                     secondClass ==
+                     CLASS_SHALLOW ?
+                     1 :
+                     0
+                 ) +
+                 (
+                     secondFavorable ?
+                     1 :
+                     0
+                 ) +
+                 (
+                     earlyConfirmed ?
+                     1 :
+                     0
+                 ) +
+                 (
+                     not na(
+                         bearProjectionEventTime) and
+                     bearProjectionEventTime >=
+                     secondLegTime ?
+                     1 :
+                     0
+                 )
+
+            lastEventCode :=
+                 EVENT_FULL_BEAR
+            lastEventClass :=
+                 secondClass
+            lastEventFavorable :=
+                 secondFavorable
+            lastEventProjection :=
+                 not na(
+                     bearProjectionEventTime) and
+                 bearProjectionEventTime >=
+                 secondLegTime
+            lastEventScore := score
+            lastEventKey := keyLevel
+            lastEventNeck := neckline
+            lastEventTime := extTime
+
+            if showFullMarkersInput
+                label lab = label.new(
+                     extTime,
+                     extHigh,
+                     "FULL M\nQ" +
+                     str.tostring(
+                         score),
+                     xloc=xloc.bar_time,
+                     style=label.style_label_down,
+                     color=color.new(
+                         BEAR,
+                         15),
+                     textcolor=color.white,
+                     size=size.small)
+
+                f_keepLabel(lab)
+
+            if enableDynamicAlertsInput and alertFullInput
+
+                alert(
+                     "STRUCTURE RESEARCH | FULL BEAR M | KEY " +
+                     str.tostring(
+                         keyLevel,
+                         format.mintick) +
+                     " | NECK " +
+                     str.tostring(
+                         neckline,
+                         format.mintick) +
+                     " | Q" +
+                     str.tostring(
+                         score) +
+                     " | " +
+                     syminfo.ticker,
+                     alert.freq_once_per_bar_close)
+
+    lastProcessedExtClose :=
+         extClose
+
+//=============================================================================
+// INTERNAL 5m GEOMETRY ENGINE
+//=============================================================================
+
+if newInternalBar and thesisDir != DIR_NONE and buildStage != ST_FULL
+
+    internalBarsSinceBos += 1
+
+    bool expired =
+         internalBarsSinceBos >
+         maxInternalBarsInput
+
+    bool bullHardInvalid =
+         thesisDir ==
+         DIR_BULL and
+         intClose <
+         keyLevel -
+         extAtr *
+         hardInvalidationAtrInput
+
+    bool bearHardInvalid =
+         thesisDir ==
+         DIR_BEAR and
+         intClose >
+         keyLevel +
+         extAtr *
+         hardInvalidationAtrInput
+
+    if expired or bullHardInvalid or bearHardInvalid
+
+        thesisDir := DIR_NONE
+        buildStage := ST_IDLE
+        keyLevel := na
+        bosTime := na
+        internalBarsSinceBos := 0
+
+        firstLeg := na
+        firstLegTime := na
+        neckline := na
+        necklineTime := na
+        secondLeg := na
+        secondLegTime := na
+
+        secondClass := CLASS_NONE
+        secondFavorable := false
+
+        earlyConfirmed := false
+        earlyTime := na
+        earlyPrice := na
+
+        fullConfirmed := false
+        fullTime := na
+        fullPrice := na
+
+    else
+
+        //---------------------------------------------------------------------
+        // BULL W INTERNAL GEOMETRY
+        //---------------------------------------------------------------------
+
+        if thesisDir == DIR_BULL
+
+            if buildStage == ST_WAIT_FIRST and not na( intPivotLow) and intPivotLowTime > bosTime
+
+                bool nearKey =
+                     math.abs(
+                         intPivotLow -
+                         keyLevel) <=
+                     extAtr *
+                     retestZoneAtrInput
+
+                if nearKey
+                    firstLeg :=
+                         intPivotLow
+                    firstLegTime :=
+                         intPivotLowTime
+                    buildStage :=
+                         ST_WAIT_NECK
+
+                    if showLegLabelsInput
+                        label lab = label.new(
+                             firstLegTime,
+                             firstLeg,
+                             "L1",
+                             xloc=xloc.bar_time,
+                             style=label.style_label_up,
+                             color=color.new(
+                                 BULL,
+                                 70),
+                             textcolor=BULL,
+                             size=size.tiny)
+
+                        f_keepLabel(lab)
+
+            else if buildStage == ST_WAIT_NECK and not na( intPivotHigh) and intPivotHighTime > firstLegTime
+
+                bool rotationOK =
+                     intPivotHigh -
+                     firstLeg >=
+                     extAtr *
+                     minRotationAtrInput
+
+                if rotationOK
+                    neckline :=
+                         intPivotHigh
+                    necklineTime :=
+                         intPivotHighTime
+                    buildStage :=
+                         ST_WAIT_SECOND
+
+                    if showLegLabelsInput
+                        label lab = label.new(
+                             necklineTime,
+                             neckline,
+                             "NECK",
+                             xloc=xloc.bar_time,
+                             style=label.style_label_down,
+                             color=color.new(
+                                 KEY,
+                                 65),
+                             textcolor=KEY,
+                             size=size.tiny)
+
+                        f_keepLabel(lab)
+
+                    if showInternalGeometryInput
+                        line ln = line.new(
+                             firstLegTime,
+                             firstLeg,
+                             necklineTime,
+                             neckline,
+                             xloc=xloc.bar_time,
+                             color=BULL,
+                             width=2)
+
+                        f_keepLine(ln)
+
+            else if buildStage == ST_WAIT_SECOND and not na( intPivotLow) and intPivotLowTime > necklineTime
+
+                bool nearKey =
+                     math.abs(
+                         intPivotLow -
+                         keyLevel) <=
+                     extAtr *
+                     retestZoneAtrInput
+
+                bool insideHardInvalid =
+                     intPivotLow >=
+                     keyLevel -
+                     extAtr *
+                     hardInvalidationAtrInput
+
+                if nearKey and insideHardInvalid
+
+                    secondLeg :=
+                         intPivotLow
+                    secondLegTime :=
+                         intPivotLowTime
+
+                    float penetrationAtr =
+                         math.max(
+                             0.0,
+                             keyLevel -
+                             secondLeg) /
+                         extAtr
+
+                    secondClass :=
+                         secondLeg >=
+                         keyLevel ?
+                         CLASS_HOLD :
+                         penetrationAtr <=
+                         shallowSweepAtrInput ?
+                         CLASS_SHALLOW :
+                         CLASS_DEEP
+
+                    secondFavorable :=
+                         secondLeg >=
+                         firstLeg
+
+                    buildStage :=
+                         ST_WAIT_CONFIRM
+
+                    if showLegLabelsInput
+                        string classText =
+                             secondClass ==
+                             CLASS_HOLD ?
+                             "HOLD" :
+                             secondClass ==
+                             CLASS_SHALLOW ?
+                             "SWEEP" :
+                             "DEEP"
+
+                        label lab = label.new(
+                             secondLegTime,
+                             secondLeg,
+                             "L2 " +
+                             classText +
+                             "\n" +
+                             (
+                                 secondFavorable ?
+                                 "HL" :
+                                 "DOWN vs L1"
+                             ),
+                             xloc=xloc.bar_time,
+                             style=label.style_label_up,
+                             color=color.new(
+                                 secondClass ==
+                                 CLASS_HOLD ?
+                                 HOLD :
+                                 secondClass ==
+                                 CLASS_SHALLOW ?
+                                 SHALLOW :
+                                 DEEP,
+                                 15),
+                             textcolor=color.white,
+                             size=size.small)
+
+                        f_keepLabel(lab)
+
+                    if showInternalGeometryInput
+                        line ln = line.new(
+                             necklineTime,
+                             neckline,
+                             secondLegTime,
+                             secondLeg,
+                             xloc=xloc.bar_time,
+                             color=BULL,
+                             width=2)
+
+                        f_keepLine(ln)
+
+            else if ( buildStage == ST_WAIT_CONFIRM or buildStage == ST_EARLY ) and not na( intPivotLow) and intPivotLowTime > secondLegTime
+
+                bool nearKey =
+                     math.abs(
+                         intPivotLow -
+                         keyLevel) <=
+                     extAtr *
+                     retestZoneAtrInput
+
+                if nearKey and intPivotLow < secondLeg
+
+                    secondLeg :=
+                         intPivotLow
+                    secondLegTime :=
+                         intPivotLowTime
+
+                    float penetrationAtr =
+                         math.max(
+                             0.0,
+                             keyLevel -
+                             secondLeg) /
+                         extAtr
+
+                    secondClass :=
+                         secondLeg >=
+                         keyLevel ?
+                         CLASS_HOLD :
+                         penetrationAtr <=
+                         shallowSweepAtrInput ?
+                         CLASS_SHALLOW :
+                         CLASS_DEEP
+
+                    secondFavorable :=
+                         secondLeg >=
+                         firstLeg
+
+        //---------------------------------------------------------------------
+        // BEAR M INTERNAL GEOMETRY
+        //---------------------------------------------------------------------
+
+        if thesisDir == DIR_BEAR
+
+            if buildStage == ST_WAIT_FIRST and not na( intPivotHigh) and intPivotHighTime > bosTime
+
+                bool nearKey =
+                     math.abs(
+                         intPivotHigh -
+                         keyLevel) <=
+                     extAtr *
+                     retestZoneAtrInput
+
+                if nearKey
+                    firstLeg :=
+                         intPivotHigh
+                    firstLegTime :=
+                         intPivotHighTime
+                    buildStage :=
+                         ST_WAIT_NECK
+
+                    if showLegLabelsInput
+                        label lab = label.new(
+                             firstLegTime,
+                             firstLeg,
+                             "H1",
+                             xloc=xloc.bar_time,
+                             style=label.style_label_down,
+                             color=color.new(
+                                 BEAR,
+                                 70),
+                             textcolor=BEAR,
+                             size=size.tiny)
+
+                        f_keepLabel(lab)
+
+            else if buildStage == ST_WAIT_NECK and not na( intPivotLow) and intPivotLowTime > firstLegTime
+
+                bool rotationOK =
+                     firstLeg -
+                     intPivotLow >=
+                     extAtr *
+                     minRotationAtrInput
+
+                if rotationOK
+                    neckline :=
+                         intPivotLow
+                    necklineTime :=
+                         intPivotLowTime
+                    buildStage :=
+                         ST_WAIT_SECOND
+
+                    if showLegLabelsInput
+                        label lab = label.new(
+                             necklineTime,
+                             neckline,
+                             "NECK",
+                             xloc=xloc.bar_time,
+                             style=label.style_label_up,
+                             color=color.new(
+                                 KEY,
+                                 65),
+                             textcolor=KEY,
+                             size=size.tiny)
+
+                        f_keepLabel(lab)
+
+                    if showInternalGeometryInput
+                        line ln = line.new(
+                             firstLegTime,
+                             firstLeg,
+                             necklineTime,
+                             neckline,
+                             xloc=xloc.bar_time,
+                             color=BEAR,
+                             width=2)
+
+                        f_keepLine(ln)
+
+            else if buildStage == ST_WAIT_SECOND and not na( intPivotHigh) and intPivotHighTime > necklineTime
+
+                bool nearKey =
+                     math.abs(
+                         intPivotHigh -
+                         keyLevel) <=
+                     extAtr *
+                     retestZoneAtrInput
+
+                bool insideHardInvalid =
+                     intPivotHigh <=
+                     keyLevel +
+                     extAtr *
+                     hardInvalidationAtrInput
+
+                if nearKey and insideHardInvalid
+
+                    secondLeg :=
+                         intPivotHigh
+                    secondLegTime :=
+                         intPivotHighTime
+
+                    float penetrationAtr =
+                         math.max(
+                             0.0,
+                             secondLeg -
+                             keyLevel) /
+                         extAtr
+
+                    secondClass :=
+                         secondLeg <=
+                         keyLevel ?
+                         CLASS_HOLD :
+                         penetrationAtr <=
+                         shallowSweepAtrInput ?
+                         CLASS_SHALLOW :
+                         CLASS_DEEP
+
+                    secondFavorable :=
+                         secondLeg <=
+                         firstLeg
+
+                    buildStage :=
+                         ST_WAIT_CONFIRM
+
+                    if showLegLabelsInput
+                        string classText =
+                             secondClass ==
+                             CLASS_HOLD ?
+                             "HOLD" :
+                             secondClass ==
+                             CLASS_SHALLOW ?
+                             "SWEEP" :
+                             "DEEP"
+
+                        label lab = label.new(
+                             secondLegTime,
+                             secondLeg,
+                             "H2 " +
+                             classText +
+                             "\n" +
+                             (
+                                 secondFavorable ?
+                                 "LH" :
+                                 "UP vs H1"
+                             ),
+                             xloc=xloc.bar_time,
+                             style=label.style_label_down,
+                             color=color.new(
+                                 secondClass ==
+                                 CLASS_HOLD ?
+                                 HOLD :
+                                 secondClass ==
+                                 CLASS_SHALLOW ?
+                                 SHALLOW :
+                                 DEEP,
+                                 15),
+                             textcolor=color.white,
+                             size=size.small)
+
+                        f_keepLabel(lab)
+
+                    if showInternalGeometryInput
+                        line ln = line.new(
+                             necklineTime,
+                             neckline,
+                             secondLegTime,
+                             secondLeg,
+                             xloc=xloc.bar_time,
+                             color=BEAR,
+                             width=2)
+
+                        f_keepLine(ln)
+
+            else if ( buildStage == ST_WAIT_CONFIRM or buildStage == ST_EARLY ) and not na( intPivotHigh) and intPivotHighTime > secondLegTime
+
+                bool nearKey =
+                     math.abs(
+                         intPivotHigh -
+                         keyLevel) <=
+                     extAtr *
+                     retestZoneAtrInput
+
+                if nearKey and intPivotHigh > secondLeg
+
+                    secondLeg :=
+                         intPivotHigh
+                    secondLegTime :=
+                         intPivotHighTime
+
+                    float penetrationAtr =
+                         math.max(
+                             0.0,
+                             secondLeg -
+                             keyLevel) /
+                         extAtr
+
+                    secondClass :=
+                         secondLeg <=
+                         keyLevel ?
+                         CLASS_HOLD :
+                         penetrationAtr <=
+                         shallowSweepAtrInput ?
+                         CLASS_SHALLOW :
+                         CLASS_DEEP
+
+                    secondFavorable :=
+                         secondLeg <=
+                         firstLeg
+
+        //---------------------------------------------------------------------
+        // EARLY CONFIRMATION - 5m MICRO BOS + DISPLACEMENT
+        //---------------------------------------------------------------------
+
+        if thesisDir == DIR_BULL and buildStage == ST_WAIT_CONFIRM and not earlyConfirmed and not na( secondLegTime)
+
+            bool earlyOK =
+                 not requireEarlyMicroBosInput or
+                 (
+                     intBullBosDisp and
+                     intTime >
+                     secondLegTime
+                 )
+
+            if earlyOK
+                bullEarlyEvent := true
+                earlyConfirmed := true
+                earlyTime := intTime
+                earlyPrice := intClose
+                buildStage := ST_EARLY
+
+                bool projectionOK =
+                     not na(
+                         bullProjectionEventTime) and
+                     bullProjectionEventTime >=
+                     secondLegTime
+
+                int score =
+                     (
+                         secondClass ==
+                         CLASS_HOLD ?
+                         2 :
+                         secondClass ==
+                         CLASS_SHALLOW ?
+                         1 :
+                         0
+                     ) +
+                     (
+                         secondFavorable ?
+                         1 :
+                         0
+                     ) +
+                     1 +
+                     (
+                         projectionOK ?
+                         1 :
+                         0
+                     )
+
+                lastEventCode :=
+                     EVENT_EARLY_BULL
+                lastEventClass :=
+                     secondClass
+                lastEventFavorable :=
+                     secondFavorable
+                lastEventProjection :=
+                     projectionOK
+                lastEventScore := score
+                lastEventKey := keyLevel
+                lastEventNeck := neckline
+                lastEventTime := intTime
+
+                if showInternalGeometryInput
+                    line ln = line.new(
+                         secondLegTime,
+                         secondLeg,
+                         earlyTime,
+                         earlyPrice,
+                         xloc=xloc.bar_time,
+                         color=HOLD,
+                         width=3)
+
+                    f_keepLine(ln)
+
+                if enableDynamicAlertsInput and alertEarlyInput
+
+                    alert(
+                         "STRUCTURE RESEARCH | EARLY BULL W | " +
+                         (
+                             secondClass ==
+                             CLASS_HOLD ?
+                             "HOLD" :
+                             secondClass ==
+                             CLASS_SHALLOW ?
+                             "SHALLOW SWEEP" :
+                             "DEEP SWEEP"
+                         ) +
+                         " | 2ND LEG " +
+                         (
+                             secondFavorable ?
+                             "HL" :
+                             "DETERIORATING"
+                         ) +
+                         " | KEY " +
+                         str.tostring(
+                             keyLevel,
+                             format.mintick) +
+                         " | " +
+                         syminfo.ticker,
+                         alert.freq_once_per_bar_close)
+
+        if thesisDir == DIR_BEAR and buildStage == ST_WAIT_CONFIRM and not earlyConfirmed and not na( secondLegTime)
+
+            bool earlyOK =
+                 not requireEarlyMicroBosInput or
+                 (
+                     intBearBosDisp and
+                     intTime >
+                     secondLegTime
+                 )
+
+            if earlyOK
+                bearEarlyEvent := true
+                earlyConfirmed := true
+                earlyTime := intTime
+                earlyPrice := intClose
+                buildStage := ST_EARLY
+
+                bool projectionOK =
+                     not na(
+                         bearProjectionEventTime) and
+                     bearProjectionEventTime >=
+                     secondLegTime
+
+                int score =
+                     (
+                         secondClass ==
+                         CLASS_HOLD ?
+                         2 :
+                         secondClass ==
+                         CLASS_SHALLOW ?
+                         1 :
+                         0
+                     ) +
+                     (
+                         secondFavorable ?
+                         1 :
+                         0
+                     ) +
+                     1 +
+                     (
+                         projectionOK ?
+                         1 :
+                         0
+                     )
+
+                lastEventCode :=
+                     EVENT_EARLY_BEAR
+                lastEventClass :=
+                     secondClass
+                lastEventFavorable :=
+                     secondFavorable
+                lastEventProjection :=
+                     projectionOK
+                lastEventScore := score
+                lastEventKey := keyLevel
+                lastEventNeck := neckline
+                lastEventTime := intTime
+
+                if showInternalGeometryInput
+                    line ln = line.new(
+                         secondLegTime,
+                         secondLeg,
+                         earlyTime,
+                         earlyPrice,
+                         xloc=xloc.bar_time,
+                         color=BEAR,
+                         width=3)
+
+                    f_keepLine(ln)
+
+                if enableDynamicAlertsInput and alertEarlyInput
+
+                    alert(
+                         "STRUCTURE RESEARCH | EARLY BEAR M | " +
+                         (
+                             secondClass ==
+                             CLASS_HOLD ?
+                             "HOLD" :
+                             secondClass ==
+                             CLASS_SHALLOW ?
+                             "SHALLOW SWEEP" :
+                             "DEEP SWEEP"
+                         ) +
+                         " | 2ND LEG " +
+                         (
+                             secondFavorable ?
+                             "LH" :
+                             "DETERIORATING"
+                         ) +
+                         " | KEY " +
+                         str.tostring(
+                             keyLevel,
+                             format.mintick) +
+                         " | " +
+                         syminfo.ticker,
+                         alert.freq_once_per_bar_close)
+
+//=============================================================================
+// VISUAL KEY LEVEL / RETEST ZONE
+//=============================================================================
+
+float zoneTop =
+     thesisDir !=
+     DIR_NONE and
+     not na(
+         keyLevel) ?
+     keyLevel +
+     extAtr *
+     retestZoneAtrInput :
+     na
+
+float zoneBottom =
+     thesisDir !=
+     DIR_NONE and
+     not na(
+         keyLevel) ?
+     keyLevel -
+     extAtr *
+     retestZoneAtrInput :
+     na
+
+plot(
+     showKeyZoneInput ?
+     keyLevel :
+     na,
+     "Frozen External Key Level",
+     color=
+         thesisDir ==
+         DIR_BULL ?
+         BULL :
+         thesisDir ==
+         DIR_BEAR ?
+         BEAR :
+         KEY,
+     linewidth=2,
+     style=plot.style_linebr)
+
+pZoneTop = plot(
+     showKeyZoneInput ?
+     zoneTop :
+     na,
+     "Retest Zone Top",
+     color=color.new(
+         KEY,
+         80),
+     style=plot.style_linebr)
+
+pZoneBottom = plot(
+     showKeyZoneInput ?
+     zoneBottom :
+     na,
+     "Retest Zone Bottom",
+     color=color.new(
+         KEY,
+         80),
+     style=plot.style_linebr)
+
+fill(
+     pZoneTop,
+     pZoneBottom,
+     color=color.new(
+         KEY,
+         92),
+     title="External Retest Zone")
+
+//=============================================================================
+// ENTRY-TIMING RESEARCH MARKERS
+//=============================================================================
+
+plotshape(
+     showEarlyTrianglesInput and
+     bullEarlyEvent,
+     title="EARLY Bull W",
+     style=shape.triangleup,
+     location=location.belowbar,
+     color=color.lime,
+     size=size.small,
+     text="E")
+
+plotshape(
+     showEarlyTrianglesInput and
+     bearEarlyEvent,
+     title="EARLY Bear M",
+     style=shape.triangledown,
+     location=location.abovebar,
+     color=color.red,
+     size=size.small,
+     text="E")
+
+plotshape(
+     showFullMarkersInput and
+     bullFullEvent,
+     title="FULL Bull W",
+     style=shape.diamond,
+     location=location.belowbar,
+     color=BULL,
+     size=size.small,
+     text="F")
+
+plotshape(
+     showFullMarkersInput and
+     bearFullEvent,
+     title="FULL Bear M",
+     style=shape.diamond,
+     location=location.abovebar,
+     color=BEAR,
+     size=size.small,
+     text="F")
+
+//=============================================================================
+// DASHBOARD HELPERS
+//=============================================================================
+
+f_dashboardPosition(string positionText) =>
+    positionText ==
+    "Top Left" ?
+     position.top_left :
+     positionText ==
+     "Top Center" ?
+     position.top_center :
+     positionText ==
+     "Middle Left" ?
+     position.middle_left :
+     positionText ==
+     "Middle Center" ?
+     position.middle_center :
+     positionText ==
+     "Middle Right" ?
+     position.middle_right :
+     positionText ==
+     "Bottom Left" ?
+     position.bottom_left :
+     positionText ==
+     "Bottom Center" ?
+     position.bottom_center :
+     positionText ==
+     "Bottom Right" ?
+     position.bottom_right :
+     position.top_right
+
+f_dashboardTextSize(string sizeText) =>
+    sizeText ==
+    "Tiny" ?
+     size.tiny :
+     sizeText ==
+     "Small" ?
+     size.small :
+     sizeText ==
+     "Large" ?
+     size.large :
+     sizeText ==
+     "Huge" ?
+     size.huge :
+     size.normal
+
+string dashPos =
+     f_dashboardPosition(
+         dashboardPositionInput)
+
+string dashSize =
+     f_dashboardTextSize(
+         dashboardTextSizeInput)
+
+//=============================================================================
+// DASHBOARD SERIES / HISTORICAL REFERENCE
+//=============================================================================
+
+int currentStructureCode =
+     extBullStructure ?
+     DIR_BULL :
+     extBearStructure ?
+     DIR_BEAR :
+     DIR_NONE
+
+int currentProjectionCode =
+     thesisDir ==
+     DIR_BULL and
+     not na(
+         secondLegTime) and
+     not na(
+         bullProjectionEventTime) and
+     bullProjectionEventTime >=
+     secondLegTime ?
+     1 :
+     thesisDir ==
+     DIR_BEAR and
+     not na(
+         secondLegTime) and
+     not na(
+         bearProjectionEventTime) and
+     bearProjectionEventTime >=
+     secondLegTime ?
+     -1 :
+     0
+
+bool useVisibleReference =
+     dashboardReferenceInput ==
+     "Visible Right Edge"
+
+bool visibleRefCondition =
+     time <=
+     chart.right_visible_bar_time
+
+int refStructure =
+     useVisibleReference ?
+     nz(
+         ta.valuewhen(
+             visibleRefCondition,
+             currentStructureCode,
+             0),
+         DIR_NONE) :
+     currentStructureCode
+
+int refThesis =
+     useVisibleReference ?
+     nz(
+         ta.valuewhen(
+             visibleRefCondition,
+             thesisDir,
+             0),
+         DIR_NONE) :
+     thesisDir
+
+int refStage =
+     useVisibleReference ?
+     nz(
+         ta.valuewhen(
+             visibleRefCondition,
+             buildStage,
+             0),
+         ST_IDLE) :
+     buildStage
+
+float refKey =
+     useVisibleReference ?
+     ta.valuewhen(
+         visibleRefCondition,
+         keyLevel,
+         0) :
+     keyLevel
+
+float refFirst =
+     useVisibleReference ?
+     ta.valuewhen(
+         visibleRefCondition,
+         firstLeg,
+         0) :
+     firstLeg
+
+float refNeck =
+     useVisibleReference ?
+     ta.valuewhen(
+         visibleRefCondition,
+         neckline,
+         0) :
+     neckline
+
+float refSecond =
+     useVisibleReference ?
+     ta.valuewhen(
+         visibleRefCondition,
+         secondLeg,
+         0) :
+     secondLeg
+
+int refClass =
+     useVisibleReference ?
+     nz(
+         ta.valuewhen(
+             visibleRefCondition,
+             secondClass,
+             0),
+         CLASS_NONE) :
+     secondClass
+
+int refFavorable =
+     useVisibleReference ?
+     nz(
+         ta.valuewhen(
+             visibleRefCondition,
+             secondFavorable ?
+             1 :
+             0,
+             0),
+         0) :
+     (
+         secondFavorable ?
+         1 :
+         0
+     )
+
+int refEarly =
+     useVisibleReference ?
+     nz(
+         ta.valuewhen(
+             visibleRefCondition,
+             earlyConfirmed ?
+             1 :
+             0,
+             0),
+         0) :
+     (
+         earlyConfirmed ?
+         1 :
+         0
+     )
+
+int refProjection =
+     useVisibleReference ?
+     nz(
+         ta.valuewhen(
+             visibleRefCondition,
+             currentProjectionCode,
+             0),
+         0) :
+     currentProjectionCode
+
+int refLastEvent =
+     useVisibleReference ?
+     nz(
+         ta.valuewhen(
+             visibleRefCondition,
+             lastEventCode,
+             0),
+         EVENT_NONE) :
+     lastEventCode
+
+int refLastScore =
+     useVisibleReference ?
+     nz(
+         ta.valuewhen(
+             visibleRefCondition,
+             lastEventScore,
+             0),
+         0) :
+     lastEventScore
+
+//=============================================================================
+// DASHBOARD TEXT
+//=============================================================================
+
+string structureText =
+     refStructure ==
+     DIR_BULL ?
+     "EXTERNAL HH / HL" :
+     refStructure ==
+     DIR_BEAR ?
+     "EXTERNAL LH / LL" :
+     "EXTERNAL MIXED"
+
+string thesisText =
+     refThesis ==
+     DIR_BULL ?
+     "BULL THESIS" :
+     refThesis ==
+     DIR_BEAR ?
+     "BEAR THESIS" :
+     "NO THESIS"
+
+string stageText =
+     refStage ==
+     ST_WAIT_FIRST ?
+     "WAIT FIRST RETEST" :
+     refStage ==
+     ST_WAIT_NECK ?
+     "WAIT ROTATION / NECK" :
+     refStage ==
+     ST_WAIT_SECOND ?
+     "WAIT SECOND RETEST" :
+     refStage ==
+     ST_WAIT_CONFIRM ?
+     "WAIT 5m EARLY CONFIRM" :
+     refStage ==
+     ST_EARLY ?
+     "EARLY CONFIRMED / WAIT FULL" :
+     refStage ==
+     ST_FULL ?
+     "FULL CONFIRMED" :
+     "WAIT EXTERNAL BOS"
+
+string classText =
+     refClass ==
+     CLASS_HOLD ?
+     "HOLD" :
+     refClass ==
+     CLASS_SHALLOW ?
+     "SHALLOW SWEEP" :
+     refClass ==
+     CLASS_DEEP ?
+     "DEEP SWEEP" :
+     "--"
+
+string secondQualityText =
+     refThesis ==
+     DIR_NONE or
+     na(
+         refSecond) ?
+     "--" :
+     refFavorable ==
+     1 ?
+     (
+         refThesis ==
+         DIR_BULL ?
+         "HL / FAVORABLE" :
+         "LH / FAVORABLE"
+     ) :
+     "DETERIORATING"
+
+string earlyText =
+     refEarly ==
+     1 ?
+     "5m BOS + DISP OK" :
+     "5m EARLY ..."
+
+string projectionText =
+     refProjection !=
+     0 ?
+     "1m PROJECTION OK" :
+     "1m PROJECTION ..."
+
+string lastEventText =
+     refLastEvent ==
+     EVENT_EARLY_BULL ?
+     "EARLY BULL W" :
+     refLastEvent ==
+     EVENT_EARLY_BEAR ?
+     "EARLY BEAR M" :
+     refLastEvent ==
+     EVENT_FULL_BULL ?
+     "FULL BULL W" :
+     refLastEvent ==
+     EVENT_FULL_BEAR ?
+     "FULL BEAR M" :
+     "--"
+
+bool timingChartReady =
+     timeframe.in_seconds(
+         timeframe.period) <=
+     timeframe.in_seconds(
+         internalTfInput)
+
+//=============================================================================
+// DASHBOARD
+//=============================================================================
+
+var table dash = table.new(
+     dashPos,
+     2,
+     14,
+     bgcolor=color.new(
+         color.rgb(
+             42,
+             48,
+             60),
+         dashboardBgTransparencyInput),
+     frame_color=color.new(
+         color.white,
+         45),
+     frame_width=1,
+     border_color=color.new(
+         color.white,
+         70),
+     border_width=1)
+
+if barstate.islast and showDashboardInput
+
+    table.set_position(
+         dash,
+         dashPos)
+
+    string modeText =
+         useVisibleReference ?
+         "HIST" :
+         "LIVE"
+
+    string timingText =
+         timingChartReady ?
+         internalTfInput +
+         " TIMING READY" :
+         "USE " +
+         internalTfInput +
+         " OR LOWER"
+
+    table.cell(
+         dash,
+         0,
+         0,
+         "STRUCTURE GEOMETRY",
+         text_color=color.white,
+         bgcolor=color.new(
+             color.blue,
+             25),
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         0,
+         modeText +
+         " | " +
+         timingText,
+         text_color=
+             timingChartReady ?
+             color.lime :
+             color.orange,
+         bgcolor=color.new(
+             color.blue,
+             25),
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         1,
+         "External Structure",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         1,
+         structureText,
+         text_color=
+             refStructure ==
+             DIR_BULL ?
+             BULL :
+             refStructure ==
+             DIR_BEAR ?
+             BEAR :
+             color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         2,
+         "Thesis",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         2,
+         thesisText,
+         text_color=
+             refThesis ==
+             DIR_BULL ?
+             BULL :
+             refThesis ==
+             DIR_BEAR ?
+             BEAR :
+             color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         3,
+         "Build Stage",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         3,
+         stageText,
+         text_color=
+             refStage ==
+             ST_EARLY ?
+             color.lime :
+             refStage ==
+             ST_FULL ?
+             color.aqua :
+             color.yellow,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         4,
+         "Frozen Key",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         4,
+         na(
+             refKey) ?
+         "--" :
+         str.tostring(
+             refKey,
+             format.mintick),
+         text_color=KEY,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         5,
+         "First Leg",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         5,
+         na(
+             refFirst) ?
+         "--" :
+         str.tostring(
+             refFirst,
+             format.mintick),
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         6,
+         "Internal Neck",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         6,
+         na(
+             refNeck) ?
+         "--" :
+         str.tostring(
+             refNeck,
+             format.mintick),
+         text_color=KEY,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         7,
+         "Second Leg",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         7,
+         na(
+             refSecond) ?
+         "--" :
+         str.tostring(
+             refSecond,
+             format.mintick),
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         8,
+         "Level Behavior",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         8,
+         classText,
+         text_color=
+             refClass ==
+             CLASS_HOLD ?
+             HOLD :
+             refClass ==
+             CLASS_SHALLOW ?
+             SHALLOW :
+             refClass ==
+             CLASS_DEEP ?
+             DEEP :
+             color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         9,
+         "Second-Leg Quality",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         9,
+         secondQualityText,
+         text_color=
+             refFavorable ==
+             1 ?
+             color.lime :
+             color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         10,
+         "Early Confirm",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         10,
+         earlyText,
+         text_color=
+             refEarly ==
+             1 ?
+             color.lime :
+             color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         11,
+         "1m Projection",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         11,
+         projectionText,
+         text_color=
+             refProjection !=
+             0 ?
+             color.lime :
+             color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         12,
+         "Last Event",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         12,
+         lastEventText,
+         text_color=
+             refLastEvent >
+             0 ?
+             BULL :
+             refLastEvent <
+             0 ?
+             BEAR :
+             color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         0,
+         13,
+         "Last Score",
+         text_color=color.white,
+         text_size=dashSize)
+
+    table.cell(
+         dash,
+         1,
+         13,
+         "Q" +
+         str.tostring(
+             refLastScore) +
+         " / 5",
+         text_color=
+             refLastScore >=
+             4 ?
+             color.lime :
+             refLastScore >=
+             3 ?
+             color.yellow :
+             color.white,
+         text_size=dashSize)
+
+if barstate.islast and not showDashboardInput
+
+    table.clear(
+         dash,
+         0,
+         0,
+         1,
+         13)
+
+//=============================================================================
+// DATA WINDOW
+//=============================================================================
+
+plot(
+     currentStructureCode,
+     "External Structure +1 Bull / -1 Bear",
+     display=display.data_window)
+
+plot(
+     thesisDir,
+     "Active Thesis +1 Bull / -1 Bear",
+     display=display.data_window)
+
+plot(
+     buildStage,
+     "Build Stage 0-6",
+     display=display.data_window)
+
+plot(
+     keyLevel,
+     "Frozen External Key",
+     display=display.data_window)
+
+plot(
+     firstLeg,
+     "Internal First Leg",
+     display=display.data_window)
+
+plot(
+     neckline,
+     "Internal Neckline",
+     display=display.data_window)
+
+plot(
+     secondLeg,
+     "Internal Second Leg",
+     display=display.data_window)
+
+plot(
+     secondClass,
+     "Second Class 1 Hold / 2 Shallow / 3 Deep",
+     display=display.data_window)
+
+plot(
+     secondFavorable ?
+     1 :
+     0,
+     "Second Leg Favorable",
+     display=display.data_window)
+
+plot(
+     earlyConfirmed ?
+     1 :
+     0,
+     "Early Confirmed",
+     display=display.data_window)
+
+plot(
+     fullConfirmed ?
+     1 :
+     0,
+     "Full Confirmed",
+     display=display.data_window)
+
+//=============================================================================
+// NAMED ALERT CONDITIONS
+//=============================================================================
+
+alertcondition(
+     bullExternalBosEvent,
+     "External Bull BOS",
+     "External bullish structure BOS on {{ticker}}.")
+
+alertcondition(
+     bearExternalBosEvent,
+     "External Bear BOS",
+     "External bearish structure BOS on {{ticker}}.")
+
+alertcondition(
+     bullEarlyEvent,
+     "EARLY Bull W Confirmation",
+     "EARLY bullish W confirmation: 5m displacement after second leg on {{ticker}}.")
+
+alertcondition(
+     bearEarlyEvent,
+     "EARLY Bear M Confirmation",
+     "EARLY bearish M confirmation: 5m displacement after second leg on {{ticker}}.")
+
+alertcondition(
+     bullFullEvent,
+     "FULL Bull W Confirmation",
+     "FULL bullish W confirmation: confirmed external-timeframe close through neckline on {{ticker}}.")
+
+alertcondition(
+     bearFullEvent,
+     "FULL Bear M Confirmation",
+     "FULL bearish M confirmation: confirmed external-timeframe close through neckline on {{ticker}}.")
