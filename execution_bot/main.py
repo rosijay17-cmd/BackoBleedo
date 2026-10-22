@@ -45,7 +45,8 @@ async def webhook(request: Request):
         return {"status": "close_submitted", "symbol": symbol}
 
     side = OrderSide.BUY if action == "buy" else OrderSide.SELL
-    time_in_force = TimeInForce.DAY
+    is_crypto = "/" in symbol
+    time_in_force = TimeInForce.GTC if is_crypto else TimeInForce.DAY
 
     qty = payload.get("qty")
     notional = payload.get("notional")

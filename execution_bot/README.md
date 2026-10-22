@@ -68,6 +68,14 @@ Fields:
 You'll want one alert per entry/exit condition in your strategy, each with
 its own hardcoded `action` (and `qty`/`notional`) in the message.
 
+### Crypto
+
+Alpaca also supports crypto on the same account (paper included). Use a
+symbol with a slash, e.g. `"symbol": "BTC/USD"` -- the bot detects the `/`
+and automatically submits it as `GTC` (good-till-canceled) instead of a
+day order, since crypto trades 24/7 and Alpaca doesn't accept day orders
+for it.
+
 ## 4. Going live
 
 Once paper trading looks correct: generate a **live** API key/secret from
